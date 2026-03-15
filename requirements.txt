@@ -1,0 +1,5 @@
+# Core dependencies for Damanat PMS Video Analytics
+ultralytics>=8.1.0        # YOLO11 inference + built-in tracking
+opencv-python-headless>=4.8.0  # Video I/O without GUI overhead
+shapely>=2.0.0            # Polygon geometry for slot assignment
+pyyaml>=6.0               # Config file parsing

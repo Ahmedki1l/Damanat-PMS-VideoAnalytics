@@ -1,0 +1,140 @@
+# =============================================================================
+# Damanat PMS Video Analytics — Multi-Camera Configuration (TEMPLATE)
+# =============================================================================
+# Copy this file to config.yaml and fill in your camera credentials:
+#   cp config.example.yaml config.yaml
+# =============================================================================
+
+# --- Camera Definitions ---
+# Ground floor cameras (CAM_01, CAM_02) are excluded — outdoor, no ANPR.
+
+cameras:
+  # ── B1 Floor ──────────────────────────────────────────────
+  - id: CAM_03
+    name: B1-PARKING
+    floor: B1
+    ip: "10.1.13.62"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b1_cam03.json"
+
+  - id: CAM_04
+    name: B1-PARKING
+    floor: B1
+    ip: "10.1.13.63"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b1_cam04.json"
+
+  - id: CAM_05
+    name: B1-PARKING
+    floor: B1
+    ip: "10.1.13.64"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b1_cam05.json"
+
+  - id: CAM_06
+    name: B1-PARKING
+    floor: B1
+    ip: "10.1.13.65"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b1_cam06.json"
+
+  - id: CAM_07
+    name: B1-PARKING
+    floor: B1
+    ip: "10.1.13.66"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b1_cam07.json"
+
+  - id: CAM_08
+    name: B1-PARKING
+    floor: B1
+    ip: "10.1.13.67"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b1_cam08.json"
+
+  # ── B2 Floor ──────────────────────────────────────────────
+  - id: CAM_09
+    name: B2-PARKING
+    floor: B2
+    ip: "10.1.13.68"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b2_cam09.json"
+
+  - id: CAM_10
+    name: B2-PARKING
+    floor: B2
+    ip: "10.1.13.69"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b2_cam10.json"
+
+  - id: CAM_11
+    name: B2-PARKING
+    floor: B2
+    ip: "10.1.13.70"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b2_cam11.json"
+
+  - id: CAM_12
+    name: B2-PARKING
+    floor: B2
+    ip: "10.1.13.71"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b2_cam12.json"
+
+  - id: CAM_13
+    name: B2-PARKING
+    floor: B2
+    ip: "10.1.13.72"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b2_cam13.json"
+
+  - id: CAM_14
+    name: B2-PARKING
+    floor: B2
+    ip: "10.1.13.73"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/b2_cam14.json"
+
+# --- Processing Settings ---
+processing:
+  mode: "round_robin"           # Process cameras one at a time in rotation
+  target_fps_per_camera: 1      # Each camera gets ~1 frame/second
+  stream_channel: 102           # RTSP channel: 101=main(4K), 102=sub(720p)
+
+# --- Detector Settings ---
+detector:
+  model_path: "models/yolo11n.pt"
+  confidence: 0.35
+  classes: [2]                  # 2 = car only
+  imgsz: 480                    # Lower resolution for CPU efficiency
+
+# --- Tracker Settings ---
+tracker:
+  type: "bytetrack"
+
+# --- State Machine Settings ---
+state_machine:
+  confirm_enter_frames: 5
+  confirm_leave_frames: 8
+
+# --- Slot Assignment Settings ---
+assigner:
+  overlap_threshold: 0.3
+
+# --- Output Settings ---
+output:
+  log_file: ""                  # Optional: path to event log file
+  show_video: false             # Show annotated video (debug only)
+  show_camera: ""               # Which camera to show when show_video=true

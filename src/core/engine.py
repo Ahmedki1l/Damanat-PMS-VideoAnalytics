@@ -1,0 +1,387 @@
+"""
+engine.py — Main pipeline orchestrator (multi-camera support).
+
+Supports two modes:
+  1. Multi-camera: round-robin processing of 12 cameras.
+  2. Single-camera: legacy mode for testing with one stream.
+
+Pipeline per frame:
+  Frame Grabber → Detector/Tracker → Slot Assigner → State Machines → Event Bus
+"""
+
+import os
+import time
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+from src.config import AppConfig
+from src.models.slot import ParkingSlot, load_slots
+from src.models.state_machine import SlotStateMachine, SlotState
+from src.detection.tracker import TrackedDetector
+from src.core.slot_assigner import SlotAssigner
+from src.events.event_bus import EventBus
+from src.camera_manager import CameraManager, CameraConfig
+
+
+# Colors for visualization (BGR format)
+COLORS = {
+    SlotState.VACANT: (0, 255, 0),       # Green
+    SlotState.ENTERING: (0, 255, 255),   # Yellow
+    SlotState.OCCUPIED: (0, 0, 255),     # Red
+    SlotState.LEAVING: (0, 165, 255),    # Orange
+}
+
+
+class CameraPipeline:
+    """
+    Per-camera processing state.
+
+    Holds the slot polygons, state machines, and assigner
+    specific to one camera's view.
+    """
+
+    def __init__(
+        self,
+        camera_id: str,
+        floor: str,
+        slots: List[ParkingSlot],
+        config: AppConfig,
+    ):
+        self.camera_id = camera_id
+        self.floor = floor
+        self.slots = slots
+
+        # Per-slot state machines
+        self.state_machines: Dict[str, SlotStateMachine] = {}
+        for slot in slots:
+            self.state_machines[slot.id] = SlotStateMachine(
+                slot_id=slot.id,
+                confirm_enter_frames=config.state_machine.confirm_enter_frames,
+                confirm_leave_frames=config.state_machine.confirm_leave_frames,
+            )
+
+        # Slot assigner for this camera's polygons
+        self.assigner = SlotAssigner(slots=slots, config=config.assigner)
+
+    @property
+    def slot_count(self) -> int:
+        return len(self.slots)
+
+
+class ParkingEngine:
+    """
+    Main orchestrator for the parking management system.
+
+    Multi-camera mode: round-robin across all cameras.
+    Single-camera mode: processes one video source.
+    """
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+        # --- Shared detector (one YOLO model for all cameras) ---
+        self.detector = TrackedDetector(
+            detector_config=config.detector,
+            tracker_config=config.tracker,
+        )
+
+        # --- Event bus ---
+        self.event_bus = EventBus(log_file=config.output.log_file)
+
+        # --- Per-camera pipelines ---
+        self.pipelines: Dict[str, CameraPipeline] = {}
+
+        # --- Frame counter for perf logging ---
+        self._frame_count = 0
+        self._start_time = 0.0
+
+    def run_multi_camera(self) -> None:
+        """
+        Multi-camera round-robin processing loop.
+
+        Cycles through all cameras, processing one frame at a time.
+        """
+        if not self.config.cameras:
+            print("[ERROR] No cameras defined in config.")
+            return
+
+        # Build camera configs
+        camera_configs: List[CameraConfig] = []
+        for cam in self.config.cameras:
+            cc = CameraConfig(
+                id=cam.id,
+                name=cam.name,
+                floor=cam.floor,
+                ip=cam.ip,
+                user=cam.user,
+                password=cam.password,
+                slots_file=cam.slots_file,
+            )
+            cc.build_rtsp_url(channel=self.config.processing.stream_channel)
+            camera_configs.append(cc)
+
+        # Initialize camera manager
+        cam_manager = CameraManager(camera_configs)
+        opened = cam_manager.open_all()
+
+        if opened == 0:
+            print("[ERROR] No cameras could be opened. Exiting.")
+            return
+
+        # Load per-camera slot polygons and create pipelines
+        total_slots = 0
+        for cc in camera_configs:
+            slots = []
+            if cc.slots_file and os.path.exists(cc.slots_file):
+                slots = load_slots(cc.slots_file)
+            elif cc.slots_file:
+                print(f"[WARN] Slots file '{cc.slots_file}' not found for {cc.id}. "
+                      f"Run: python draw_slots.py --camera {cc.id}")
+
+            pipeline = CameraPipeline(
+                camera_id=cc.id,
+                floor=cc.floor,
+                slots=slots,
+                config=self.config,
+            )
+            self.pipelines[cc.id] = pipeline
+            total_slots += pipeline.slot_count
+
+        print(f"[INFO] Total parking slots across all cameras: {total_slots}")
+        print(f"[INFO] Processing mode: {self.config.processing.mode}")
+        print(f"[INFO] Target FPS per camera: {self.config.processing.target_fps_per_camera}\n")
+
+        # Visualization setup
+        show = self.config.output.show_video
+        show_camera = self.config.output.show_camera
+
+        self._start_time = time.time()
+        summary_interval = max(1, len(camera_configs) * 10)  # Every ~10 full cycles
+
+        try:
+            while True:
+                # Get next frame (round-robin)
+                cam_id, frame = cam_manager.next_frame()
+
+                if cam_id is None:
+                    print("[WARN] All cameras unavailable. Retrying in 5s...")
+                    time.sleep(5)
+                    continue
+
+                t_start = time.time()
+
+                # Process this camera's frame
+                pipeline = self.pipelines.get(cam_id)
+                if pipeline is None or pipeline.slot_count == 0:
+                    continue
+
+                # --- 1. Detect + Track ---
+                detections = self.detector.detect_and_track(frame)
+
+                # --- 2. Assign to slots ---
+                assignment = pipeline.assigner.assign(detections)
+
+                # --- 3. Update state machines ---
+                all_events = []
+                for slot in pipeline.slots:
+                    vehicle_in_slot = slot.id in assignment.slot_vehicle_map
+                    track_id = None
+                    if vehicle_in_slot:
+                        track_id, _ = assignment.slot_vehicle_map[slot.id]
+
+                    events = pipeline.state_machines[slot.id].update(
+                        vehicle_present=vehicle_in_slot,
+                        track_id=track_id,
+                    )
+                    # Add camera/floor context to events
+                    for evt in events:
+                        evt.camera_id = cam_id
+                        evt.floor = pipeline.floor
+                    all_events.extend(events)
+
+                # --- 4. Emit events ---
+                if all_events:
+                    self.event_bus.emit_batch(all_events)
+
+                # --- 5. Periodic status summary ---
+                self._frame_count += 1
+                if self._frame_count % summary_interval == 0:
+                    self._emit_full_summary()
+
+                # --- 6. Visualization (optional, single camera) ---
+                if show and (not show_camera or show_camera == cam_id):
+                    self._draw_frame(frame, pipeline, assignment, cam_id)
+                    cv2.imshow(f"PMS — {cam_id}", frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
+                        print("[INFO] 'q' pressed — exiting.")
+                        break
+
+                # --- 7. Pacing ---
+                t_elapsed = time.time() - t_start
+                if self._frame_count % (len(camera_configs) * 5) == 0:
+                    total_elapsed = time.time() - self._start_time
+                    avg_fps = self._frame_count / total_elapsed if total_elapsed > 0 else 0
+                    print(f"[PERF] Total frames: {self._frame_count} | "
+                          f"Camera: {cam_id} | "
+                          f"Detections: {len(detections)} | "
+                          f"Processing: {t_elapsed*1000:.0f}ms | "
+                          f"Avg FPS: {avg_fps:.1f} | "
+                          f"Active cams: {cam_manager.active_count}/{cam_manager.total_count}")
+
+        except KeyboardInterrupt:
+            print("\n[INFO] Interrupted — shutting down.")
+
+        finally:
+            cam_manager.close_all()
+            if show:
+                cv2.destroyAllWindows()
+            self.event_bus.close()
+            print("[INFO] Engine stopped.")
+
+    def run_single_camera(self, video_source: str, slots_file: str = "") -> None:
+        """
+        Single-camera mode (legacy/testing).
+
+        Args:
+            video_source: Video file path or RTSP URL.
+            slots_file: Path to slot polygon JSON file.
+        """
+        print(f"[INFO] Single-camera mode: {video_source}")
+
+        cap = cv2.VideoCapture(video_source)
+        if not cap.isOpened():
+            print(f"[ERROR] Cannot open video source: {video_source}")
+            return
+
+        # Load slots
+        sf = slots_file or self.config.slots_file
+        slots = load_slots(sf) if os.path.exists(sf) else []
+
+        pipeline = CameraPipeline(
+            camera_id="SINGLE",
+            floor="",
+            slots=slots,
+            config=self.config,
+        )
+        self.pipelines["SINGLE"] = pipeline
+
+        source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        target_fps = self.config.video_target_fps or 2
+        frame_skip = max(1, int(source_fps / target_fps))
+
+        print(f"[INFO] Source FPS: {source_fps:.1f}, Target FPS: {target_fps}")
+        print(f"[INFO] Processing every {frame_skip}th frame")
+
+        show = self.config.output.show_video
+        frame_idx = 0
+        summary_interval = target_fps * 10
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("[INFO] End of video stream.")
+                    break
+
+                frame_idx += 1
+                if frame_idx % frame_skip != 0:
+                    continue
+
+                t_start = time.time()
+
+                detections = self.detector.detect_and_track(frame)
+                assignment = pipeline.assigner.assign(detections)
+
+                all_events = []
+                for slot in pipeline.slots:
+                    vehicle_in_slot = slot.id in assignment.slot_vehicle_map
+                    track_id = None
+                    if vehicle_in_slot:
+                        track_id, _ = assignment.slot_vehicle_map[slot.id]
+                    events = pipeline.state_machines[slot.id].update(
+                        vehicle_present=vehicle_in_slot,
+                        track_id=track_id,
+                    )
+                    all_events.extend(events)
+
+                if all_events:
+                    self.event_bus.emit_batch(all_events)
+
+                self._frame_count += 1
+                if summary_interval > 0 and self._frame_count % summary_interval == 0:
+                    statuses = [sm.get_status() for sm in pipeline.state_machines.values()]
+                    self.event_bus.emit_status_summary(statuses)
+
+                if show:
+                    self._draw_frame(frame, pipeline, assignment, "SINGLE")
+                    cv2.imshow("Parking Management System", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                t_elapsed = time.time() - t_start
+                if self._frame_count % (target_fps * 5) == 0:
+                    fps = 1.0 / t_elapsed if t_elapsed > 0 else 999
+                    print(f"[PERF] Frame {frame_idx} | "
+                          f"Detections: {len(detections)} | "
+                          f"Processing: {t_elapsed*1000:.0f}ms | "
+                          f"Effective FPS: {fps:.1f}")
+
+        except KeyboardInterrupt:
+            print("\n[INFO] Interrupted — shutting down.")
+
+        finally:
+            cap.release()
+            if show:
+                cv2.destroyAllWindows()
+            self.event_bus.close()
+            print("[INFO] Engine stopped.")
+
+    def _emit_full_summary(self):
+        """Emit status summary across all cameras."""
+        all_statuses = []
+        for cam_id, pipeline in self.pipelines.items():
+            for sm in pipeline.state_machines.values():
+                status = sm.get_status()
+                status["camera_id"] = cam_id
+                status["floor"] = pipeline.floor
+                all_statuses.append(status)
+        self.event_bus.emit_status_summary(all_statuses)
+
+    @staticmethod
+    def _draw_frame(frame, pipeline, assignment, cam_id):
+        """Draw slot polygons and detections on a frame."""
+        # Draw camera label
+        cv2.putText(
+            frame, f"{cam_id} | {pipeline.floor}",
+            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+        )
+
+        for slot in pipeline.slots:
+            sm = pipeline.state_machines[slot.id]
+            color = COLORS.get(sm.state, (128, 128, 128))
+
+            coords = list(slot.polygon.exterior.coords)
+            pts = np.array(coords, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
+
+            cx, cy = int(slot.centroid_x), int(slot.centroid_y)
+            label = f"{slot.id}: {sm.state.value}"
+            cv2.putText(
+                frame, label, (cx - 40, cy),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
+            )
+
+        for det_info in assignment.slot_vehicle_map.values():
+            track_id, detection = det_info
+            x1, y1, x2, y2 = [int(v) for v in detection.bbox]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+            cv2.putText(
+                frame, f"ID:{track_id}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2,
+            )
+            bc_x, bc_y = detection.bottom_center
+            cv2.circle(frame, (int(bc_x), int(bc_y)), 5, (0, 0, 255), -1)

@@ -1,0 +1,46 @@
+# YOLO model weights (download via setup_model.py)
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+logs/
+events.jsonl
+
+# Test videos
+*.mp4
+*.avi
+*.mkv
+
+# Snapshots (generated during setup)
+snapshot*.jpg
+snapshot*.png
+
+# Config with real credentials (use config.example.yaml as template)
+config.yaml
+
+# Temporary scripts
+capture_snapshot.py
