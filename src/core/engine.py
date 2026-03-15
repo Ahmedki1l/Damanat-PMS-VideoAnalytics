@@ -78,8 +78,9 @@ class ParkingEngine:
     Single-camera mode: processes one video source.
     """
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, vehicle_registry=None):
         self.config = config
+        self.vehicle_registry = vehicle_registry
 
         # --- Shared detector (one YOLO model for all cameras) ---
         self.detector = TrackedDetector(

@@ -3,3 +3,9 @@ ultralytics>=8.1.0        # YOLO11 inference + built-in tracking
 opencv-python-headless>=4.8.0  # Video I/O without GUI overhead
 shapely>=2.0.0            # Polygon geometry for slot assignment
 pyyaml>=6.0               # Config file parsing
+
+# API server
+fastapi>=0.110.0          # REST API framework
+uvicorn>=0.27.0           # ASGI server for FastAPI
+python-multipart>=0.0.6   # File upload support
+

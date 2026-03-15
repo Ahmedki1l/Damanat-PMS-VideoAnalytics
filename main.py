@@ -1,12 +1,14 @@
 """
 main.py — Entry point for the Damanat PMS Video Analytics system.
 
-Supports two modes:
+Supports three modes:
   1. Multi-camera mode (default): processes all cameras from config.yaml
-  2. Single-camera mode: --video flag for testing with one stream
+  2. Single-camera mode: --camera or --video flag
+  3. API server mode: --api flag starts FastAPI alongside the engine
 
 Usage:
     python main.py                                     # Multi-camera mode
+    python main.py --api                               # Multi-camera + API server
     python main.py --camera CAM_04 --show              # Single camera with visualization
     python main.py --video sample.mp4 --show           # Legacy single-file mode
     python main.py --show --show-camera CAM_04         # Multi-camera, visualize one
@@ -18,9 +20,41 @@ Press Ctrl+C to stop at any time.
 import argparse
 import os
 import sys
+import threading
 
 from src.config import load_config
 from src.core.engine import ParkingEngine
+
+
+def start_api_server(engine, registry, host="0.0.0.0", port=8000):
+    """Start the FastAPI server in a background thread."""
+    import uvicorn
+    from src.api import create_app
+
+    def get_slot_statuses():
+        """Callback for the API to get current slot statuses."""
+        all_statuses = []
+        for cam_id, pipeline in engine.pipelines.items():
+            for sm in pipeline.state_machines.values():
+                status = sm.get_status()
+                status["camera_id"] = cam_id
+                status["floor"] = pipeline.floor
+                all_statuses.append(status)
+        return all_statuses
+
+    app = create_app(
+        vehicle_registry=registry,
+        get_slot_statuses=get_slot_statuses,
+    )
+
+    def run_server():
+        uvicorn.run(app, host=host, port=port, log_level="info")
+
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    print(f"[INFO] API server started at http://{host}:{port}")
+    print(f"[INFO] Docs: http://{host}:{port}/docs\n")
+    return thread
 
 
 def main():
@@ -30,6 +64,8 @@ def main():
         epilog="""
 Examples:
   python main.py                                  # All cameras, round-robin
+  python main.py --api                            # Multi-camera + API server
+  python main.py --api --port 9000                # Custom API port
   python main.py --camera CAM_04 --show           # Single camera with visualization
   python main.py --video sample.mp4 --show        # Legacy single-file mode
   python main.py --show --show-camera CAM_04      # Multi-cam, show one camera
@@ -59,6 +95,14 @@ Examples:
         "--fps", type=int, default=None,
         help="Override target processing FPS.",
     )
+    parser.add_argument(
+        "--api", action="store_true",
+        help="Start the FastAPI server alongside the engine.",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000,
+        help="API server port (default: 8000).",
+    )
     args = parser.parse_args()
 
     # --- Load configuration ---
@@ -81,7 +125,17 @@ Examples:
         print(f"[HINT] Run 'python setup_model.py' first to download the model.")
         sys.exit(1)
 
-    engine = ParkingEngine(config)
+    # --- Initialize vehicle registry (shared between engine and API) ---
+    registry = None
+    if args.api:
+        from src.vehicle_registry import VehicleRegistry
+        registry = VehicleRegistry()
+
+    engine = ParkingEngine(config, vehicle_registry=registry)
+
+    # --- Start API server if requested ---
+    if args.api:
+        start_api_server(engine, registry, port=args.port)
 
     # --- Decide which mode to run ---
     if args.video:
