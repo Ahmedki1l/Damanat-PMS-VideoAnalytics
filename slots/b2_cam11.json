@@ -1,6 +1,6 @@
 [
   {
-    "id": "A1",
+    "id": "B17",
     "polygon": [
       [
         445,
@@ -19,10 +19,10 @@
         163
       ]
     ],
-    "label": "Slot A1"
+    "label": "Slot B17"
   },
   {
-    "id": "A2",
+    "id": "B18",
     "polygon": [
       [
         508,
@@ -41,10 +41,10 @@
         263
       ]
     ],
-    "label": "Slot A2"
+    "label": "Slot B18"
   },
   {
-    "id": "A3",
+    "id": "B19",
     "polygon": [
       [
         506,
@@ -63,10 +63,10 @@
         356
       ]
     ],
-    "label": "Slot A3"
+    "label": "Slot B19"
   },
   {
-    "id": "A4",
+    "id": "B20",
     "polygon": [
       [
         79,
@@ -85,32 +85,10 @@
         153
       ]
     ],
-    "label": "Slot A4"
+    "label": "Slot B20"
   },
   {
-    "id": "A5",
-    "polygon": [
-      [
-        258,
-        85
-      ],
-      [
-        290,
-        55
-      ],
-      [
-        230,
-        54
-      ],
-      [
-        176,
-        81
-      ]
-    ],
-    "label": "Slot A5"
-  },
-  {
-    "id": "A6",
+    "id": "B16",
     "polygon": [
       [
         410,
@@ -129,6 +107,6 @@
         100
       ]
     ],
-    "label": "Slot A6"
+    "label": "Slot B16"
   }
 ]

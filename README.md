@@ -52,7 +52,7 @@ python draw_slots.py --camera all          # All cameras sequentially
 ### 5. Run
 
 ```bash
-# Multi-camera (all 12 cameras, round-robin)
+# Multi-camera (all 14 cameras, round-robin)
 python main.py
 
 # Single camera with visualization
