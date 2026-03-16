@@ -1,18 +1,23 @@
 """
-vehicle_registry.py — Vehicle plate-to-slot tracking.
+vehicle_registry.py — Vehicle plate-to-slot tracking with track ID matching.
 
-Stores ANPR events (plate + image) and links them to parking slots
-via time-window correlation.
+Stores ANPR events (plate + image) and links them to parking slots.
+
+Linking strategy (in priority order):
+  1. Track ID match: if the track_id already has a plate → known car moving slots
+  2. Time-window match: most recent unlinked ANPR entry within 2 minutes
+
+This prevents a known parked car from consuming a pending ANPR entry
+when it simply moves to a different slot.
 
 Thread-safe for concurrent access from the API and engine.
 """
 
 import os
-import time
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -24,29 +29,35 @@ class VehicleRecord:
     plate: str
     direction: str                     # "entry" or "exit"
     timestamp: datetime
-    image_path: Optional[str] = None   # Path to saved car crop image
+    image_path: Optional[str] = None   # Path to saved ANPR image
     linked_slot: Optional[str] = None  # Slot ID if linked
     linked_camera: Optional[str] = None
     linked_floor: Optional[str] = None
     linked_at: Optional[datetime] = None
+    track_id: Optional[int] = None     # ByteTrack ID when linked
 
 
 class VehicleRegistry:
     """
     Central registry linking ANPR plates to parking slots.
 
-    Flow:
-      1. ANPR server sends plate + image → stored as pending entry
-      2. Engine detects vehicle entering a slot → tries to link to a pending plate
-      3. When linked: we know plate "ABC-1234" is in slot A2 on floor B1
-      4. On exit ANPR event → mark the vehicle as departed
+    Maintains three key mappings:
+      - _pending_entries: ANPR plates awaiting slot assignment
+      - _parked: slot_id → VehicleRecord (currently parked)
+      - _track_plate_map: (camera_id, track_id) → plate
+        Ensures known cars are recognized when they move slots.
     """
 
     def __init__(self, image_dir: str = "vehicle_images"):
         self._lock = threading.Lock()
-        self._pending_entries: List[VehicleRecord] = []   # Awaiting slot link
-        self._parked: Dict[str, VehicleRecord] = {}       # slot_id → record
-        self._history: List[VehicleRecord] = []           # Completed visits
+        self._pending_entries: List[VehicleRecord] = []    # Awaiting slot link
+        self._parked: Dict[str, VehicleRecord] = {}        # slot_id → record
+        self._history: List[VehicleRecord] = []            # Completed visits
+
+        # Track ID → plate mapping (per camera)
+        # Key: (camera_id, track_id), Value: plate
+        self._track_plate_map: Dict[Tuple[str, int], str] = {}
+
         self._image_dir = image_dir
         os.makedirs(image_dir, exist_ok=True)
 
@@ -58,7 +69,7 @@ class VehicleRegistry:
         image_bytes: Optional[bytes] = None,
     ) -> VehicleRecord:
         """
-        Register a new ANPR event.
+        Register a new ANPR event (entry or exit).
 
         Args:
             plate: License plate string.
@@ -98,27 +109,45 @@ class VehicleRegistry:
         slot_id: str,
         camera_id: str,
         floor: str,
+        track_id: Optional[int],
         timestamp: datetime,
         time_window_seconds: int = 120,
     ) -> Optional[str]:
         """
-        Try to link a newly occupied slot to a pending ANPR entry.
+        Try to link a newly occupied slot to a plate.
 
-        Uses time-window matching: the most recent unlinked plate
-        within the time window is linked to this slot.
+        Priority:
+          1. Check if this track_id already has a known plate
+             → known car moving to a different slot (just update location)
+          2. Search pending ANPR entries (time-window match)
+             → new car just entered via ANPR
 
         Args:
             slot_id: The slot that just became occupied.
             camera_id: Camera that detected the vehicle.
             floor: Floor of the slot.
+            track_id: ByteTrack ID of the vehicle.
             timestamp: When the slot became occupied.
-            time_window_seconds: How far back to search for matching plates.
+            time_window_seconds: How far back to search for ANPR entries.
 
         Returns:
             The linked plate string, or None if no match found.
         """
         with self._lock:
-            # Search pending entries in reverse (most recent first)
+            # --- Strategy 1: Track ID already has a plate ---
+            if track_id is not None:
+                key = (camera_id, track_id)
+                existing_plate = self._track_plate_map.get(key)
+                if existing_plate:
+                    # Known car — update its slot location
+                    self._move_car_to_slot(
+                        existing_plate, slot_id, camera_id, floor, track_id, timestamp
+                    )
+                    print(f"[MOVE] Known car {existing_plate} (track {track_id}) "
+                          f"→ {slot_id} ({floor})")
+                    return existing_plate
+
+            # --- Strategy 2: Time-window match with pending ANPR entries ---
             for record in reversed(self._pending_entries):
                 age = (timestamp - record.timestamp).total_seconds()
                 if age <= time_window_seconds and record.linked_slot is None:
@@ -127,10 +156,73 @@ class VehicleRegistry:
                     record.linked_camera = camera_id
                     record.linked_floor = floor
                     record.linked_at = timestamp
+                    record.track_id = track_id
                     self._parked[slot_id] = record
-                    print(f"[LINK] Plate {record.plate} → {slot_id} ({floor}, {camera_id})")
+
+                    # Register track_id → plate mapping
+                    if track_id is not None:
+                        self._track_plate_map[(camera_id, track_id)] = record.plate
+
+                    print(f"[LINK] Plate {record.plate} → {slot_id} ({floor}, "
+                          f"track={track_id})")
                     return record.plate
+
             return None
+
+    def _move_car_to_slot(
+        self,
+        plate: str,
+        new_slot_id: str,
+        camera_id: str,
+        floor: str,
+        track_id: int,
+        timestamp: datetime,
+    ):
+        """Move a known car from its current slot to a new slot."""
+        # Find and remove from old slot
+        old_slot = None
+        record = None
+        for sid, rec in self._parked.items():
+            if rec.plate == plate:
+                old_slot = sid
+                record = rec
+                break
+
+        if old_slot:
+            del self._parked[old_slot]
+            print(f"[MOVE] {plate}: {old_slot} → {new_slot_id}")
+
+        if record is None:
+            # This shouldn't happen, but handle gracefully
+            record = VehicleRecord(
+                plate=plate, direction="entry", timestamp=timestamp
+            )
+
+        # Update slot info
+        record.linked_slot = new_slot_id
+        record.linked_camera = camera_id
+        record.linked_floor = floor
+        record.linked_at = timestamp
+        record.track_id = track_id
+        self._parked[new_slot_id] = record
+
+    def update_track_plate(
+        self, camera_id: str, track_id: int, plate: str
+    ):
+        """
+        Manually associate a track_id with a plate.
+
+        Useful when cross-camera matching identifies a car.
+        """
+        with self._lock:
+            self._track_plate_map[(camera_id, track_id)] = plate
+
+    def get_plate_for_track(
+        self, camera_id: str, track_id: int
+    ) -> Optional[str]:
+        """Get the plate associated with a track_id (if any)."""
+        with self._lock:
+            return self._track_plate_map.get((camera_id, track_id))
 
     def _handle_exit(self, plate: str, timestamp: datetime):
         """Handle an exit ANPR event — find and archive the parked record."""
@@ -144,6 +236,10 @@ class VehicleRegistry:
         if slot_to_remove:
             record = self._parked.pop(slot_to_remove)
             self._history.append(record)
+            # Clean up track_id mapping
+            if record.track_id and record.linked_camera:
+                key = (record.linked_camera, record.track_id)
+                self._track_plate_map.pop(key, None)
             print(f"[EXIT] Plate {plate} left slot {slot_to_remove}")
 
         # Also remove from pending entries
@@ -167,6 +263,7 @@ class VehicleRegistry:
                         "slot_id": slot_id,
                         "camera_id": record.linked_camera,
                         "floor": record.linked_floor,
+                        "track_id": record.track_id,
                         "parked_at": record.linked_at.isoformat() if record.linked_at else None,
                         "entry_time": record.timestamp.isoformat(),
                     }
@@ -181,6 +278,7 @@ class VehicleRegistry:
                     "slot_id": sid,
                     "camera_id": r.linked_camera,
                     "floor": r.linked_floor,
+                    "track_id": r.track_id,
                     "parked_at": r.linked_at.isoformat() if r.linked_at else None,
                     "entry_time": r.timestamp.isoformat(),
                 }
@@ -208,4 +306,5 @@ class VehicleRegistry:
                 "parked_count": len(self._parked),
                 "pending_entries": sum(1 for r in self._pending_entries if r.linked_slot is None),
                 "total_visits": len(self._history),
+                "tracked_ids": len(self._track_plate_map),
             }

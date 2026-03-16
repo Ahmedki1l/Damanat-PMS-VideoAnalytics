@@ -1,5 +1,5 @@
 # YOLO model weights (download via setup_model.py)
-models/
+*.pt
 
 # Python
 __pycache__/
@@ -29,6 +29,9 @@ Thumbs.db
 *.log
 logs/
 events.jsonl
+
+# Vehicle images (generated at runtime)
+vehicle_images/
 
 # Test videos
 *.mp4

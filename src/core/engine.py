@@ -189,8 +189,9 @@ class ParkingEngine:
                 for slot in pipeline.slots:
                     vehicle_in_slot = slot.id in assignment.slot_vehicle_map
                     track_id = None
+                    detection = None
                     if vehicle_in_slot:
-                        track_id, _ = assignment.slot_vehicle_map[slot.id]
+                        track_id, detection = assignment.slot_vehicle_map[slot.id]
 
                     events = pipeline.state_machines[slot.id].update(
                         vehicle_present=vehicle_in_slot,
@@ -200,6 +201,23 @@ class ParkingEngine:
                     for evt in events:
                         evt.camera_id = cam_id
                         evt.floor = pipeline.floor
+
+                        # --- Auto-link ANPR plate when slot becomes OCCUPIED ---
+                        if evt.event_type == "vehicle_parked" and self.vehicle_registry:
+                            from datetime import datetime as dt
+                            plate = self.vehicle_registry.try_link_to_slot(
+                                slot_id=slot.id,
+                                camera_id=cam_id,
+                                floor=pipeline.floor,
+                                track_id=track_id,
+                                timestamp=dt.now(),
+                            )
+                            if plate:
+                                evt.plate = plate
+                                # Crop car image from frame for visual reference
+                                if detection is not None:
+                                    self._save_car_crop(frame, detection, plate, cam_id)
+
                     all_events.extend(events)
 
                 # --- 4. Emit events ---
@@ -386,3 +404,28 @@ class ParkingEngine:
             )
             bc_x, bc_y = detection.bottom_center
             cv2.circle(frame, (int(bc_x), int(bc_y)), 5, (0, 0, 255), -1)
+
+    def _save_car_crop(self, frame, detection, plate: str, cam_id: str):
+        """Crop and save the detected car image for visual reference."""
+        try:
+            x1, y1, x2, y2 = [int(v) for v in detection.bbox]
+            h, w = frame.shape[:2]
+            # Add 10% padding
+            pad_x = int((x2 - x1) * 0.1)
+            pad_y = int((y2 - y1) * 0.1)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(w, x2 + pad_x)
+            y2 = min(h, y2 + pad_y)
+
+            crop = frame[y1:y2, x1:x2]
+            if crop.size > 0:
+                import os
+                from datetime import datetime
+                os.makedirs("vehicle_images", exist_ok=True)
+                filename = f"vehicle_images/{plate}_{cam_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                cv2.imwrite(filename, crop)
+                print(f"[CROP] Saved car image: {filename}")
+        except Exception as e:
+            print(f"[WARN] Failed to save car crop: {e}")
+
