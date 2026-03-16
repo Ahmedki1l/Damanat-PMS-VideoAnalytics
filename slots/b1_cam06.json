@@ -1,6 +1,6 @@
 [
   {
-    "id": "A1",
+    "id": "B6-Reserved",
     "polygon": [
       [
         156,
@@ -19,6 +19,6 @@
         145
       ]
     ],
-    "label": "Slot A1"
+    "label": "Slot B6-Reserved"
   }
 ]

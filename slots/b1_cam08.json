@@ -1,6 +1,6 @@
 [
   {
-    "id": "A1",
+    "id": "Chief Operating Officer",
     "polygon": [
       [
         524,
@@ -19,6 +19,28 @@
         80
       ]
     ],
-    "label": "Slot A1"
+    "label": "Slot Chief Operating Officer"
+  },
+  {
+    "id": "B5",
+    "polygon": [
+      [
+        305,
+        67
+      ],
+      [
+        388,
+        100
+      ],
+      [
+        314,
+        133
+      ],
+      [
+        305,
+        128
+      ]
+    ],
+    "label": "Slot B5"
   }
 ]

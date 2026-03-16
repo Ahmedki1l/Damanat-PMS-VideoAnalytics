@@ -1,6 +1,6 @@
 [
   {
-    "id": "A1",
+    "id": "B2",
     "polygon": [
       [
         327,
@@ -19,10 +19,10 @@
         179
       ]
     ],
-    "label": "Slot A1"
+    "label": "Slot B2"
   },
   {
-    "id": "A2",
+    "id": "B3-CEO",
     "polygon": [
       [
         409,
@@ -41,10 +41,10 @@
         272
       ]
     ],
-    "label": "Slot A2"
+    "label": "Slot B3-CEO"
   },
   {
-    "id": "A3",
+    "id": "B1-CRO",
     "polygon": [
       [
         329,
@@ -63,6 +63,6 @@
         76
       ]
     ],
-    "label": "Slot A3"
+    "label": "Slot B1-CRO"
   }
 ]
