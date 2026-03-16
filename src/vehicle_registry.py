@@ -217,24 +217,23 @@ class VehicleRegistry:
             if existing:
                 return existing
 
-            # Expire old pending entries (> 30 seconds)
-            now = datetime.now()
-            expired = []
-            remaining = []
-            for record in self._pending_entries:
-                if record.linked_slot is not None:
-                    remaining.append(record)  # Already linked, keep
-                    continue
-                age = (now - record.timestamp).total_seconds()
-                if age > self.PENDING_EXPIRY_SECONDS:
-                    expired.append(record)
-                else:
-                    remaining.append(record)
-
-            if expired:
-                for r in expired:
-                    print(f"[EXPIRE] Plate {r.plate} expired after {self.PENDING_EXPIRY_SECONDS}s (not assigned)")
-            self._pending_entries = remaining
+            # Expiry disabled for now — keep all pending entries
+            # now = datetime.now()
+            # expired = []
+            # remaining = []
+            # for record in self._pending_entries:
+            #     if record.linked_slot is not None:
+            #         remaining.append(record)
+            #         continue
+            #     age = (now - record.timestamp).total_seconds()
+            #     if age > self.PENDING_EXPIRY_SECONDS:
+            #         expired.append(record)
+            #     else:
+            #         remaining.append(record)
+            # if expired:
+            #     for r in expired:
+            #         print(f"[EXPIRE] Plate {r.plate} expired after {self.PENDING_EXPIRY_SECONDS}s")
+            # self._pending_entries = remaining
 
             # Find the oldest unlinked pending entry
             for record in self._pending_entries:
@@ -379,7 +378,7 @@ class VehicleRegistry:
         car_crop: np.ndarray,
         track_id: int,
         camera_id: str,
-        similarity_threshold: float = 0.45,
+        similarity_threshold: float = 0.35,
     ) -> Optional[str]:
         """
         Match a car crop from a camera against pending ANPR images.
@@ -421,10 +420,12 @@ class VehicleRegistry:
                     ref_images = [ref_images]
 
                 # Compare against each reference image, keep best score
-                for ref_img in ref_images:
+                for i, ref_img in enumerate(ref_images):
                     if ref_img is None or ref_img.size == 0:
                         continue
                     score = self.matcher.compare(car_crop, ref_img)
+                    print(f"[MATCH-DEBUG] Plate={record.plate} crop#{i} vs Track:{track_id} "
+                          f"(cam={camera_id}) → score={score:.3f}")
                     if score > best_score:
                         best_score = score
                         best_plate = record.plate

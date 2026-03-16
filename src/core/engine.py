@@ -308,12 +308,12 @@ class ParkingEngine:
                 if self._frame_count % (len(camera_configs) * 5) == 0:
                     total_elapsed = time.time() - self._start_time
                     avg_fps = self._frame_count / total_elapsed if total_elapsed > 0 else 0
-                    print(f"[PERF] Total frames: {self._frame_count} | "
-                          f"Camera: {cam_id} | "
-                          f"Detections: {len(detections)} | "
-                          f"Processing: {t_elapsed*1000:.0f}ms | "
-                          f"Avg FPS: {avg_fps:.1f} | "
-                          f"Active cams: {cam_manager.active_count}/{cam_manager.total_count}")
+                    #print(f"[PERF] Total frames: {self._frame_count} | "
+                    #      f"Camera: {cam_id} | "
+                    #      f"Detections: {len(detections)} | "
+                    #      f"Processing: {t_elapsed*1000:.0f}ms | "
+                    #      f"Avg FPS: {avg_fps:.1f} | "
+                    #      f"Active cams: {cam_manager.active_count}/{cam_manager.total_count}")
 
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted — shutting down.")
@@ -408,10 +408,10 @@ class ParkingEngine:
                 t_elapsed = time.time() - t_start
                 if self._frame_count % (target_fps * 5) == 0:
                     fps = 1.0 / t_elapsed if t_elapsed > 0 else 999
-                    print(f"[PERF] Frame {frame_idx} | "
-                          f"Detections: {len(detections)} | "
-                          f"Processing: {t_elapsed*1000:.0f}ms | "
-                          f"Effective FPS: {fps:.1f}")
+                    #print(f"[PERF] Frame {frame_idx} | "
+                    #      f"Detections: {len(detections)} | "
+                    #      f"Processing: {t_elapsed*1000:.0f}ms | "
+                    #      f"Effective FPS: {fps:.1f}")
 
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted — shutting down.")

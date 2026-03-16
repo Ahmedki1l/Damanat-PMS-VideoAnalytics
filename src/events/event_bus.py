@@ -45,7 +45,7 @@ class EventBus:
         event_json = json.dumps(event.to_dict())
 
         # Always print to stdout
-        print(f"[EVENT] {event_json}")
+        #print(f"[EVENT] {event_json}")
 
         # Optionally write to file
         if self._log_file:

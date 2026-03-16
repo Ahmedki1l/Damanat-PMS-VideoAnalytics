@@ -37,11 +37,12 @@ class VehicleImageMatcher:
         # score: 0.0 (different) to 1.0 (identical)
     """
 
-    # Feature weights for final score
-    WEIGHT_DOMINANT_COLOR = 0.45   # Most reliable across viewpoints
-    WEIGHT_REGIONAL_COLOR = 0.25  # Two-tone pattern matching
-    WEIGHT_SSIM = 0.15            # Structural similarity
-    WEIGHT_EDGE = 0.15            # Edge density comparison
+    # Feature weights for final score — color features dominate
+    WEIGHT_DOMINANT_COLOR = 0.35   # K-means dominant color
+    WEIGHT_COLOR_HIST = 0.25       # LAB color histogram
+    WEIGHT_REGIONAL_COLOR = 0.20   # Two-tone pattern matching
+    WEIGHT_SSIM = 0.10             # Structural similarity
+    WEIGHT_EDGE = 0.10             # Edge density comparison
 
     # Minimum crop size to process (pixels)
     MIN_CROP_SIZE = 20
@@ -75,29 +76,38 @@ class VehicleImageMatcher:
         try:
             scores = {}
 
-            # --- 1. Dominant color matching ---
+            # --- 1. Dominant color matching (K-means) ---
             scores["dominant_color"] = self._compare_dominant_colors(img1, img2)
 
-            # --- 2. Regional color comparison ---
+            # --- 2. Color histogram correlation ---
+            scores["color_hist"] = self._compare_color_histogram(img1, img2)
+
+            # --- 3. Regional color comparison ---
             scores["regional_color"] = self._compare_regional_colors(img1, img2)
 
-            # --- 3. Structural similarity ---
+            # --- 4. Structural similarity ---
             scores["ssim"] = self._compute_ssim(img1, img2)
 
-            # --- 4. Edge density comparison ---
+            # --- 5. Edge density comparison ---
             scores["edge"] = self._compare_edges(img1, img2)
 
             # Weighted combination
             final = (
                 scores["dominant_color"] * self.WEIGHT_DOMINANT_COLOR +
+                scores["color_hist"] * self.WEIGHT_COLOR_HIST +
                 scores["regional_color"] * self.WEIGHT_REGIONAL_COLOR +
                 scores["ssim"] * self.WEIGHT_SSIM +
                 scores["edge"] * self.WEIGHT_EDGE
             )
 
+            # Debug: show per-feature breakdown
+            parts = " | ".join(f"{k}={v:.2f}" for k, v in scores.items())
+            print(f"    [FEATURES] {parts} → final={final:.3f}")
+
             return max(0.0, min(1.0, final))
 
-        except Exception:
+        except Exception as e:
+            print(f"    [FEATURES] Error: {e}")
             return 0.0
 
     def _extract_dominant_colors(
@@ -170,6 +180,30 @@ class VehicleImageMatcher:
             return 0.0
 
         return total_score / total_weight
+
+    @staticmethod
+    def _compare_color_histogram(img1: np.ndarray, img2: np.ndarray) -> float:
+        """
+        Compare LAB color histograms using correlation.
+
+        Computes separate histograms for L, A, B channels and averages
+        the correlation scores. More broadly captures color distribution
+        than K-means dominant colors alone.
+        """
+        size = (64, 64)
+        lab1 = cv2.cvtColor(cv2.resize(img1, size), cv2.COLOR_BGR2LAB)
+        lab2 = cv2.cvtColor(cv2.resize(img2, size), cv2.COLOR_BGR2LAB)
+
+        scores = []
+        for ch in range(3):
+            h1 = cv2.calcHist([lab1], [ch], None, [32], [0, 256])
+            cv2.normalize(h1, h1, 0, 1, cv2.NORM_MINMAX)
+            h2 = cv2.calcHist([lab2], [ch], None, [32], [0, 256])
+            cv2.normalize(h2, h2, 0, 1, cv2.NORM_MINMAX)
+            score = cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+            scores.append(max(0.0, score))  # Clamp negative
+
+        return sum(scores) / len(scores)
 
     def _compare_regional_colors(self, img1: np.ndarray, img2: np.ndarray) -> float:
         """
