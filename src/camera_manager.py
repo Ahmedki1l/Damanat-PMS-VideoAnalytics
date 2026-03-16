@@ -1,19 +1,22 @@
 """
-camera_manager.py — Multi-camera RTSP stream manager.
+camera_manager.py — Multi-camera RTSP stream manager with threaded grabbing.
 
-Manages 12 RTSP camera streams with round-robin scheduling.
-Each camera gets ~1 frame per second (sufficient for parking detection).
+Each camera runs a background thread that continuously reads frames,
+keeping only the latest one. This prevents RTSP buffer overflow and
+ensures all cameras stay connected even when processing is slow.
 
 Features:
-  - Round-robin frame reading (one camera at a time)
+  - Per-camera background threads for continuous frame grabbing
+  - Round-robin or all-at-once frame retrieval
   - Automatic stream reconnection on failure
   - Sub-stream (720p) by default for CPU efficiency
-  - Per-camera slot polygon loading
-  - Shares a single YOLO model instance across all cameras
+  - Thread-safe latest-frame access
 """
 
+import os
 import time
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -46,24 +49,50 @@ class CameraConfig:
 
 
 class CameraStream:
-    """Manages a single RTSP stream with reconnection logic."""
+    """
+    Manages a single RTSP stream with a background grabber thread.
+
+    The grabber thread continuously reads frames from the RTSP stream,
+    keeping only the latest one. This prevents buffer overflow and
+    ensures the stream stays alive.
+    """
 
     def __init__(self, config: CameraConfig):
         self.config = config
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_open = False
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_lock = threading.Lock()
+        self._grab_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._reconnect_interval = 10.0
         self._last_reconnect = 0.0
-        self._reconnect_interval = 10.0  # seconds between reconnect attempts
 
     def open(self) -> bool:
-        """Open the RTSP stream."""
+        """Open the RTSP stream and start the background grabber."""
         try:
-            self.cap = cv2.VideoCapture(self.config.rtsp_url)
-            # Set buffer size to 1 to always get the latest frame
+            # Set FFmpeg to use TCP before opening
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+            self.cap = cv2.VideoCapture(
+                self.config.rtsp_url,
+                cv2.CAP_FFMPEG,
+            )
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+
             self.is_open = self.cap.isOpened()
             if self.is_open:
                 print(f"  [OK] {self.config.id} ({self.config.name}) — connected")
+                # Start the background grabber thread
+                self._stop_event.clear()
+                self._grab_thread = threading.Thread(
+                    target=self._grabber_loop,
+                    name=f"grab-{self.config.id}",
+                    daemon=True,
+                )
+                self._grab_thread.start()
             else:
                 print(f"  [FAIL] {self.config.id} ({self.config.name}) — cannot open stream")
             return self.is_open
@@ -72,56 +101,92 @@ class CameraStream:
             self.is_open = False
             return False
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+    def _grabber_loop(self):
         """
-        Read a single frame. Returns (success, frame).
+        Background thread: continuously grabs frames to keep stream alive.
 
-        If the stream has dropped, attempts reconnection with rate limiting.
+        Only keeps the latest frame — old frames are discarded.
+        This is the key to preventing RTSP buffer overflow.
         """
-        if not self.is_open or self.cap is None:
-            return self._try_reconnect()
+        while not self._stop_event.is_set():
+            if self.cap is None or not self.cap.isOpened():
+                # Stream died — try reconnecting
+                time.sleep(self._reconnect_interval)
+                self._reconnect()
+                continue
 
-        ret, frame = self.cap.read()
-        if not ret:
-            self.is_open = False
-            return self._try_reconnect()
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self._frame_lock:
+                    self._latest_frame = frame
+            else:
+                # Read failed — reconnect
+                self.is_open = False
+                self._reconnect()
 
-        return True, frame
-
-    def _try_reconnect(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Rate-limited reconnection attempt."""
+    def _reconnect(self):
+        """Reconnect the stream (called from grabber thread)."""
         now = time.time()
         if now - self._last_reconnect < self._reconnect_interval:
-            return False, None
+            time.sleep(1)
+            return
 
         self._last_reconnect = now
         print(f"[WARN] {self.config.id} — reconnecting...")
-        self.close()
-        if self.open():
-            return self.read()
+
+        if self.cap is not None:
+            self.cap.release()
+
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        self.cap = cv2.VideoCapture(
+            self.config.rtsp_url,
+            cv2.CAP_FFMPEG,
+        )
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+
+        self.is_open = self.cap.isOpened()
+        if self.is_open:
+            print(f"  [OK] {self.config.id} ({self.config.name}) — reconnected")
+        else:
+            print(f"  [FAIL] {self.config.id} — reconnect failed")
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """
+        Get the latest frame (non-blocking).
+
+        Returns the most recent frame grabbed by the background thread.
+        """
+        with self._frame_lock:
+            if self._latest_frame is not None:
+                frame = self._latest_frame.copy()
+                return True, frame
         return False, None
 
     def close(self):
-        """Release the stream."""
+        """Stop the grabber thread and release the stream."""
+        self._stop_event.set()
+        if self._grab_thread is not None:
+            self._grab_thread.join(timeout=3)
+            self._grab_thread = None
         if self.cap is not None:
             self.cap.release()
             self.cap = None
         self.is_open = False
+        self._latest_frame = None
 
 
 class CameraManager:
     """
-    Manages multiple camera streams with round-robin scheduling.
+    Manages multiple camera streams with threaded frame grabbing.
 
-    Cycles through all cameras, reading one frame at a time.
-    This keeps CPU usage low while covering all cameras.
+    Each camera has its own thread that continuously reads frames.
+    The main processing loop can then grab the latest frame from
+    any camera instantly without blocking.
     """
 
     def __init__(self, camera_configs: List[CameraConfig]):
-        """
-        Args:
-            camera_configs: List of CameraConfig for each camera.
-        """
         self.cameras: Dict[str, CameraStream] = {}
         self.camera_ids: List[str] = []
         self._current_index: int = 0
@@ -132,18 +197,15 @@ class CameraManager:
             self.camera_ids.append(config.id)
 
     def open_all(self) -> int:
-        """
-        Open all camera streams.
-
-        Returns:
-            Number of successfully opened streams.
-        """
+        """Open all camera streams (starts background grabber threads)."""
         print(f"\n[INFO] Opening {len(self.cameras)} camera streams...")
         success_count = 0
         for cam_id in self.camera_ids:
             if self.cameras[cam_id].open():
                 success_count += 1
 
+        # Give grabber threads a moment to get first frames
+        time.sleep(1)
         print(f"[INFO] {success_count}/{len(self.cameras)} cameras connected.\n")
         return success_count
 
@@ -151,10 +213,9 @@ class CameraManager:
         """
         Read the next frame in round-robin order.
 
-        Returns:
-            (camera_id, frame) if successful, (None, None) if all cameras failed.
+        Since frames are grabbed in background threads, this is
+        essentially instant — just picks up the latest frame.
         """
-        # Try each camera in sequence until we get a frame
         attempts = 0
         while attempts < len(self.camera_ids):
             cam_id = self.camera_ids[self._current_index]
@@ -169,7 +230,7 @@ class CameraManager:
         return None, None
 
     def read_camera(self, camera_id: str) -> Tuple[bool, Optional[np.ndarray]]:
-        """Read a specific camera's frame (for single-camera mode)."""
+        """Read a specific camera's latest frame."""
         if camera_id not in self.cameras:
             return False, None
         return self.cameras[camera_id].read()
@@ -181,7 +242,7 @@ class CameraManager:
         return None
 
     def close_all(self):
-        """Release all streams."""
+        """Stop all grabber threads and release all streams."""
         for stream in self.cameras.values():
             stream.close()
         print("[INFO] All camera streams released.")

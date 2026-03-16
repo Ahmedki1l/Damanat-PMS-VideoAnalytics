@@ -39,7 +39,7 @@ class TrackedDetector:
         self.tracker_config = tracker_config
 
         print(f"[INFO] Loading YOLO model from '{detector_config.model_path}'...")
-        self.model = YOLO(detector_config.model_path)
+        self.model = YOLO(detector_config.model_path, task="detect")
         print(f"[INFO] Model loaded. Tracker: {tracker_config.type}")
 
     def detect_and_track(self, frame: np.ndarray) -> List[Detection]:

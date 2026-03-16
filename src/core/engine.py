@@ -161,6 +161,21 @@ class ParkingEngine:
         self._start_time = time.time()
         summary_interval = max(1, len(camera_configs) * 10)  # Every ~10 full cycles
 
+        # Per-floor grid view: store latest annotated frame per camera
+        grid_frames: Dict[str, np.ndarray] = {}
+        grid_cell_width = 480
+        grid_cell_height = 270
+
+        # Group camera IDs by floor for per-floor windows
+        floor_cameras: Dict[str, list] = {}
+        for cfg in camera_configs:
+            floor = cfg.floor
+            if floor not in floor_cameras:
+                floor_cameras[floor] = []
+            floor_cameras[floor].append(cfg.id)
+        # Use 3 columns per floor (6 cameras = 3×2 grid per floor)
+        floor_cols = 3
+
         try:
             while True:
                 # Get next frame (round-robin)
@@ -176,6 +191,12 @@ class ParkingEngine:
                 # Process this camera's frame
                 pipeline = self.pipelines.get(cam_id)
                 if pipeline is None or pipeline.slot_count == 0:
+                    # Still store raw frame for grid (cameras without slots)
+                    if show:
+                        label_frame = frame.copy()
+                        cv2.putText(label_frame, cam_id, (10, 25),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        grid_frames[cam_id] = label_frame
                     continue
 
                 # --- 1. Detect + Track ---
@@ -229,10 +250,24 @@ class ParkingEngine:
                 if self._frame_count % summary_interval == 0:
                     self._emit_full_summary()
 
-                # --- 6. Visualization (optional, single camera) ---
-                if show and (not show_camera or show_camera == cam_id):
-                    self._draw_frame(frame, pipeline, assignment, cam_id)
-                    cv2.imshow(f"PMS — {cam_id}", frame)
+                # --- 6. Visualization ---
+                if show:
+                    self._draw_frame(frame, pipeline, assignment, cam_id, detections)
+                    grid_frames[cam_id] = frame
+
+                    if show_camera:
+                        # Single camera mode
+                        if show_camera == cam_id:
+                            cv2.imshow(f"PMS — {cam_id}", frame)
+                    else:
+                        # Per-floor grid windows
+                        for floor_name, floor_cam_ids in floor_cameras.items():
+                            grid = self._build_grid(
+                                grid_frames, floor_cam_ids,
+                                floor_cols, grid_cell_width, grid_cell_height,
+                            )
+                            cv2.imshow(f"Damanat PMS — {floor_name}", grid)
+
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         print("[INFO] 'q' pressed — exiting.")
@@ -335,7 +370,7 @@ class ParkingEngine:
                     self.event_bus.emit_status_summary(statuses)
 
                 if show:
-                    self._draw_frame(frame, pipeline, assignment, "SINGLE")
+                    self._draw_frame(frame, pipeline, assignment, "SINGLE", detections)
                     cv2.imshow("Parking Management System", frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
@@ -370,7 +405,7 @@ class ParkingEngine:
         self.event_bus.emit_status_summary(all_statuses)
 
     @staticmethod
-    def _draw_frame(frame, pipeline, assignment, cam_id):
+    def _draw_frame(frame, pipeline, assignment, cam_id, all_detections=None):
         """Draw slot polygons and detections on a frame."""
         # Draw camera label
         cv2.putText(
@@ -393,8 +428,11 @@ class ParkingEngine:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
             )
 
+        # Draw assigned detections (cyan bbox)
+        assigned_track_ids = set()
         for det_info in assignment.slot_vehicle_map.values():
             track_id, detection = det_info
+            assigned_track_ids.add(track_id)
             x1, y1, x2, y2 = [int(v) for v in detection.bbox]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
             cv2.putText(
@@ -404,6 +442,26 @@ class ParkingEngine:
             )
             bc_x, bc_y = detection.bottom_center
             cv2.circle(frame, (int(bc_x), int(bc_y)), 5, (0, 0, 255), -1)
+
+        # Draw UNASSIGNED detections (magenta bbox) — helps debug slot alignment
+        if all_detections:
+            for det in all_detections:
+                if det.track_id not in assigned_track_ids:
+                    x1, y1, x2, y2 = [int(v) for v in det.bbox]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+                    cv2.putText(
+                        frame, f"ID:{det.track_id} NOT ASSIGNED",
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1,
+                    )
+                    # Show the reference point used for slot assignment
+                    bc_x, bc_y = det.bottom_center
+                    cv2.circle(frame, (int(bc_x), int(bc_y)), 7, (0, 0, 255), -1)
+                    cv2.putText(
+                        frame, "ref",
+                        (int(bc_x) + 10, int(bc_y)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1,
+                    )
 
     def _save_car_crop(self, frame, detection, plate: str, cam_id: str):
         """Crop and save the detected car image for visual reference."""
@@ -428,4 +486,50 @@ class ParkingEngine:
                 print(f"[CROP] Saved car image: {filename}")
         except Exception as e:
             print(f"[WARN] Failed to save car crop: {e}")
+
+    @staticmethod
+    def _build_grid(
+        frames: Dict[str, np.ndarray],
+        camera_ids: List[str],
+        cols: int = 4,
+        cell_w: int = 480,
+        cell_h: int = 270,
+    ) -> np.ndarray:
+        """
+        Assemble camera frames into a single grid image.
+
+        Args:
+            frames: Dict of camera_id → annotated frame.
+            camera_ids: Ordered list of all camera IDs.
+            cols: Number of columns in the grid.
+            cell_w: Width of each cell in pixels.
+            cell_h: Height of each cell in pixels.
+
+        Returns:
+            Single numpy image with all cameras tiled.
+        """
+        import math
+        rows = math.ceil(len(camera_ids) / cols)
+        grid = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
+
+        for idx, cam_id in enumerate(camera_ids):
+            row = idx // cols
+            col = idx % cols
+            y_off = row * cell_h
+            x_off = col * cell_w
+
+            if cam_id in frames:
+                cell = cv2.resize(frames[cam_id], (cell_w, cell_h))
+            else:
+                # Black placeholder with camera label
+                cell = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+                cv2.putText(
+                    cell, f"{cam_id} — waiting...",
+                    (10, cell_h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1,
+                )
+
+            grid[y_off:y_off + cell_h, x_off:x_off + cell_w] = cell
+
+        return grid
 

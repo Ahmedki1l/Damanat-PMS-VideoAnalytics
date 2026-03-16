@@ -40,10 +40,10 @@ class Detection:
     @property
     def bottom_center(self) -> Tuple[float, float]:
         """
-        Compute the bottom-center point of the bounding box.
+        Compute the center point of the bounding box.
 
-        This is the primary point used for slot assignment — it
-        approximates where the vehicle's wheels contact the ground.
+        Uses true center (not bottom) so it works reliably for both
+        fully visible and partially visible (half-shown) vehicles.
         """
         x1, y1, x2, y2 = self.bbox
         cx = (x1 + x2) / 2.0

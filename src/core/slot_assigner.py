@@ -68,11 +68,15 @@ class SlotAssigner:
         # Collect all candidate (slot, detection, distance) triples
         candidates: List[Tuple[str, Detection, float]] = []
 
+        # Track a simple counter for detections without stable IDs
+        temp_id_counter = -100
+
         for det in detections:
+            # Assign a temporary ID if tracker hasn't assigned one
+            # (common in round-robin multi-cam where tracker state resets)
             if det.track_id == -1:
-                # No track ID — skip, we need stable IDs for the state machine
-                result.unassigned.append(det)
-                continue
+                det.track_id = temp_id_counter
+                temp_id_counter -= 1
 
             assigned = False
             bc_x, bc_y = det.bottom_center
@@ -101,6 +105,12 @@ class SlotAssigner:
 
             for slot in self.slots:
                 overlap = self._compute_overlap(det_box, slot.polygon)
+                # Debug: show why assignment fails
+                contains = slot.polygon.contains(bc_point)
+                print(f"[DEBUG-ASSIGN] Track:{det.track_id} → Slot:{slot.id} | "
+                      f"center=({bc_x:.0f},{bc_y:.0f}) in_poly={contains} | "
+                      f"overlap={overlap:.2%} (thresh={self.overlap_threshold:.0%})")
+
                 if overlap > self.overlap_threshold and overlap > best_overlap:
                     best_overlap = overlap
                     best_slot_id = slot.id
