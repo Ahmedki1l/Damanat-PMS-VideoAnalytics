@@ -107,9 +107,9 @@ class SlotAssigner:
                 overlap = self._compute_overlap(det_box, slot.polygon)
                 # Debug: show why assignment fails
                 contains = slot.polygon.contains(bc_point)
-                print(f"[DEBUG-ASSIGN] Track:{det.track_id} → Slot:{slot.id} | "
-                      f"center=({bc_x:.0f},{bc_y:.0f}) in_poly={contains} | "
-                      f"overlap={overlap:.2%} (thresh={self.overlap_threshold:.0%})")
+                # print(f"[DEBUG-ASSIGN] Track:{det.track_id} → Slot:{slot.id} | "
+                #       f"center=({bc_x:.0f},{bc_y:.0f}) in_poly={contains} | "
+                #       f"overlap={overlap:.2%} (thresh={self.overlap_threshold:.0%})")
 
                 if overlap > self.overlap_threshold and overlap > best_overlap:
                     best_overlap = overlap

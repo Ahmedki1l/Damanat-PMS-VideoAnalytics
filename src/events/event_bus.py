@@ -71,7 +71,7 @@ class EventBus:
             "slots": slot_statuses,
         }
         summary_json = json.dumps(summary)
-        print(f"[STATUS] {summary_json}")
+        #print(f"[STATUS] {summary_json}")
 
         if self._log_file:
             self._log_file.write(summary_json + "\n")
