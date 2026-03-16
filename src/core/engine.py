@@ -207,30 +207,31 @@ class ParkingEngine:
                     self.vehicle_registry.update_gate_snapshot(frame, detections)
 
                 # --- 1.5. Assign ANPR plates to unplated detections ---
-                # Strategy 1: Simple queue (oldest pending plate → first unplated car)
-                # Strategy 2: Image matching (if ANPR images available)
-                if self.vehicle_registry and detections:
+                # Using IMAGE MATCHING ONLY (queue disabled for testing)
+                # Only run on parking floors (B1, B2) — not gate/ground floor
+                cam_floor = pipeline.floor
+                if self.vehicle_registry and detections and cam_floor in ("B1", "B2"):
                     h, w = frame.shape[:2]
                     for det in detections:
                         if det.track_id == -1:
                             continue
-                        # Try simple queue first
-                        plate = self.vehicle_registry.try_assign_plate(
-                            track_id=det.track_id,
-                            camera_id=cam_id,
+                        # Skip if already has a plate
+                        existing = self.vehicle_registry.get_plate_for_track(
+                            det.track_id, cam_id
                         )
-                        # If queue didn't match, try image matching
-                        if not plate:
-                            x1, y1, x2, y2 = [int(v) for v in det.bbox]
-                            x1, y1 = max(0, x1), max(0, y1)
-                            x2, y2 = min(w, x2), min(h, y2)
-                            car_crop = frame[y1:y2, x1:x2]
-                            if car_crop.size > 0:
-                                self.vehicle_registry.try_match_by_image(
-                                    car_crop=car_crop,
-                                    track_id=det.track_id,
-                                    camera_id=cam_id,
-                                )
+                        if existing:
+                            continue
+                        # Try image matching
+                        x1, y1, x2, y2 = [int(v) for v in det.bbox]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
+                        car_crop = frame[y1:y2, x1:x2]
+                        if car_crop.size > 0:
+                            self.vehicle_registry.try_match_by_image(
+                                car_crop=car_crop,
+                                track_id=det.track_id,
+                                camera_id=cam_id,
+                            )
 
                 # --- 2. Assign to slots ---
                 assignment = pipeline.assigner.assign(detections)
