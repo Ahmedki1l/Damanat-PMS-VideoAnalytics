@@ -30,6 +30,7 @@ class VehicleRecord:
     direction: str                     # "entry" or "exit"
     timestamp: datetime
     image_path: Optional[str] = None   # Path to saved ANPR image
+    anpr_image: Optional[np.ndarray] = None  # ANPR image for visual matching
     linked_slot: Optional[str] = None  # Slot ID if linked
     linked_camera: Optional[str] = None
     linked_floor: Optional[str] = None
@@ -58,6 +59,10 @@ class VehicleRegistry:
         # Key: (camera_id, track_id), Value: plate
         self._track_plate_map: Dict[Tuple[str, int], str] = {}
 
+        # Cross-camera re-identification:
+        # plate → latest car crop (used to identify the car on ANY camera)
+        self._plate_crops: Dict[str, np.ndarray] = {}
+
         self._image_dir = image_dir
         os.makedirs(image_dir, exist_ok=True)
 
@@ -83,15 +88,19 @@ class VehicleRegistry:
         now = datetime.now()
         record = VehicleRecord(plate=plate, direction=direction, timestamp=now)
 
-        # Save image if provided
+        # Save image and keep in memory for visual matching
         if image is not None or image_bytes is not None:
             filename = f"{plate}_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
             filepath = os.path.join(self._image_dir, filename)
             if image_bytes is not None:
                 with open(filepath, "wb") as f:
                     f.write(image_bytes)
+                # Decode bytes to numpy for visual matching
+                arr = np.frombuffer(image_bytes, dtype=np.uint8)
+                record.anpr_image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             elif image is not None:
                 cv2.imwrite(filepath, image)
+                record.anpr_image = image.copy()
             record.image_path = filepath
 
         with self._lock:
@@ -223,6 +232,126 @@ class VehicleRegistry:
         """Get the plate associated with a track_id (if any)."""
         with self._lock:
             return self._track_plate_map.get((camera_id, track_id))
+
+    def try_match_by_image(
+        self,
+        car_crop: np.ndarray,
+        track_id: int,
+        camera_id: str,
+        similarity_threshold: float = 0.4,
+    ) -> Optional[str]:
+        """
+        Match a car crop against pending ANPR images AND known plate crops
+        from other cameras (cross-camera re-identification).
+
+        Priority:
+          1. Already known on this camera → return immediately
+          2. Compare vs pending ANPR images (entrance camera match)
+          3. Compare vs known plate crops (cross-camera re-ID)
+
+        When matched, the crop is stored for future cross-camera matching.
+
+        Args:
+            car_crop: Cropped car image from the camera frame (BGR).
+            track_id: Track ID of the detected car.
+            camera_id: Camera that detected the car.
+            similarity_threshold: Minimum histogram correlation to match (0-1).
+
+        Returns:
+            Plate string if matched, None otherwise.
+        """
+        if car_crop is None or car_crop.size == 0:
+            return None
+
+        with self._lock:
+            # Already known on THIS camera?
+            existing = self._track_plate_map.get((camera_id, track_id))
+            if existing:
+                # Update crop for better matching on next camera
+                self._plate_crops[existing] = car_crop.copy()
+                return existing
+
+            best_score = 0.0
+            best_plate = None
+
+            # --- Strategy 1: Compare vs pending ANPR images ---
+            for record in self._pending_entries:
+                if record.linked_slot is not None:
+                    continue
+                if record.anpr_image is None:
+                    continue
+
+                score = self._compare_images(car_crop, record.anpr_image)
+                if score > best_score:
+                    best_score = score
+                    best_plate = record.plate
+
+            # --- Strategy 2: Compare vs known plate crops (cross-camera) ---
+            for plate, known_crop in self._plate_crops.items():
+                score = self._compare_images(car_crop, known_crop)
+                if score > best_score:
+                    best_score = score
+                    best_plate = plate
+
+            if best_plate and best_score >= similarity_threshold:
+                # Match found! Link plate → track_id on this camera
+                self._track_plate_map[(camera_id, track_id)] = best_plate
+                # Store/update crop for future cross-camera matching
+                self._plate_crops[best_plate] = car_crop.copy()
+                print(f"[MATCH] Plate {best_plate} → Track:{track_id} "
+                      f"(cam={camera_id}, similarity={best_score:.2%})")
+                return best_plate
+
+        return None
+
+    def get_plate_for_any_camera(self, track_id: int) -> Optional[str]:
+        """
+        Get the plate for a track_id regardless of which camera identified it.
+
+        Searches all camera entries in the track_plate_map.
+        """
+        with self._lock:
+            for (cam, tid), plate in self._track_plate_map.items():
+                if tid == track_id:
+                    return plate
+            return None
+
+    @staticmethod
+    def _compare_images(img1: np.ndarray, img2: np.ndarray) -> float:
+        """
+        Compare two car images using HSV histogram correlation.
+
+        Returns similarity score between 0.0 (different) and 1.0 (identical).
+        """
+        try:
+            # Resize both to same size for fair comparison
+            size = (128, 128)
+            a = cv2.resize(img1, size)
+            b = cv2.resize(img2, size)
+
+            # Convert to HSV (more robust to lighting changes)
+            a_hsv = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
+            b_hsv = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
+
+            # Compute histograms (H: 50 bins, S: 60 bins)
+            h_bins, s_bins = 50, 60
+            channels = [0, 1]
+            ranges = [0, 180, 0, 256]
+            hist_size = [h_bins, s_bins]
+
+            hist_a = cv2.calcHist([a_hsv], channels, None, hist_size, ranges)
+            cv2.normalize(hist_a, hist_a, 0, 1, cv2.NORM_MINMAX)
+
+            hist_b = cv2.calcHist([b_hsv], channels, None, hist_size, ranges)
+            cv2.normalize(hist_b, hist_b, 0, 1, cv2.NORM_MINMAX)
+
+            # Correlation: 1.0 = perfect match, -1.0 = inverse
+            score = cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL)
+
+            # Clamp to [0, 1]
+            return max(0.0, score)
+        except Exception:
+            return 0.0
 
     def _handle_exit(self, plate: str, timestamp: datetime):
         """Handle an exit ANPR event — find and archive the parked record."""

@@ -21,6 +21,7 @@ Usage:
 import os
 import base64
 from datetime import datetime
+import logging
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
@@ -120,11 +121,21 @@ def create_app(
 
         Accepts plate number and optionally a base64-encoded vehicle image.
         """
+        print(f"\n{'='*60}")
+        print(f"[API] ANPR EVENT RECEIVED (JSON)")
+        print(f"[API]   Plate     : {event.plate}")
+        print(f"[API]   Direction : {event.direction}")
+        print(f"[API]   Camera    : {event.camera_id or 'N/A'}")
+        print(f"[API]   Image     : {'yes' if event.image_base64 else 'no'}")
+        print(f"[API]   Time      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}")
+
         image_bytes = None
         if event.image_base64:
             try:
                 image_bytes = base64.b64decode(event.image_base64)
             except Exception:
+                print(f"[API] ERROR: Invalid base64 image for plate {event.plate}")
                 raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
         record = registry.register_anpr_event(
@@ -132,6 +143,8 @@ def create_app(
             direction=event.direction,
             image_bytes=image_bytes,
         )
+
+        print(f"[API] ✓ Plate {record.plate} registered | Image saved: {record.image_path or 'none'}")
 
         return ANPREventResponse(
             status="ok",
@@ -152,6 +165,14 @@ def create_app(
 
         Alternative to JSON endpoint — accepts image as file upload.
         """
+        print(f"\n{'='*60}")
+        print(f"[API] ANPR EVENT RECEIVED (FILE UPLOAD)")
+        print(f"[API]   Plate     : {plate}")
+        print(f"[API]   Direction : {direction}")
+        print(f"[API]   Image     : {image.filename if image else 'none'}")
+        print(f"[API]   Time      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}")
+
         image_bytes = None
         if image:
             image_bytes = await image.read()
@@ -161,6 +182,8 @@ def create_app(
             direction=direction,
             image_bytes=image_bytes,
         )
+
+        print(f"[API] ✓ Plate {record.plate} registered | Image saved: {record.image_path or 'none'}")
 
         return ANPREventResponse(
             status="ok",

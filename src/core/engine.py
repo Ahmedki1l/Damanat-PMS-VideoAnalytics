@@ -202,6 +202,24 @@ class ParkingEngine:
                 # --- 1. Detect + Track ---
                 detections = self.detector.detect_and_track(frame)
 
+                # --- 1.5. ANPR Image Matching ---
+                # For each detection, crop the car and compare with pending ANPR images
+                if self.vehicle_registry and detections:
+                    h, w = frame.shape[:2]
+                    for det in detections:
+                        if det.track_id == -1:
+                            continue
+                        x1, y1, x2, y2 = [int(v) for v in det.bbox]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
+                        car_crop = frame[y1:y2, x1:x2]
+                        if car_crop.size > 0:
+                            self.vehicle_registry.try_match_by_image(
+                                car_crop=car_crop,
+                                track_id=det.track_id,
+                                camera_id=cam_id,
+                            )
+
                 # --- 2. Assign to slots ---
                 assignment = pipeline.assigner.assign(detections)
 
@@ -435,9 +453,22 @@ class ParkingEngine:
             assigned_track_ids.add(track_id)
             x1, y1, x2, y2 = [int(v) for v in detection.bbox]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+
+            # Show plate if known, otherwise show track ID
+            label = f"ID:{track_id}"
+            if self.vehicle_registry:
+                plate = self.vehicle_registry.get_plate_for_any_camera(track_id)
+                if plate:
+                    label = f"[{plate}]"
+                    # Green plate label above bbox
+                    cv2.putText(
+                        frame, label, (x1, y1 - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                    )
+                    label = f"ID:{track_id}"  # Still show track ID below
+
             cv2.putText(
-                frame, f"ID:{track_id}",
-                (x1, y1 - 10),
+                frame, label, (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2,
             )
             bc_x, bc_y = detection.bottom_center
