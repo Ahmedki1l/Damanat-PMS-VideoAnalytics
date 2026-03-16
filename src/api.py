@@ -121,12 +121,20 @@ def create_app(
 
         Accepts plate number and optionally a base64-encoded vehicle image.
         """
+        img_status = "no"
+        if event.image_base64 is None:
+            img_status = "no (field is None)"
+        elif event.image_base64 == "":
+            img_status = "no (empty string)"
+        else:
+            img_status = f"yes ({len(event.image_base64)} base64 chars ≈ {len(event.image_base64)*3//4//1024}KB)"
+
         print(f"\n{'='*60}")
         print(f"[API] ANPR EVENT RECEIVED (JSON)")
         print(f"[API]   Plate     : {event.plate}")
         print(f"[API]   Direction : {event.direction}")
         print(f"[API]   Camera    : {event.camera_id or 'N/A'}")
-        print(f"[API]   Image     : {'yes' if event.image_base64 else 'no'}")
+        print(f"[API]   Image     : {img_status}")
         print(f"[API]   Time      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
 
