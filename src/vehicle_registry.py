@@ -58,6 +58,10 @@ class VehicleRegistry:
         # Key: (camera_id, track_id), Value: plate
         self._track_plate_map: Dict[Tuple[str, int], str] = {}
 
+        # Plates currently in transit (left one camera, may appear on another).
+        # Key: plate, Value: VehicleRecord from the slot they just left.
+        self._in_transit: Dict[str, VehicleRecord] = {}
+
         self._image_dir = image_dir
         os.makedirs(image_dir, exist_ok=True)
 
@@ -147,6 +151,32 @@ class VehicleRegistry:
                           f"→ {slot_id} ({floor})")
                     return existing_plate
 
+            # --- Strategy 1.5: In-transit plate (cross-camera sync) ---
+            # When a car leaves one camera's slot, its plate is stored in
+            # _in_transit. If a new slot becomes occupied on any camera,
+            # check if an in-transit plate matches within the time window.
+            best_transit_plate = None
+            best_transit_age = float("inf")
+            for plate, record in self._in_transit.items():
+                age = (timestamp - record.linked_at).total_seconds() if record.linked_at else float("inf")
+                if age <= time_window_seconds and age < best_transit_age:
+                    best_transit_plate = plate
+                    best_transit_age = age
+
+            if best_transit_plate:
+                transit_record = self._in_transit.pop(best_transit_plate)
+                transit_record.linked_slot = slot_id
+                transit_record.linked_camera = camera_id
+                transit_record.linked_floor = floor
+                transit_record.linked_at = timestamp
+                transit_record.track_id = track_id
+                self._parked[slot_id] = transit_record
+
+                if track_id is not None:
+                    self._track_plate_map[(camera_id, track_id)] = best_transit_plate
+
+                return best_transit_plate
+
             # --- Strategy 2: Time-window match with pending ANPR entries ---
             for record in reversed(self._pending_entries):
                 age = (timestamp - record.timestamp).total_seconds()
@@ -206,6 +236,90 @@ class VehicleRegistry:
         record.track_id = track_id
         self._parked[new_slot_id] = record
 
+    def try_immediate_link(
+        self,
+        plate: str,
+        active_slots: List[Dict],
+    ) -> Optional[Dict]:
+        """
+        Immediately link a plate to the most recently active unlinked slot.
+
+        Called right after an ANPR entry event so the plate doesn't wait
+        in _pending_entries for the next vehicle_parked event.
+
+        Args:
+            plate: The plate string from the ANPR event.
+            active_slots: List of slot status dicts from get_slot_statuses(),
+                          each with slot_id, state, assigned_track_id,
+                          camera_id, floor, last_update_time.
+
+        Returns:
+            Dict with slot_id/camera_id/floor/track_id if linked, else None.
+        """
+        with self._lock:
+            # Only consider OCCUPIED or ENTERING slots
+            candidates = [
+                s for s in active_slots
+                if s.get("state") in ("OCCUPIED", "ENTERING")
+                and s.get("assigned_track_id") is not None
+            ]
+
+            # Filter out slots that already have a plate
+            unlinked = []
+            for s in candidates:
+                slot_id = s["slot_id"]
+                track_id = s.get("assigned_track_id")
+                camera_id = s.get("camera_id", "")
+
+                if slot_id in self._parked:
+                    continue
+                if track_id is not None and camera_id:
+                    if (camera_id, track_id) in self._track_plate_map:
+                        continue
+                unlinked.append(s)
+
+            if not unlinked:
+                return None
+
+            # Pick the most recently updated slot
+            best = max(unlinked, key=lambda s: s.get("last_update_time", ""))
+
+            slot_id = best["slot_id"]
+            camera_id = best.get("camera_id", "")
+            floor = best.get("floor", "")
+            track_id = best.get("assigned_track_id")
+
+            # Find the pending entry for this plate
+            record = None
+            for r in self._pending_entries:
+                if r.plate == plate and r.linked_slot is None:
+                    record = r
+                    break
+
+            if record is None:
+                return None
+
+            now = datetime.now()
+            record.linked_slot = slot_id
+            record.linked_camera = camera_id
+            record.linked_floor = floor
+            record.linked_at = now
+            record.track_id = track_id
+            self._parked[slot_id] = record
+
+            if track_id is not None and camera_id:
+                self._track_plate_map[(camera_id, track_id)] = plate
+
+            print(f"[LINK] Immediate: plate {plate} → {slot_id} "
+                  f"({floor}, cam={camera_id}, track={track_id})")
+
+            return {
+                "slot_id": slot_id,
+                "camera_id": camera_id,
+                "floor": floor,
+                "track_id": track_id,
+            }
+
     def update_track_plate(
         self, camera_id: str, track_id: int, plate: str
     ):
@@ -223,6 +337,33 @@ class VehicleRegistry:
         """Get the plate associated with a track_id (if any)."""
         with self._lock:
             return self._track_plate_map.get((camera_id, track_id))
+
+    def release_slot(self, slot_id: str) -> Optional[str]:
+        """
+        Mark a slot as vacated — move its plate to in-transit for cross-camera sync.
+
+        Called by the engine when a slot_vacant event fires.
+
+        Returns:
+            The plate that was released, or None.
+        """
+        with self._lock:
+            record = self._parked.pop(slot_id, None)
+            if record is None:
+                return None
+
+            plate = record.plate
+            # Clean up per-camera track mapping
+            if record.track_id is not None and record.linked_camera:
+                self._track_plate_map.pop(
+                    (record.linked_camera, record.track_id), None
+                )
+
+            # Make available for re-linking on any camera
+            from datetime import datetime as dt
+            record.linked_at = dt.now()
+            self._in_transit[plate] = record
+            return plate
 
     def _handle_exit(self, plate: str, timestamp: datetime):
         """Handle an exit ANPR event — find and archive the parked record."""

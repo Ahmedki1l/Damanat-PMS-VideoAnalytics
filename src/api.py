@@ -20,6 +20,7 @@ Usage:
 
 import os
 import base64
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -29,6 +30,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from src.vehicle_registry import VehicleRegistry
+
+logger = logging.getLogger(__name__)
 
 
 # --- Pydantic Models ---
@@ -120,6 +123,11 @@ def create_app(
 
         Accepts plate number and optionally a base64-encoded vehicle image.
         """
+        logger.info(
+            "[ANPR] Received from PMS AI server: plate=%s direction=%s camera_id=%s timestamp=%s",
+            event.plate, event.direction, event.camera_id, datetime.now().isoformat(),
+        )
+
         image_bytes = None
         if event.image_base64:
             try:
@@ -132,6 +140,18 @@ def create_app(
             direction=event.direction,
             image_bytes=image_bytes,
         )
+
+        # Immediately try to link to a currently active unlinked slot
+        linked_slot = None
+        if event.direction == "entry" and get_slot_statuses:
+            active_slots = get_slot_statuses()
+            result = registry.try_immediate_link(event.plate, active_slots)
+            if result:
+                linked_slot = result["slot_id"]
+                logger.info(
+                    "[ANPR] Immediate link: plate=%s → slot=%s (cam=%s, track=%s)",
+                    event.plate, result["slot_id"], result["camera_id"], result["track_id"],
+                )
 
         return ANPREventResponse(
             status="ok",
@@ -152,6 +172,11 @@ def create_app(
 
         Alternative to JSON endpoint — accepts image as file upload.
         """
+        logger.info(
+            "[ANPR] plate=%s camera_id=%s timestamp=%s",
+            plate, None, datetime.now().isoformat(),
+        )
+
         image_bytes = None
         if image:
             image_bytes = await image.read()
@@ -161,6 +186,16 @@ def create_app(
             direction=direction,
             image_bytes=image_bytes,
         )
+
+        # Immediately try to link to a currently active unlinked slot
+        if direction == "entry" and get_slot_statuses:
+            active_slots = get_slot_statuses()
+            result = registry.try_immediate_link(plate, active_slots)
+            if result:
+                logger.info(
+                    "[ANPR] Immediate link: plate=%s → slot=%s (cam=%s, track=%s)",
+                    plate, result["slot_id"], result["camera_id"], result["track_id"],
+                )
 
         return ANPREventResponse(
             status="ok",
