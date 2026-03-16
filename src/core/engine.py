@@ -202,23 +202,31 @@ class ParkingEngine:
                 # --- 1. Detect + Track ---
                 detections = self.detector.detect_and_track(frame)
 
-                # --- 1.5. ANPR Image Matching ---
-                # For each detection, crop the car and compare with pending ANPR images
+                # --- 1.5. Assign ANPR plates to unplated detections ---
+                # Strategy 1: Simple queue (oldest pending plate → first unplated car)
+                # Strategy 2: Image matching (if ANPR images available)
                 if self.vehicle_registry and detections:
                     h, w = frame.shape[:2]
                     for det in detections:
                         if det.track_id == -1:
                             continue
-                        x1, y1, x2, y2 = [int(v) for v in det.bbox]
-                        x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(w, x2), min(h, y2)
-                        car_crop = frame[y1:y2, x1:x2]
-                        if car_crop.size > 0:
-                            self.vehicle_registry.try_match_by_image(
-                                car_crop=car_crop,
-                                track_id=det.track_id,
-                                camera_id=cam_id,
-                            )
+                        # Try simple queue first
+                        plate = self.vehicle_registry.try_assign_plate(
+                            track_id=det.track_id,
+                            camera_id=cam_id,
+                        )
+                        # If queue didn't match, try image matching
+                        if not plate:
+                            x1, y1, x2, y2 = [int(v) for v in det.bbox]
+                            x1, y1 = max(0, x1), max(0, y1)
+                            x2, y2 = min(w, x2), min(h, y2)
+                            car_crop = frame[y1:y2, x1:x2]
+                            if car_crop.size > 0:
+                                self.vehicle_registry.try_match_by_image(
+                                    car_crop=car_crop,
+                                    track_id=det.track_id,
+                                    camera_id=cam_id,
+                                )
 
                 # --- 2. Assign to slots ---
                 assignment = pipeline.assigner.assign(detections)

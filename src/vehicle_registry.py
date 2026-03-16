@@ -1,14 +1,18 @@
 """
-vehicle_registry.py — Vehicle plate-to-slot tracking with track ID matching.
+vehicle_registry.py — Vehicle plate-to-slot tracking.
 
-Stores ANPR events (plate + image) and links them to parking slots.
+Two assignment strategies (use one or both):
 
-Linking strategy (in priority order):
-  1. Track ID match: if the track_id already has a plate → known car moving slots
-  2. Time-window match: most recent unlinked ANPR entry within 2 minutes
+  SIMPLE QUEUE (try_assign_plate):
+    1. ANPR sends a plate → stored in a pending queue
+    2. Any detected car without a plate gets the OLDEST pending plate
+    3. Pending plates older than 30 seconds are auto-expired
 
-This prevents a known parked car from consuming a pending ANPR entry
-when it simply moves to a different slot.
+  IMAGE MATCHING (try_match_by_image):
+    1. ANPR sends a plate + car image → both stored
+    2. For each detected car, crop is compared vs ANPR images
+    3. Uses multi-feature matching (dominant color, regional color, SSIM, edges)
+    4. Best match above threshold gets the plate assigned
 
 Thread-safe for concurrent access from the API and engine.
 """
@@ -42,16 +46,17 @@ class VehicleRegistry:
     """
     Central registry linking ANPR plates to parking slots.
 
-    Maintains three key mappings:
-      - _pending_entries: ANPR plates awaiting slot assignment
+    Simple queue-based approach:
+      - _pending_entries: FIFO queue of plates awaiting assignment
       - _parked: slot_id → VehicleRecord (currently parked)
       - _track_plate_map: (camera_id, track_id) → plate
-        Ensures known cars are recognized when they move slots.
     """
+
+    PENDING_EXPIRY_SECONDS = 30  # Auto-expire unassigned plates after 30s
 
     def __init__(self, image_dir: str = "vehicle_images"):
         self._lock = threading.Lock()
-        self._pending_entries: List[VehicleRecord] = []    # Awaiting slot link
+        self._pending_entries: List[VehicleRecord] = []    # FIFO queue
         self._parked: Dict[str, VehicleRecord] = {}        # slot_id → record
         self._history: List[VehicleRecord] = []            # Completed visits
 
@@ -59,12 +64,19 @@ class VehicleRegistry:
         # Key: (camera_id, track_id), Value: plate
         self._track_plate_map: Dict[Tuple[str, int], str] = {}
 
-        # Cross-camera re-identification:
-        # plate → latest car crop (used to identify the car on ANY camera)
-        self._plate_crops: Dict[str, np.ndarray] = {}
+        # Image matcher instance (lazy-loaded)
+        self._matcher = None
 
         self._image_dir = image_dir
         os.makedirs(image_dir, exist_ok=True)
+
+    @property
+    def matcher(self):
+        """Lazy-load the image matcher."""
+        if self._matcher is None:
+            from src.image_matcher import VehicleImageMatcher
+            self._matcher = VehicleImageMatcher()
+        return self._matcher
 
     def register_anpr_event(
         self,
@@ -95,7 +107,7 @@ class VehicleRegistry:
             if image_bytes is not None:
                 with open(filepath, "wb") as f:
                     f.write(image_bytes)
-                # Decode bytes to numpy for visual matching
+                # Decode to numpy for visual matching
                 arr = np.frombuffer(image_bytes, dtype=np.uint8)
                 record.anpr_image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             elif image is not None:
@@ -112,6 +124,60 @@ class VehicleRegistry:
                 print(f"[ANPR] Exit: plate={plate}")
 
         return record
+
+    def try_assign_plate(
+        self,
+        track_id: int,
+        camera_id: str,
+    ) -> Optional[str]:
+        """
+        Try to assign the oldest pending plate to a car that has no plate.
+
+        Called for every detection that doesn't already have a plate.
+        Auto-expires pending plates older than 30 seconds.
+
+        Args:
+            track_id: Track ID of the detected car.
+            camera_id: Camera that detected the car.
+
+        Returns:
+            Plate string if assigned, None otherwise.
+        """
+        with self._lock:
+            # Already has a plate?
+            existing = self._track_plate_map.get((camera_id, track_id))
+            if existing:
+                return existing
+
+            # Expire old pending entries (> 30 seconds)
+            now = datetime.now()
+            expired = []
+            remaining = []
+            for record in self._pending_entries:
+                if record.linked_slot is not None:
+                    remaining.append(record)  # Already linked, keep
+                    continue
+                age = (now - record.timestamp).total_seconds()
+                if age > self.PENDING_EXPIRY_SECONDS:
+                    expired.append(record)
+                else:
+                    remaining.append(record)
+
+            if expired:
+                for r in expired:
+                    print(f"[EXPIRE] Plate {r.plate} expired after {self.PENDING_EXPIRY_SECONDS}s (not assigned)")
+            self._pending_entries = remaining
+
+            # Find the oldest unlinked pending entry
+            for record in self._pending_entries:
+                if record.linked_slot is None:
+                    # Assign this plate to this track_id
+                    self._track_plate_map[(camera_id, track_id)] = record.plate
+                    record.track_id = track_id
+                    print(f"[ASSIGN] Plate {record.plate} → Track:{track_id} (cam={camera_id})")
+                    return record.plate
+
+        return None
 
     def try_link_to_slot(
         self,
@@ -202,7 +268,6 @@ class VehicleRegistry:
             print(f"[MOVE] {plate}: {old_slot} → {new_slot_id}")
 
         if record is None:
-            # This shouldn't happen, but handle gracefully
             record = VehicleRecord(
                 plate=plate, direction="entry", timestamp=timestamp
             )
@@ -218,91 +283,16 @@ class VehicleRegistry:
     def update_track_plate(
         self, camera_id: str, track_id: int, plate: str
     ):
-        """
-        Manually associate a track_id with a plate.
-
-        Useful when cross-camera matching identifies a car.
-        """
+        """Manually associate a track_id with a plate."""
         with self._lock:
             self._track_plate_map[(camera_id, track_id)] = plate
 
     def get_plate_for_track(
         self, camera_id: str, track_id: int
     ) -> Optional[str]:
-        """Get the plate associated with a track_id (if any)."""
+        """Get the plate associated with a track_id on a specific camera."""
         with self._lock:
             return self._track_plate_map.get((camera_id, track_id))
-
-    def try_match_by_image(
-        self,
-        car_crop: np.ndarray,
-        track_id: int,
-        camera_id: str,
-        similarity_threshold: float = 0.4,
-    ) -> Optional[str]:
-        """
-        Match a car crop against pending ANPR images AND known plate crops
-        from other cameras (cross-camera re-identification).
-
-        Priority:
-          1. Already known on this camera → return immediately
-          2. Compare vs pending ANPR images (entrance camera match)
-          3. Compare vs known plate crops (cross-camera re-ID)
-
-        When matched, the crop is stored for future cross-camera matching.
-
-        Args:
-            car_crop: Cropped car image from the camera frame (BGR).
-            track_id: Track ID of the detected car.
-            camera_id: Camera that detected the car.
-            similarity_threshold: Minimum histogram correlation to match (0-1).
-
-        Returns:
-            Plate string if matched, None otherwise.
-        """
-        if car_crop is None or car_crop.size == 0:
-            return None
-
-        with self._lock:
-            # Already known on THIS camera?
-            existing = self._track_plate_map.get((camera_id, track_id))
-            if existing:
-                # Update crop for better matching on next camera
-                self._plate_crops[existing] = car_crop.copy()
-                return existing
-
-            best_score = 0.0
-            best_plate = None
-
-            # --- Strategy 1: Compare vs pending ANPR images ---
-            for record in self._pending_entries:
-                if record.linked_slot is not None:
-                    continue
-                if record.anpr_image is None:
-                    continue
-
-                score = self._compare_images(car_crop, record.anpr_image)
-                if score > best_score:
-                    best_score = score
-                    best_plate = record.plate
-
-            # --- Strategy 2: Compare vs known plate crops (cross-camera) ---
-            for plate, known_crop in self._plate_crops.items():
-                score = self._compare_images(car_crop, known_crop)
-                if score > best_score:
-                    best_score = score
-                    best_plate = plate
-
-            if best_plate and best_score >= similarity_threshold:
-                # Match found! Link plate → track_id on this camera
-                self._track_plate_map[(camera_id, track_id)] = best_plate
-                # Store/update crop for future cross-camera matching
-                self._plate_crops[best_plate] = car_crop.copy()
-                print(f"[MATCH] Plate {best_plate} → Track:{track_id} "
-                      f"(cam={camera_id}, similarity={best_score:.2%})")
-                return best_plate
-
-        return None
 
     def get_plate_for_any_camera(self, track_id: int) -> Optional[str]:
         """
@@ -316,46 +306,62 @@ class VehicleRegistry:
                     return plate
             return None
 
-    @staticmethod
-    def _compare_images(img1: np.ndarray, img2: np.ndarray) -> float:
+    def try_match_by_image(
+        self,
+        car_crop: np.ndarray,
+        track_id: int,
+        camera_id: str,
+        similarity_threshold: float = 0.45,
+    ) -> Optional[str]:
         """
-        Compare two car images using HSV histogram correlation.
+        Match a car crop from a camera against pending ANPR images.
 
-        Returns similarity score between 0.0 (different) and 1.0 (identical).
+        Uses multi-feature matching (dominant color, regional color, SSIM, edges)
+        via the VehicleImageMatcher for robust cross-angle comparison.
+
+        Args:
+            car_crop: Cropped car image from the camera frame (BGR).
+            track_id: Track ID of the detected car.
+            camera_id: Camera that detected the car.
+            similarity_threshold: Minimum score to accept a match (0-1).
+
+        Returns:
+            Plate string if matched, None otherwise.
         """
-        try:
-            # Resize both to same size for fair comparison
-            size = (128, 128)
-            a = cv2.resize(img1, size)
-            b = cv2.resize(img2, size)
+        if car_crop is None or car_crop.size == 0:
+            return None
 
-            # Convert to HSV (more robust to lighting changes)
-            a_hsv = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
-            b_hsv = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
+        with self._lock:
+            # Already has a plate?
+            existing = self._track_plate_map.get((camera_id, track_id))
+            if existing:
+                return existing
 
-            # Compute histograms (H: 50 bins, S: 60 bins)
-            h_bins, s_bins = 50, 60
-            channels = [0, 1]
-            ranges = [0, 180, 0, 256]
-            hist_size = [h_bins, s_bins]
+            # Compare against pending entries that have ANPR images
+            best_score = 0.0
+            best_plate = None
 
-            hist_a = cv2.calcHist([a_hsv], channels, None, hist_size, ranges)
-            cv2.normalize(hist_a, hist_a, 0, 1, cv2.NORM_MINMAX)
+            for record in self._pending_entries:
+                if record.linked_slot is not None:
+                    continue  # Already linked
+                if record.anpr_image is None:
+                    continue  # No image to compare
 
-            hist_b = cv2.calcHist([b_hsv], channels, None, hist_size, ranges)
-            cv2.normalize(hist_b, hist_b, 0, 1, cv2.NORM_MINMAX)
+                score = self.matcher.compare(car_crop, record.anpr_image)
+                if score > best_score:
+                    best_score = score
+                    best_plate = record.plate
 
-            # Correlation: 1.0 = perfect match, -1.0 = inverse
-            score = cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL)
+            if best_plate and best_score >= similarity_threshold:
+                self._track_plate_map[(camera_id, track_id)] = best_plate
+                print(f"[IMAGE-MATCH] Plate {best_plate} → Track:{track_id} "
+                      f"(cam={camera_id}, score={best_score:.2%})")
+                return best_plate
 
-            # Clamp to [0, 1]
-            return max(0.0, score)
-        except Exception:
-            return 0.0
+        return None
 
     def _handle_exit(self, plate: str, timestamp: datetime):
         """Handle an exit ANPR event — find and archive the parked record."""
-        # Find the slot this plate is linked to
         slot_to_remove = None
         for slot_id, record in self._parked.items():
             if record.plate == plate:
