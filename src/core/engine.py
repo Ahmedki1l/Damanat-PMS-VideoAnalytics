@@ -422,8 +422,7 @@ class ParkingEngine:
                 all_statuses.append(status)
         self.event_bus.emit_status_summary(all_statuses)
 
-    @staticmethod
-    def _draw_frame(frame, pipeline, assignment, cam_id, all_detections=None):
+    def _draw_frame(self, frame, pipeline, assignment, cam_id, all_detections=None):
         """Draw slot polygons and detections on a frame."""
         # Draw camera label
         cv2.putText(
