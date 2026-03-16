@@ -53,6 +53,7 @@ class VehicleRegistry:
     """
 
     PENDING_EXPIRY_SECONDS = 30  # Auto-expire unassigned plates after 30s
+    GATE_CAMERA_ID = "CAM_01"    # Camera that sees the entrance gate
 
     def __init__(self, image_dir: str = "vehicle_images"):
         self._lock = threading.Lock()
@@ -63,6 +64,11 @@ class VehicleRegistry:
         # Track ID → plate mapping (per camera)
         # Key: (camera_id, track_id), Value: plate
         self._track_plate_map: Dict[Tuple[str, int], str] = {}
+
+        # Gate camera latest snapshot (set by the engine on every CAM_01 frame)
+        self._gate_frame: Optional[np.ndarray] = None
+        self._gate_detections: list = []  # List of Detection objects
+        self._gate_lock = threading.Lock()
 
         # Image matcher instance (lazy-loaded)
         self._matcher = None
@@ -114,6 +120,20 @@ class VehicleRegistry:
                 cv2.imwrite(filepath, image)
                 record.anpr_image = image.copy()
             record.image_path = filepath
+        else:
+            # No image from ANPR → capture crops from gate camera (CAM_01)
+            gate_crops = self._capture_gate_crops()
+            if gate_crops:
+                # Store all gate crops as reference images
+                record.anpr_image = gate_crops  # Will be a list of crops
+                # Save the first crop to disk as reference
+                filename = f"{plate}_{now.strftime('%Y%m%d_%H%M%S')}_gate.jpg"
+                filepath = os.path.join(self._image_dir, filename)
+                cv2.imwrite(filepath, gate_crops[0])
+                record.image_path = filepath
+                print(f"[GATE] Captured {len(gate_crops)} car crop(s) from {self.GATE_CAMERA_ID} for plate {plate}")
+            else:
+                print(f"[GATE] No cars detected on {self.GATE_CAMERA_ID} for plate {plate}")
 
         with self._lock:
             if direction == "entry":
@@ -124,6 +144,54 @@ class VehicleRegistry:
                 print(f"[ANPR] Exit: plate={plate}")
 
         return record
+
+    def update_gate_snapshot(
+        self,
+        frame: np.ndarray,
+        detections: list,
+    ) -> None:
+        """
+        Store the latest frame and detections from the gate camera.
+
+        Called by the engine every time CAM_01 is processed.
+        Thread-safe — the API can read this concurrently.
+
+        Args:
+            frame: Latest gate camera frame (BGR).
+            detections: List of Detection objects from the gate camera.
+        """
+        with self._gate_lock:
+            self._gate_frame = frame.copy()
+            self._gate_detections = list(detections)
+
+    def _capture_gate_crops(self) -> Optional[List[np.ndarray]]:
+        """
+        Crop all detected cars from the gate camera's latest frame.
+
+        Returns:
+            List of car crop images, or None if no frame/detections available.
+        """
+        with self._gate_lock:
+            frame = self._gate_frame
+            detections = self._gate_detections
+
+        if frame is None or not detections:
+            return None
+
+        crops = []
+        h, w = frame.shape[:2]
+        for det in detections:
+            try:
+                x1, y1, x2, y2 = [int(v) for v in det.bbox]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                crop = frame[y1:y2, x1:x2]
+                if crop.size > 0 and crop.shape[0] > 20 and crop.shape[1] > 20:
+                    crops.append(crop.copy())
+            except Exception:
+                continue
+
+        return crops if crops else None
 
     def try_assign_plate(
         self,
@@ -347,10 +415,19 @@ class VehicleRegistry:
                 if record.anpr_image is None:
                     continue  # No image to compare
 
-                score = self.matcher.compare(car_crop, record.anpr_image)
-                if score > best_score:
-                    best_score = score
-                    best_plate = record.plate
+                # anpr_image can be a single image or a list of gate crops
+                ref_images = record.anpr_image
+                if isinstance(ref_images, np.ndarray):
+                    ref_images = [ref_images]
+
+                # Compare against each reference image, keep best score
+                for ref_img in ref_images:
+                    if ref_img is None or ref_img.size == 0:
+                        continue
+                    score = self.matcher.compare(car_crop, ref_img)
+                    if score > best_score:
+                        best_score = score
+                        best_plate = record.plate
 
             if best_plate and best_score >= similarity_threshold:
                 self._track_plate_map[(camera_id, track_id)] = best_plate

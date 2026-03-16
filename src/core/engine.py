@@ -202,6 +202,10 @@ class ParkingEngine:
                 # --- 1. Detect + Track ---
                 detections = self.detector.detect_and_track(frame)
 
+                # --- 1.1. Feed gate camera data for ANPR snapshot capture ---
+                if self.vehicle_registry and cam_id == "CAM_01" and detections:
+                    self.vehicle_registry.update_gate_snapshot(frame, detections)
+
                 # --- 1.5. Assign ANPR plates to unplated detections ---
                 # Strategy 1: Simple queue (oldest pending plate → first unplated car)
                 # Strategy 2: Image matching (if ANPR images available)
