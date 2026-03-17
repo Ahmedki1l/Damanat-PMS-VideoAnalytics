@@ -107,6 +107,11 @@ class SlotStateMachine:
         """True if the slot is confirmed occupied."""
         return self.state == SlotState.OCCUPIED
 
+    @property
+    def is_violation_zone(self) -> bool:
+        """True if the slot ID indicates a violation zone."""
+        return "violation" in self.slot_id.lower()
+
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the slot's current status."""
         return {
@@ -115,6 +120,7 @@ class SlotStateMachine:
             "assigned_track_id": self.assigned_track_id,
             "occupied": self.is_occupied,
             "last_update_time": self.last_update_time,
+            "is_violation_zone": self.is_violation_zone,
         }
 
     def update(

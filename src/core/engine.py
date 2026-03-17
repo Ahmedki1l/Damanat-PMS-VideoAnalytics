@@ -94,6 +94,11 @@ class ParkingEngine:
         # --- Per-camera pipelines ---
         self.pipelines: Dict[str, CameraPipeline] = {}
 
+        # --- Violation Alert State ---
+        self._recent_violators: List[Dict] = []  # List of {crop, timestamp, camera_id}
+        self._violation_match_threshold = 0.4
+        self._violation_history_limit = 30 # seconds
+
         # --- Frame counter for perf logging ---
         self._frame_count = 0
         self._start_time = 0.0
@@ -274,7 +279,55 @@ class ParkingEngine:
 
                 # --- 4. Emit events ---
                 if all_events:
-                    self.event_bus.emit_batch(all_events)
+                    final_events = []
+                    for evt in all_events:
+                        slot_sm = pipeline.state_machines.get(evt.slot_id)
+                        if slot_sm and slot_sm.is_violation_zone and pipeline.floor == "Ground Floor":
+                            if evt.event_type == "vehicle_parked":
+                                # Extract crop for visual matching
+                                track_id, detection = assignment.slot_vehicle_map.get(evt.slot_id, (None, None))
+                                if detection:
+                                    x1, y1, x2, y2 = [int(v) for v in detection.bbox]
+                                    h, w = frame.shape[:2]
+                                    crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                                    
+                                    # Clean up old violators
+                                    now_ts = time.time()
+                                    self._recent_violators = [v for v in self._recent_violators 
+                                                             if now_ts - v['timestamp'] < self._violation_history_limit]
+                                    
+                                    # Check visual similarity
+                                    is_duplicate = False
+                                    if crop.size > 0:
+                                        for v in self._recent_violators:
+                                            # Using the existing matcher in vehicle_registry
+                                            score = self.vehicle_registry.matcher.compare(crop, v['crop'])
+                                            if score > self._violation_match_threshold:
+                                                is_duplicate = True
+                                                break
+                                    
+                                    if not is_duplicate:
+                                        evt.event_type = "vehicle_violation"
+                                        if crop.size > 0:
+                                            self._recent_violators.append({
+                                                'crop': crop.copy(),
+                                                'timestamp': now_ts,
+                                                'camera_id': cam_id
+                                            })
+                                        final_events.append(evt)
+                                        print(f"[ALERT] New Violation! {cam_id} | Slot:{evt.slot_id}")
+                                    else:
+                                        # Duplicate of a recent violator
+                                        final_events.append(evt)
+                                else:
+                                    final_events.append(evt)
+                            else:
+                                final_events.append(evt)
+                        else:
+                            final_events.append(evt)
+
+                    if final_events:
+                        self.event_bus.emit_batch(final_events)
 
                 # --- 5. Periodic status summary ---
                 self._frame_count += 1
@@ -393,7 +446,27 @@ class ParkingEngine:
                     all_events.extend(events)
 
                 if all_events:
-                    self.event_bus.emit_batch(all_events)
+                    final_events = []
+                    for evt in all_events:
+                        slot_sm = pipeline.state_machines.get(evt.slot_id)
+                        if slot_sm and slot_sm.is_violation_zone:
+                            # In single camera mode floor might be empty, so check zone only
+                            if evt.event_type == "vehicle_parked":
+                                now_ts = time.time()
+                                if now_ts - self._last_violation_alert_time >= self._violation_cooldown_seconds:
+                                    evt.event_type = "vehicle_violation"
+                                    self._last_violation_alert_time = now_ts
+                                    final_events.append(evt)
+                                    print(f"[ALERT] Violation detected in {evt.slot_id}!")
+                                else:
+                                    final_events.append(evt)
+                            else:
+                                final_events.append(evt)
+                        else:
+                            final_events.append(evt)
+                    
+                    if final_events:
+                        self.event_bus.emit_batch(final_events)
 
                 self._frame_count += 1
                 if summary_interval > 0 and self._frame_count % summary_interval == 0:
@@ -445,14 +518,30 @@ class ParkingEngine:
 
         for slot in pipeline.slots:
             sm = pipeline.state_machines[slot.id]
-            color = COLORS.get(sm.state, (128, 128, 128))
+            
+            # Violation visualization
+            is_violation = sm.is_violation_zone and pipeline.floor == "Ground Floor"
+            if is_violation and sm.is_occupied:
+                # Flickering red for violation
+                if int(time.time() * 2) % 2 == 0:
+                    color = (0, 0, 255) # Bright red
+                else:
+                    color = (0, 0, 150) # Dark red
+                thickness = 4
+            else:
+                color = COLORS.get(sm.state, (128, 128, 128))
+                thickness = 2
 
             coords = list(slot.polygon.exterior.coords)
             pts = np.array(coords, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
+            cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
 
             cx, cy = int(slot.centroid_x), int(slot.centroid_y)
-            label = f"{slot.id}: {sm.state.value}"
+            if is_violation and sm.is_occupied:
+                label = "!!! VIOLATION !!!"
+            else:
+                label = f"{slot.id}: {sm.state.value}"
+            
             cv2.putText(
                 frame, label, (cx - 40, cy),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,

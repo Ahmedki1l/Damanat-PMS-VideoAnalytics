@@ -47,3 +47,9 @@ config.yaml
 
 # Temporary scripts
 capture_snapshot.py
+
+#preview images
+preview_*.jpg
+
+#preview_slots.py
+preview_slots.py
