@@ -67,6 +67,10 @@ class OutputConfig:
     show_video: bool = False
     show_camera: str = ""  # Which camera to visualize (e.g., "CAM_04")
 
+@dataclass
+class DatabaseConfig:
+    """Database configuration."""
+    url: str = ""
 
 @dataclass
 class AppConfig:
@@ -78,6 +82,7 @@ class AppConfig:
     state_machine: StateMachineConfig = field(default_factory=StateMachineConfig)
     assigner: AssignerConfig = field(default_factory=AssignerConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
     # Legacy single-camera support
     video_source: str = ""
@@ -104,12 +109,16 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     """
     config = AppConfig()
 
+
     if not os.path.exists(config_path):
         print(f"[WARN] Config file '{config_path}' not found. Using defaults.")
         return config
 
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    
+    if "database" in raw:
+        config.database.url = raw["database"].get("DATABASE_URL", "")
 
     # --- Cameras (multi-camera mode) ---
     if "cameras" in raw:

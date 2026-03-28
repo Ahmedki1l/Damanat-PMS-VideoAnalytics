@@ -22,7 +22,7 @@
     "label": "Slot B2"
   },
   {
-    "id": "B3-CEO",
+    "id": "B3_CEO",
     "polygon": [
       [
         409,
@@ -41,10 +41,10 @@
         272
       ]
     ],
-    "label": "Slot B3-CEO"
+    "label": "Slot B3 CEO"
   },
   {
-    "id": "B1-CRO",
+    "id": "B1_CRO",
     "polygon": [
       [
         329,
@@ -63,6 +63,6 @@
         76
       ]
     ],
-    "label": "Slot B1-CRO"
+    "label": "Slot B1 CRO"
   }
 ]

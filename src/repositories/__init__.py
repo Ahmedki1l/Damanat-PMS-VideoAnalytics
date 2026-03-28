@@ -1,0 +1,2 @@
+from .parking_slot_repository import ParkingSlotRepository
+from .slot_status_repository import SlotStatusRepository

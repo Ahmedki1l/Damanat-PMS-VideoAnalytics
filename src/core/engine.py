@@ -2,7 +2,7 @@
 engine.py — Main pipeline orchestrator (multi-camera support).
 
 Supports two modes:
-  1. Multi-camera: round-robin processing of 12 cameras.
+  1. Multi-camera: round-robin processing of 14 cameras.
   2. Single-camera: legacy mode for testing with one stream.
 
 Pipeline per frame:
@@ -23,7 +23,9 @@ from src.detection.tracker import TrackedDetector
 from src.core.slot_assigner import SlotAssigner
 from src.events.event_bus import EventBus
 from src.camera_manager import CameraManager, CameraConfig
-
+from src.model.parkingslot import ParkingSlot as DB_ParkingSlot
+from src.services.parking_service import sync_slots_from_config
+from src.services.slot_status_service import log_vehicle_event
 
 # Colors for visualization (BGR format)
 COLORS = {
@@ -78,9 +80,10 @@ class ParkingEngine:
     Single-camera mode: processes one video source.
     """
 
-    def __init__(self, config: AppConfig, vehicle_registry=None):
+    def __init__(self, config: AppConfig, vehicle_registry=None, db_manager=None):
         self.config = config
         self.vehicle_registry = vehicle_registry
+        self.db_manager = db_manager
 
         # --- Shared detector (one YOLO model for all cameras) ---
         self.detector = TrackedDetector(
@@ -142,9 +145,16 @@ class ParkingEngine:
             slots = []
             if cc.slots_file and os.path.exists(cc.slots_file):
                 slots = load_slots(cc.slots_file)
-            elif cc.slots_file:
-                print(f"[WARN] Slots file '{cc.slots_file}' not found for {cc.id}. "
-                      f"Run: python draw_slots.py --camera {cc.id}")
+                if self.db_manager and slots:
+                    session = self.db_manager.SessionLocal()
+                    try:
+                        sync_slots_from_config(session, slots, cc.floor)
+                        print(f"[DB] Synced {len(slots)} slots for {cc.id}")
+                    except Exception as e:
+                        session.rollback()
+                        print(f"[ERROR] Failed to save slots to database: {e}")
+                    finally:
+                        session.close()
 
             pipeline = CameraPipeline(
                 camera_id=cc.id,
@@ -328,6 +338,19 @@ class ParkingEngine:
 
                     if final_events:
                         self.event_bus.emit_batch(final_events)
+                        if self.db_manager:
+                            session = self.db_manager.SessionLocal()
+                            try:
+                                for evt in final_events:
+                                    if evt.event_type in ("vehicle_parked", "vehicle_left"):
+                                        is_parked = (evt.event_type == "vehicle_parked")
+                                        plate = getattr(evt, "plate", None) 
+                                        log_vehicle_event(session, evt.slot_id, plate, is_parked)
+                            except Exception as e:
+                                session.rollback()
+                                print(f"[ERROR] Failed to update slot DB status: {e}")
+                            finally:
+                                session.close()
 
                 # --- 5. Periodic status summary ---
                 self._frame_count += 1
