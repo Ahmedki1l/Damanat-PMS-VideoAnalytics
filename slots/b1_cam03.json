@@ -22,7 +22,7 @@
     "label": "Slot B8"
   },
   {
-    "id": "B11 CFO",
+    "id": "B11_CFO",
     "polygon": [
       [
         331,
@@ -66,7 +66,7 @@
     "label": "Slot B12"
   },
   {
-    "id": "B10-CTO",
+    "id": "B10_CTO",
     "polygon": [
       [
         316,
@@ -85,6 +85,6 @@
         160
       ]
     ],
-    "label": "Slot B10-CTO"
+    "label": "Slot B10 CTO"
   }
 ]

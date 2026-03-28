@@ -1,6 +1,6 @@
 [
   {
-    "id": "Chief Operating Officer",
+    "id": "B13_COO",
     "polygon": [
       [
         524,
@@ -19,7 +19,7 @@
         80
       ]
     ],
-    "label": "Slot Chief Operating Officer"
+    "label": "Slot B13 COO"
   },
   {
     "id": "B5",

@@ -66,7 +66,7 @@
     "label": "Slot G3"
   },
   {
-    "id": "Violation",
+    "id": "V1_Violation_1",
     "polygon": [
       [
         638,
@@ -89,6 +89,6 @@
         118
       ]
     ],
-    "label": "Slot Violation"
+    "label": "Slot V1 Violation 1"
   }
 ]

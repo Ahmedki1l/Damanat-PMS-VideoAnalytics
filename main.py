@@ -24,7 +24,7 @@ import threading
 
 from src.config import load_config
 from src.core.engine import ParkingEngine
-
+from src.database import init_db
 
 def start_api_server(engine, registry, host="0.0.0.0", port=8000):
     """Start the FastAPI server in a background thread."""
@@ -46,6 +46,12 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         vehicle_registry=registry,
         get_slot_statuses=get_slot_statuses,
     )
+
+    # Include routers
+    from src.routers.parking_router import router as parking_router
+    from src.routers.slot_status_router import router as slot_status_router
+    app.include_router(parking_router)
+    app.include_router(slot_status_router)
 
     def run_server():
         uvicorn.run(app, host=host, port=port, log_level="info")
@@ -112,6 +118,8 @@ Examples:
     print("=" * 60)
 
     config = load_config(args.config)
+    db = init_db(config.database.url)
+    db.create_tables()
 
     # Apply CLI overrides
     if args.show:
@@ -131,7 +139,7 @@ Examples:
         from src.vehicle_registry import VehicleRegistry
         registry = VehicleRegistry()
 
-    engine = ParkingEngine(config, vehicle_registry=registry)
+    engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)
 
     # --- Start API server if requested ---
     if args.api:
