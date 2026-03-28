@@ -53,3 +53,5 @@ preview_*.jpg
 
 #preview_slots.py
 preview_slots.py
+
+sync_restricted_slots.py

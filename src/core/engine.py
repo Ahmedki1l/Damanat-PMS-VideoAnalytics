@@ -292,7 +292,7 @@ class ParkingEngine:
                     final_events = []
                     for evt in all_events:
                         slot_sm = pipeline.state_machines.get(evt.slot_id)
-                        if slot_sm and slot_sm.is_violation_zone and pipeline.floor == "Ground Floor":
+                        if slot_sm and slot_sm.is_violation_zone:
                             if evt.event_type == "vehicle_parked":
                                 # Extract crop for visual matching
                                 track_id, detection = assignment.slot_vehicle_map.get(evt.slot_id, (None, None))
@@ -342,8 +342,8 @@ class ParkingEngine:
                             session = self.db_manager.SessionLocal()
                             try:
                                 for evt in final_events:
-                                    if evt.event_type in ("vehicle_parked", "vehicle_left"):
-                                        is_parked = (evt.event_type == "vehicle_parked")
+                                    if evt.event_type in ("vehicle_parked", "slot_vacant", "vehicle_violation"):
+                                        is_parked = (evt.event_type in ("vehicle_parked", "vehicle_violation"))
                                         plate = getattr(evt, "plate", None) 
                                         log_vehicle_event(session, evt.slot_id, plate, is_parked)
                             except Exception as e:
@@ -543,7 +543,7 @@ class ParkingEngine:
             sm = pipeline.state_machines[slot.id]
             
             # Violation visualization
-            is_violation = sm.is_violation_zone and pipeline.floor == "Ground Floor"
+            is_violation = sm.is_violation_zone
             if is_violation and sm.is_occupied:
                 # Flickering red for violation
                 if int(time.time() * 2) % 2 == 0:

@@ -43,9 +43,9 @@ def get_intrusion_history(slot_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/check/{slot_id}")
-def check_slot_restricted(slot_id: str):
+def check_slot_restricted(slot_id: str, db: Session = Depends(get_db)):
     """Check if a slot is in the restricted list."""
     return {
         "slot_id": slot_id,
-        "restricted": intrusion_service.check_slot_restricted(slot_id)
+        "restricted": intrusion_service.check_slot_restricted(db, slot_id)
     }

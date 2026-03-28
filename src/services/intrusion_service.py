@@ -1,22 +1,20 @@
 from sqlalchemy.orm import Session
 from src.model import Intrusion
-from src.repositories import IntrusionRepository
-
-# -- Restricted slots: parking here is a violation --
-RESTRICTED_SLOTS = {"G1", "B11", "B10", "B3", "B1", "B6", "B5", "B13"}
+from src.repositories import IntrusionRepository, ParkingSlotRepository
 
 
-def check_slot_restricted(slot_id: str) -> bool:
-    """Check if a slot is in the restricted list."""
-    return slot_id in RESTRICTED_SLOTS
+def check_slot_restricted(db: Session, slot_id: str) -> bool:
+    """Check if a slot has the is_violation_zone flag enabled in the DB."""
+    slot = ParkingSlotRepository.get_by_id(db, slot_id)
+    return slot.is_violation_zone if slot else False
 
 
 def report_intrusion(db: Session, slot_id: str, plate_number: str = None, camera_id: str = None):
     """
-    YOLO detects car in a slot → check if restricted → create intrusion.
+    YOLO detects car in a slot → check if restricted (is_violation_zone) → create intrusion.
     Returns None if slot is not restricted or intrusion already active.
     """
-    if not check_slot_restricted(slot_id):
+    if not check_slot_restricted(db, slot_id):
         return None
 
     # Don't duplicate — check if there's already an active intrusion on this slot
