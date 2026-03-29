@@ -53,3 +53,7 @@ preview_*.jpg
 
 #preview_slots.py
 preview_slots.py
+
+
+#docker-compose.yml
+docker-compose.yml
