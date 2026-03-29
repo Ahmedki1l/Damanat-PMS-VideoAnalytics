@@ -50,8 +50,10 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
     # Include routers
     from src.routers.parking_router import router as parking_router
     from src.routers.slot_status_router import router as slot_status_router
+    from src.routers.intrusion_router import router as intrusion_router
     app.include_router(parking_router)
     app.include_router(slot_status_router)
+    app.include_router(intrusion_router)
 
     def run_server():
         uvicorn.run(app, host=host, port=port, log_level="info")
