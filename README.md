@@ -25,8 +25,8 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows
 # source .venv/bin/activate     # Linux/Mac
 
-docker run --name damanat-mysql -e MYSQL_ROOT_PASSWORD=password -e MYSQL_DATABASE=damanat_pms -p 3306:3306 -d mysql:8.0
-
+# Start the attached SQL Server database container
+docker-compose up -d
 pip install -r requirements.txt
 ```
 

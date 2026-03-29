@@ -39,6 +39,7 @@ class DetectorConfig:
     confidence: float = 0.35
     classes: List[int] = field(default_factory=lambda: [2])  # 2 = car
     imgsz: int = 480
+    device: str = "auto"  # "auto", "cpu", or "cuda"
 
 
 @dataclass
@@ -160,6 +161,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.detector.confidence = d.get("confidence", config.detector.confidence)
         config.detector.classes = d.get("classes", config.detector.classes)
         config.detector.imgsz = d.get("imgsz", config.detector.imgsz)
+        config.detector.device = d.get("device", config.detector.device)
 
     # --- Tracker ---
     if "tracker" in raw:

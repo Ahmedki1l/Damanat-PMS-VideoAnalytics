@@ -117,7 +117,7 @@ processing:
 detector:
   model_path: "models/yolo11n.pt"
   confidence: 0.35
-  classes: [2]                  # 2 = car only
+  classes: [2, 5, 7]                  # 2 = car only
   imgsz: 480                    # Lower resolution for CPU efficiency
 
 # --- Tracker Settings ---
