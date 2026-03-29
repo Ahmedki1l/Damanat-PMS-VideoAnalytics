@@ -14,6 +14,7 @@ Why not a standalone tracker?
 
 from typing import List
 
+import torch
 import numpy as np
 from ultralytics import YOLO
 
@@ -40,7 +41,14 @@ class TrackedDetector:
 
         print(f"[INFO] Loading YOLO model from '{detector_config.model_path}'...")
         self.model = YOLO(detector_config.model_path, task="detect")
-        print(f"[INFO] Model loaded. Tracker: {tracker_config.type}")
+
+        # Resolve device: "auto" picks CUDA if available, else CPU
+        if detector_config.device == "auto":
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = detector_config.device
+
+        print(f"[INFO] Model loaded. Tracker: {tracker_config.type} | Device: {self.device}")
 
     def detect_and_track(self, frame: np.ndarray) -> List[Detection]:
         """
@@ -63,6 +71,7 @@ class TrackedDetector:
             conf=self.detector_config.confidence,
             classes=self.detector_config.classes,
             imgsz=self.detector_config.imgsz,
+            device=self.device,
             persist=True,               # Maintain tracker state across frames
             tracker=tracker_cfg,         # e.g., "bytetrack.yaml"
             verbose=False,

@@ -8,9 +8,9 @@ from src.repositories import ParkingSlotRepository
 
 router = APIRouter(prefix="/api/parking/slots", tags=["Parking Slots"])
 
-@router.get("/", response_model=List[ParkingSlotResponse])
+@router.get("", response_model=List[ParkingSlotResponse])
 def get_all_slots(db: Session = Depends(get_db)):
-    return parking_service.get_slot_or_404(db, slot_id="all")
+    return ParkingSlotRepository.get_all(db)
 
 @router.get("/available", response_model=List[ParkingSlotResponse])
 def get_available_slots(db: Session = Depends(get_db)):

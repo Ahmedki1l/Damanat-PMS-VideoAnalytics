@@ -54,6 +54,9 @@ preview_*.jpg
 #preview_slots.py
 preview_slots.py
 
+
+#docker-compose.yml
+docker-compose.yml
 sync_restricted_slots.py
 
 test_db_connection.py
