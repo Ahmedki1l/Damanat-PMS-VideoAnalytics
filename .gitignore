@@ -54,8 +54,12 @@ preview_*.jpg
 #preview_slots.py
 preview_slots.py
 
-migrate_slots.py
-
 sync_restricted_slots.py
 
 test_db_connection.py
+
+src/tools/roi_selector.py
+
+test_sse_logic.py
+
+migrate_slots.py
