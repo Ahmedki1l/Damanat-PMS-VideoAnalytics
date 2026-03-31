@@ -25,6 +25,8 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows
 # source .venv/bin/activate     # Linux/Mac
 
+# Start the attached SQL Server database container
+docker-compose up -d
 pip install -r requirements.txt
 ```
 
