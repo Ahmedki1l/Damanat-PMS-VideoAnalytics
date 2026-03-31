@@ -22,7 +22,7 @@
     "label": "Slot B13 COO"
   },
   {
-    "id": "B5",
+    "id": "GMIA",
     "polygon": [
       [
         305,
@@ -41,6 +41,6 @@
         128
       ]
     ],
-    "label": "Slot B5"
+    "label": "GMIA"
   }
 ]
