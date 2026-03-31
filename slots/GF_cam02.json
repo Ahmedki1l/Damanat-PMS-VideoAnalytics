@@ -98,5 +98,27 @@
       ]
     ],
     "label": "Slot V2 Violation 2"
+  },
+  {
+    "id": "roi",
+    "polygon": [
+      [
+        81,
+        113
+      ],
+      [
+        414,
+        69
+      ],
+      [
+        568,
+        179
+      ],
+      [
+        180,
+        358
+      ]
+    ],
+    "label": "Global ROI Mask"
   }
 ]
