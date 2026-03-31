@@ -16,11 +16,13 @@ def sync_slots_from_config(db: Session, slots_from_json: list, floor: int):
         
         existing = ParkingSlotRepository.get_by_id(db, slot.id)
         if existing:
+            # Update geometry and name ONLY — do NOT overwrite is_violation_zone
+            # so that sync_restricted_slots.py settings are preserved
             existing.slot_name = slot.label or slot.id
             existing.floor = floor
             existing.polygon = polygon_json
-            existing.is_violation_zone = "violation" in slot.id.lower()
         else:
+            # New slot: infer violation zone from name as a sensible default
             new_slot = ParkingSlot(
                 slot_id=slot.id,
                 slot_name=slot.label or slot.id,

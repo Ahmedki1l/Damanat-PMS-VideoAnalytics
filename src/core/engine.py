@@ -50,18 +50,21 @@ class CameraPipeline:
         floor: str,
         slots: List[ParkingSlot],
         config: AppConfig,
+        violation_slots: set = None,
     ):
         self.camera_id = camera_id
         self.floor = floor
         self.slots = slots
 
-        # Per-slot state machines
+        # Per-slot state machines — pass is_violation_zone from DB
         self.state_machines: Dict[str, SlotStateMachine] = {}
         for slot in slots:
+            is_restricted = (violation_slots is not None) and (slot.id in violation_slots)
             self.state_machines[slot.id] = SlotStateMachine(
                 slot_id=slot.id,
                 confirm_enter_frames=config.state_machine.confirm_enter_frames,
                 confirm_leave_frames=config.state_machine.confirm_leave_frames,
+                is_violation_zone=is_restricted,
             )
 
         # Slot assigner for this camera's polygons
@@ -156,11 +159,29 @@ class ParkingEngine:
                     finally:
                         session.close()
 
+            # Load violation zone flags from DB for this camera's slots
+            violation_slots = set()
+            if self.db_manager and slots:
+                session = self.db_manager.SessionLocal()
+                try:
+                    slot_ids = [s.id for s in slots]
+                    from src.repositories import ParkingSlotRepository
+                    db_slots = [ParkingSlotRepository.get_by_id(session, sid) for sid in slot_ids]
+                    violation_slots = {
+                        db_s.slot_id for db_s in db_slots
+                        if db_s and db_s.is_violation_zone
+                    }
+                except Exception as e:
+                    print(f"[ERROR] Failed to load violation zone flags from DB: {e}")
+                finally:
+                    session.close()
+
             pipeline = CameraPipeline(
                 camera_id=cc.id,
                 floor=cc.floor,
                 slots=slots,
                 config=self.config,
+                violation_slots=violation_slots,
             )
             self.pipelines[cc.id] = pipeline
             total_slots += pipeline.slot_count
@@ -317,7 +338,11 @@ class ParkingEngine:
                                                 break
                                     
                                     if not is_duplicate:
-                                        evt.event_type = "vehicle_violation"
+                                        # Distinguish violation zones vs intrusion (restricted) zones
+                                        alert_type = "vehicle_violation" if "violation" in evt.slot_id.lower() else "vehicle_intrusion"
+                                        evt.event_type = alert_type
+                                        evt.is_alert = True
+                                        evt.severity = "critical"
                                         if crop.size > 0:
                                             self._recent_violators.append({
                                                 'crop': crop.copy(),
@@ -325,7 +350,7 @@ class ParkingEngine:
                                                 'camera_id': cam_id
                                             })
                                         final_events.append(evt)
-                                        print(f"[ALERT] New Violation! {cam_id} | Slot:{evt.slot_id}")
+                                        print(f"[ALERT] {alert_type.replace('_', ' ').title()}! {cam_id} | Slot:{evt.slot_id}")
                                     else:
                                         # Duplicate of a recent violator
                                         final_events.append(evt)
@@ -477,10 +502,14 @@ class ParkingEngine:
                             if evt.event_type == "vehicle_parked":
                                 now_ts = time.time()
                                 if now_ts - self._last_violation_alert_time >= self._violation_cooldown_seconds:
-                                    evt.event_type = "vehicle_violation"
+                                    # Distinguish violation zones vs intrusion (restricted) zones
+                                    alert_type = "vehicle_violation" if "violation" in evt.slot_id.lower() else "vehicle_intrusion"
+                                    evt.event_type = alert_type
+                                    evt.is_alert = True
+                                    evt.severity = "critical"
                                     self._last_violation_alert_time = now_ts
                                     final_events.append(evt)
-                                    print(f"[ALERT] Violation detected in {evt.slot_id}!")
+                                    print(f"[ALERT] {alert_type.replace('_', ' ').title()} in {evt.slot_id}!")
                                 else:
                                     final_events.append(evt)
                             else:
