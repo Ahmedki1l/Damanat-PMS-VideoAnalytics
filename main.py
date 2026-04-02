@@ -42,9 +42,32 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
                 all_statuses.append(status)
         return all_statuses
 
+    def get_camera_frame(cam_id: str):
+        if hasattr(engine, "cam_manager") and engine.cam_manager:
+            return engine.cam_manager.read_camera(cam_id)
+        return False, None
+
+    def get_park_entry_crop(cam_id: str):
+        success, frame = get_camera_frame(cam_id)
+        if not success or frame is None:
+            return False, None
+        zones = getattr(engine, "special_zones", {}).get(cam_id, {})
+        for zone_id, zone in zones.items():
+            if "Park_Entry" in zone_id:
+                minx, miny, maxx, maxy = zone.polygon.bounds
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, int(minx)), max(0, int(miny))
+                x2, y2 = min(w, int(maxx)), min(h, int(maxy))
+                crop = frame[y1:y2, x1:x2]
+                if crop.size > 0:
+                    return True, crop
+        return True, frame
+
     app = create_app(
         vehicle_registry=registry,
         get_slot_statuses=get_slot_statuses,
+        get_camera_frame=get_camera_frame,
+        get_park_entry_crop=get_park_entry_crop,
     )
 
     # Include routers

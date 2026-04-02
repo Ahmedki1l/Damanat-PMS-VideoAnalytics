@@ -162,9 +162,9 @@ class SlotAssigner:
 
         try:
             intersection_area = det_box.intersection(slot_polygon).area
-            det_area = det_box.area
-            if det_area == 0:
+            slot_area = slot_polygon.area
+            if slot_area == 0:
                 return 0.0
-            return intersection_area / det_area
+            return intersection_area / slot_area
         except Exception:
             return 0.0
