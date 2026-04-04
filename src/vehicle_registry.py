@@ -17,8 +17,11 @@ Two assignment strategies (use one or both):
 Thread-safe for concurrent access from the API and engine.
 """
 
+import logging
 import os
 import threading
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -26,225 +29,517 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+# [CHANGE 6] Replace all print() calls with a module-level logger.
+# Callers can configure handlers, levels, and formatters externally.
+logger = logging.getLogger(__name__)
+
 
 @dataclass
-class VehicleRecord:
-    """Record of a vehicle seen by ANPR."""
+class PendingANPREvent:
+    """Plate received from ANPR, waiting for the real car body at Park_Entry."""
+    event_id: str
     plate: str
-    direction: str                     # "entry" or "exit"
+    direction: str
     timestamp: datetime
-    image_path: Optional[str] = None   # Path to saved ANPR image
-    anpr_image: Optional[np.ndarray] = None  # ANPR image for visual matching
-    linked_slot: Optional[str] = None  # Slot ID if linked
+    camera_id: Optional[str] = None
+
+    status: str = "pending"   # pending, provisional, confirmed, expired, dropped
+    candidate_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+@dataclass
+class ParkEntryCandidate:
+    """A real car seen in the Park_Entry zone."""
+    candidate_id: str
+    camera_id: str
+    track_id: int
+    entered_at: datetime
+    last_seen_at: datetime
+
+    snapshot_path: Optional[str] = None
+    snapshot_image: Optional[np.ndarray] = None
+    feature_vector: Optional[np.ndarray] = None
+    quality_score: float = 0.0
+
+    status: str = "open"   # open, provisional, confirmed, expired, dropped
+    bound_event_id: Optional[str] = None
+
+
+@dataclass
+class VehicleSession:
+    """Final confirmed identity: this plate belongs to this exact car."""
+    session_id: str
+    plate: str
+    event_id: str
+    candidate_id: str
+
+    confirmed_at: datetime
+    current_camera_id: Optional[str] = None
+    current_track_id: Optional[int] = None
+
+    linked_slot: Optional[str] = None
     linked_camera: Optional[str] = None
     linked_floor: Optional[str] = None
     linked_at: Optional[datetime] = None
-    track_id: Optional[int] = None     # ByteTrack ID when linked
 
 
 class VehicleRegistry:
     """
-    Central registry linking ANPR plates to parking slots.
-
-    Simple queue-based approach:
-      - _pending_entries: FIFO queue of plates awaiting assignment
-      - _parked: slot_id → VehicleRecord (currently parked)
-      - _track_plate_map: (camera_id, track_id) → plate
+    Central registry for ANPR -> Park_Entry -> B1_Entrance -> parking slot flow.
     """
 
-    PENDING_EXPIRY_SECONDS = 30  # Auto-expire unassigned plates after 30s
-    GATE_CAMERA_ID = "CAM_01"    # Camera that sees the entrance gate
+    PENDING_ANPR_EXPIRY_SECONDS = 30
+    CANDIDATE_EXPIRY_SECONDS = 30
+
+    # [CHANGE 3] How often the background GC thread wakes up (seconds).
+    _GC_INTERVAL_SECONDS = 5
 
     def __init__(self, image_dir: str = "vehicle_images"):
-        self._lock = threading.Lock()
-        self._pending_entries: List[VehicleRecord] = []    # FIFO queue
-        self._parked: Dict[str, VehicleRecord] = {}        # slot_id → record
-        self._history: List[VehicleRecord] = []            # Completed visits
+        self._lock = threading.RLock()
 
-        # Track ID → plate mapping (per camera)
-        # Key: (camera_id, track_id), Value: plate
-        self._track_plate_map: Dict[Tuple[str, int], str] = {}
+        # [CHANGE 1] Dedicated lock so only one thread ever instantiates the matcher.
+        self._matcher_lock = threading.Lock()
 
-        # Gate camera latest snapshot (set by the engine on every CAM_01 frame)
-        self._gate_frame: Optional[np.ndarray] = None
-        self._gate_detections: list = []  # List of Detection objects
-        self._gate_lock = threading.Lock()
+        # FIFO ANPR queue
+        self._pending_event_order: List[str] = []
+        self._pending_events: Dict[str, PendingANPREvent] = {}
 
-        # Image matcher instance (lazy-loaded)
+        # Real cars seen at Park_Entry
+        self._park_entry_candidates: Dict[str, ParkEntryCandidate] = {}
+
+        # Final confirmed identities
+        self._sessions: Dict[str, VehicleSession] = {}
+
+        # Track -> session map
+        # Key: (camera_id, track_id), Value: session_id
+        self._track_session_map: Dict[Tuple[str, int], str] = {}
+
+        # Slot -> session map for currently parked cars
+        self._parked: Dict[str, VehicleSession] = {}
+
+        # Completed visits
+        self._history: List[VehicleSession] = []
+
         self._matcher = None
-
         self._image_dir = image_dir
         os.makedirs(image_dir, exist_ok=True)
 
+        # [CHANGE 3] Start background GC daemon thread.
+        # daemon=True so it never blocks clean process shutdown.
+        self._gc_thread = threading.Thread(
+            target=self._gc_loop,
+            name="VehicleRegistry-GC",
+            daemon=True,
+        )
+        self._gc_thread.start()
+        logger.debug("Background GC thread started (interval=%ds)", self._GC_INTERVAL_SECONDS)
+
+    # ------------------------------------------------------------------
+    # [CHANGE 3] Background garbage-collection loop
+    # ------------------------------------------------------------------
+
+    def _gc_loop(self) -> None:
+        """Runs in a daemon thread; periodically purges stale state."""
+        while True:
+            time.sleep(self._GC_INTERVAL_SECONDS)
+            try:
+                self._cleanup_stale_data(datetime.now())
+            except Exception:
+                # Never let the GC thread die silently.
+                logger.exception("Unhandled error in VehicleRegistry GC loop")
+
+    # ------------------------------------------------------------------
+    # [CHANGE 1] Thread-safe lazy matcher property
+    # ------------------------------------------------------------------
+
     @property
     def matcher(self):
-        """Lazy-load the image matcher."""
-        if self._matcher is None:
-            from src.image_matcher import VehicleImageMatcher
-            self._matcher = VehicleImageMatcher()
+        """
+        Lazy-load the image matcher exactly once, even under concurrent access.
+
+        The double-checked locking pattern avoids acquiring the lock on every
+        call once the matcher is initialised.
+        """
+        if self._matcher is None:                        # fast path (no lock)
+            with self._matcher_lock:
+                if self._matcher is None:                # slow path (one winner)
+                    from src.image_matcher import VehicleImageMatcher
+                    self._matcher = VehicleImageMatcher()
+                    logger.debug("VehicleImageMatcher instantiated")
         return self._matcher
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def register_anpr_event(
         self,
         plate: str,
         direction: str,
-        image: Optional[np.ndarray] = None,
-        image_bytes: Optional[bytes] = None,
-    ) -> VehicleRecord:
+        timestamp: Optional[datetime] = None,
+        camera_id: Optional[str] = None,
+    ) -> PendingANPREvent:
         """
-        Register a new ANPR event (entry or exit).
+        Register a new ANPR event.
 
-        Args:
-            plate: License plate string.
-            direction: "entry" or "exit".
-            image: OpenCV image (numpy array) of the vehicle.
-            image_bytes: Raw image bytes (alternative to numpy array).
+        Entry events become pending ANPR records.
+        Exit events close an existing confirmed session if found.
 
-        Returns:
-            The created VehicleRecord.
+        [CHANGE 3] _cleanup_stale_data is no longer called here;
+        the background GC thread handles it so this hot path stays fast.
         """
-        now = datetime.now()
-        record = VehicleRecord(plate=plate, direction=direction, timestamp=now)
+        now = timestamp or datetime.now()
 
-        # Save image and keep in memory for visual matching
-        if image is not None or image_bytes is not None:
-            filename = f"{plate}_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
-            filepath = os.path.join(self._image_dir, filename)
-            if image_bytes is not None:
-                with open(filepath, "wb") as f:
-                    f.write(image_bytes)
-                # Decode to numpy for visual matching
-                arr = np.frombuffer(image_bytes, dtype=np.uint8)
-                record.anpr_image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            elif image is not None:
-                cv2.imwrite(filepath, image)
-                record.anpr_image = image.copy()
-            record.image_path = filepath
+        event = PendingANPREvent(
+            event_id=f"anpr_{uuid.uuid4().hex[:12]}",
+            plate=plate,
+            direction=direction,
+            timestamp=now,
+            camera_id=camera_id,
+        )
+
+        if direction == "entry":
+            with self._lock:
+                self._pending_events[event.event_id] = event
+                self._pending_event_order.append(event.event_id)
+                logger.info("[ANPR] Entry: plate=%s", plate)
+        elif direction == "exit":
+            self._handle_exit(plate, now)
+            logger.info("[ANPR] Exit: plate=%s", plate)
         else:
-            # No image from ANPR → capture crops from gate camera (CAM_01)
-            gate_crops = self._capture_gate_crops()
-            if gate_crops:
-                # Store all gate crops as reference images
-                record.anpr_image = gate_crops  # Will be a list of crops
-                # Save the first crop to disk as reference
-                filename = f"{plate}_{now.strftime('%Y%m%d_%H%M%S')}_gate.jpg"
-                filepath = os.path.join(self._image_dir, filename)
-                cv2.imwrite(filepath, gate_crops[0])
-                record.image_path = filepath
-                print(f"[GATE] Captured {len(gate_crops)} car crop(s) from {self.GATE_CAMERA_ID} for plate {plate}")
-            else:
-                print(f"[GATE] No cars detected on {self.GATE_CAMERA_ID} for plate {plate}")
+            raise ValueError(f"Unsupported ANPR direction: {direction}")
+
+        return event
+
+    def _cleanup_stale_data(self, now: datetime):
+        """Garbage collection for expired candidates and pending events."""
+        with self._lock:
+            # 1. Expire pending/provisional ANPR events and clear broken links.
+            active_orders = []
+            for eid in self._pending_event_order:
+                e = self._pending_events.get(eid)
+                if not e:
+                    continue
+                if e.status in ("pending", "provisional"):
+                    age = (now - e.timestamp).total_seconds()
+                    if age > self.PENDING_ANPR_EXPIRY_SECONDS:
+                        e.status = "expired"
+                        if e.candidate_id:
+                            candidate = self._park_entry_candidates.get(e.candidate_id)
+                            if candidate is not None:
+                                candidate.status = "expired"
+                                candidate.bound_event_id = None
+                                # [CHANGE 4] Release bulky numpy arrays immediately.
+                                candidate.snapshot_image = None
+                                candidate.feature_vector = None
+                            e.candidate_id = None
+                    else:
+                        active_orders.append(eid)
+            self._pending_event_order = active_orders
+
+            # 2. Expire or retire Park_Entry candidates and clear their event links.
+            c_to_delete = []
+            for cid, c in self._park_entry_candidates.items():
+                if c.status in ("open", "provisional"):
+                    age = (now - c.last_seen_at).total_seconds()
+                    if age > self.CANDIDATE_EXPIRY_SECONDS:
+                        c.status = "expired"
+                        if c.bound_event_id:
+                            event = self._pending_events.get(c.bound_event_id)
+                            if event is not None and event.status in ("pending", "provisional"):
+                                event.status = "expired"
+                                event.candidate_id = None
+                        c.bound_event_id = None
+                        # [CHANGE 4] Release bulky numpy arrays immediately.
+                        c.snapshot_image = None
+                        c.feature_vector = None
+                        c_to_delete.append(cid)
+                elif c.status in ("confirmed", "dropped", "expired"):
+                    c_to_delete.append(cid)
+
+            for cid in c_to_delete:
+                self._park_entry_candidates.pop(cid, None)
+
+    def open_park_entry_candidate(
+        self,
+        camera_id: str,
+        track_id: int,
+        timestamp: Optional[datetime] = None,
+    ) -> ParkEntryCandidate:
+        """
+        Create a candidate for a car entering the Park_Entry zone.
+        """
+        now = timestamp or datetime.now()
+        candidate = ParkEntryCandidate(
+            candidate_id=f"cand_{uuid.uuid4().hex[:12]}",
+            camera_id=camera_id,
+            track_id=track_id,
+            entered_at=now,
+            last_seen_at=now,
+        )
 
         with self._lock:
-            if direction == "entry":
-                self._pending_entries.append(record)
-                print(f"[ANPR] Entry: plate={plate} | image={'yes' if record.image_path else 'no'}")
-            elif direction == "exit":
-                self._handle_exit(plate, now)
-                print(f"[ANPR] Exit: plate={plate}")
+            self._park_entry_candidates[candidate.candidate_id] = candidate
 
-        return record
+        return candidate
 
-    def update_gate_snapshot(
+    def update_park_entry_candidate_snapshot(
         self,
-        frame: np.ndarray,
-        detections: list,
+        candidate_id: str,
+        image: np.ndarray,
+        quality_score: float,
+        feature_vector: Optional[np.ndarray] = None,
+        timestamp: Optional[datetime] = None,
     ) -> None:
         """
-        Store the latest frame and detections from the gate camera.
-
-        Called by the engine every time CAM_01 is processed.
-        Thread-safe — the API can read this concurrently.
-
-        Args:
-            frame: Latest gate camera frame (BGR).
-            detections: List of Detection objects from the gate camera.
+        Keep the best Park_Entry snapshot for this candidate.
+        Replace only when the new snapshot is better.
         """
-        with self._gate_lock:
-            self._gate_frame = frame.copy()
-            self._gate_detections = list(detections)
+        now = timestamp or datetime.now()
 
-    def _capture_gate_crops(self) -> Optional[List[np.ndarray]]:
-        """
-        Crop all detected cars from the gate camera's latest frame.
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if not candidate:
+                return
 
-        Returns:
-            List of car crop images, or None if no frame/detections available.
-        """
-        with self._gate_lock:
-            frame = self._gate_frame
-            detections = self._gate_detections
+            candidate.last_seen_at = now
 
-        if frame is None or not detections:
-            return None
+            if quality_score <= candidate.quality_score:
+                return
 
-        crops = []
-        h, w = frame.shape[:2]
-        for det in detections:
-            try:
-                x1, y1, x2, y2 = [int(v) for v in det.bbox]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-                crop = frame[y1:y2, x1:x2]
-                if crop.size > 0 and crop.shape[0] > 20 and crop.shape[1] > 20:
-                    crops.append(crop.copy())
-            except Exception:
-                continue
+            candidate.quality_score = quality_score
+            candidate.snapshot_image = image.copy()
+            candidate.feature_vector = feature_vector
 
-        return crops if crops else None
+            filename = f"{candidate.candidate_id}_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
+            filepath = os.path.join(self._image_dir, filename)
 
-    def try_assign_plate(
+            cv2.imwrite(filepath, image)
+            candidate.snapshot_path = filepath
+
+            logger.debug(
+                "[PARK_ENTRY] Updated snapshot for %s (score=%.3f)",
+                candidate.candidate_id,
+                quality_score,
+            )
+
+    def bind_next_pending_anpr_to_candidate(
         self,
-        track_id: int,
-        camera_id: str,
+        candidate_id: str,
+        timestamp: Optional[datetime] = None,
     ) -> Optional[str]:
         """
-        Try to assign the oldest pending plate to a car that has no plate.
+        FIFO rule:
+        the first pending ANPR entry is provisionally bound to the first Park_Entry candidate.
+        """
+        now = timestamp or datetime.now()
 
-        Called for every detection that doesn't already have a plate.
-        Auto-expires pending plates older than 30 seconds.
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if candidate is None or candidate.status != "open":
+                return None
 
-        Args:
-            track_id: Track ID of the detected car.
-            camera_id: Camera that detected the car.
+            event = None
+            for event_id in self._pending_event_order:
+                pending = self._pending_events.get(event_id)
+                if pending and pending.direction == "entry" and pending.status == "pending":
+                    age = (now - pending.timestamp).total_seconds()
+                    if age <= self.PENDING_ANPR_EXPIRY_SECONDS:
+                        event = pending
+                        break
+                    else:
+                        pending.status = "expired"
 
-        Returns:
-            Plate string if assigned, None otherwise.
+            if event is None:
+                return None
+
+            event.status = "provisional"
+            event.candidate_id = candidate.candidate_id
+
+            candidate.status = "provisional"
+            candidate.bound_event_id = event.event_id
+            candidate.last_seen_at = now
+
+            logger.info(
+                "[PARK_ENTRY] Bound ANPR event %s (plate=%s) to candidate %s",
+                event.event_id,
+                event.plate,
+                candidate_id,
+            )
+
+            return event.plate
+
+    def confirm_at_b1_entrance(
+        self,
+        camera_id: str,
+        track_id: int,
+        image: np.ndarray,
+        similarity_threshold: float = 0.35,
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Confirm that a B1_Entrance car is the same car that was provisionally
+        captured at Park_Entry.
+
+        [CHANGE 2] After image matching (done outside the lock to avoid
+        blocking), the lock is re-acquired and we re-verify that both the
+        winning candidate AND its bound event are still in their expected
+        states before committing the session. This closes the TOCTOU window
+        that existed in the original implementation.
+
+        On success:
+          - create VehicleSession
+          - map this track to that session
+          - return the plate
+
+        On failure:
+          - keep provisional bindings intact and wait for a later match
+        """
+        now = timestamp or datetime.now()
+
+        # Snapshot the provisional pairs while holding the lock.
+        with self._lock:
+            provisional_pairs = []
+            for candidate in self._park_entry_candidates.values():
+                if candidate.status != "provisional" or candidate.snapshot_image is None:
+                    continue
+                if not candidate.bound_event_id:
+                    continue
+                event = self._pending_events.get(candidate.bound_event_id)
+                if event is None or event.status != "provisional":
+                    continue
+                provisional_pairs.append((event.timestamp, candidate))
+
+        provisional_pairs.sort(key=lambda item: item[0])
+
+        # Image comparison runs outside the lock — it's CPU-bound and must not
+        # block ANPR ingestion or the GC thread.
+        best_candidate = None
+        best_score = 0.0
+        for _, candidate in provisional_pairs:
+            # candidate.snapshot_image could theoretically be None if the GC
+            # thread cleared it between our snapshot and now; guard defensively.
+            snap = candidate.snapshot_image
+            if snap is None:
+                continue
+            score = self.matcher.compare(image, snap)
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+
+        if best_candidate is None or best_score < similarity_threshold:
+            return None
+
+        # [CHANGE 2] Re-acquire lock and re-validate before committing.
+        with self._lock:
+            # Re-fetch from the live registry — our local reference may be stale.
+            live_candidate = self._park_entry_candidates.get(best_candidate.candidate_id)
+            if live_candidate is None or live_candidate.status != "provisional":
+                logger.debug(
+                    "[B1] Candidate %s is no longer provisional; discarding match",
+                    best_candidate.candidate_id,
+                )
+                return None
+
+            event = self._pending_events.get(live_candidate.bound_event_id)
+            if event is None or event.status != "provisional":
+                logger.debug(
+                    "[B1] Bound event for candidate %s is no longer provisional; discarding match",
+                    live_candidate.candidate_id,
+                )
+                return None
+
+            session = VehicleSession(
+                session_id=f"sess_{uuid.uuid4().hex[:12]}",
+                plate=event.plate,
+                event_id=event.event_id,
+                candidate_id=live_candidate.candidate_id,
+                confirmed_at=now,
+                current_camera_id=camera_id,
+                current_track_id=track_id,
+            )
+
+            self._sessions[session.session_id] = session
+            self._track_session_map[(camera_id, track_id)] = session.session_id
+
+            event.status = "confirmed"
+            event.session_id = session.session_id
+            event.candidate_id = live_candidate.candidate_id
+
+            live_candidate.status = "confirmed"
+            live_candidate.last_seen_at = now
+
+            # [CHANGE 4] Free numpy memory now that matching is complete.
+            live_candidate.snapshot_image = None
+            live_candidate.feature_vector = None
+
+            logger.info(
+                "[B1] Confirmed plate=%s for track (%s, %d) — session %s (score=%.3f)",
+                session.plate,
+                camera_id,
+                track_id,
+                session.session_id,
+                best_score,
+            )
+
+            return session.plate
+
+    def drop_provisional_binding(self, candidate_id: str) -> None:
+        """
+        Remove a failed provisional match.
         """
         with self._lock:
-            # Already has a plate?
-            existing = self._track_plate_map.get((camera_id, track_id))
-            if existing:
-                return existing
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if candidate is None:
+                return
 
-            # Expiry disabled for now — keep all pending entries
-            # now = datetime.now()
-            # expired = []
-            # remaining = []
-            # for record in self._pending_entries:
-            #     if record.linked_slot is not None:
-            #         remaining.append(record)
-            #         continue
-            #     age = (now - record.timestamp).total_seconds()
-            #     if age > self.PENDING_EXPIRY_SECONDS:
-            #         expired.append(record)
-            #     else:
-            #         remaining.append(record)
-            # if expired:
-            #     for r in expired:
-            #         print(f"[EXPIRE] Plate {r.plate} expired after {self.PENDING_EXPIRY_SECONDS}s")
-            # self._pending_entries = remaining
+            if candidate.bound_event_id:
+                event = self._pending_events.get(candidate.bound_event_id)
+                if event:
+                    event.status = "dropped"
+                    event.candidate_id = None
 
-            # Find the oldest unlinked pending entry
-            for record in self._pending_entries:
-                if record.linked_slot is None:
-                    # Assign this plate to this track_id
-                    self._track_plate_map[(camera_id, track_id)] = record.plate
-                    record.track_id = track_id
-                    print(f"[ASSIGN] Plate {record.plate} → Track:{track_id} (cam={camera_id})")
-                    return record.plate
+            candidate.status = "dropped"
+            candidate.bound_event_id = None
 
-        return None
+            # [CHANGE 4] Release numpy arrays on drop.
+            candidate.snapshot_image = None
+            candidate.feature_vector = None
+
+    def attach_session_to_track(
+        self,
+        camera_id: str,
+        track_id: int,
+        session_id: str,
+    ) -> None:
+        """
+        Attach a confirmed session to a new camera/track.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+
+            session.current_camera_id = camera_id
+            session.current_track_id = track_id
+            self._track_session_map[(camera_id, track_id)] = session_id
+
+    def get_plate_for_track(
+        self,
+        camera_id: str,
+        track_id: int,
+    ) -> Optional[str]:
+        """
+        Resolve plate through confirmed session mapping.
+        """
+        with self._lock:
+            session_id = self._track_session_map.get((camera_id, track_id))
+            if session_id is None:
+                return None
+
+            session = self._sessions.get(session_id)
+            return session.plate if session else None
 
     def try_link_to_slot(
         self,
@@ -253,271 +548,123 @@ class VehicleRegistry:
         floor: str,
         track_id: Optional[int],
         timestamp: datetime,
-        time_window_seconds: int = 120,
     ) -> Optional[str]:
         """
-        Try to link a newly occupied slot to a plate.
+        Link a slot only from a confirmed session.
+        No blind fallback to recent ANPR events.
+        """
+        if track_id is None:
+            return None
 
-        Priority:
-          1. Check if this track_id already has a known plate
-             → known car moving to a different slot (just update location)
-          2. Search pending ANPR entries (time-window match)
-             → new car just entered via ANPR
+        with self._lock:
+            session_id = self._track_session_map.get((camera_id, track_id))
+            if session_id is None:
+                return None
 
-        Args:
-            slot_id: The slot that just became occupied.
-            camera_id: Camera that detected the vehicle.
-            floor: Floor of the slot.
-            track_id: ByteTrack ID of the vehicle.
-            timestamp: When the slot became occupied.
-            time_window_seconds: How far back to search for ANPR entries.
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
 
-        Returns:
-            The linked plate string, or None if no match found.
+            session.linked_slot = slot_id
+            session.linked_camera = camera_id
+            session.linked_floor = floor
+            session.linked_at = timestamp
+            self._parked[slot_id] = session
+
+            return session.plate
+
+    def _handle_exit(self, plate: str, timestamp: datetime) -> None:
+        """
+        Close a parked session when ANPR sends an exit event.
         """
         with self._lock:
-            # --- Strategy 1: Track ID already has a plate ---
-            if track_id is not None:
-                key = (camera_id, track_id)
-                existing_plate = self._track_plate_map.get(key)
-                if existing_plate:
-                    # Known car — update its slot location
-                    self._move_car_to_slot(
-                        existing_plate, slot_id, camera_id, floor, track_id, timestamp
+            slot_to_remove = None
+            for slot_id, session in self._parked.items():
+                if session.plate == plate:
+                    slot_to_remove = slot_id
+                    break
+
+            if slot_to_remove is not None:
+                session = self._parked.pop(slot_to_remove)
+                self._sessions.pop(session.session_id, None)
+                self._history.append(session)
+
+                if session.current_camera_id and session.current_track_id is not None:
+                    self._track_session_map.pop(
+                        (session.current_camera_id, session.current_track_id),
+                        None,
                     )
-                    print(f"[MOVE] Known car {existing_plate} (track {track_id}) "
-                          f"→ {slot_id} ({floor})")
-                    return existing_plate
 
-            # --- Strategy 2: Time-window match with pending ANPR entries ---
-            for record in reversed(self._pending_entries):
-                age = (timestamp - record.timestamp).total_seconds()
-                if age <= time_window_seconds and record.linked_slot is None:
-                    # Link this plate to this slot
-                    record.linked_slot = slot_id
-                    record.linked_camera = camera_id
-                    record.linked_floor = floor
-                    record.linked_at = timestamp
-                    record.track_id = track_id
-                    self._parked[slot_id] = record
-
-                    # Register track_id → plate mapping
-                    if track_id is not None:
-                        self._track_plate_map[(camera_id, track_id)] = record.plate
-
-                    print(f"[LINK] Plate {record.plate} → {slot_id} ({floor}, "
-                          f"track={track_id})")
-                    return record.plate
-
-            return None
-
-    def _move_car_to_slot(
-        self,
-        plate: str,
-        new_slot_id: str,
-        camera_id: str,
-        floor: str,
-        track_id: int,
-        timestamp: datetime,
-    ):
-        """Move a known car from its current slot to a new slot."""
-        # Find and remove from old slot
-        old_slot = None
-        record = None
-        for sid, rec in self._parked.items():
-            if rec.plate == plate:
-                old_slot = sid
-                record = rec
-                break
-
-        if old_slot:
-            del self._parked[old_slot]
-            print(f"[MOVE] {plate}: {old_slot} → {new_slot_id}")
-
-        if record is None:
-            record = VehicleRecord(
-                plate=plate, direction="entry", timestamp=timestamp
-            )
-
-        # Update slot info
-        record.linked_slot = new_slot_id
-        record.linked_camera = camera_id
-        record.linked_floor = floor
-        record.linked_at = timestamp
-        record.track_id = track_id
-        self._parked[new_slot_id] = record
-
-    def update_track_plate(
-        self, camera_id: str, track_id: int, plate: str
-    ):
-        """Manually associate a track_id with a plate."""
-        with self._lock:
-            self._track_plate_map[(camera_id, track_id)] = plate
-
-    def get_plate_for_track(
-        self, camera_id: str, track_id: int
-    ) -> Optional[str]:
-        """Get the plate associated with a track_id on a specific camera."""
-        with self._lock:
-            return self._track_plate_map.get((camera_id, track_id))
-
-    def get_plate_for_any_camera(self, track_id: int) -> Optional[str]:
-        """
-        Get the plate for a track_id regardless of which camera identified it.
-
-        Searches all camera entries in the track_plate_map.
-        """
-        with self._lock:
-            for (cam, tid), plate in self._track_plate_map.items():
-                if tid == track_id:
-                    return plate
-            return None
-
-    def try_match_by_image(
-        self,
-        car_crop: np.ndarray,
-        track_id: int,
-        camera_id: str,
-        similarity_threshold: float = 0.35,
-    ) -> Optional[str]:
-        """
-        Match a car crop from a camera against pending ANPR images.
-
-        Uses multi-feature matching (dominant color, regional color, SSIM, edges)
-        via the VehicleImageMatcher for robust cross-angle comparison.
-
-        Args:
-            car_crop: Cropped car image from the camera frame (BGR).
-            track_id: Track ID of the detected car.
-            camera_id: Camera that detected the car.
-            similarity_threshold: Minimum score to accept a match (0-1).
-
-        Returns:
-            Plate string if matched, None otherwise.
-        """
-        if car_crop is None or car_crop.size == 0:
-            return None
-
-        with self._lock:
-            # Already has a plate?
-            existing = self._track_plate_map.get((camera_id, track_id))
-            if existing:
-                return existing
-
-            # Compare against pending entries that have ANPR images
-            best_score = 0.0
-            best_plate = None
-
-            for record in self._pending_entries:
-                if record.linked_slot is not None:
-                    continue  # Already linked
-                if record.anpr_image is None:
-                    continue  # No image to compare
-
-                # anpr_image can be a single image or a list of gate crops
-                ref_images = record.anpr_image
-                if isinstance(ref_images, np.ndarray):
-                    ref_images = [ref_images]
-
-                # Compare against each reference image, keep best score
-                for i, ref_img in enumerate(ref_images):
-                    if ref_img is None or ref_img.size == 0:
-                        continue
-                    score = self.matcher.compare(car_crop, ref_img)
-                    print(f"[MATCH-DEBUG] Plate={record.plate} crop#{i} vs Track:{track_id} "
-                          f"(cam={camera_id}) → score={score:.3f}")
-                    if score > best_score:
-                        best_score = score
-                        best_plate = record.plate
-
-            if best_plate and best_score >= similarity_threshold:
-                self._track_plate_map[(camera_id, track_id)] = best_plate
-                print(f"[IMAGE-MATCH] Plate {best_plate} → Track:{track_id} "
-                      f"(cam={camera_id}, score={best_score:.2%})")
-                return best_plate
-
-        return None
-
-    def _handle_exit(self, plate: str, timestamp: datetime):
-        """Handle an exit ANPR event — find and archive the parked record."""
-        slot_to_remove = None
-        for slot_id, record in self._parked.items():
-            if record.plate == plate:
-                slot_to_remove = slot_id
-                break
-
-        if slot_to_remove:
-            record = self._parked.pop(slot_to_remove)
-            self._history.append(record)
-            # Clean up track_id mapping
-            if record.track_id and record.linked_camera:
-                key = (record.linked_camera, record.track_id)
-                self._track_plate_map.pop(key, None)
-            print(f"[EXIT] Plate {plate} left slot {slot_to_remove}")
-
-        # Also remove from pending entries
-        self._pending_entries = [
-            r for r in self._pending_entries if r.plate != plate
-        ]
+    # ------------------------------------------------------------------
+    # Query helpers
+    # ------------------------------------------------------------------
 
     def get_slot_plate(self, slot_id: str) -> Optional[str]:
-        """Get the plate linked to a specific slot."""
         with self._lock:
-            record = self._parked.get(slot_id)
-            return record.plate if record else None
+            session = self._parked.get(slot_id)
+            return session.plate if session else None
 
     def get_plate_location(self, plate: str) -> Optional[Dict]:
-        """Find where a specific plate is parked."""
         with self._lock:
-            for slot_id, record in self._parked.items():
-                if record.plate == plate:
+            for slot_id, session in self._parked.items():
+                if session.plate == plate:
                     return {
-                        "plate": record.plate,
+                        "plate": session.plate,
                         "slot_id": slot_id,
-                        "camera_id": record.linked_camera,
-                        "floor": record.linked_floor,
-                        "track_id": record.track_id,
-                        "parked_at": record.linked_at.isoformat() if record.linked_at else None,
-                        "entry_time": record.timestamp.isoformat(),
+                        "camera_id": session.linked_camera,
+                        "floor": session.linked_floor,
+                        "track_id": session.current_track_id,
+                        "parked_at": session.linked_at.isoformat() if session.linked_at else None,
+                        "confirmed_at": session.confirmed_at.isoformat(),
                     }
             return None
 
     def get_all_parked(self) -> List[Dict]:
-        """Get all currently parked vehicles with slot info."""
         with self._lock:
             return [
                 {
-                    "plate": r.plate,
-                    "slot_id": sid,
-                    "camera_id": r.linked_camera,
-                    "floor": r.linked_floor,
-                    "track_id": r.track_id,
-                    "parked_at": r.linked_at.isoformat() if r.linked_at else None,
-                    "entry_time": r.timestamp.isoformat(),
+                    "plate": s.plate,
+                    "slot_id": slot_id,
+                    "camera_id": s.linked_camera,
+                    "floor": s.linked_floor,
+                    "track_id": s.current_track_id,
+                    "parked_at": s.linked_at.isoformat() if s.linked_at else None,
+                    "confirmed_at": s.confirmed_at.isoformat(),
                 }
-                for sid, r in self._parked.items()
+                for slot_id, s in self._parked.items()
             ]
 
     def get_pending_entries(self) -> List[Dict]:
-        """Get plates that entered but haven't been linked to a slot yet."""
         with self._lock:
             return [
                 {
-                    "plate": r.plate,
-                    "entry_time": r.timestamp.isoformat(),
-                    "image_path": r.image_path,
-                    "linked": r.linked_slot is not None,
+                    "event_id": e.event_id,
+                    "plate": e.plate,
+                    "timestamp": e.timestamp.isoformat(),
+                    "status": e.status,
+                    "candidate_id": e.candidate_id,
+                    "session_id": e.session_id,
                 }
-                for r in self._pending_entries
-                if r.linked_slot is None
+                for e in self._pending_events.values()
+                if e.direction == "entry" and e.status in ("pending", "provisional")
             ]
 
     def get_stats(self) -> Dict:
-        """Get summary statistics."""
+        """
+        [CHANGE 5] active_sessions now reads len(self._sessions) directly.
+
+        _handle_exit already removes exited sessions from self._sessions via
+        .pop(), so the count is always accurate without building an O(n) set
+        against self._history.
+        """
         with self._lock:
             return {
                 "parked_count": len(self._parked),
-                "pending_entries": sum(1 for r in self._pending_entries if r.linked_slot is None),
+                "pending_entries": sum(
+                    1 for e in self._pending_events.values()
+                    if e.direction == "entry" and e.status in ("pending", "provisional")
+                ),
                 "total_visits": len(self._history),
-                "tracked_ids": len(self._track_plate_map),
+                "active_sessions": len(self._sessions),   # O(1), always correct
+                "tracked_ids": len(self._track_session_map),
             }

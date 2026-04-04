@@ -121,6 +121,32 @@ def create_app(
     # Use provided or create new registry
     registry = vehicle_registry or VehicleRegistry()
 
+    def _capture_instant_snapshot(plate: str, direction: str) -> bool:
+        if get_park_entry_crop is not None and direction == "entry":
+            import cv2
+            success, crop = get_park_entry_crop("CAM_01")
+            if success and crop is not None:
+                # 1. Force open an artificial candidate so it can be matched
+                # Give it an arbitrary negative ID so YOLO tracks won't conflict
+                import time
+                fake_track_id = -int(time.time() * 1000) % 100000
+                candidate = registry.open_park_entry_candidate("CAM_01", fake_track_id)
+                
+                # 2. Inject our cropped entry zone as the car snapshot
+                registry.update_park_entry_candidate_snapshot(
+                    candidate.candidate_id, crop, quality_score=999.0
+                )
+                
+                # 3. Bind this candidate instantly to the ANPR entry that was just created
+                registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id)
+                
+                os.makedirs("vehicle_images", exist_ok=True)
+                timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+                image_path = f"vehicle_images/{plate}_CAM01_bound_{timestamp_str}.jpg"
+                cv2.imwrite(image_path, crop)
+                print(f"[API] Instant candidate created & bound from CAM_01 for plate {plate}")
+                return True
+        return False
     # ── SSE Endpoints ───────────────────────────────────────
 
     @app.get("/api/alerts/stream", response_class=EventSourceResponse)
@@ -269,16 +295,18 @@ def create_app(
         record = registry.register_anpr_event(
             plate=event.plate,
             direction=event.direction,
-            image_bytes=image_bytes,
+            camera_id=event.camera_id,
         )
 
-        print(f"[API] ✓ Plate {record.plate} registered | Image saved: {record.image_path or 'none'}")
+        print(f"[API] ✓ Plate {record.plate} registered")
+        
+        image_saved = _capture_instant_snapshot(record.plate, record.direction)
 
         return ANPREventResponse(
             status="ok",
             plate=record.plate,
             direction=record.direction,
-            image_saved=record.image_path is not None,
+            image_saved=image_saved,
             timestamp=record.timestamp.isoformat(),
         )
 
@@ -308,16 +336,17 @@ def create_app(
         record = registry.register_anpr_event(
             plate=plate,
             direction=direction,
-            image_bytes=image_bytes,
         )
 
-        print(f"[API] ✓ Plate {record.plate} registered | Image saved: {record.image_path or 'none'}")
+        print(f"[API] ✓ Plate {record.plate} registered")
+
+        image_saved = _capture_instant_snapshot(record.plate, record.direction)
 
         return ANPREventResponse(
             status="ok",
             plate=record.plate,
             direction=record.direction,
-            image_saved=record.image_path is not None,
+            image_saved=image_saved,
             timestamp=record.timestamp.isoformat(),
         )
 

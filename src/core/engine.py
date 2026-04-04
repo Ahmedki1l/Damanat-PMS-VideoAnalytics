@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from shapely.geometry import Point
 from shapely.geometry import Polygon
 
 from src.config import AppConfig
@@ -118,6 +119,14 @@ class ParkingEngine:
 
         # --- Per-camera pipelines ---
         self.pipelines: Dict[str, CameraPipeline] = {}
+        # [NEW] Tracking zones mapping: cam_id -> zone_id -> ParkingSlot
+        self.special_zones: Dict[str, Dict[str, ParkingSlot]] = {}
+
+        # --- [NEW] Tracking State for Zones ---
+        self._park_entry_track_to_candidate: Dict[int, str] = {}
+        # Maps (cam_id, zone_id, track_id) to the last time it was seen (for entry/exit detection)
+        # Using a simple set of track_ids currently "inside" for simpler logic
+        self._tracks_inside_zones: Dict[Tuple[str, str], set] = {}
 
         # --- Violation Alert State ---
         self._recent_violators: List[Dict] = []  # List of {crop, timestamp, camera_id}
@@ -154,8 +163,8 @@ class ParkingEngine:
             camera_configs.append(cc)
 
         # Initialize camera manager
-        cam_manager = CameraManager(camera_configs)
-        opened = cam_manager.open_all()
+        self.cam_manager = CameraManager(camera_configs)
+        opened = self.cam_manager.open_all()
 
         if opened == 0:
             print("[ERROR] No cameras could be opened. Exiting.")
@@ -164,20 +173,24 @@ class ParkingEngine:
         # Load per-camera slot polygons and create pipelines
         total_slots = 0
         for cc in camera_configs:
-            slots = []
-            roi_polygon = None
+            all_slots = []
             if cc.slots_file and os.path.exists(cc.slots_file):
-                slots, roi_polygon = load_slots(cc.slots_file)
-                if self.db_manager and slots:
-                    session = self.db_manager.SessionLocal()
-                    try:
-                        sync_slots_from_config(session, slots, cc.floor)
-                        print(f"[DB] Synced {len(slots)} slots for {cc.id}")
-                    except Exception as e:
-                        session.rollback()
-                        print(f"[ERROR] Failed to save slots to database: {e}")
-                    finally:
-                        session.close()
+                all_slots = load_slots(cc.slots_file)
+            
+            # [NEW] Separate tracking zones from parking slots
+            parking_slots, special_zones = self._split_special_zones(all_slots)
+            self.special_zones[cc.id] = {z.id: z for z in special_zones}
+
+            if self.db_manager and parking_slots:
+                session = self.db_manager.SessionLocal()
+                try:
+                    sync_slots_from_config(session, parking_slots, cc.floor)
+                    print(f"[DB] Synced {len(parking_slots)} slots for {cc.id}")
+                except Exception as e:
+                    session.rollback()
+                    print(f"[ERROR] Failed to save slots to database: {e}")
+                finally:
+                    session.close()
 
             # Load violation zone flags from DB for this camera's slots
             violation_slots = set()
@@ -199,7 +212,7 @@ class ParkingEngine:
             pipeline = CameraPipeline(
                 camera_id=cc.id,
                 floor=cc.floor,
-                slots=slots,
+                slots=parking_slots,  # Only standard and violation slots
                 config=self.config,
                 violation_slots=violation_slots,
                 roi_polygon=roi_polygon,
@@ -236,7 +249,7 @@ class ParkingEngine:
         try:
             while True:
                 # Get next frame (round-robin)
-                cam_id, frame = cam_manager.next_frame()
+                cam_id, frame = self.cam_manager.next_frame()
 
                 if cam_id is None:
                     print("[WARN] All cameras unavailable. Retrying in 5s...")
@@ -261,36 +274,20 @@ class ParkingEngine:
                 detection_frame = pipeline.apply_roi_mask(frame)
                 detections = self.detector.detect_and_track(detection_frame)
 
-                # --- 1.1. Feed gate camera data for ANPR snapshot capture ---
-                if self.vehicle_registry and cam_id == "CAM_01" and detections:
-                    self.vehicle_registry.update_gate_snapshot(frame, detections)
-
-                # --- 1.5. Assign ANPR plates to unplated detections ---
-                # Using IMAGE MATCHING ONLY (queue disabled for testing)
-                # Only run on parking floors (B1, B2) — not gate/ground floor
-                cam_floor = pipeline.floor
-                if self.vehicle_registry and detections and cam_floor in ("B1", "B2"):
-                    h, w = frame.shape[:2]
-                    for det in detections:
-                        if det.track_id == -1:
-                            continue
-                        # Skip if already has a plate
-                        existing = self.vehicle_registry.get_plate_for_track(
-                            det.track_id, cam_id
-                        )
-                        if existing:
-                            continue
-                        # Try image matching
-                        x1, y1, x2, y2 = [int(v) for v in det.bbox]
-                        x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(w, x2), min(h, y2)
-                        car_crop = frame[y1:y2, x1:x2]
-                        if car_crop.size > 0:
-                            self.vehicle_registry.try_match_by_image(
-                                car_crop=car_crop,
-                                track_id=det.track_id,
-                                camera_id=cam_id,
-                            )
+                # --- 1.2. Process Special Tracking Zones ---
+                if self.vehicle_registry and detections:
+                    cam_special_zones = self.special_zones.get(cam_id, {})
+                    
+                    # CAM_01 -> Park_Entry
+                    if cam_id == "CAM_01" and "Park_Entry" in cam_special_zones:
+                        self._process_park_entry_zone(cam_id, frame, detections, cam_special_zones["Park_Entry"])
+                    
+                    # CAM_03 (B1) or confirmation cams (e.g. CAM_09-14 for B2)
+                    if "Entrence" in "".join(cam_special_zones.keys()): # Matches B1_Entrence, B2_Entrence
+                        # Find the confirmation zone for this camera
+                        conf_zone = next((z for k, z in cam_special_zones.items() if "Entrence" in k), None)
+                        if conf_zone:
+                            self._process_confirmation_zone(cam_id, frame, detections, conf_zone)
 
                 # --- 2. Assign to slots ---
                 assignment = pipeline.assigner.assign(detections)
@@ -316,6 +313,7 @@ class ParkingEngine:
                         # --- Auto-link ANPR plate when slot becomes OCCUPIED ---
                         if evt.event_type == "vehicle_parked" and self.vehicle_registry:
                             from datetime import datetime as dt
+                            # 1. Try resolving plate from already confirmed tracks
                             plate = self.vehicle_registry.try_link_to_slot(
                                 slot_id=slot.id,
                                 camera_id=cam_id,
@@ -323,6 +321,9 @@ class ParkingEngine:
                                 track_id=track_id,
                                 timestamp=dt.now(),
                             )
+                            
+
+
                             if plate:
                                 evt.plate = plate
                                 # Crop car image from frame for visual reference
@@ -444,7 +445,7 @@ class ParkingEngine:
             print("\n[INFO] Interrupted — shutting down.")
 
         finally:
-            cam_manager.close_all()
+            self.cam_manager.close_all()
             if show:
                 cv2.destroyAllWindows()
             self.event_bus.close()
@@ -645,7 +646,7 @@ class ParkingEngine:
             # Show plate if known, otherwise show track ID
             label = f"ID:{track_id}"
             if self.vehicle_registry:
-                plate = self.vehicle_registry.get_plate_for_any_camera(track_id)
+                plate = self.vehicle_registry.get_plate_for_track(cam_id, track_id)
                 if plate:
                     label = f"[{plate}]"
                     # Green plate label above bbox
@@ -662,25 +663,107 @@ class ParkingEngine:
             bc_x, bc_y = detection.bottom_center
             cv2.circle(frame, (int(bc_x), int(bc_y)), 5, (0, 0, 255), -1)
 
-        # Draw UNASSIGNED detections (magenta bbox) — helps debug slot alignment
-        if all_detections:
-            for det in all_detections:
-                if det.track_id not in assigned_track_ids:
-                    x1, y1, x2, y2 = [int(v) for v in det.bbox]
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
-                    cv2.putText(
-                        frame, f"ID:{det.track_id} NOT ASSIGNED",
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1,
+        # Draw unassigned detections (red bbox) for debugging
+        if hasattr(assignment, 'unassigned'):
+            for detection in assignment.unassigned:
+                x1, y1, x2, y2 = [int(v) for v in detection.bbox]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                label = f"ID:{detection.track_id} (Unassigned)"
+                cv2.putText(
+                    frame, label, (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2,
+                )
+                bc_x, bc_y = detection.bottom_center
+                cv2.circle(frame, (int(bc_x), int(bc_y)), 5, (0, 0, 255), -1)
+
+    # ------------------------------------------------------------------
+    # Zone Processing Helpers
+    # ------------------------------------------------------------------
+
+    def _split_special_zones(self, slots: List[ParkingSlot]) -> Tuple[List[ParkingSlot], List[ParkingSlot]]:
+        """Split polygons into standard parking slots and special tracking zones."""
+        parking = []
+        special = []
+        for s in slots:
+            if "Park_Entry" in s.id or "Entrence" in s.id:
+                special.append(s)
+            else:
+                parking.append(s)
+        return parking, special
+
+    def _detection_in_zone(self, detection, zone_slot: ParkingSlot) -> bool:
+        """Check if a detection's bottom-center is inside a zone polygon."""
+        bc_x, bc_y = detection.bottom_center
+        return zone_slot.polygon.contains(Point(bc_x, bc_y))
+
+    def _crop_detection(self, frame: np.ndarray, detection) -> Optional[np.ndarray]:
+        """Safely crop the vehicle detection from the frame."""
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in detection.bbox]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        crop = frame[y1:y2, x1:x2]
+        return crop if crop.size > 0 else None
+
+    def _score_snapshot_quality(self, detection) -> float:
+        """Score snapshot quality based on detection area."""
+        x1, y1, x2, y2 = detection.bbox
+        return (x2 - x1) * (y2 - y1)
+
+    def _process_park_entry_zone(self, cam_id: str, frame: np.ndarray, detections: List, zone: ParkingSlot):
+        """Handle CAM_01 logic for Park_Entry."""
+        currently_inside = set()
+        
+        for det in detections:
+            if det.track_id == -1:
+                continue
+            
+            if self._detection_in_zone(det, zone):
+                currently_inside.add(det.track_id)
+                
+                # 1. Open candidate if first time seen
+                candidate_id = self._park_entry_track_to_candidate.get(det.track_id)
+                if not candidate_id:
+                    candle = self.vehicle_registry.open_park_entry_candidate(cam_id, det.track_id)
+                    candidate_id = candle.candidate_id
+                    self._park_entry_track_to_candidate[det.track_id] = candidate_id
+                
+                # 2. Update snapshot with quality check
+                crop = self._crop_detection(frame, det)
+                if crop is not None:
+                    quality = self._score_snapshot_quality(det)
+                    # Feature vector is lazy-loaded in matcher if needed, passing None for now
+                    self.vehicle_registry.update_park_entry_candidate_snapshot(
+                        candidate_id, crop, quality
                     )
-                    # Show the reference point used for slot assignment
-                    bc_x, bc_y = det.bottom_center
-                    cv2.circle(frame, (int(bc_x), int(bc_y)), 7, (0, 0, 255), -1)
-                    cv2.putText(
-                        frame, "ref",
-                        (int(bc_x) + 10, int(bc_y)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1,
-                    )
+                
+                # 3. Aggressively try binding to ANPR
+                self.vehicle_registry.bind_next_pending_anpr_to_candidate(candidate_id)
+
+        # Cleanup maps for tracks that left the zone
+        last_track_ids = self._tracks_inside_zones.get((cam_id, zone.id), set())
+        left_zone = last_track_ids - currently_inside
+        for tid in left_zone:
+            # Clean up the candidate mapping to prevent ID reuse poisoning
+            if tid in self._park_entry_track_to_candidate:
+                del self._park_entry_track_to_candidate[tid]
+            
+        self._tracks_inside_zones[(cam_id, zone.id)] = currently_inside
+
+    def _process_confirmation_zone(self, cam_id: str, frame: np.ndarray, detections: List, zone: ParkingSlot):
+        """Handle CAM_03 and other confirm zones for identity matching."""
+        for det in detections:
+            if det.track_id == -1:
+                continue
+            
+            if self._detection_in_zone(det, zone):
+                # 1. Check if already session-backed
+                if self.vehicle_registry.get_plate_for_track(cam_id, det.track_id):
+                    continue
+                
+                # 2. Try visual match vs provisional candidates
+                crop = self._crop_detection(frame, det)
+                if crop is not None:
+                    self.vehicle_registry.confirm_at_b1_entrance(cam_id, det.track_id, crop)
 
     def _save_car_crop(self, frame, detection, plate: str, cam_id: str):
         """Crop and save the detected car image for visual reference."""
