@@ -34,8 +34,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="yolo11n.pt",
-        help="Model name to download (default: yolo11n.pt).",
+        default="yolo11m.pt",
+        help="Model name to download (default: yolo11m.pt).",
     )
     parser.add_argument(
         "--output-dir",
