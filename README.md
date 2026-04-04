@@ -10,8 +10,9 @@ This system processes live RTSP camera feeds to detect vehicles, determine parki
 - 🚗 Real-time vehicle detection using YOLO11 nano
 - 📍 Polygon-based parking slot definition with interactive drawing tool
 - 🔄 Per-slot state machine (VACANT → ENTERING → OCCUPIED → LEAVING)
-- 📷 12-camera support across 2 parking floors (B1 & B2)
+- 📷 14-camera support across Ground Floor (Street-facing) and Parking Floors (B1 & B2)
 - ⚡ Round-robin processing at ~1 FPS per camera on a single CPU
+- 🗺️ **Region of Interest (ROI) Masking** to exclude street traffic and noise
 - 📊 Structured JSON event output for integration
 
 ---
@@ -103,7 +104,10 @@ Damanat-PMS-VideoAnalytics/
     │
     ├── core/
     │   ├── slot_assigner.py # Vehicle-to-slot assignment logic
-    │   └── engine.py        # Main pipeline orchestrator
+    │   └── engine.py        # Main pipeline orchestrator (supports ROI masks)
+    │
+    ├── tools/               # Internal utility tools
+    │   └── roi_selector.py  # Interactive ROI visual selector
     │
     └── events/
         └── event_bus.py     # JSON event emission + file logging
@@ -231,6 +235,16 @@ python setup_model.py --export onnx        # Export to ONNX
 python setup_model.py --export openvino    # Export to OpenVINO
 python setup_model.py --model yolo11s.pt   # Use a different model
 ```
+
+---
+
+## Region of Interest (ROI) Masking
+
+To ignore irrelevant areas (like street traffic), the system supports **ROI Masking**.
+
+- **Setup:** Run `python src/tools/roi_selector.py` to draw the detection zone.
+- **Visuals:** The ROI appears as a yellow "DETECTION ZONE" border in supervised mode.
+- **Storage:** Saved as `"roi"` entries within the `slots/*.json` files.
 
 ---
 
@@ -481,11 +495,11 @@ WantedBy=multi-user.target
 |---------|---------|
 | `ultralytics` | YOLO11 inference + built-in ByteTrack tracking |
 | `opencv-python-headless` | Video I/O (no GUI overhead in production) |
-| `shapely` | Polygon geometry for slot point-in-polygon checks |
+| `shapely` | Polygon geometry for slot point-in-polygon and ROI masking |
 | `pyyaml` | Configuration file parsing |
 | `lap` | Linear assignment for ByteTrack (auto-installed by ultralytics) |
 
-> **Note:** For visualization modes (`--show`, `grid_view.py`, `draw_slots.py`), OpenCV uses its built-in HighGUI. No additional GUI deps needed on Windows. On headless Linux, install `opencv-python` instead of `opencv-python-headless`.
+> **Note:** For visualization modes (`--show`, `grid_view.py`, `draw_slots.py`, `roi_selector.py`), OpenCV uses its built-in HighGUI. No additional GUI deps needed on Windows. On headless Linux, install `opencv-python` instead of `opencv-python-headless`.
 
 ---
 

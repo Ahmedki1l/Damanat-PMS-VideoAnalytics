@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from shapely.geometry import Point
+from shapely.geometry import Polygon
 
 from src.config import AppConfig
 from src.models.slot import ParkingSlot, load_slots
@@ -51,22 +52,43 @@ class CameraPipeline:
         floor: str,
         slots: List[ParkingSlot],
         config: AppConfig,
+        violation_slots: set = None,
+        roi_polygon: Optional[Polygon] = None,
     ):
         self.camera_id = camera_id
         self.floor = floor
         self.slots = slots
+        self.roi_polygon = roi_polygon
+        self._mask = None # Cached binary mask
 
-        # Per-slot state machines
+        # Per-slot state machines — pass is_violation_zone from DB
         self.state_machines: Dict[str, SlotStateMachine] = {}
         for slot in slots:
+            is_restricted = (violation_slots is not None) and (slot.id in violation_slots)
             self.state_machines[slot.id] = SlotStateMachine(
                 slot_id=slot.id,
                 confirm_enter_frames=config.state_machine.confirm_enter_frames,
                 confirm_leave_frames=config.state_machine.confirm_leave_frames,
+                is_violation_zone=is_restricted,
             )
 
         # Slot assigner for this camera's polygons
         self.assigner = SlotAssigner(slots=slots, config=config.assigner)
+
+    def apply_roi_mask(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply the ROI mask to the frame, blacking out areas outside the ROI.
+        """
+        if self.roi_polygon is None:
+            return frame
+
+        h, w = frame.shape[:2]
+        if self._mask is None or self._mask.shape != (h, w):
+            self._mask = np.zeros((h, w), dtype=np.uint8)
+            pts = np.array(self.roi_polygon.exterior.coords, dtype=np.int32)
+            cv2.fillPoly(self._mask, [pts], 255)
+
+        return cv2.bitwise_and(frame, frame, mask=self._mask)
 
     @property
     def slot_count(self) -> int:
@@ -170,11 +192,30 @@ class ParkingEngine:
                 finally:
                     session.close()
 
+            # Load violation zone flags from DB for this camera's slots
+            violation_slots = set()
+            if self.db_manager and slots:
+                session = self.db_manager.SessionLocal()
+                try:
+                    slot_ids = [s.id for s in slots]
+                    from src.repositories import ParkingSlotRepository
+                    db_slots = [ParkingSlotRepository.get_by_id(session, sid) for sid in slot_ids]
+                    violation_slots = {
+                        db_s.slot_id for db_s in db_slots
+                        if db_s and db_s.is_violation_zone
+                    }
+                except Exception as e:
+                    print(f"[ERROR] Failed to load violation zone flags from DB: {e}")
+                finally:
+                    session.close()
+
             pipeline = CameraPipeline(
                 camera_id=cc.id,
                 floor=cc.floor,
                 slots=parking_slots,  # Only standard and violation slots
                 config=self.config,
+                violation_slots=violation_slots,
+                roi_polygon=roi_polygon,
             )
             self.pipelines[cc.id] = pipeline
             total_slots += pipeline.slot_count
@@ -229,7 +270,9 @@ class ParkingEngine:
                     continue
 
                 # --- 1. Detect + Track ---
-                detections = self.detector.detect_and_track(frame)
+                # Apply ROI mask to focus detection on relevant areas (e.g. ignore street)
+                detection_frame = pipeline.apply_roi_mask(frame)
+                detections = self.detector.detect_and_track(detection_frame)
 
                 # --- 1.2. Process Special Tracking Zones ---
                 if self.vehicle_registry and detections:
@@ -319,7 +362,11 @@ class ParkingEngine:
                                                 break
                                     
                                     if not is_duplicate:
-                                        evt.event_type = "vehicle_violation"
+                                        # Distinguish violation zones vs intrusion (restricted) zones
+                                        alert_type = "vehicle_violation" if "violation" in evt.slot_id.lower() else "vehicle_intrusion"
+                                        evt.event_type = alert_type
+                                        evt.is_alert = True
+                                        evt.severity = "critical"
                                         if crop.size > 0:
                                             self._recent_violators.append({
                                                 'crop': crop.copy(),
@@ -327,7 +374,7 @@ class ParkingEngine:
                                                 'camera_id': cam_id
                                             })
                                         final_events.append(evt)
-                                        print(f"[ALERT] New Violation! {cam_id} | Slot:{evt.slot_id}")
+                                        print(f"[ALERT] {alert_type.replace('_', ' ').title()}! {cam_id} | Slot:{evt.slot_id}")
                                     else:
                                         # Duplicate of a recent violator
                                         final_events.append(evt)
@@ -421,13 +468,14 @@ class ParkingEngine:
 
         # Load slots
         sf = slots_file or self.config.slots_file
-        slots = load_slots(sf) if os.path.exists(sf) else []
+        slots, roi_polygon = load_slots(sf) if os.path.exists(sf) else ([], None)
 
         pipeline = CameraPipeline(
             camera_id="SINGLE",
             floor="",
             slots=slots,
             config=self.config,
+            roi_polygon=roi_polygon,
         )
         self.pipelines["SINGLE"] = pipeline
 
@@ -455,7 +503,8 @@ class ParkingEngine:
 
                 t_start = time.time()
 
-                detections = self.detector.detect_and_track(frame)
+                detection_frame = pipeline.apply_roi_mask(frame)
+                detections = self.detector.detect_and_track(detection_frame)
                 assignment = pipeline.assigner.assign(detections)
 
                 all_events = []
@@ -479,10 +528,14 @@ class ParkingEngine:
                             if evt.event_type == "vehicle_parked":
                                 now_ts = time.time()
                                 if now_ts - self._last_violation_alert_time >= self._violation_cooldown_seconds:
-                                    evt.event_type = "vehicle_violation"
+                                    # Distinguish violation zones vs intrusion (restricted) zones
+                                    alert_type = "vehicle_violation" if "violation" in evt.slot_id.lower() else "vehicle_intrusion"
+                                    evt.event_type = alert_type
+                                    evt.is_alert = True
+                                    evt.severity = "critical"
                                     self._last_violation_alert_time = now_ts
                                     final_events.append(evt)
-                                    print(f"[ALERT] Violation detected in {evt.slot_id}!")
+                                    print(f"[ALERT] {alert_type.replace('_', ' ').title()} in {evt.slot_id}!")
                                 else:
                                     final_events.append(evt)
                             else:
@@ -535,6 +588,16 @@ class ParkingEngine:
 
     def _draw_frame(self, frame, pipeline, assignment, cam_id, all_detections=None):
         """Draw slot polygons and detections on a frame."""
+        # Draw ROI border if it exists (but don't mask the whole frame visually for humans)
+        if pipeline.roi_polygon is not None:
+            pts = np.array(pipeline.roi_polygon.exterior.coords, dtype=np.int32).reshape((-1, 1, 2))
+            # Draw thin yellow line for the detection boundary
+            cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 255), thickness=2)
+            cv2.putText(
+                frame, "DETECTION ZONE", (pts[0][0][0], pts[0][0][1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1,
+            )
+
         # Draw camera label
         cv2.putText(
             frame, f"{cam_id} | {pipeline.floor}",

@@ -68,6 +68,8 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         get_slot_statuses=get_slot_statuses,
         get_camera_frame=get_camera_frame,
         get_park_entry_crop=get_park_entry_crop,
+        event_bus=engine.event_bus,
+        db_manager=engine.db_manager,
     )
 
     # Include routers

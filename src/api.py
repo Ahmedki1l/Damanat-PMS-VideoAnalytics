@@ -20,16 +20,21 @@ Usage:
 
 import os
 import base64
-from datetime import datetime
+import asyncio
+import json
 import logging
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Dict, List, Optional, AsyncIterable
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.sse import EventSourceResponse
 from pydantic import BaseModel
 
 from src.vehicle_registry import VehicleRegistry
+from src.events.event_bus import EventBus
+from src.models.state_machine import SlotEvent
 
 
 # --- Pydantic Models ---
@@ -85,8 +90,8 @@ class StatsResponse(BaseModel):
 def create_app(
     vehicle_registry: Optional[VehicleRegistry] = None,
     get_slot_statuses=None,
-    get_camera_frame=None,
-    get_park_entry_crop=None,
+    event_bus: Optional[EventBus] = None,
+    db_manager=None,
 ) -> FastAPI:
     """
     Create the FastAPI application.
@@ -95,6 +100,8 @@ def create_app(
         vehicle_registry: Shared VehicleRegistry instance.
         get_slot_statuses: Callback function that returns current slot statuses
                           as a list of dicts. Provided by the engine.
+        event_bus: Optional EventBus instance for real-time alerts.
+        db_manager: Optional DB manager for querying slot restriction status.
     """
     app = FastAPI(
         title="Damanat PMS Video Analytics API",
@@ -140,6 +147,116 @@ def create_app(
                 print(f"[API] Instant candidate created & bound from CAM_01 for plate {plate}")
                 return True
         return False
+    # ── SSE Endpoints ───────────────────────────────────────
+
+    @app.get("/api/alerts/stream", response_class=EventSourceResponse)
+    async def alerts_stream():
+        """
+        Server-Sent Events (SSE) endpoint for real-time alerts.
+        
+        Broadcasts parking events (parked, vacant, violations) to connected clients
+        using flattened JSON format for root-level alert attributes.
+        """
+        if event_bus is None:
+            raise HTTPException(
+                status_code=503, 
+                detail="Real-time alerts (EventBus) not enabled on this server."
+            )
+
+        queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        # Callback to bridge engine thread and async queue
+        def callback(event: SlotEvent):
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+            except Exception as e:
+                print(f"[API] Error in SSE callback: {e}")
+
+        # Register with EventBus
+        event_bus.subscribe(callback)
+        print(f"[API] Client connected to alerts stream")
+
+        try:
+            # 1. Send initial connection confirmation (handshake)
+            yield {
+                "is_alert": False,
+                "severity": "info",
+                "alert_type": "connection_established",
+                "msg": "Real-time alerts stream established"
+            }
+
+            while True:
+                # Wait for next event
+                event: SlotEvent = await queue.get()
+                
+                # Yield the dict directly so fields match the required order/naming
+                yield event.to_dict()
+                
+        except asyncio.CancelledError:
+            print(f"[API] Client disconnected from alerts stream")
+            raise
+        finally:
+            # Always unsubscribe
+            event_bus.unsubscribe(callback)
+
+    # ── Test/Debug Endpoints ───────────────────────────────────
+
+    @app.get("/api/test/trigger")
+    async def trigger_test_event(slot_id: str = "TEST_SLOT_01"):
+        """
+        Simulate a real parking event for a given slot_id.
+
+        Queries the database to check if the slot is restricted (is_violation_zone=True).
+        - Restricted slot → is_alert=true, severity=critical, alert_type=vehicle_violation
+        - Normal slot    → is_alert=false, severity=info,     alert_type=vehicle_parked
+
+        Try with a restricted slot (e.g. B11_CFO, G1) or a normal slot (e.g. A1, G4).
+        """
+        if event_bus is None:
+            raise HTTPException(status_code=503, detail="EventBus not available")
+
+        # Query the DB to determine if this slot is restricted
+        is_restricted = False
+        slot_found = False
+        if db_manager is not None:
+            from src.repositories import ParkingSlotRepository
+            session = db_manager.SessionLocal()
+            try:
+                db_slot = ParkingSlotRepository.get_by_id(session, slot_id)
+                if db_slot:
+                    slot_found = True
+                    is_restricted = bool(db_slot.is_violation_zone)
+            except Exception as e:
+                print(f"[API] DB query failed in trigger: {e}")
+            finally:
+                session.close()
+
+        # Build event based on real DB flag — distinguish violation vs intrusion
+        if is_restricted:
+            alert_type = "vehicle_violation" if "violation" in slot_id.lower() else "vehicle_intrusion"
+        else:
+            alert_type = "vehicle_parked"
+
+        test_evt = SlotEvent(
+            event_type=alert_type,
+            slot_id=slot_id,
+            track_id=999,
+            timestamp=datetime.now().isoformat(),
+            camera_id="SIM_CAM",
+            floor="Simulation",
+            is_alert=is_restricted,
+            severity="critical" if is_restricted else "info"
+        )
+
+        event_bus.emit(test_evt)
+        return {
+            "status": "success",
+            "slot_id": slot_id,
+            "slot_found_in_db": slot_found,
+            "is_violation_zone_in_db": is_restricted,
+            "event_sent": test_evt.to_dict()
+        }
 
     # ── ANPR Endpoints ──────────────────────────────────────
 

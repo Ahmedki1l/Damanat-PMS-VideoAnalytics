@@ -12,7 +12,7 @@ objects for efficient geometric operations.
 
 import json
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from shapely.geometry import Polygon
 
@@ -42,7 +42,7 @@ class ParkingSlot:
         self.centroid_y = centroid.y
 
 
-def load_slots(json_path: str) -> List[ParkingSlot]:
+def load_slots(json_path: str) -> Tuple[List[ParkingSlot], Optional[Polygon]]:
     """
     Load parking slot definitions from a JSON file.
 
@@ -54,37 +54,43 @@ def load_slots(json_path: str) -> List[ParkingSlot]:
         "label": "Slot A1"  // optional
       },
       ...
+      {
+        "id": "roi",
+        "polygon": [[x1, y1], ...] // optional global ROI
+      }
     ]
-
-    Each polygon must have at least 3 points. The polygon is automatically
-    closed by Shapely (no need to repeat the first point).
 
     Args:
         json_path: Path to the parking slots JSON file.
 
     Returns:
-        List of ParkingSlot instances.
-
-    Raises:
-        FileNotFoundError: If the JSON file doesn't exist.
-        ValueError: If a polygon has fewer than 3 points.
+        Tuple containing:
+          - List of ParkingSlot instances.
+          - Optional Shapely Polygon representing the ROI.
     """
     with open(json_path, "r", encoding="utf-8") as f:
-        raw_slots = json.load(f)
+        raw_data = json.load(f)
 
     slots = []
-    for entry in raw_slots:
+    roi_polygon = None
+
+    for entry in raw_data:
         slot_id = entry["id"]
         points = entry["polygon"]
 
         if len(points) < 3:
-            raise ValueError(
-                f"Slot '{slot_id}' has {len(points)} points — need at least 3."
-            )
+            print(f"[WARN] Entry '{slot_id}' has {len(points)} points — skipping.")
+            continue
 
         polygon = Polygon(points)
-        label = entry.get("label", slot_id)
 
+        # Check if this is the global ROI definition
+        if slot_id.lower() == "roi":
+            roi_polygon = polygon
+            print(f"[INFO] Found ROI polygon in '{json_path}'")
+            continue
+
+        label = entry.get("label", slot_id)
         slot = ParkingSlot(
             id=slot_id,
             polygon=polygon,
@@ -92,5 +98,6 @@ def load_slots(json_path: str) -> List[ParkingSlot]:
         )
         slots.append(slot)
 
-    print(f"[INFO] Loaded {len(slots)} parking slots from '{json_path}'")
-    return slots
+    print(f"[INFO] Loaded {len(slots)} slots from '{json_path}'")
+    return slots, roi_polygon
+
