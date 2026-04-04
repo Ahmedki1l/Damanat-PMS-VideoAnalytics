@@ -41,6 +41,9 @@ class SlotEvent:
         timestamp: ISO-format timestamp of the event.
         camera_id: Which camera observed this event.
         floor: Which floor (B1, B2, etc.).
+        plate: Recognized license plate (if available).
+        is_alert: Whether this event is a security/violation alert.
+        severity: Severity level (info, warning, critical).
     """
     event_type: str
     slot_id: str
@@ -49,22 +52,22 @@ class SlotEvent:
     camera_id: str = ""
     floor: str = ""
     plate: str = ""
+    is_alert: bool = False
+    severity: str = "info"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to a JSON-serializable dictionary."""
-        d = {
-            "event": self.event_type,
+        """Convert to a JSON-serializable dictionary with specific field order."""
+        return {
+            "is_alert": self.is_alert,
+            "severity": self.severity,
+            "alert_type": self.event_type,
             "slot_id": self.slot_id,
             "track_id": self.track_id,
+            "camera_id": self.camera_id,
+            "floor": self.floor,
+            "plate": self.plate,
             "timestamp": self.timestamp,
         }
-        if self.camera_id:
-            d["camera_id"] = self.camera_id
-        if self.floor:
-            d["floor"] = self.floor
-        if self.plate:
-            d["plate"] = self.plate
-        return d
 
 
 class SlotStateMachine:
@@ -80,6 +83,7 @@ class SlotStateMachine:
         slot_id: str,
         confirm_enter_frames: int = 5,
         confirm_leave_frames: int = 8,
+        is_violation_zone: bool = False,
     ):
         """
         Args:
@@ -88,6 +92,8 @@ class SlotStateMachine:
                                   before confirming OCCUPIED.
             confirm_leave_frames: Consecutive frames without a vehicle
                                   before confirming VACANT.
+            is_violation_zone: Whether this slot is a restricted/intrusion zone
+                               (loaded from the database, not inferred from name).
         """
         self.slot_id = slot_id
         self.confirm_enter_frames = confirm_enter_frames
@@ -97,6 +103,9 @@ class SlotStateMachine:
         self.state: SlotState = SlotState.VACANT
         self.assigned_track_id: Optional[int] = None
         self.last_update_time: str = datetime.now().isoformat()
+
+        # Store violation zone status from DB
+        self._is_violation_zone: bool = is_violation_zone
 
         # Debounce counters
         self._enter_counter: int = 0
@@ -109,8 +118,8 @@ class SlotStateMachine:
 
     @property
     def is_violation_zone(self) -> bool:
-        """True if the slot ID indicates a violation zone."""
-        return "violation" in self.slot_id.lower()
+        """True if the slot is a restricted/intrusion zone (set from database)."""
+        return self._is_violation_zone
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the slot's current status."""

@@ -45,6 +45,8 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
     app = create_app(
         vehicle_registry=registry,
         get_slot_statuses=get_slot_statuses,
+        event_bus=engine.event_bus,
+        db_manager=engine.db_manager,
     )
 
     # Include routers

@@ -13,7 +13,7 @@ Event types:
 
 import json
 import sys
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 
 from src.models.state_machine import SlotEvent
 
@@ -22,7 +22,7 @@ class EventBus:
     """
     Central event emitter for the parking system.
 
-    Prints structured JSON to stdout and optionally writes to a file.
+    Broadcasts events to registered subscribers and optionally logs to a file.
     """
 
     def __init__(self, log_file: str = ""):
@@ -31,24 +31,39 @@ class EventBus:
             log_file: Path to optional log file. Empty string = stdout only.
         """
         self._log_file = None
+        self._subscribers: List[Callable[[SlotEvent], None]] = []
+        
         if log_file:
             self._log_file = open(log_file, "a", encoding="utf-8")
             print(f"[INFO] Event log file: {log_file}")
 
+    def subscribe(self, callback: Callable[[SlotEvent], None]) -> None:
+        """Register a new subscriber callback."""
+        if callback not in self._subscribers:
+            self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: Callable[[SlotEvent], None]) -> None:
+        """Unregister an existing subscriber callback."""
+        if callback in self._subscribers:
+            self._subscribers.remove(callback)
+
     def emit(self, event: SlotEvent) -> None:
         """
-        Emit a single event.
+        Emit a single event to all subscribers and log file.
 
         Args:
             event: SlotEvent to emit.
         """
-        event_json = json.dumps(event.to_dict())
+        # Broadcast to all subscribers
+        for callback in self._subscribers:
+            try:
+                callback(event)
+            except Exception as e:
+                print(f"[ERROR] EventBus subscriber error: {e}")
 
-        # Always print to stdout
-        #print(f"[EVENT] {event_json}")
-
-        # Optionally write to file
+        # Log to file
         if self._log_file:
+            event_json = json.dumps(event.to_dict())
             self._log_file.write(event_json + "\n")
             self._log_file.flush()
 
@@ -60,20 +75,17 @@ class EventBus:
     def emit_status_summary(self, slot_statuses: List[Dict[str, Any]]) -> None:
         """
         Emit a bulk status summary of all slots.
-
-        Useful for periodic health checks or dashboard updates.
-
-        Args:
-            slot_statuses: List of slot status dicts from SlotStateMachine.get_status().
         """
         summary = {
             "type": "status_summary",
             "slots": slot_statuses,
         }
-        summary_json = json.dumps(summary)
-        #print(f"[STATUS] {summary_json}")
-
+        
+        # In a real system, we might want a separate subscriber list for summaries,
+        # but for now we'll just focus on SlotEvents for SSE.
+        
         if self._log_file:
+            summary_json = json.dumps(summary)
             self._log_file.write(summary_json + "\n")
             self._log_file.flush()
 
@@ -82,3 +94,5 @@ class EventBus:
         if self._log_file:
             self._log_file.close()
             self._log_file = None
+        self._subscribers.clear()
+
