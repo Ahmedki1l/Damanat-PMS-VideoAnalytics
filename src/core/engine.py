@@ -11,6 +11,7 @@ Pipeline per frame:
 
 import os
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -142,9 +143,29 @@ class ParkingEngine:
         self._violation_match_threshold = 0.4
         self._violation_history_limit = 30 # seconds
 
+        # --- Status Tracking ---
+        self.is_running = False
+        self.start_time = 0.0
+        self.last_processed_at: Optional[datetime] = None
+        self.model_loaded = True # If TrackedDetector didn't crash, it's loaded
+
         # --- Frame counter for perf logging ---
         self._frame_count = 0
         self._start_time = 0.0
+
+    def get_engine_status(self) -> Dict:
+        """Return real-time metrics for the /api/health endpoint."""
+        return {
+            "engine_running": self.is_running,
+            "model_loaded": self.model_loaded,
+            "camera_streams_count": len(self.pipelines),
+            "camera_streams_ok": self.cam_manager.active_count if hasattr(self, 'cam_manager') else 0,
+            "total_cameras": self.cam_manager.total_count if hasattr(self, 'cam_manager') else 0,
+            "last_processed_at": self.last_processed_at.isoformat() if self.last_processed_at else None,
+            "uptime_seconds": int(time.time() - self.start_time) if self.is_running else 0,
+            "frames_processed": self._frame_count,
+            "db_ok": self.db_manager is not None,
+        }
 
     def run_multi_camera(self) -> None:
         """
@@ -266,8 +287,11 @@ class ParkingEngine:
         # Visualization setup
         show = self.config.output.show_video
         show_camera = self.config.output.show_camera
+        
+        self.is_running = True
+        self.start_time = time.time()
+        self._start_time = self.start_time
 
-        self._start_time = time.time()
         summary_interval = max(1, len(camera_configs) * 10)  # Every ~10 full cycles
 
         # Per-floor grid view: store latest annotated frame per camera
@@ -296,6 +320,7 @@ class ParkingEngine:
                     continue
 
                 t_start = time.time()
+                self.last_processed_at = datetime.now()
 
                 # Process this camera's frame
                 pipeline = self.pipelines.get(cam_id)
@@ -348,6 +373,8 @@ class ParkingEngine:
                     for evt in events:
                         evt.camera_id = cam_id
                         evt.floor = pipeline.floor
+                        evt.zone_id = slot.id
+                        evt.zone_name = slot.label
 
                         # --- Auto-link ANPR plate when slot becomes OCCUPIED ---
                         if evt.event_type == "vehicle_parked" and self.vehicle_registry:
@@ -364,7 +391,11 @@ class ParkingEngine:
 
 
                             if plate:
-                                evt.plate = plate
+                                evt.plate_number = plate
+                                # Link snapshot URL if available
+                                loc = self.vehicle_registry.get_plate_location(plate)
+                                if loc:
+                                    evt.snapshot_url = loc.get("snapshot_url", "")
                                 # Crop car image from frame for visual reference
                                 if detection is not None:
                                     self._save_car_crop(frame, detection, plate, cam_id)
@@ -528,6 +559,9 @@ class ParkingEngine:
         show = self.config.output.show_video
         frame_idx = 0
         summary_interval = target_fps * 10
+        
+        self.is_running = True
+        self.start_time = time.time()
 
         try:
             while True:
@@ -541,6 +575,7 @@ class ParkingEngine:
                     continue
 
                 t_start = time.time()
+                self.last_processed_at = datetime.now()
 
                 detection_frame = pipeline.apply_roi_mask(frame)
                 detections = self.detector.detect_and_track(detection_frame)

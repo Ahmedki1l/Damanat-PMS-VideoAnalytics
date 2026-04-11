@@ -35,10 +35,13 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         """Callback for the API to get current slot statuses."""
         all_statuses = []
         for cam_id, pipeline in engine.pipelines.items():
+            # [NEW] Map slot IDs to labels for human-readable zone names
+            slot_labels = {s.id: s.label for s in pipeline.slots}
             for sm in pipeline.state_machines.values():
                 status = sm.get_status()
                 status["camera_id"] = cam_id
                 status["floor"] = pipeline.floor
+                status["label"] = slot_labels.get(sm.slot_id, sm.slot_id)
                 all_statuses.append(status)
         return all_statuses
 
@@ -68,6 +71,7 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         get_slot_statuses=get_slot_statuses,
         get_camera_frame=get_camera_frame,
         get_park_entry_crop=get_park_entry_crop,
+        get_engine_status=engine.get_engine_status,
         event_bus=engine.event_bus,
         db_manager=engine.db_manager,
     )

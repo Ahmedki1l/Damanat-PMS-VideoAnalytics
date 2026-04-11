@@ -51,9 +51,12 @@ class SlotEvent:
     timestamp: str
     camera_id: str = ""
     floor: str = ""
-    plate: str = ""
+    plate_number: str = ""
     is_alert: bool = False
     severity: str = "info"
+    zone_id: str = ""
+    zone_name: str = ""
+    snapshot_url: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a JSON-serializable dictionary with specific field order."""
@@ -62,10 +65,12 @@ class SlotEvent:
             "severity": self.severity,
             "alert_type": self.event_type,
             "slot_id": self.slot_id,
-            "track_id": self.track_id,
+            "zone_id": self.zone_id or self.slot_id,
+            "zone_name": self.zone_name,
             "camera_id": self.camera_id,
             "floor": self.floor,
-            "plate": self.plate,
+            "plate_number": self.plate_number,
+            "snapshot_url": self.snapshot_url,
             "timestamp": self.timestamp,
         }
 
