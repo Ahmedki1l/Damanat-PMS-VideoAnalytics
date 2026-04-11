@@ -17,8 +17,8 @@ class ParkingSlot(Base):
         cascade="all, delete"
     )
 
-    intrusions = relationship(
-        "Intrusion",
+    alerts = relationship(
+        "Alert",
         back_populates="slot",
         cascade="all, delete"
     )

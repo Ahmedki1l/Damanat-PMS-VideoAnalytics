@@ -174,8 +174,9 @@ class ParkingEngine:
         total_slots = 0
         for cc in camera_configs:
             all_slots = []
+            roi_polygon = None
             if cc.slots_file and os.path.exists(cc.slots_file):
-                all_slots = load_slots(cc.slots_file)
+                all_slots, roi_polygon = load_slots(cc.slots_file)
             
             # [NEW] Separate tracking zones from parking slots
             parking_slots, special_zones = self._split_special_zones(all_slots)
@@ -194,10 +195,10 @@ class ParkingEngine:
 
             # Load violation zone flags from DB for this camera's slots
             violation_slots = set()
-            if self.db_manager and slots:
+            if self.db_manager and parking_slots:
                 session = self.db_manager.SessionLocal()
                 try:
-                    slot_ids = [s.id for s in slots]
+                    slot_ids = [s.id for s in parking_slots]
                     from src.repositories import ParkingSlotRepository
                     db_slots = [ParkingSlotRepository.get_by_id(session, sid) for sid in slot_ids]
                     violation_slots = {

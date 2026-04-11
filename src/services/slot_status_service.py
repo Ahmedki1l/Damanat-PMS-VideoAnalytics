@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 from src.model import SlotStatus
 from src.repositories import SlotStatusRepository, ParkingSlotRepository
-from . import intrusion_service
+from . import alert_service
 
 def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool):
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
@@ -15,9 +15,9 @@ def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool):
     )
     
     if is_parked:
-        intrusion_service.report_intrusion(db, slot_id, plate)
+        alert_service.report_alert(db, slot_id, plate)
     else:
-        intrusion_service.resolve_intrusion(db, slot_id)
+        alert_service.resolve_alert(db, slot_id)
     
     return SlotStatusRepository.create(db, new_log)
 

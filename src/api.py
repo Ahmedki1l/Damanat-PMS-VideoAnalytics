@@ -90,6 +90,8 @@ class StatsResponse(BaseModel):
 def create_app(
     vehicle_registry: Optional[VehicleRegistry] = None,
     get_slot_statuses=None,
+    get_camera_frame=None,
+    get_park_entry_crop=None,
     event_bus: Optional[EventBus] = None,
     db_manager=None,
 ) -> FastAPI:
