@@ -53,6 +53,7 @@ class CameraPipeline:
         slots: List[ParkingSlot],
         config: AppConfig,
         violation_slots: set = None,
+        initial_statuses: Dict[str, bool] = None,
         roi_polygon: Optional[Polygon] = None,
     ):
         self.camera_id = camera_id
@@ -60,16 +61,24 @@ class CameraPipeline:
         self.slots = slots
         self.roi_polygon = roi_polygon
         self._mask = None # Cached binary mask
+        initial_statuses = initial_statuses or {}
 
         # Per-slot state machines — pass is_violation_zone from DB
         self.state_machines: Dict[str, SlotStateMachine] = {}
         for slot in slots:
             is_restricted = (violation_slots is not None) and (slot.id in violation_slots)
+            
+            # Map DB 'is_available' to SlotState
+            # If is_available is False, start as OCCUPIED so engine corrects it if empty
+            db_avail = initial_statuses.get(slot.id, True)
+            start_state = SlotState.VACANT if db_avail else SlotState.OCCUPIED
+
             self.state_machines[slot.id] = SlotStateMachine(
                 slot_id=slot.id,
                 confirm_enter_frames=config.state_machine.confirm_enter_frames,
                 confirm_leave_frames=config.state_machine.confirm_leave_frames,
                 is_violation_zone=is_restricted,
+                initial_state=start_state,
             )
 
         # Slot assigner for this camera's polygons
@@ -172,6 +181,8 @@ class ParkingEngine:
 
         # Load per-camera slot polygons and create pipelines
         total_slots = 0
+        all_active_slot_ids = set()
+
         for cc in camera_configs:
             all_slots = []
             roi_polygon = None
@@ -193,20 +204,23 @@ class ParkingEngine:
                 finally:
                     session.close()
 
-            # Load violation zone flags from DB for this camera's slots
+            # Load violation zone flags and initial availability from DB for this camera's slots
             violation_slots = set()
+            initial_statuses = {} # slot_id -> is_available
             if self.db_manager and parking_slots:
                 session = self.db_manager.SessionLocal()
                 try:
                     slot_ids = [s.id for s in parking_slots]
                     from src.repositories import ParkingSlotRepository
                     db_slots = [ParkingSlotRepository.get_by_id(session, sid) for sid in slot_ids]
-                    violation_slots = {
-                        db_s.slot_id for db_s in db_slots
-                        if db_s and db_s.is_violation_zone
-                    }
+                    for db_s in db_slots:
+                        if db_s:
+                            if db_s.is_violation_zone:
+                                violation_slots.add(db_s.slot_id)
+                            initial_statuses[db_s.slot_id] = db_s.is_available
+                            all_active_slot_ids.add(db_s.slot_id)
                 except Exception as e:
-                    print(f"[ERROR] Failed to load violation zone flags from DB: {e}")
+                    print(f"[ERROR] Failed to load initial slot states from DB: {e}")
                 finally:
                     session.close()
 
@@ -216,10 +230,34 @@ class ParkingEngine:
                 slots=parking_slots,  # Only standard and violation slots
                 config=self.config,
                 violation_slots=violation_slots,
+                initial_statuses=initial_statuses,
                 roi_polygon=roi_polygon,
             )
             self.pipelines[cc.id] = pipeline
             total_slots += pipeline.slot_count
+            
+            # Also ensure manually added slots in JSON that might NOT be in DB yet are added to active set
+            for s in parking_slots:
+                all_active_slot_ids.add(s.id)
+
+        # --- [NEW] Full Sync Purge ---
+        # Any slot in DB that is NOT in the current configs should be removed
+        if self.db_manager:
+            session = self.db_manager.SessionLocal()
+            try:
+                from src.model.parkingslot import ParkingSlot as DB_ParkingSlot
+                db_all_slots = session.query(DB_ParkingSlot).all()
+                to_delete = [s for s in db_all_slots if s.slot_id not in all_active_slot_ids]
+                if to_delete:
+                    print(f"[DB] Purging {len(to_delete)} stale slots from database: {[s.slot_id for s in to_delete]}")
+                    for s in to_delete:
+                        session.delete(s)
+                    session.commit()
+            except Exception as e:
+                session.rollback()
+                print(f"[ERROR] Failed to purge stale slots: {e}")
+            finally:
+                session.close()
 
         print(f"[INFO] Total parking slots across all cameras: {total_slots}")
         print(f"[INFO] Processing mode: {self.config.processing.mode}")

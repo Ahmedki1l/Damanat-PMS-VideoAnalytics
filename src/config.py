@@ -39,7 +39,7 @@ class DetectorConfig:
     confidence: float = 0.35
     classes: List[int] = field(default_factory=lambda: [2])  # 2 = car
     imgsz: int = 480
-    device: str = "auto"  # "auto", "cpu", or "cuda"
+    device: str = "cuda"  # "auto", "cpu", or "cuda"
 
 
 @dataclass

@@ -84,6 +84,7 @@ class SlotStateMachine:
         confirm_enter_frames: int = 5,
         confirm_leave_frames: int = 8,
         is_violation_zone: bool = False,
+        initial_state: SlotState = SlotState.VACANT,
     ):
         """
         Args:
@@ -94,13 +95,14 @@ class SlotStateMachine:
                                   before confirming VACANT.
             is_violation_zone: Whether this slot is a restricted/intrusion zone
                                (loaded from the database, not inferred from name).
+            initial_state: Starting state (useful for syncing with DB on startup).
         """
         self.slot_id = slot_id
         self.confirm_enter_frames = confirm_enter_frames
         self.confirm_leave_frames = confirm_leave_frames
 
         # Current state
-        self.state: SlotState = SlotState.VACANT
+        self.state: SlotState = initial_state
         self.assigned_track_id: Optional[int] = None
         self.last_update_time: str = datetime.now().isoformat()
 
