@@ -79,8 +79,11 @@ class VehicleSession:
     current_track_id: Optional[int] = None
 
     linked_slot: Optional[str] = None
+    linked_slot_name: Optional[str] = None
     linked_camera: Optional[str] = None
     linked_floor: Optional[str] = None
+    linked_zone_id: Optional[str] = None
+    linked_zone_name: Optional[str] = None
     linked_at: Optional[datetime] = None
     snapshot_path: Optional[str] = None
 
@@ -547,6 +550,9 @@ class VehicleRegistry:
     def try_link_to_slot(
         self,
         slot_id: str,
+        slot_name: str,
+        zone_id: Optional[str],
+        zone_name: Optional[str],
         camera_id: str,
         floor: str,
         track_id: Optional[int],
@@ -569,8 +575,11 @@ class VehicleRegistry:
                 return None
 
             session.linked_slot = slot_id
+            session.linked_slot_name = slot_name
             session.linked_camera = camera_id
             session.linked_floor = floor
+            session.linked_zone_id = zone_id
+            session.linked_zone_name = zone_name
             session.linked_at = timestamp
             self._parked[slot_id] = session
 
@@ -619,7 +628,9 @@ class VehicleRegistry:
                     return {
                         "plate_number": session.plate,
                         "slot_id": slot_id,
-                        "zone_id": slot_id,  # Standardized alias
+                        "slot_name": session.linked_slot_name,
+                        "zone_id": session.linked_zone_id,
+                        "zone_name": session.linked_zone_name,
                         "camera_id": session.linked_camera,
                         "floor": session.linked_floor,
                         "track_id": session.current_track_id,
@@ -635,7 +646,9 @@ class VehicleRegistry:
                 {
                     "plate_number": s.plate,
                     "slot_id": slot_id,
-                    "zone_id": slot_id,
+                    "slot_name": s.linked_slot_name,
+                    "zone_id": s.linked_zone_id,
+                    "zone_name": s.linked_zone_name,
                     "camera_id": s.linked_camera,
                     "floor": s.linked_floor,
                     "track_id": s.current_track_id,

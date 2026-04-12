@@ -30,15 +30,21 @@ def report_alert(db: Session, slot_id: str, plate_number: str = None, camera_id:
     if existing:
         return existing
         
+    slot = ParkingSlotRepository.get_by_id(db, slot_id)
     alert_type = get_alert_type_for_slot(db, slot_id)
+    zone_id = slot.zone_id if slot and slot.zone_id else None
+    zone_name = slot.zone_name if slot and slot.zone_name else zone_id or slot_id
+    slot_name = slot.slot_name if slot and slot.slot_name else slot_id
 
     new_alert = Alert(
         alert_type=alert_type,
         camera_id=camera_id or "UNKNOWN",
-        zone_id=slot_id,
-        zone_name=ParkingSlotRepository.get_by_id(db, slot_id).slot_name if ParkingSlotRepository.get_by_id(db, slot_id) else slot_id,
+        zone_id=zone_id,
+        zone_name=zone_name,
+        slot_id=slot_id,
         event_type="vehicle_detected",
-        description=f"Unauthorized vehicle detected in {slot_id}",
+        slot_number=slot_name,
+        description=f"Unauthorized vehicle detected in {slot_name}",
         is_resolved=False,
         triggered_at=datetime.utcnow(),
         plate_number=plate_number

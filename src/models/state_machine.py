@@ -54,6 +54,7 @@ class SlotEvent:
     plate_number: str = ""
     is_alert: bool = False
     severity: str = "info"
+    slot_name: str = ""
     zone_id: str = ""
     zone_name: str = ""
     snapshot_url: str = ""
@@ -65,7 +66,8 @@ class SlotEvent:
             "severity": self.severity,
             "alert_type": self.event_type,
             "slot_id": self.slot_id,
-            "zone_id": self.zone_id or self.slot_id,
+            "slot_name": self.slot_name or self.slot_id,
+            "zone_id": self.zone_id,
             "zone_name": self.zone_name,
             "camera_id": self.camera_id,
             "floor": self.floor,

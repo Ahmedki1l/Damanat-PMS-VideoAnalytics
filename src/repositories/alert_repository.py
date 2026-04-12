@@ -1,3 +1,4 @@
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from src.model import Alert
 from datetime import datetime
@@ -14,7 +15,7 @@ class AlertRepository:
     @staticmethod
     def get_active_by_slot(db: Session, slot_id: str, alert_type: Optional[str] = None):
         query = db.query(Alert).filter(
-            Alert.zone_id == slot_id,
+            or_(Alert.slot_id == slot_id, Alert.zone_id == slot_id),
             Alert.is_resolved == False
         )
         if alert_type:
@@ -33,7 +34,7 @@ class AlertRepository:
     @staticmethod
     def get_history_by_slot(db: Session, slot_id: str):
         return db.query(Alert).filter(
-            Alert.zone_id == slot_id
+            or_(Alert.slot_id == slot_id, Alert.zone_id == slot_id)
         ).order_by(Alert.triggered_at.desc()).all()
 
     @staticmethod

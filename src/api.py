@@ -60,6 +60,7 @@ class ANPREventResponse(BaseModel):
 
 class SlotStatus(BaseModel):
     slot_id: str
+    slot_name: Optional[str] = None
     floor: Optional[str] = None
     zone_id: Optional[str] = None
     zone_name: Optional[str] = None
@@ -74,8 +75,10 @@ class SlotStatus(BaseModel):
 class VehicleLocation(BaseModel):
     plate_number: str
     slot_id: str
+    slot_name: Optional[str] = None
     floor: Optional[str] = None
     zone_id: Optional[str] = None
+    zone_name: Optional[str] = None
     parked_at: Optional[str] = None
     camera_id: Optional[str] = None
     snapshot_url: Optional[str] = None
@@ -381,9 +384,10 @@ def create_app(
             # Map existing state structure to standardized SlotStatus
             result.append(SlotStatus(
                 slot_id=slot_id,
+                slot_name=s.get("slot_name") or s.get("label", slot_id),
                 floor=s.get("floor"),
-                zone_id=slot_id, # Alias for now
-                zone_name=s.get("label", slot_id),
+                zone_id=s.get("zone_id"),
+                zone_name=s.get("zone_name"),
                 occupied=s.get("occupied", False),
                 state=s.get("state", "UNKNOWN"),
                 plate_number=plate,
@@ -407,9 +411,10 @@ def create_app(
                 plate = registry.get_slot_plate(slot_id)
                 result.append(SlotStatus(
                     slot_id=slot_id,
+                    slot_name=s.get("slot_name") or s.get("label", slot_id),
                     floor=s.get("floor"),
-                    zone_id=slot_id,
-                    zone_name=s.get("label", slot_id),
+                    zone_id=s.get("zone_id"),
+                    zone_name=s.get("zone_name"),
                     occupied=s.get("occupied", False),
                     state=s.get("state", "UNKNOWN"),
                     plate_number=plate,

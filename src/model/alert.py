@@ -9,8 +9,9 @@ class Alert(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     alert_type = Column(String(50), nullable=False, index=True)
     camera_id = Column(String(50), nullable=False)
-    zone_id = Column(String(100), ForeignKey("parking_slots.slot_id"), nullable=True)
+    zone_id = Column(String(100), nullable=True)
     zone_name = Column(String(100))
+    slot_id = Column(String(100), ForeignKey("parking_slots.slot_id"), nullable=True, index=True)
     region_id = Column(Integer)
     slot_number = Column(String(100), nullable=True)
     event_type = Column(String(100))
@@ -24,7 +25,7 @@ class Alert(Base):
     # Custom addition to track plates natively
     plate_number = Column(String(50), nullable=True, index=True)
 
-    slot = relationship("ParkingSlot", back_populates="alerts")
+    slot = relationship("ParkingSlot", back_populates="alerts", foreign_keys=[slot_id])
 
     def __repr__(self):
         return f"<Alert {self.id} type={self.alert_type} zone={self.zone_id} resolved={self.is_resolved}>"

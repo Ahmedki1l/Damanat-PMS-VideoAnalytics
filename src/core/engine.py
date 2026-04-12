@@ -208,7 +208,11 @@ class ParkingEngine:
             all_slots = []
             roi_polygon = None
             if cc.slots_file and os.path.exists(cc.slots_file):
-                all_slots, roi_polygon = load_slots(cc.slots_file)
+                all_slots, roi_polygon = load_slots(
+                    cc.slots_file,
+                    default_zone_id=cc.name,
+                    default_zone_name=cc.name,
+                )
             
             # [NEW] Separate tracking zones from parking slots
             parking_slots, special_zones = self._split_special_zones(all_slots)
@@ -217,7 +221,13 @@ class ParkingEngine:
             if self.db_manager and parking_slots:
                 session = self.db_manager.SessionLocal()
                 try:
-                    sync_slots_from_config(session, parking_slots, cc.floor)
+                    sync_slots_from_config(
+                        session,
+                        parking_slots,
+                        cc.floor,
+                        default_zone_id=cc.name,
+                        default_zone_name=cc.name,
+                    )
                     print(f"[DB] Synced {len(parking_slots)} slots for {cc.id}")
                 except Exception as e:
                     session.rollback()
@@ -373,8 +383,9 @@ class ParkingEngine:
                     for evt in events:
                         evt.camera_id = cam_id
                         evt.floor = pipeline.floor
-                        evt.zone_id = slot.id
-                        evt.zone_name = slot.label
+                        evt.slot_name = slot.label
+                        evt.zone_id = slot.zone_id
+                        evt.zone_name = slot.zone_name
 
                         # --- Auto-link ANPR plate when slot becomes OCCUPIED ---
                         if evt.event_type == "vehicle_parked" and self.vehicle_registry:
@@ -382,6 +393,9 @@ class ParkingEngine:
                             # 1. Try resolving plate from already confirmed tracks
                             plate = self.vehicle_registry.try_link_to_slot(
                                 slot_id=slot.id,
+                                slot_name=slot.label,
+                                zone_id=slot.zone_id,
+                                zone_name=slot.zone_name,
                                 camera_id=cam_id,
                                 floor=pipeline.floor,
                                 track_id=track_id,
@@ -463,8 +477,8 @@ class ParkingEngine:
                                 for evt in final_events:
                                     if evt.event_type in ("vehicle_parked", "slot_vacant", "vehicle_violation"):
                                         is_parked = (evt.event_type in ("vehicle_parked", "vehicle_violation"))
-                                        plate = getattr(evt, "plate", None) 
-                                        log_vehicle_event(session, evt.slot_id, plate, is_parked)
+                                        plate = getattr(evt, "plate_number", None) 
+                                        log_vehicle_event(session, evt.slot_id, plate, is_parked, camera_id=evt.camera_id)
                             except Exception as e:
                                 session.rollback()
                                 print(f"[ERROR] Failed to update slot DB status: {e}")

@@ -7,6 +7,7 @@ class AlertBase(BaseModel):
     camera_id: str
     zone_id: Optional[str] = None
     zone_name: Optional[str] = None
+    slot_id: Optional[str] = None
     region_id: Optional[int] = None
     slot_number: Optional[str] = None
     event_type: Optional[str] = None
