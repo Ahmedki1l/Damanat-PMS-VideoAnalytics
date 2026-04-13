@@ -30,6 +30,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.sse import EventSourceResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.vehicle_registry import VehicleRegistry
@@ -59,21 +60,29 @@ class ANPREventResponse(BaseModel):
 
 class SlotStatus(BaseModel):
     slot_id: str
-    state: str
-    occupied: bool
-    assigned_track_id: Optional[int] = None
-    camera_id: Optional[str] = None
+    slot_name: Optional[str] = None
     floor: Optional[str] = None
-    plate: Optional[str] = None
+    zone_id: Optional[str] = None
+    zone_name: Optional[str] = None
+    occupied: bool
+    state: str
+    plate_number: Optional[str] = None
+    camera_id: Optional[str] = None
+    is_restricted: bool = False
+    restriction_type: Optional[str] = None
 
 
 class VehicleLocation(BaseModel):
-    plate: str
+    plate_number: str
     slot_id: str
-    camera_id: Optional[str] = None
+    slot_name: Optional[str] = None
     floor: Optional[str] = None
+    zone_id: Optional[str] = None
+    zone_name: Optional[str] = None
     parked_at: Optional[str] = None
-    entry_time: str
+    camera_id: Optional[str] = None
+    snapshot_url: Optional[str] = None
+    entry_time: Optional[str] = None
 
 
 class StatsResponse(BaseModel):
@@ -90,6 +99,9 @@ class StatsResponse(BaseModel):
 def create_app(
     vehicle_registry: Optional[VehicleRegistry] = None,
     get_slot_statuses=None,
+    get_camera_frame=None,
+    get_park_entry_crop=None,
+    get_engine_status=None,
     event_bus: Optional[EventBus] = None,
     db_manager=None,
 ) -> FastAPI:
@@ -100,6 +112,7 @@ def create_app(
         vehicle_registry: Shared VehicleRegistry instance.
         get_slot_statuses: Callback function that returns current slot statuses
                           as a list of dicts. Provided by the engine.
+        get_engine_status: Callback function for health metrics.
         event_bus: Optional EventBus instance for real-time alerts.
         db_manager: Optional DB manager for querying slot restriction status.
     """
@@ -117,6 +130,10 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Mount static assets for vehicle images
+    os.makedirs("vehicle_images", exist_ok=True)
+    app.mount("/images", StaticFiles(directory="vehicle_images"), name="images")
 
     # Use provided or create new registry
     registry = vehicle_registry or VehicleRegistry()
@@ -363,14 +380,20 @@ def create_app(
         for s in statuses:
             slot_id = s.get("slot_id", "")
             plate = registry.get_slot_plate(slot_id)
+            
+            # Map existing state structure to standardized SlotStatus
             result.append(SlotStatus(
                 slot_id=slot_id,
-                state=s.get("state", "UNKNOWN"),
-                occupied=s.get("occupied", False),
-                assigned_track_id=s.get("assigned_track_id"),
-                camera_id=s.get("camera_id"),
+                slot_name=s.get("slot_name") or s.get("label", slot_id),
                 floor=s.get("floor"),
-                plate=plate,
+                zone_id=s.get("zone_id"),
+                zone_name=s.get("zone_name"),
+                occupied=s.get("occupied", False),
+                state=s.get("state", "UNKNOWN"),
+                plate_number=plate,
+                camera_id=s.get("camera_id"),
+                is_restricted=s.get("is_violation_zone", False),
+                restriction_type="violation" if s.get("is_violation_zone") else None
             ))
         return result
 
@@ -388,12 +411,16 @@ def create_app(
                 plate = registry.get_slot_plate(slot_id)
                 result.append(SlotStatus(
                     slot_id=slot_id,
-                    state=s.get("state", "UNKNOWN"),
-                    occupied=s.get("occupied", False),
-                    assigned_track_id=s.get("assigned_track_id"),
-                    camera_id=s.get("camera_id"),
+                    slot_name=s.get("slot_name") or s.get("label", slot_id),
                     floor=s.get("floor"),
-                    plate=plate,
+                    zone_id=s.get("zone_id"),
+                    zone_name=s.get("zone_name"),
+                    occupied=s.get("occupied", False),
+                    state=s.get("state", "UNKNOWN"),
+                    plate_number=plate,
+                    camera_id=s.get("camera_id"),
+                    is_restricted=s.get("is_violation_zone", False),
+                    restriction_type="violation" if s.get("is_violation_zone") else None
                 ))
         return result
 
@@ -447,7 +474,15 @@ def create_app(
 
     @app.get("/api/health")
     async def health():
-        return {"status": "ok", "service": "Damanat PMS Video Analytics"}
+        """Enriched health reporting including engine status."""
+        health_data = {
+            "status": "ok", 
+            "service": "Damanat PMS Video Analytics",
+            "timestamp": datetime.now().isoformat()
+        }
+        if get_engine_status:
+            health_data.update(get_engine_status())
+        return health_data
 
     return app
 

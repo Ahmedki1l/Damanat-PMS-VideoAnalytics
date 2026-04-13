@@ -51,9 +51,13 @@ class SlotEvent:
     timestamp: str
     camera_id: str = ""
     floor: str = ""
-    plate: str = ""
+    plate_number: str = ""
     is_alert: bool = False
     severity: str = "info"
+    slot_name: str = ""
+    zone_id: str = ""
+    zone_name: str = ""
+    snapshot_url: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a JSON-serializable dictionary with specific field order."""
@@ -62,10 +66,13 @@ class SlotEvent:
             "severity": self.severity,
             "alert_type": self.event_type,
             "slot_id": self.slot_id,
-            "track_id": self.track_id,
+            "slot_name": self.slot_name or self.slot_id,
+            "zone_id": self.zone_id,
+            "zone_name": self.zone_name,
             "camera_id": self.camera_id,
             "floor": self.floor,
-            "plate": self.plate,
+            "plate_number": self.plate_number,
+            "snapshot_url": self.snapshot_url,
             "timestamp": self.timestamp,
         }
 
@@ -84,6 +91,7 @@ class SlotStateMachine:
         confirm_enter_frames: int = 5,
         confirm_leave_frames: int = 8,
         is_violation_zone: bool = False,
+        initial_state: SlotState = SlotState.VACANT,
     ):
         """
         Args:
@@ -94,13 +102,14 @@ class SlotStateMachine:
                                   before confirming VACANT.
             is_violation_zone: Whether this slot is a restricted/intrusion zone
                                (loaded from the database, not inferred from name).
+            initial_state: Starting state (useful for syncing with DB on startup).
         """
         self.slot_id = slot_id
         self.confirm_enter_frames = confirm_enter_frames
         self.confirm_leave_frames = confirm_leave_frames
 
         # Current state
-        self.state: SlotState = SlotState.VACANT
+        self.state: SlotState = initial_state
         self.assigned_track_id: Optional[int] = None
         self.last_update_time: str = datetime.now().isoformat()
 

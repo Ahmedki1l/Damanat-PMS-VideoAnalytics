@@ -11,6 +11,7 @@ Pipeline per frame:
 
 import os
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -53,6 +54,7 @@ class CameraPipeline:
         slots: List[ParkingSlot],
         config: AppConfig,
         violation_slots: set = None,
+        initial_statuses: Dict[str, bool] = None,
         roi_polygon: Optional[Polygon] = None,
     ):
         self.camera_id = camera_id
@@ -60,16 +62,24 @@ class CameraPipeline:
         self.slots = slots
         self.roi_polygon = roi_polygon
         self._mask = None # Cached binary mask
+        initial_statuses = initial_statuses or {}
 
         # Per-slot state machines — pass is_violation_zone from DB
         self.state_machines: Dict[str, SlotStateMachine] = {}
         for slot in slots:
             is_restricted = (violation_slots is not None) and (slot.id in violation_slots)
+            
+            # Map DB 'is_available' to SlotState
+            # If is_available is False, start as OCCUPIED so engine corrects it if empty
+            db_avail = initial_statuses.get(slot.id, True)
+            start_state = SlotState.VACANT if db_avail else SlotState.OCCUPIED
+
             self.state_machines[slot.id] = SlotStateMachine(
                 slot_id=slot.id,
                 confirm_enter_frames=config.state_machine.confirm_enter_frames,
                 confirm_leave_frames=config.state_machine.confirm_leave_frames,
                 is_violation_zone=is_restricted,
+                initial_state=start_state,
             )
 
         # Slot assigner for this camera's polygons
@@ -133,9 +143,29 @@ class ParkingEngine:
         self._violation_match_threshold = 0.4
         self._violation_history_limit = 30 # seconds
 
+        # --- Status Tracking ---
+        self.is_running = False
+        self.start_time = 0.0
+        self.last_processed_at: Optional[datetime] = None
+        self.model_loaded = True # If TrackedDetector didn't crash, it's loaded
+
         # --- Frame counter for perf logging ---
         self._frame_count = 0
         self._start_time = 0.0
+
+    def get_engine_status(self) -> Dict:
+        """Return real-time metrics for the /api/health endpoint."""
+        return {
+            "engine_running": self.is_running,
+            "model_loaded": self.model_loaded,
+            "camera_streams_count": len(self.pipelines),
+            "camera_streams_ok": self.cam_manager.active_count if hasattr(self, 'cam_manager') else 0,
+            "total_cameras": self.cam_manager.total_count if hasattr(self, 'cam_manager') else 0,
+            "last_processed_at": self.last_processed_at.isoformat() if self.last_processed_at else None,
+            "uptime_seconds": int(time.time() - self.start_time) if self.is_running else 0,
+            "frames_processed": self._frame_count,
+            "db_ok": self.db_manager is not None,
+        }
 
     def run_multi_camera(self) -> None:
         """
@@ -172,10 +202,17 @@ class ParkingEngine:
 
         # Load per-camera slot polygons and create pipelines
         total_slots = 0
+        all_active_slot_ids = set()
+
         for cc in camera_configs:
             all_slots = []
+            roi_polygon = None
             if cc.slots_file and os.path.exists(cc.slots_file):
-                all_slots = load_slots(cc.slots_file)
+                all_slots, roi_polygon = load_slots(
+                    cc.slots_file,
+                    default_zone_id=cc.name,
+                    default_zone_name=cc.name,
+                )
             
             # [NEW] Separate tracking zones from parking slots
             parking_slots, special_zones = self._split_special_zones(all_slots)
@@ -184,7 +221,13 @@ class ParkingEngine:
             if self.db_manager and parking_slots:
                 session = self.db_manager.SessionLocal()
                 try:
-                    sync_slots_from_config(session, parking_slots, cc.floor)
+                    sync_slots_from_config(
+                        session,
+                        parking_slots,
+                        cc.floor,
+                        default_zone_id=cc.name,
+                        default_zone_name=cc.name,
+                    )
                     print(f"[DB] Synced {len(parking_slots)} slots for {cc.id}")
                 except Exception as e:
                     session.rollback()
@@ -192,20 +235,23 @@ class ParkingEngine:
                 finally:
                     session.close()
 
-            # Load violation zone flags from DB for this camera's slots
+            # Load violation zone flags and initial availability from DB for this camera's slots
             violation_slots = set()
-            if self.db_manager and slots:
+            initial_statuses = {} # slot_id -> is_available
+            if self.db_manager and parking_slots:
                 session = self.db_manager.SessionLocal()
                 try:
-                    slot_ids = [s.id for s in slots]
+                    slot_ids = [s.id for s in parking_slots]
                     from src.repositories import ParkingSlotRepository
                     db_slots = [ParkingSlotRepository.get_by_id(session, sid) for sid in slot_ids]
-                    violation_slots = {
-                        db_s.slot_id for db_s in db_slots
-                        if db_s and db_s.is_violation_zone
-                    }
+                    for db_s in db_slots:
+                        if db_s:
+                            if db_s.is_violation_zone:
+                                violation_slots.add(db_s.slot_id)
+                            initial_statuses[db_s.slot_id] = db_s.is_available
+                            all_active_slot_ids.add(db_s.slot_id)
                 except Exception as e:
-                    print(f"[ERROR] Failed to load violation zone flags from DB: {e}")
+                    print(f"[ERROR] Failed to load initial slot states from DB: {e}")
                 finally:
                     session.close()
 
@@ -215,10 +261,34 @@ class ParkingEngine:
                 slots=parking_slots,  # Only standard and violation slots
                 config=self.config,
                 violation_slots=violation_slots,
+                initial_statuses=initial_statuses,
                 roi_polygon=roi_polygon,
             )
             self.pipelines[cc.id] = pipeline
             total_slots += pipeline.slot_count
+            
+            # Also ensure manually added slots in JSON that might NOT be in DB yet are added to active set
+            for s in parking_slots:
+                all_active_slot_ids.add(s.id)
+
+        # --- [NEW] Full Sync Purge ---
+        # Any slot in DB that is NOT in the current configs should be removed
+        if self.db_manager:
+            session = self.db_manager.SessionLocal()
+            try:
+                from src.model.parkingslot import ParkingSlot as DB_ParkingSlot
+                db_all_slots = session.query(DB_ParkingSlot).all()
+                to_delete = [s for s in db_all_slots if s.slot_id not in all_active_slot_ids]
+                if to_delete:
+                    print(f"[DB] Purging {len(to_delete)} stale slots from database: {[s.slot_id for s in to_delete]}")
+                    for s in to_delete:
+                        session.delete(s)
+                    session.commit()
+            except Exception as e:
+                session.rollback()
+                print(f"[ERROR] Failed to purge stale slots: {e}")
+            finally:
+                session.close()
 
         print(f"[INFO] Total parking slots across all cameras: {total_slots}")
         print(f"[INFO] Processing mode: {self.config.processing.mode}")
@@ -227,8 +297,11 @@ class ParkingEngine:
         # Visualization setup
         show = self.config.output.show_video
         show_camera = self.config.output.show_camera
+        
+        self.is_running = True
+        self.start_time = time.time()
+        self._start_time = self.start_time
 
-        self._start_time = time.time()
         summary_interval = max(1, len(camera_configs) * 10)  # Every ~10 full cycles
 
         # Per-floor grid view: store latest annotated frame per camera
@@ -257,6 +330,7 @@ class ParkingEngine:
                     continue
 
                 t_start = time.time()
+                self.last_processed_at = datetime.now()
 
                 # Process this camera's frame
                 pipeline = self.pipelines.get(cam_id)
@@ -309,6 +383,9 @@ class ParkingEngine:
                     for evt in events:
                         evt.camera_id = cam_id
                         evt.floor = pipeline.floor
+                        evt.slot_name = slot.label
+                        evt.zone_id = slot.zone_id
+                        evt.zone_name = slot.zone_name
 
                         # --- Auto-link ANPR plate when slot becomes OCCUPIED ---
                         if evt.event_type == "vehicle_parked" and self.vehicle_registry:
@@ -316,6 +393,9 @@ class ParkingEngine:
                             # 1. Try resolving plate from already confirmed tracks
                             plate = self.vehicle_registry.try_link_to_slot(
                                 slot_id=slot.id,
+                                slot_name=slot.label,
+                                zone_id=slot.zone_id,
+                                zone_name=slot.zone_name,
                                 camera_id=cam_id,
                                 floor=pipeline.floor,
                                 track_id=track_id,
@@ -325,7 +405,11 @@ class ParkingEngine:
 
 
                             if plate:
-                                evt.plate = plate
+                                evt.plate_number = plate
+                                # Link snapshot URL if available
+                                loc = self.vehicle_registry.get_plate_location(plate)
+                                if loc:
+                                    evt.snapshot_url = loc.get("snapshot_url", "")
                                 # Crop car image from frame for visual reference
                                 if detection is not None:
                                     self._save_car_crop(frame, detection, plate, cam_id)
@@ -393,8 +477,8 @@ class ParkingEngine:
                                 for evt in final_events:
                                     if evt.event_type in ("vehicle_parked", "slot_vacant", "vehicle_violation"):
                                         is_parked = (evt.event_type in ("vehicle_parked", "vehicle_violation"))
-                                        plate = getattr(evt, "plate", None) 
-                                        log_vehicle_event(session, evt.slot_id, plate, is_parked)
+                                        plate = getattr(evt, "plate_number", None) 
+                                        log_vehicle_event(session, evt.slot_id, plate, is_parked, camera_id=evt.camera_id)
                             except Exception as e:
                                 session.rollback()
                                 print(f"[ERROR] Failed to update slot DB status: {e}")
@@ -489,6 +573,9 @@ class ParkingEngine:
         show = self.config.output.show_video
         frame_idx = 0
         summary_interval = target_fps * 10
+        
+        self.is_running = True
+        self.start_time = time.time()
 
         try:
             while True:
@@ -502,6 +589,7 @@ class ParkingEngine:
                     continue
 
                 t_start = time.time()
+                self.last_processed_at = datetime.now()
 
                 detection_frame = pipeline.apply_roi_mask(frame)
                 detections = self.detector.detect_and_track(detection_frame)

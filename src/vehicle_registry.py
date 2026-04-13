@@ -79,9 +79,13 @@ class VehicleSession:
     current_track_id: Optional[int] = None
 
     linked_slot: Optional[str] = None
+    linked_slot_name: Optional[str] = None
     linked_camera: Optional[str] = None
     linked_floor: Optional[str] = None
+    linked_zone_id: Optional[str] = None
+    linked_zone_name: Optional[str] = None
     linked_at: Optional[datetime] = None
+    snapshot_path: Optional[str] = None
 
 
 class VehicleRegistry:
@@ -323,6 +327,7 @@ class VehicleRegistry:
                 candidate.candidate_id,
                 quality_score,
             )
+            return filepath
 
     def bind_next_pending_anpr_to_candidate(
         self,
@@ -458,6 +463,7 @@ class VehicleRegistry:
                 confirmed_at=now,
                 current_camera_id=camera_id,
                 current_track_id=track_id,
+                snapshot_path=live_candidate.snapshot_path
             )
 
             self._sessions[session.session_id] = session
@@ -544,6 +550,9 @@ class VehicleRegistry:
     def try_link_to_slot(
         self,
         slot_id: str,
+        slot_name: str,
+        zone_id: Optional[str],
+        zone_name: Optional[str],
         camera_id: str,
         floor: str,
         track_id: Optional[int],
@@ -566,8 +575,11 @@ class VehicleRegistry:
                 return None
 
             session.linked_slot = slot_id
+            session.linked_slot_name = slot_name
             session.linked_camera = camera_id
             session.linked_floor = floor
+            session.linked_zone_id = zone_id
+            session.linked_zone_name = zone_name
             session.linked_at = timestamp
             self._parked[slot_id] = session
 
@@ -604,18 +616,27 @@ class VehicleRegistry:
             session = self._parked.get(slot_id)
             return session.plate if session else None
 
+    def _get_snapshot_url(self, path: Optional[str]) -> Optional[str]:
+        if not path:
+            return None
+        return f"/images/{os.path.basename(path)}"
+
     def get_plate_location(self, plate: str) -> Optional[Dict]:
         with self._lock:
             for slot_id, session in self._parked.items():
                 if session.plate == plate:
                     return {
-                        "plate": session.plate,
+                        "plate_number": session.plate,
                         "slot_id": slot_id,
+                        "slot_name": session.linked_slot_name,
+                        "zone_id": session.linked_zone_id,
+                        "zone_name": session.linked_zone_name,
                         "camera_id": session.linked_camera,
                         "floor": session.linked_floor,
                         "track_id": session.current_track_id,
                         "parked_at": session.linked_at.isoformat() if session.linked_at else None,
                         "confirmed_at": session.confirmed_at.isoformat(),
+                        "snapshot_url": self._get_snapshot_url(session.snapshot_path)
                     }
             return None
 
@@ -623,13 +644,17 @@ class VehicleRegistry:
         with self._lock:
             return [
                 {
-                    "plate": s.plate,
+                    "plate_number": s.plate,
                     "slot_id": slot_id,
+                    "slot_name": s.linked_slot_name,
+                    "zone_id": s.linked_zone_id,
+                    "zone_name": s.linked_zone_name,
                     "camera_id": s.linked_camera,
                     "floor": s.linked_floor,
                     "track_id": s.current_track_id,
                     "parked_at": s.linked_at.isoformat() if s.linked_at else None,
                     "confirmed_at": s.confirmed_at.isoformat(),
+                    "snapshot_url": self._get_snapshot_url(s.snapshot_path)
                 }
                 for slot_id, s in self._parked.items()
             ]
@@ -639,7 +664,7 @@ class VehicleRegistry:
             return [
                 {
                     "event_id": e.event_id,
-                    "plate": e.plate,
+                    "plate_number": e.plate,
                     "timestamp": e.timestamp.isoformat(),
                     "status": e.status,
                     "candidate_id": e.candidate_id,

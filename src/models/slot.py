@@ -32,6 +32,8 @@ class ParkingSlot:
     id: str
     polygon: Polygon
     label: str = ""
+    zone_id: str = ""
+    zone_name: str = ""
     centroid_x: float = 0.0
     centroid_y: float = 0.0
 
@@ -42,7 +44,11 @@ class ParkingSlot:
         self.centroid_y = centroid.y
 
 
-def load_slots(json_path: str) -> Tuple[List[ParkingSlot], Optional[Polygon]]:
+def load_slots(
+    json_path: str,
+    default_zone_id: str = "",
+    default_zone_name: str = "",
+) -> Tuple[List[ParkingSlot], Optional[Polygon]]:
     """
     Load parking slot definitions from a JSON file.
 
@@ -91,10 +97,14 @@ def load_slots(json_path: str) -> Tuple[List[ParkingSlot], Optional[Polygon]]:
             continue
 
         label = entry.get("label", slot_id)
+        zone_id = entry.get("zone_id", default_zone_id or "")
+        zone_name = entry.get("zone_name", default_zone_name or zone_id or label)
         slot = ParkingSlot(
             id=slot_id,
             polygon=polygon,
             label=label,
+            zone_id=zone_id,
+            zone_name=zone_name,
         )
         slots.append(slot)
 

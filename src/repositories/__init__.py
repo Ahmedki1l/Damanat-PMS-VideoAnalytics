@@ -1,3 +1,3 @@
 from .parking_slot_repository import ParkingSlotRepository
 from .slot_status_repository import SlotStatusRepository
-from .intrusion_repository import IntrusionRepository
+from .alert_repository import AlertRepository

@@ -35,10 +35,16 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         """Callback for the API to get current slot statuses."""
         all_statuses = []
         for cam_id, pipeline in engine.pipelines.items():
+            slot_meta = {s.id: s for s in pipeline.slots}
             for sm in pipeline.state_machines.values():
                 status = sm.get_status()
                 status["camera_id"] = cam_id
                 status["floor"] = pipeline.floor
+                slot = slot_meta.get(sm.slot_id)
+                status["label"] = slot.label if slot else sm.slot_id
+                status["slot_name"] = slot.label if slot else sm.slot_id
+                status["zone_id"] = slot.zone_id if slot else ""
+                status["zone_name"] = slot.zone_name if slot else status["label"]
                 all_statuses.append(status)
         return all_statuses
 
@@ -68,6 +74,7 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         get_slot_statuses=get_slot_statuses,
         get_camera_frame=get_camera_frame,
         get_park_entry_crop=get_park_entry_crop,
+        get_engine_status=engine.get_engine_status,
         event_bus=engine.event_bus,
         db_manager=engine.db_manager,
     )
@@ -75,10 +82,10 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
     # Include routers
     from src.routers.parking_router import router as parking_router
     from src.routers.slot_status_router import router as slot_status_router
-    from src.routers.intrusion_router import router as intrusion_router
+    from src.routers.alert_router import router as alert_router
     app.include_router(parking_router)
     app.include_router(slot_status_router)
-    app.include_router(intrusion_router)
+    app.include_router(alert_router)
 
     def run_server():
         uvicorn.run(app, host=host, port=port, log_level="info")
