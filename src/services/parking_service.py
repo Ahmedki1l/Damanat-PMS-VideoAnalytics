@@ -30,12 +30,16 @@ def sync_slots_from_config(
             # Keep the restriction flag stable while refreshing geometry and metadata.
             existing.slot_name = slot.label or slot.id
             existing.floor = floor
+            existing.zone_id = zone_id
+            existing.zone_name = zone_name
             existing.polygon = polygon_json
         else:
             new_slot = ParkingSlot(
                 slot_id=slot.id,
                 slot_name=slot.label or slot.id,
                 floor=floor,
+                zone_id=zone_id,
+                zone_name=zone_name,
                 polygon=polygon_json,
                 is_available=True,
                 is_violation_zone="violation" in slot.id.lower(),

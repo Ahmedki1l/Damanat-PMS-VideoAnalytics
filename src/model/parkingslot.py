@@ -4,9 +4,11 @@ from src.database import Base
 
 class ParkingSlot(Base):
     __tablename__ = "parking_slots"
-    slot_id = Column(String(50), primary_key=True, index=True,nullable=False)
+    slot_id = Column(String(50), primary_key=True, index=True, nullable=False)
     slot_name = Column(String(100), index=True)
     floor = Column(String(50), index=True)
+    zone_id = Column(String(100), nullable=True)
+    zone_name = Column(String(100), nullable=True)
     polygon = Column(JSON)
     is_available = Column(Boolean, default=True)
     is_violation_zone = Column(Boolean, default=False)
