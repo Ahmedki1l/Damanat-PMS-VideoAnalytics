@@ -16,6 +16,7 @@ class AlertBase(BaseModel):
     is_test: bool = False
     is_resolved: bool = False
     plate_number: Optional[str] = None
+    severity: str = "info"
 
 class AlertCreate(AlertBase):
     pass

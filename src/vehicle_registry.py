@@ -86,6 +86,12 @@ class VehicleSession:
     linked_zone_name: Optional[str] = None
     linked_at: Optional[datetime] = None
     snapshot_path: Optional[str] = None
+    
+    # [PHASE 1] Identity Management fields
+    status: str = "confirmed"  # confirmed, parked, exited
+    last_seen_camera: str = ""
+    last_seen_time: Optional[datetime] = None
+    feature_vector: Optional[np.ndarray] = None
 
 
 class VehicleRegistry:
@@ -126,6 +132,7 @@ class VehicleRegistry:
         self._history: List[VehicleSession] = []
 
         self._matcher = None
+        self._reid_matcher = None
         self._image_dir = image_dir
         os.makedirs(image_dir, exist_ok=True)
 
@@ -172,6 +179,17 @@ class VehicleRegistry:
                     self._matcher = VehicleImageMatcher()
                     logger.debug("VehicleImageMatcher instantiated")
         return self._matcher
+    
+    @property
+    def reid_matcher(self):
+        """Lazy-load the deep ReID matcher."""
+        if self._reid_matcher is None:
+            with self._matcher_lock:
+                if self._reid_matcher is None:
+                    from src.reid_matcher import get_reid_matcher
+                    self._reid_matcher = get_reid_matcher()
+                    logger.debug("VehicleReIDMatcher (OSNet) instantiated")
+        return self._reid_matcher
 
     # ------------------------------------------------------------------
     # Public API
@@ -299,9 +317,27 @@ class VehicleRegistry:
         """
         Keep the best Park_Entry snapshot for this candidate.
         Replace only when the new snapshot is better.
+
+        ReID embedding is extracted OUTSIDE the lock so inference
+        (~50-200ms) does not block ANPR ingestion or GC threads.
         """
         now = timestamp or datetime.now()
 
+        # Fast check: is this even worth processing?
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if not candidate or quality_score <= candidate.quality_score:
+                if candidate:
+                    candidate.last_seen_at = now
+                return
+
+        # --- Extract ReID embedding OUTSIDE the lock (CPU/GPU bound) ---
+        if feature_vector is None:
+            feature_vector = self.reid_matcher.extract_feature(image)
+            if feature_vector is not None:
+                logger.debug("[REID] Extracted 512-D vector for candidate %s", candidate_id)
+
+        # Re-acquire lock to commit the update
         with self._lock:
             candidate = self._park_entry_candidates.get(candidate_id)
             if not candidate:
@@ -309,6 +345,7 @@ class VehicleRegistry:
 
             candidate.last_seen_at = now
 
+            # Re-check quality under lock (another thread may have updated)
             if quality_score <= candidate.quality_score:
                 return
 
@@ -318,7 +355,6 @@ class VehicleRegistry:
 
             filename = f"{candidate.candidate_id}_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
             filepath = os.path.join(self._image_dir, filename)
-
             cv2.imwrite(filepath, image)
             candidate.snapshot_path = filepath
 
@@ -418,22 +454,51 @@ class VehicleRegistry:
 
         provisional_pairs.sort(key=lambda item: item[0])
 
-        # Image comparison runs outside the lock — it's CPU-bound and must not
-        # block ANPR ingestion or the GC thread.
+        # [PHASE 2] Extract ReID feature for the current B1 sighting
+        current_reid_feat = self.reid_matcher.extract_feature(image)
+
         best_candidate = None
         best_score = 0.0
+        
         for _, candidate in provisional_pairs:
-            # candidate.snapshot_image could theoretically be None if the GC
-            # thread cleared it between our snapshot and now; guard defensively.
             snap = candidate.snapshot_image
             if snap is None:
                 continue
-            score = self.matcher.compare(image, snap)
-            if score > best_score:
+
+            # 1. Color Hard-Filter (Recommendation)
+            # Ensure the car color is at least somewhat similar before trusting deep ReID.
+            # Sensitivity testing shows cross-camera color drops to ~0.50.
+            color_similarity = self.matcher._compare_dominant_colors(image, snap)
+            if color_similarity < 0.45:
+                logger.debug(
+                    "[REID] Candidate %s rejected by color filter (score=%.2f)",
+                    candidate.candidate_id, color_similarity
+                )
+                continue
+
+            # 2. Deep ReID Vector Matching
+            if current_reid_feat is not None and candidate.feature_vector is not None:
+                score = self.reid_matcher.compute_similarity(current_reid_feat, candidate.feature_vector)
+                logger.debug("[REID] Candidate %s vector similarity: %.3f", candidate.candidate_id, score)
+                
+                # Calibration: OSNet vectors for cars on different cameras can hover around 0.6.
+                # Threshold of 0.55 provides better separation than 0.35.
+                match_threshold = 0.55
+            else:
+                # Fallback to legacy multi-feature matcher if vectors are missing
+                score = self.matcher.compare(image, snap)
+                logger.debug("[REID] Candidate %s using legacy fallback: %.3f", candidate.candidate_id, score)
+                match_threshold = similarity_threshold
+
+            if score > best_score and score >= match_threshold:
                 best_score = score
                 best_candidate = candidate
 
-        if best_candidate is None or best_score < similarity_threshold:
+        # When using deep ReID, effective threshold is match_threshold (0.55).
+        # The legacy fallback uses similarity_threshold (0.35).
+        # best_candidate is only set when score >= its respective threshold,
+        # so a None check is sufficient here.
+        if best_candidate is None:
             return None
 
         # [CHANGE 2] Re-acquire lock and re-validate before committing.
@@ -455,6 +520,11 @@ class VehicleRegistry:
                 )
                 return None
 
+            # Save the CAM_03 high-quality snapshot
+            filename = f"session_{uuid.uuid4().hex[:12]}_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
+            cam03_path = os.path.join(self._image_dir, filename)
+            cv2.imwrite(cam03_path, image)
+
             session = VehicleSession(
                 session_id=f"sess_{uuid.uuid4().hex[:12]}",
                 plate=event.plate,
@@ -463,7 +533,12 @@ class VehicleRegistry:
                 confirmed_at=now,
                 current_camera_id=camera_id,
                 current_track_id=track_id,
-                snapshot_path=live_candidate.snapshot_path
+                snapshot_path=cam03_path,
+                # [PHASE 1] Initial identity state
+                status="confirmed",
+                last_seen_camera=camera_id,
+                last_seen_time=now,
+                feature_vector=live_candidate.feature_vector # Keep for cross-camera tracking
             )
 
             self._sessions[session.session_id] = session
@@ -529,6 +604,8 @@ class VehicleRegistry:
 
             session.current_camera_id = camera_id
             session.current_track_id = track_id
+            session.last_seen_camera = camera_id
+            session.last_seen_time = datetime.now()
             self._track_session_map[(camera_id, track_id)] = session_id
 
     def get_plate_for_track(
@@ -546,6 +623,59 @@ class VehicleRegistry:
 
             session = self._sessions.get(session_id)
             return session.plate if session else None
+
+    def match_global_session(
+        self,
+        image: np.ndarray,
+        camera_id: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        [PHASE 3] Search for an existing confirmed session that matches this sighting.
+        
+        Args:
+            image: Crop of the vehicle seen on CAM_03+
+            camera_id: Current camera (to avoid self-matching if needed)
+            
+        Returns:
+            session_id if matched, else None
+        """
+        # 1. Extract vector for the unidentified car
+        query_vector = self.reid_matcher.extract_feature(image)
+        if query_vector is None:
+            return None
+
+        # 2. Score against all active confirmed/parked sessions
+        with self._lock:
+            potential_sessions = [
+                s for s in self._sessions.values() 
+                if s.status in ("confirmed", "parked") and s.feature_vector is not None
+            ]
+
+        if not potential_sessions:
+            return None
+
+        best_sid = None
+        best_score = 0.0
+
+        for sess in potential_sessions:
+            # Match similarity
+            score = self.reid_matcher.compute_similarity(query_vector, sess.feature_vector)
+            
+            # Calibration: OSNet vectors for different cameras hover around 0.6.
+            if score > best_score and score > 0.55:
+                best_score = score
+                best_sid = sess.session_id
+
+        if best_sid:
+            # [ISSUE 6 FIX] Re-acquire lock and re-validate before committing.
+            # A session could have technically been closed/expired during similarity calculation.
+            with self._lock:
+                final_sess = self._sessions.get(best_sid)
+                if final_sess and final_sess.status in ("confirmed", "parked"):
+                    logger.info("[GLOBAL] Sighting matched to session %s (score=%.3f)", best_sid, best_score)
+                    return best_sid
+
+        return None
 
     def try_link_to_slot(
         self,

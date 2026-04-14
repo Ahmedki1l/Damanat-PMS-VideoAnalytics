@@ -42,7 +42,7 @@ python setup_model.py --export openvino  # Optional: OpenVINO for best CPU perf
 ### 3. Test Camera Connectivity
 
 ```bash
-python test_cameras.py
+python tests/test_cameras.py
 ```
 
 ### 4. Define Parking Slots
@@ -77,8 +77,9 @@ Damanat-PMS-VideoAnalytics/
 ├── setup_model.py           # YOLO model download & ONNX/OpenVINO export
 ├── draw_slots.py            # Interactive polygon drawing tool
 ├── grid_view.py             # Multi-camera live grid display
-├── test_cameras.py          # Camera connectivity test
-├── capture_snapshot.py      # Quick frame capture utility
+├── tests/                   # Test & verification scripts
+│   ├── test_cameras.py      # Camera connectivity test
+│   └── ...
 │
 ├── models/                  # YOLO weight files (git-ignored)
 │   └── yolo11n.pt
@@ -223,8 +224,8 @@ Controls: `f` = fullscreen, `1`–`9` = solo a camera, `q` = quit.
 ### `test_cameras.py` — Connectivity Test
 
 ```bash
-python test_cameras.py                     # Tests all cameras from config
-python test_cameras.py --channel 101       # Test main stream (4K)
+python tests/test_cameras.py                     # Tests all cameras from config
+python tests/test_cameras.py --channel 101       # Test main stream (4K)
 ```
 
 ### `setup_model.py` — Model Management
@@ -409,7 +410,7 @@ python main.py --video parking_video.mp4 --show   # Local video file
 ### Adding a New Camera
 
 1. Add the camera entry to `cameras:` in `config.yaml`
-2. Run `python test_cameras.py` to verify connectivity
+2. Run `python tests/test_cameras.py` to verify connectivity
 3. Run `python draw_slots.py --camera CAM_XX` to define slot polygons
 4. Restart `main.py`
 
@@ -513,7 +514,7 @@ WantedBy=multi-user.target
 | High CPU usage | Lower `imgsz` to 320, reduce cameras, or export to ONNX |
 | Detection misses vehicles | Lower `confidence` to 0.25, increase `imgsz` to 640 |
 | Flickering slot states | Increase `confirm_enter_frames` / `confirm_leave_frames` |
-| Camera shows OFFLINE in grid | Check network, try `test_cameras.py` — auto-reconnects after 10s |
+| Camera shows OFFLINE in grid | Check network, try `tests/test_cameras.py` — auto-reconnects after 10s |
 
 ---
 

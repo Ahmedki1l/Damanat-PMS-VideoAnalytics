@@ -15,7 +15,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 from shapely.geometry import Point
 from shapely.geometry import Polygon
 
@@ -137,6 +140,9 @@ class ParkingEngine:
         # Maps (cam_id, zone_id, track_id) to the last time it was seen (for entry/exit detection)
         # Using a simple set of track_ids currently "inside" for simpler logic
         self._tracks_inside_zones: Dict[Tuple[str, str], set] = {}
+        
+        # [PHASE 1] Confirmation bursts mapping: (cam_id, track_id) -> {'best_crop', 'best_quality'}
+        self._confirmation_bursts: Dict[Tuple[str, int], Dict] = {}
 
         # --- Violation Alert State ---
         self._recent_violators: List[Dict] = []  # List of {crop, timestamp, camera_id}
@@ -152,6 +158,9 @@ class ParkingEngine:
         # --- Frame counter for perf logging ---
         self._frame_count = 0
         self._start_time = 0.0
+        
+        # [PHASE 3] Global tracking state
+        self._reid_check_timer: Dict[Tuple[str, int], float] = {} # (cam, tid) -> timestamp
 
     def get_engine_status(self) -> Dict:
         """Return real-time metrics for the /api/health endpoint."""
@@ -329,6 +338,7 @@ class ParkingEngine:
                     time.sleep(5)
                     continue
 
+                self._cleanup_stale_data()
                 t_start = time.time()
                 self.last_processed_at = datetime.now()
 
@@ -362,6 +372,11 @@ class ParkingEngine:
                         conf_zone = next((z for k, z in cam_special_zones.items() if "Entrence" in k), None)
                         if conf_zone:
                             self._process_confirmation_zone(cam_id, frame, detections, conf_zone)
+                    
+                    # [PHASE 3] Global Tracking (Cross-Camera Linker)
+                    # Exclusion: Request specifically asked to exclude CAM_01 and CAM_02
+                    if cam_id not in ["CAM_01", "CAM_02"] and detections:
+                        self._process_global_tracking(cam_id, frame, detections)
 
                 # --- 2. Assign to slots ---
                 assignment = pipeline.assigner.assign(detections)
@@ -838,20 +853,98 @@ class ParkingEngine:
         self._tracks_inside_zones[(cam_id, zone.id)] = currently_inside
 
     def _process_confirmation_zone(self, cam_id: str, frame: np.ndarray, detections: List, zone: ParkingSlot):
-        """Handle CAM_03 and other confirm zones for identity matching."""
+        """
+        Handle CAM_03 and other confirm zones for identity matching.
+        Uses the zone entry transition as a 'Virtual Line' crossing event,
+        but allows collecting multiple frames (burst) for best quality selection.
+        """
+        currently_inside = set()
+        last_track_ids = self._tracks_inside_zones.get((cam_id, zone.id), set())
+
         for det in detections:
             if det.track_id == -1:
                 continue
             
             if self._detection_in_zone(det, zone):
-                # 1. Check if already session-backed
+                currently_inside.add(det.track_id)
+                
+                # Check if already session-backed
                 if self.vehicle_registry.get_plate_for_track(cam_id, det.track_id):
                     continue
                 
-                # 2. Try visual match vs provisional candidates
+                # --- SNAPSHOT BURST COLLECTION ---
+                burst_key = (cam_id, det.track_id)
                 crop = self._crop_detection(frame, det)
                 if crop is not None:
-                    self.vehicle_registry.confirm_at_b1_entrance(cam_id, det.track_id, crop)
+                    quality = self._score_snapshot_quality(det)
+                    
+                    if burst_key not in self._confirmation_bursts:
+                        # NEW entry into confirmation zone
+                        self._confirmation_bursts[burst_key] = {
+                            'best_crop': crop,
+                            'best_quality': quality,
+                            'frames_collected': 1
+                        }
+                    else:
+                        # Ongoing burst: update if quality is better
+                        burst = self._confirmation_bursts[burst_key]
+                        burst['frames_collected'] += 1
+                        if quality > burst['best_quality']:
+                            burst['best_crop'] = crop
+                            burst['best_quality'] = quality
+
+        # --- EVENT TRIGGER: When car leaves confirmation zone ---
+        left_zone = last_track_ids - currently_inside
+        for tid in left_zone:
+            burst_key = (cam_id, tid)
+            if burst_key in self._confirmation_bursts:
+                burst = self._confirmation_bursts.pop(burst_key)
+                
+                # Commit the best frame found during the crossing
+                self.vehicle_registry.confirm_at_b1_entrance(
+                    cam_id, tid, burst['best_crop']
+                )
+                
+                print(f"[LINE] Car {tid} finished crossing {zone.id} on {cam_id} | "
+                      f"Sync across {burst['frames_collected']} frames | Quality: {burst['best_quality']:.0f}")
+
+        # Update tracking state for next frame
+        self._tracks_inside_zones[(cam_id, zone.id)] = currently_inside
+
+    def _process_global_tracking(self, cam_id: str, frame: np.ndarray, detections: List):
+        """
+        [PHASE 3] Identify confirmed vehicles as they move between CAM_03 and CAM_14.
+        """
+        if not self.vehicle_registry:
+            return
+
+        for det in detections:
+            if det.track_id == -1:
+                continue
+
+            # 1. Optimization: Only try to identify if not already known on this camera
+            plate = self.vehicle_registry.get_plate_for_track(cam_id, det.track_id)
+            if plate:
+                continue
+
+            # 2. Optimization: Don't repeat ReID every frame for the same track
+            # We'll check again after 3 seconds if not matched yet
+            track_key = (cam_id, det.track_id)
+            last_reid_attempt = self._reid_check_timer.get(track_key, 0)
+            if time.time() - last_reid_attempt < 3.0: 
+                continue
+            
+            self._reid_check_timer[track_key] = time.time()
+
+            # 3. Cross-Camera Match
+            crop = self._crop_detection(frame, det)
+            if crop is not None:
+                session_id = self.vehicle_registry.match_global_session(crop, cam_id)
+                if session_id:
+                    # [PHASE 4] Robust re-validation: match_global_session already re-checked under lock,
+                    # but attach_session_to_track provides a secondary safety gate.
+                    self.vehicle_registry.attach_session_to_track(cam_id, det.track_id, session_id)
+                    logger.info("[GLOBAL] Track (%s, %d) identified via ReID", cam_id, det.track_id)
 
     def _save_car_crop(self, frame, detection, plate: str, cam_id: str):
         """Crop and save the detected car image for visual reference."""
@@ -876,6 +969,20 @@ class ParkingEngine:
                 print(f"[CROP] Saved car image: {filename}")
         except Exception as e:
             print(f"[WARN] Failed to save car crop: {e}")
+
+    def _cleanup_stale_data(self):
+        """[BUG 5 FIX] Prune stale state to prevent memory leaks."""
+        now = time.time()
+        
+        # 1. Prune ReID check timers (entries older than 30s)
+        stale_reid = [k for k, ts in self._reid_check_timer.items() if now - ts > 30.0]
+        if stale_reid:
+            for k in stale_reid:
+                del self._reid_check_timer[k]
+        
+        # 2. Prune recent violators (already handled in-line, but good to have a dedicated place)
+        self._recent_violators = [v for v in self._recent_violators 
+                                 if now - v['timestamp'] < self._violation_history_limit]
 
     @staticmethod
     def _build_grid(

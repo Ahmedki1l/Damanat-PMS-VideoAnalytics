@@ -4,7 +4,7 @@ from src.repositories import SlotStatusRepository, ParkingSlotRepository
 from . import alert_service
 from . import pms_api_client
 
-def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, camera_id: str = None):
+def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, camera_id: str = None, severity: str = None):
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
     if slot:
         slot.is_available = not is_parked
@@ -16,7 +16,7 @@ def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, ca
     )
     
     if is_parked:
-        alert_service.report_alert(db, slot_id, plate, camera_id=camera_id)
+        alert_service.report_alert(db, slot_id, plate, camera_id=camera_id, severity=severity)
     else:
         alert_service.resolve_alert(db, slot_id)
 

@@ -82,7 +82,13 @@ def load_slots(
 
     for entry in raw_data:
         slot_id = entry["id"]
-        points = entry["polygon"]
+
+        # Skip virtual_line entries — they are processed separately by LineCrossingDetector
+        if entry.get("type") == "virtual_line":
+            print(f"[INFO] Skipping virtual_line entry '{slot_id}' (not a parking slot)")
+            continue
+
+        points = entry.get("polygon", [])
 
         if len(points) < 3:
             print(f"[WARN] Entry '{slot_id}' has {len(points)} points — skipping.")
@@ -110,4 +116,3 @@ def load_slots(
 
     print(f"[INFO] Loaded {len(slots)} slots from '{json_path}'")
     return slots, roi_polygon
-

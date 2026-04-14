@@ -179,6 +179,35 @@ Examples:
     if args.api:
         start_api_server(engine, registry, port=args.port)
 
+    # --- [PHASE 4] Bridge Engine Events to Database Persistence ---
+    def db_event_subscriber(event):
+        """Persistent subscriber that saves vision events to SQL Server."""
+        try:
+            from src.services.slot_status_service import log_vehicle_event
+            from src.database import get_db
+            
+            # Persist status changes
+            if event.event_type in ("vehicle_parked", "slot_vacant", "vehicle_violation", "vehicle_intrusion"):
+                db_gen = get_db()
+                db_session = next(db_gen)
+                
+                is_parked = event.event_type != "slot_vacant"
+                plate = getattr(event, "plate_number", "")
+                
+                log_vehicle_event(
+                    db=db_session,
+                    slot_id=event.slot_id,
+                    plate=plate,
+                    is_parked=is_parked,
+                    camera_id=event.camera_id,
+                    severity=getattr(event, "severity", None)
+                )
+                db_session.close()
+        except Exception as e:
+            print(f"[DB ERROR] Failed to persist event {event.event_type}: {e}")
+
+    engine.event_bus.subscribe(db_event_subscriber)
+
     # --- Decide which mode to run ---
     if args.video:
         # Legacy single-video mode

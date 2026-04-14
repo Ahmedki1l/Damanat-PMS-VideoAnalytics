@@ -24,6 +24,7 @@ class Alert(Base):
     
     # Custom addition to track plates natively
     plate_number = Column(String(50), nullable=True, index=True)
+    severity = Column(String(20), nullable=False, default="info")
 
     slot = relationship("ParkingSlot", back_populates="alerts", foreign_keys=[slot_id])
 
