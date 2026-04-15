@@ -1,8 +1,45 @@
 from sqlalchemy.orm import Session
-from src.model import SlotStatus
+from src.model import SlotStatus, CameraFeed
 from src.repositories import SlotStatusRepository, ParkingSlotRepository
+from datetime import datetime
 from . import alert_service
 from . import pms_api_client
+
+def log_camera_feed_event(db: Session, event_type: str, camera_id: str, plate: str = None, slot_id: str = None, snapshot_path: str = None):
+    """
+    Log a security/violation event to the camera_feeds table.
+    """
+    slot = None
+    if slot_id:
+        slot = ParkingSlotRepository.get_by_id(db, slot_id)
+        
+    # Derive Location Label (e.g. "(B1-NORTH)")
+    location_label = f"({camera_id})"
+    if slot:
+        floor = slot.floor or "B1"
+        zone = slot.zone_name or slot.zone_id or "ZONE"
+        location_label = f"({floor}-{zone})"
+
+    # Map Event Type to Description
+    description_map = {
+        "vehicle_violation": "Unauthorized Parking Violation",
+        "vehicle_intrusion": "Security Intrusion Detected",
+    }
+    event_description = description_map.get(event_type, event_type.replace("_", " ").title())
+
+    new_feed = CameraFeed(
+        camera_id=camera_id,
+        location_label=location_label,
+        event_description=event_description,
+        detection_source="Vision Detection",
+        plate_number=plate,
+        snapshot_path=snapshot_path,
+        timestamp=datetime.now()
+    )
+    
+    db.add(new_feed)
+    db.commit()
+    return new_feed
 
 def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, camera_id: str = None, severity: str = None):
     slot = ParkingSlotRepository.get_by_id(db, slot_id)

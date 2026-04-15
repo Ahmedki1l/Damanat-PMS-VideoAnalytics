@@ -202,6 +202,18 @@ Examples:
                     camera_id=event.camera_id,
                     severity=getattr(event, "severity", None)
                 )
+
+                # Special case: Log to camera_feeds table for security monitoring
+                if event.event_type in ("vehicle_violation", "vehicle_intrusion"):
+                    from src.services.slot_status_service import log_camera_feed_event
+                    log_camera_feed_event(
+                        db=db_session,
+                        event_type=event.event_type,
+                        camera_id=event.camera_id,
+                        plate=plate,
+                        slot_id=event.slot_id,
+                        snapshot_path=getattr(event, "snapshot_url", None)
+                    )
                 db_session.close()
         except Exception as e:
             print(f"[DB ERROR] Failed to persist event {event.event_type}: {e}")
