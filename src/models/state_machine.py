@@ -111,6 +111,8 @@ class SlotStateMachine:
         # Current state
         self.state: SlotState = initial_state
         self.assigned_track_id: Optional[int] = None
+        self.plate_number: str = ""
+        self.snapshot_url: str = ""
         self.last_update_time: str = datetime.now().isoformat()
 
         # Store violation zone status from DB
@@ -139,7 +141,21 @@ class SlotStateMachine:
             "occupied": self.is_occupied,
             "last_update_time": self.last_update_time,
             "is_violation_zone": self.is_violation_zone,
+            "plate_number": self.plate_number,
+            "snapshot_url": self.snapshot_url,
         }
+
+    def bind_identity(self, plate_number: Optional[str], snapshot_url: str = "") -> None:
+        """Persist the confirmed identity for this slot until vacancy is confirmed."""
+        if plate_number:
+            self.plate_number = plate_number
+        if snapshot_url:
+            self.snapshot_url = snapshot_url
+
+    def clear_identity(self) -> None:
+        """Clear the persisted identity after the slot is confirmed vacant."""
+        self.plate_number = ""
+        self.snapshot_url = ""
 
     def update(
         self,
@@ -197,6 +213,7 @@ class SlotStateMachine:
                 self.state = SlotState.VACANT
                 self.assigned_track_id = None
                 self._enter_counter = 0
+                self.clear_identity()
                 self.last_update_time = now
 
         # ----- OCCUPIED -----
@@ -229,6 +246,7 @@ class SlotStateMachine:
                     self.state = SlotState.VACANT
                     self.assigned_track_id = None
                     self._leave_counter = 0
+                    self.clear_identity()
                     events.append(SlotEvent(
                         event_type="slot_vacant",
                         slot_id=self.slot_id,

@@ -1,14 +1,13 @@
+from typing import Dict, List, Optional
+
 import cv2
 import numpy as np
 from shapely.geometry import Polygon
-from typing import Dict, List, Optional
 
 from src.config import AppConfig
-from src.models.slot import ParkingSlot
-from src.models.state_machine import SlotStateMachine
 from src.core.slot_assigner import SlotAssigner
-
-
+from src.models.slot import ParkingSlot
+from src.models.state_machine import SlotState, SlotStateMachine
 
 
 class CameraPipeline:
@@ -26,32 +25,34 @@ class CameraPipeline:
         slots: List[ParkingSlot],
         config: AppConfig,
         violation_slots: set = None,
+        initial_statuses: Dict[str, bool] = None,
         roi_polygon: Optional[Polygon] = None,
     ):
         self.camera_id = camera_id
         self.floor = floor
         self.slots = slots
         self.roi_polygon = roi_polygon
-        self._mask = None # Cached binary mask
+        self._mask = None
+        initial_statuses = initial_statuses or {}
 
-        # Per-slot state machines — pass is_violation_zone from DB
         self.state_machines: Dict[str, SlotStateMachine] = {}
         for slot in slots:
             is_restricted = (violation_slots is not None) and (slot.id in violation_slots)
+            db_avail = initial_statuses.get(slot.id, True)
+            start_state = SlotState.VACANT if db_avail else SlotState.OCCUPIED
+
             self.state_machines[slot.id] = SlotStateMachine(
                 slot_id=slot.id,
                 confirm_enter_frames=config.state_machine.confirm_enter_frames,
                 confirm_leave_frames=config.state_machine.confirm_leave_frames,
                 is_violation_zone=is_restricted,
+                initial_state=start_state,
             )
 
-        # Slot assigner for this camera's polygons
         self.assigner = SlotAssigner(slots=slots, config=config.assigner)
 
     def apply_roi_mask(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Apply the ROI mask to the frame, blacking out areas outside the ROI.
-        """
+        """Apply the ROI mask to the frame, blacking out areas outside the ROI."""
         if self.roi_polygon is None:
             return frame
 

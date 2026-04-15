@@ -17,7 +17,7 @@ def get_alert_type_for_slot(db: Session, slot_id: str) -> str:
         return "violation"
     return "intrusion"
 
-def report_alert(db: Session, slot_id: str, plate_number: str = None, camera_id: str = None):
+def report_alert(db: Session, slot_id: str, plate_number: str = None, camera_id: str = None, severity: str = "critical"):
     """
     YOLO detects car in a slot -> check if restricted (is_violation_zone) -> create alert.
     Returns None if slot is not restricted or alert already active.
@@ -47,7 +47,8 @@ def report_alert(db: Session, slot_id: str, plate_number: str = None, camera_id:
         description=f"Unauthorized vehicle detected in {slot_name}",
         is_resolved=False,
         triggered_at=datetime.utcnow(),
-        plate_number=plate_number
+        plate_number=plate_number,
+        severity=severity
     )
     return AlertRepository.create(db, new_alert)
 

@@ -32,6 +32,7 @@ events.jsonl
 
 # Vehicle images (generated at runtime)
 vehicle_images/
+vehicle_images_p3/
 
 # Test videos
 *.mp4
