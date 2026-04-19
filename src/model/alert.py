@@ -11,7 +11,7 @@ class Alert(Base):
     camera_id = Column(String(50), nullable=False)
     zone_id = Column(String(100), nullable=True)
     zone_name = Column(String(100))
-    slot_id = Column(String(100), ForeignKey("parking_slots.slot_id"), nullable=True, index=True)
+    slot_id = Column(String(50), ForeignKey("parking_slots.slot_id"), nullable=True, index=True)
     region_id = Column(Integer)
     slot_number = Column(String(100), nullable=True)
     event_type = Column(String(100))
