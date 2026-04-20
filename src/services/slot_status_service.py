@@ -52,10 +52,15 @@ def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, ca
         status="occupied" if is_parked else "available"
     )
     
+    alert_id = None
     if is_parked:
-        alert_service.report_alert(db, slot_id, plate, camera_id=camera_id, severity=severity)
+        alert = alert_service.report_alert(db, slot_id, plate, camera_id=camera_id, severity=severity)
+        if alert:
+            alert_id = alert.id
     else:
-        alert_service.resolve_alert(db, slot_id)
+        alert = alert_service.resolve_alert(db, slot_id)
+        if alert:
+            alert_id = alert.id
 
     created = SlotStatusRepository.create(db, new_log)
 
@@ -80,7 +85,8 @@ def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, ca
                 left_at=created.time.isoformat() if created.time else None,
             )
 
-    return created
+    return created, alert_id
+
 
 def get_vehicle_current_location(db: Session, plate: str):
     last_event = SlotStatusRepository.get_latest_by_plate(db, plate)

@@ -58,6 +58,7 @@ class SlotEvent:
     zone_id: str = ""
     zone_name: str = ""
     snapshot_url: str = ""
+    alert_id: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a JSON-serializable dictionary with specific field order."""
@@ -73,6 +74,7 @@ class SlotEvent:
             "floor": self.floor,
             "plate_number": self.plate_number,
             "snapshot_url": self.snapshot_url,
+            "alert_id": self.alert_id,
             "timestamp": self.timestamp,
         }
 

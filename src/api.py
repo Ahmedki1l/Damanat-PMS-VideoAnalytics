@@ -83,6 +83,21 @@ class VehicleLocation(BaseModel):
     camera_id: Optional[str] = None
     snapshot_url: Optional[str] = None
     entry_time: Optional[str] = None
+    
+class StreamEventRequest(BaseModel):
+    """Payload for triggering a raw SSE event without DB persistence."""
+    event_type: str = "vehicle_parked"
+    slot_id: str
+    track_id: Optional[int] = None
+    camera_id: str = "EXTERNAL"
+    floor: str = "N/A"
+    plate_number: str = ""
+    is_alert: bool = False
+    severity: str = "info"
+    slot_name: Optional[str] = None
+    zone_id: str = ""
+    zone_name: str = ""
+    alert_id: Optional[int] = None
 
 
 class StatsResponse(BaseModel):
@@ -207,6 +222,10 @@ def create_app(
                 # Wait for next event
                 event: SlotEvent = await queue.get()
                 
+                # Filter: Only send actual alerts to this stream
+                if not event.is_alert:
+                    continue
+
                 # Yield the dict directly so fields match the required order/naming
                 yield event.to_dict()
                 
