@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import List, Optional
@@ -8,9 +9,68 @@ import numpy as np
 from src.vehicle_registry.vehicle_registry_models import VehicleSession
 
 logger = logging.getLogger(__name__)
+REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
+REID_USE_LAB_CLAHE = os.getenv("REID_USE_LAB_CLAHE", "false").lower() == "true"
+REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
+match_logger = logging.getLogger("reid_match_perf")
 
 
 class VehicleRegistryIdentityMixin:
+    @staticmethod
+    def _dedupe_valid_images(images: List[np.ndarray]) -> List[np.ndarray]:
+        deduped: List[np.ndarray] = []
+        for image in images:
+            if image is None or image.size == 0:
+                continue
+            if any(
+                existing.shape == image.shape and np.array_equal(existing, image)
+                for existing in deduped
+            ):
+                continue
+            deduped.append(image)
+        return deduped
+
+    @staticmethod
+    def _candidate_snapshot_paths(candidate) -> List[str]:
+        if list(candidate.snapshot_paths):
+            return list(candidate.snapshot_paths)
+        if candidate.snapshot_path:
+            return [candidate.snapshot_path]
+        return []
+
+    def _persist_session_gallery(
+        self,
+        session: VehicleSession,
+        images: List[np.ndarray],
+        now: datetime,
+        primary_snapshot_index: int = 0,
+    ) -> bool:
+        ordered_images = self._dedupe_valid_images(images)
+        if not ordered_images:
+            return False
+
+        primary_snapshot_index = max(
+            0,
+            min(primary_snapshot_index, len(ordered_images) - 1),
+        )
+        feature_vectors = self.reid_matcher.extract_features_batch(ordered_images)
+        stored_paths = self._store_session_reference_snapshots(
+            ordered_images,
+            timestamp=now,
+        )
+
+        session.reference_snapshot_paths = stored_paths
+        session.reference_feature_vectors = [
+            feature for feature in feature_vectors if feature is not None
+        ]
+        if stored_paths:
+            session.snapshot_path = stored_paths[primary_snapshot_index]
+        if feature_vectors:
+            primary_feature = feature_vectors[primary_snapshot_index]
+            if primary_feature is not None:
+                session.feature_vector = primary_feature
+        return True
+
     def bind_next_pending_anpr_to_candidate(
         self,
         candidate_id: str,
@@ -63,20 +123,34 @@ class VehicleRegistryIdentityMixin:
         reference_images: Optional[List[np.ndarray]] = None,
         similarity_threshold: float = 0.35,
         timestamp: Optional[datetime] = None,
+        ordered_images: Optional[List[np.ndarray]] = None,
+        primary_snapshot_index: int = 0,
     ) -> Optional[str]:
         """
         Confirm that a B1_Entrance car is the same car that was provisionally
         captured at Park_Entry.
         """
         now = timestamp or datetime.now()
-        session_reference_images = [image]
-        if reference_images:
-            for extra in reference_images:
-                if extra is None or extra.size == 0:
-                    continue
-                if extra.shape == image.shape and np.array_equal(extra, image):
-                    continue
-                session_reference_images.append(extra)
+        if ordered_images:
+            session_reference_images = self._dedupe_valid_images(ordered_images)
+        else:
+            session_reference_images = [image]
+            if reference_images:
+                for extra in reference_images:
+                    if extra is None or extra.size == 0:
+                        continue
+                    if extra.shape == image.shape and np.array_equal(extra, image):
+                        continue
+                    session_reference_images.append(extra)
+            session_reference_images = self._dedupe_valid_images(session_reference_images)
+
+        if not session_reference_images:
+            return None
+
+        primary_snapshot_index = max(
+            0,
+            min(primary_snapshot_index, len(session_reference_images) - 1),
+        )
 
         with self._lock:
             provisional_pairs = []
@@ -96,11 +170,19 @@ class VehicleRegistryIdentityMixin:
             session_reference_images
         )
         current_reid_feat = (
-            session_reference_features[0] if session_reference_features else None
+            session_reference_features[primary_snapshot_index]
+            if session_reference_features
+            else None
         )
+
+        query_hsv = None
+        if REID_USE_COLOR_FILTER:
+            from src.reid_matcher import dominant_color_hsv
+            query_hsv = dominant_color_hsv(image)
 
         best_candidate = None
         best_score = 0.0
+        hard_rejected_candidate_ids = set()
 
         for _, candidate in provisional_pairs:
             snapshot = candidate.snapshot_image
@@ -116,15 +198,42 @@ class VehicleRegistryIdentityMixin:
                 )
                 continue
 
-            if current_reid_feat is not None and candidate.feature_vector is not None:
-                score = self.reid_matcher.compute_similarity(
-                    current_reid_feat,
-                    candidate.feature_vector,
+            if REID_USE_COLOR_FILTER:
+                from src.reid_matcher import color_compatible
+                candidate_hsv_values = [hsv for hsv in list(candidate.color_hsv_values) if hsv is not None]
+                if not candidate_hsv_values and candidate.color_hsv is not None:
+                    candidate_hsv_values = [candidate.color_hsv]
+                
+                if candidate_hsv_values and not any(
+                    color_compatible(query_hsv, candidate_hsv)
+                    for candidate_hsv in candidate_hsv_values
+                ):
+                    hard_rejected_candidate_ids.add(candidate.candidate_id)
+                    logger.debug(
+                        "[REID] Candidate %s rejected by HSV color filter",
+                        candidate.candidate_id,
+                    )
+                    continue
+
+            candidate_vectors = [
+                feature for feature in list(candidate.feature_vectors) if feature is not None
+            ]
+            if not candidate_vectors and candidate.feature_vector is not None:
+                candidate_vectors = [candidate.feature_vector]
+
+            if current_reid_feat is not None and candidate_vectors:
+                score = max(
+                    self.reid_matcher.compute_similarity(
+                        current_reid_feat,
+                        candidate_vector,
+                    )
+                    for candidate_vector in candidate_vectors
                 )
                 logger.debug(
-                    "[REID] Candidate %s vector similarity: %.3f",
+                    "[REID] Candidate %s vector similarity: %.3f (refs=%d)",
                     candidate.candidate_id,
                     score,
+                    len(candidate_vectors),
                 )
                 match_threshold = 0.55
             else:
@@ -139,10 +248,24 @@ class VehicleRegistryIdentityMixin:
             if score > best_score and score >= match_threshold:
                 best_score = score
                 best_candidate = candidate
+                
+                # Compute old score in parallel for logging (single-shot ReID)
+                if current_reid_feat is not None and candidate.feature_vector is not None:
+                    candidate.old_pipeline_score = self.reid_matcher.compute_similarity(
+                        current_reid_feat,
+                        candidate.feature_vector
+                    )
+                else:
+                    candidate.old_pipeline_score = score # fallback
 
         if best_candidate is None:
-            if len(provisional_pairs) == 1:
-                best_candidate = provisional_pairs[0][1]
+            fallback_pairs = [
+                pair
+                for pair in provisional_pairs
+                if pair[1].candidate_id not in hard_rejected_candidate_ids
+            ]
+            if len(fallback_pairs) == 1:
+                best_candidate = fallback_pairs[0][1]
                 logger.warning(
                     "[B1] Falling back to the only provisional candidate %s "
                     "for track (%s, %d); strict visual threshold was not met",
@@ -179,12 +302,6 @@ class VehicleRegistryIdentityMixin:
                 )
                 return None
 
-            stored_paths = self._store_session_reference_snapshots(
-                session_reference_images,
-                timestamp=now,
-            )
-            cam03_path = stored_paths[0] if stored_paths else None
-
             existing_sid = self._track_session_map.get((camera_id, track_id))
             session = self._sessions.get(existing_sid) if existing_sid else None
 
@@ -200,11 +317,18 @@ class VehicleRegistryIdentityMixin:
                 session.last_seen_at = now
                 session.last_seen_camera = camera_id
                 session.last_seen_track_id = track_id
-                session.snapshot_path = cam03_path
-                session.reference_snapshot_paths = stored_paths
                 if session_feature_vector is not None:
                     session.feature_vector = session_feature_vector
-                session.reference_feature_vectors = reference_feature_vectors
+                self._persist_session_gallery(
+                    session,
+                    session_reference_images,
+                    now,
+                    primary_snapshot_index=primary_snapshot_index,
+                )
+                session.new_pipeline_score = best_score
+                session.old_pipeline_score = getattr(best_candidate, "old_pipeline_score", best_score)
+                session.gate_snapshot_paths = self._candidate_snapshot_paths(live_candidate)
+                
                 self._drop_other_track_mappings_for_session(
                     session.session_id,
                     keep=(camera_id, track_id),
@@ -223,9 +347,15 @@ class VehicleRegistryIdentityMixin:
                     event_id=event.event_id,
                     candidate_id=live_candidate.candidate_id,
                     status="confirmed",
-                    snapshot_path=cam03_path,
-                    reference_snapshot_paths=stored_paths,
-                    reference_feature_vectors=reference_feature_vectors,
+                    new_pipeline_score=best_score,
+                    old_pipeline_score=getattr(best_candidate, "old_pipeline_score", best_score),
+                    gate_snapshot_paths=self._candidate_snapshot_paths(live_candidate),
+                )
+                self._persist_session_gallery(
+                    session,
+                    session_reference_images,
+                    now,
+                    primary_snapshot_index=primary_snapshot_index,
                 )
                 self._sessions[session.session_id] = session
                 self._drop_other_track_mappings_for_session(
@@ -253,6 +383,34 @@ class VehicleRegistryIdentityMixin:
                 best_score,
             )
             return session.plate
+
+    def update_confirmed_session_gallery(
+        self,
+        camera_id: str,
+        track_id: int,
+        ordered_images: List[np.ndarray],
+        primary_snapshot_index: int = 0,
+        timestamp: Optional[datetime] = None,
+    ) -> bool:
+        """
+        Enrich an already confirmed session with the final ordered CAM_03 gallery.
+        """
+        now = timestamp or datetime.now()
+        with self._lock:
+            session_id = self._track_session_map.get((camera_id, track_id))
+            session = self._sessions.get(session_id) if session_id else None
+            if session is None:
+                return False
+
+            session.last_seen_at = now
+            session.last_seen_camera = camera_id
+            session.last_seen_track_id = track_id
+            return self._persist_session_gallery(
+                session,
+                ordered_images,
+                now,
+                primary_snapshot_index=primary_snapshot_index,
+            )
 
     def drop_provisional_binding(self, candidate_id: str) -> None:
         """Remove a failed provisional match."""
@@ -605,6 +763,7 @@ class VehicleRegistryIdentityMixin:
         floor: str,
         track_id: Optional[int],
         timestamp: datetime,
+        snapshot_path: Optional[str] = None,
     ) -> Optional[str]:
         """
         Link a slot only from a confirmed session.
@@ -637,6 +796,27 @@ class VehicleRegistryIdentityMixin:
             session.linked_at = timestamp
             session.status = "parked"
             self._parked[slot_id] = session
+
+            # Detailed Match Performance Logging
+            flags = {
+                "CLAHE": REID_USE_LAB_CLAHE,
+                "MULTISHOT": REID_USE_MULTISHOT,
+                "COLOR_FILTER": REID_USE_COLOR_FILTER
+            }
+            match_logger.info(
+                "MATCH_EVENT | Plate: %s | Slot: %s | Time: %s | "
+                "NewCost: %.4f | OldCost: %.4f | Flags: %s | "
+                "GateSnapshots: %s | SlotSnapshot: %s",
+                session.plate,
+                slot_id,
+                timestamp.isoformat(),
+                session.new_pipeline_score,
+                session.old_pipeline_score,
+                flags,
+                session.gate_snapshot_paths,
+                snapshot_path or "N/A"
+            )
+
             return session.plate
 
     def unlink_slot(self, slot_id: str) -> Optional[str]:

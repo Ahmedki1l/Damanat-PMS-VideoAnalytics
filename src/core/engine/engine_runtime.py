@@ -243,7 +243,13 @@ class ParkingEngineRuntimeMixin:
                 event.zone_name = slot.zone_name
 
                 if event.event_type == "vehicle_parked" and self.vehicle_registry:
-                    plate = self.vehicle_registry.try_link_to_slot(
+                    # Attempt to get plate first to save crop with correct filename
+                    plate = self.vehicle_registry.get_plate_for_track(cam_id, track_id)
+                    snapshot_path = None
+                    if plate and detection is not None:
+                        snapshot_path = self._save_car_crop(frame, detection, plate, cam_id)
+
+                    linked_plate = self.vehicle_registry.try_link_to_slot(
                         slot_id=slot.id,
                         slot_name=slot.label,
                         zone_id=slot.zone_id,
@@ -252,18 +258,17 @@ class ParkingEngineRuntimeMixin:
                         floor=pipeline.floor,
                         track_id=track_id,
                         timestamp=datetime.now(),
+                        snapshot_path=snapshot_path,
                     )
-                    if plate:
-                        event.plate_number = plate
-                        location = self.vehicle_registry.get_plate_location(plate)
+                    if linked_plate:
+                        event.plate_number = linked_plate
+                        location = self.vehicle_registry.get_plate_location(linked_plate)
                         if location:
                             event.snapshot_url = location.get("snapshot_url", "")
                         pipeline.state_machines[slot.id].bind_identity(
-                            plate,
+                            linked_plate,
                             event.snapshot_url,
                         )
-                        if detection is not None:
-                            self._save_car_crop(frame, detection, plate, cam_id)
                 elif event.event_type == "slot_vacant" and self.vehicle_registry:
                     plate = self.vehicle_registry.unlink_slot(slot.id)
                     if plate:

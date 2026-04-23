@@ -6,14 +6,15 @@ robust to changes in lighting, perspective, and camera quality.
 """
 
 import logging
+import os
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
 import numpy as np
 import cv2
 from typing import Optional, List
+from src.reid_matcher.reid_preprocessing import normalize_for_reid
 
 logger = logging.getLogger(__name__)
+USE_LAB_CLAHE = os.getenv("REID_USE_LAB_CLAHE", "false").lower() == "true"
 
 try:
     import torchreid
@@ -69,6 +70,9 @@ class VehicleReIDMatcher:
         Returns:
             Preprocessed tensor (3, H, W).
         """
+        if USE_LAB_CLAHE:
+            image = normalize_for_reid(image)
+
         # Convert BGR to RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         

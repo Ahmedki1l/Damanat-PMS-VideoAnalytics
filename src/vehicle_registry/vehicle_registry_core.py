@@ -11,6 +11,8 @@ import numpy as np
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, PendingANPREvent
 
 logger = logging.getLogger(__name__)
+REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
+REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
 
 
 class VehicleRegistryCoreMixin:
@@ -209,8 +211,7 @@ class VehicleRegistryCoreMixin:
                             if candidate is not None:
                                 candidate.status = "expired"
                                 candidate.bound_event_id = None
-                                candidate.snapshot_image = None
-                                candidate.feature_vector = None
+                                self._clear_candidate_references(candidate)
                             event.candidate_id = None
                     else:
                         active_orders.append(event_id)
@@ -231,8 +232,7 @@ class VehicleRegistryCoreMixin:
                                 event.status = "expired"
                                 event.candidate_id = None
                         candidate.bound_event_id = None
-                        candidate.snapshot_image = None
-                        candidate.feature_vector = None
+                        self._clear_candidate_references(candidate)
                         candidates_to_delete.append(candidate_id)
                 elif candidate.status in ("confirmed", "dropped", "expired"):
                     candidates_to_delete.append(candidate_id)
@@ -261,6 +261,18 @@ class VehicleRegistryCoreMixin:
 
         return candidate
 
+    @staticmethod
+    def _clear_candidate_references(candidate: ParkEntryCandidate) -> None:
+        candidate.snapshot_image = None
+        candidate.snapshot_path = None
+        candidate.feature_vector = None
+        candidate.quality_score = 0.0
+        candidate.snapshot_images.clear()
+        candidate.snapshot_paths.clear()
+        candidate.feature_vectors.clear()
+        candidate.color_hsv = None
+        candidate.color_hsv_values.clear()
+
     def update_park_entry_candidate_snapshot(
         self,
         candidate_id: str,
@@ -274,6 +286,15 @@ class VehicleRegistryCoreMixin:
         Replace only when the new snapshot is better.
         """
         now = timestamp or datetime.now()
+
+        if REID_USE_MULTISHOT:
+            return self._update_park_entry_candidate_multishot(
+                candidate_id,
+                image,
+                quality_score,
+                feature_vector=feature_vector,
+                timestamp=now,
+            )
 
         with self._lock:
             candidate = self._park_entry_candidates.get(candidate_id)
@@ -301,6 +322,13 @@ class VehicleRegistryCoreMixin:
             candidate.feature_vector = feature_vector
             filepath = self._write_snapshot_file(candidate.candidate_id, image, timestamp=now)
             candidate.snapshot_path = filepath
+            if REID_USE_COLOR_FILTER:
+                from src.reid_matcher import dominant_color_hsv
+
+                candidate.color_hsv = dominant_color_hsv(image)
+                candidate.color_hsv_values = (
+                    [candidate.color_hsv] if candidate.color_hsv is not None else []
+                )
 
             logger.debug(
                 "[PARK_ENTRY] Updated snapshot for %s (score=%.3f)",
@@ -308,3 +336,92 @@ class VehicleRegistryCoreMixin:
                 quality_score,
             )
             return filepath
+
+    def _update_park_entry_candidate_multishot(
+        self,
+        candidate_id: str,
+        image: np.ndarray,
+        quality_score: float,
+        feature_vector: Optional[np.ndarray] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Keep up to three sharp Park_Entry references for this candidate.
+        """
+        if image is None or image.size == 0:
+            return None
+
+        now = timestamp or datetime.now()
+        from src.reid_matcher import select_best_frames
+        from src.reid_matcher.reid_burst import sharpness_score
+
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if not candidate:
+                return None
+            candidate.last_seen_at = now
+            existing_images = [img for img in candidate.snapshot_images if img is not None and img.size > 0]
+            candidate_images = existing_images + [image.copy()]
+
+        selected_images = select_best_frames(candidate_images, top_k=3)
+        if not selected_images:
+            return None
+
+        if feature_vector is not None and len(selected_images) == 1 and selected_images[0] is image:
+            feature_vectors = [feature_vector]
+        else:
+            feature_vectors = self.reid_matcher.extract_features_batch(selected_images)
+
+        token = uuid.uuid4().hex[:12]
+        snapshot_paths: List[str] = []
+        for idx, selected_image in enumerate(selected_images):
+            suffix = "" if idx == 0 else f"_ref{idx + 1}"
+            path = self._write_snapshot_file(
+                f"{candidate_id}_{token}{suffix}",
+                selected_image,
+                timestamp=now,
+            )
+            if path:
+                snapshot_paths.append(path)
+
+        primary_image = selected_images[0]
+        primary_vector = feature_vectors[0] if feature_vectors else None
+        primary_path = snapshot_paths[0] if snapshot_paths else None
+        primary_quality = max(float(quality_score), float(sharpness_score(primary_image)))
+        color_hsv_values = []
+        if REID_USE_COLOR_FILTER:
+            from src.reid_matcher import dominant_color_hsv
+
+            color_hsv_values = [
+                hsv
+                for hsv in (dominant_color_hsv(img) for img in selected_images)
+                if hsv is not None
+            ]
+
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if not candidate:
+                return None
+
+            candidate.last_seen_at = now
+            candidate.snapshot_images = [img.copy() for img in selected_images]
+            candidate.snapshot_paths = snapshot_paths
+            candidate.feature_vectors = [
+                vec for vec in feature_vectors if vec is not None
+            ]
+            candidate.snapshot_image = primary_image.copy()
+            candidate.snapshot_path = primary_path
+            candidate.feature_vector = primary_vector
+            candidate.quality_score = primary_quality
+            if REID_USE_COLOR_FILTER:
+                candidate.color_hsv_values = color_hsv_values
+                candidate.color_hsv = (
+                    color_hsv_values[0] if color_hsv_values else None
+                )
+
+            logger.debug(
+                "[PARK_ENTRY] Updated multishot snapshot set for %s (refs=%d)",
+                candidate.candidate_id,
+                len(candidate.snapshot_images),
+            )
+            return primary_path

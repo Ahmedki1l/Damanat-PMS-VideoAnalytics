@@ -55,6 +55,7 @@ class ParkingEngine(
         self._park_entry_track_to_candidate: Dict[int, str] = {}
         self._tracks_inside_zones: Dict[tuple, set] = {}
         self._confirmation_bursts: Dict[tuple, Dict] = {}
+        self._latest_zone_vehicle_crops: Dict[tuple, Dict] = {}
         self._recent_violators = []
         self._violation_match_threshold = 0.4
         self._violation_history_limit = 30

@@ -35,7 +35,7 @@ class VehicleRegistry(
     PENDING_ANPR_EXPIRY_SECONDS = 30
     CANDIDATE_EXPIRY_SECONDS = 30
     TRACK_MAPPING_EXPIRY_SECONDS = 8
-    SESSION_HANDOFF_GUARD_SECONDS = 2
+    SESSION_HANDOFF_GUARD_SECONDS = 10
     _GC_INTERVAL_SECONDS = 5
 
     def __init__(self, image_dir: str = "vehicle_images"):
