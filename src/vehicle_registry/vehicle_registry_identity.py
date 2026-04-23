@@ -669,7 +669,15 @@ class VehicleRegistryIdentityMixin:
                 ),
                 default=0.0,
             )
-            effective_threshold = 0.52 if session.plate else similarity_threshold
+            effective_threshold = similarity_threshold
+            if session.plate:
+                effective_threshold = 0.46
+                if (
+                    session.last_seen_camera
+                    and camera_id
+                    and session.last_seen_camera != camera_id
+                ):
+                    effective_threshold = 0.43
             if score >= effective_threshold and score > best_score:
                 best_score = score
                 best_sid = session.session_id
@@ -794,7 +802,14 @@ class VehicleRegistryIdentityMixin:
                 ),
                 default=0.0,
             )
-            if score >= similarity_threshold and score > best_score:
+            effective_threshold = similarity_threshold
+            if (
+                session.last_seen_camera
+                and camera_id
+                and session.last_seen_camera != camera_id
+            ):
+                effective_threshold = min(similarity_threshold, 0.43)
+            if score >= effective_threshold and score > best_score:
                 best_score = score
                 best_sid = session.session_id
 

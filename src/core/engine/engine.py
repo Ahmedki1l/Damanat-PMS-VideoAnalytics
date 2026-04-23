@@ -72,6 +72,8 @@ class ParkingEngine(
         self._start_time = 0.0
         self._reid_check_timer: Dict[tuple, float] = {}
         self._tracking_managers: Dict[str, object] = {}
+        self._display_label_cache: Dict[tuple, Dict[str, object]] = {}
+        self._display_label_ttl_seconds = 3.0
 
         # Legacy single-camera cooldown state.
         self._last_violation_alert_time = 0.0
