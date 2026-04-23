@@ -11,6 +11,7 @@ import threading
 from datetime import datetime
 from typing import Dict, List, Tuple
 
+from src.config import ReIDPreprocessingConfig
 from src.vehicle_registry.vehicle_registry_core import VehicleRegistryCoreMixin
 from src.vehicle_registry.vehicle_registry_identity import VehicleRegistryIdentityMixin
 from src.vehicle_registry.vehicle_registry_models import (
@@ -38,7 +39,11 @@ class VehicleRegistry(
     SESSION_HANDOFF_GUARD_SECONDS = 10
     _GC_INTERVAL_SECONDS = 5
 
-    def __init__(self, image_dir: str = "vehicle_images"):
+    def __init__(
+        self,
+        image_dir: str = "vehicle_images",
+        reid_preprocessing_config: ReIDPreprocessingConfig = None,
+    ):
         self._lock = threading.RLock()
         self._matcher_lock = threading.Lock()
 
@@ -54,6 +59,9 @@ class VehicleRegistry(
         self._matcher = None
         self._reid_matcher = None
         self._image_dir = image_dir
+        self._reid_preprocessing_config = (
+            reid_preprocessing_config or ReIDPreprocessingConfig()
+        )
         os.makedirs(image_dir, exist_ok=True)
 
         self._gc_thread = threading.Thread(

@@ -18,8 +18,9 @@ import torch
 import numpy as np
 from ultralytics import YOLO
 
-from src.config import DetectorConfig, TrackerConfig
+from src.config import DetectorConfig, TrackerConfig, DetectorPreprocessingConfig
 from src.detection.detector import Detection
+from src.preprocessing import luminance_normalize, auto_gamma
 
 
 class TrackedDetector:
@@ -30,14 +31,21 @@ class TrackedDetector:
     maintains state across consecutive frames.
     """
 
-    def __init__(self, detector_config: DetectorConfig, tracker_config: TrackerConfig):
+    def __init__(
+        self,
+        detector_config: DetectorConfig,
+        tracker_config: TrackerConfig,
+        preprocessing_config: DetectorPreprocessingConfig = None,
+    ):
         """
         Args:
             detector_config: Model path, confidence, classes, imgsz.
             tracker_config: Tracker type (bytetrack or botsort).
+            preprocessing_config: Optional luminance normalization settings.
         """
         self.detector_config = detector_config
         self.tracker_config = tracker_config
+        self.preprocessing_config = preprocessing_config or DetectorPreprocessingConfig()
 
         print(f"[INFO] Loading YOLO model from '{detector_config.model_path}'...")
         self.model = YOLO(detector_config.model_path, task="detect")
@@ -48,7 +56,31 @@ class TrackedDetector:
         else:
             self.device = detector_config.device
 
-        print(f"[INFO] Model loaded. Tracker: {tracker_config.type} | Device: {self.device}")
+        pp_status = "ON" if self.preprocessing_config.enabled else "OFF"
+        print(f"[INFO] Model loaded. Tracker: {tracker_config.type} | Device: {self.device} | Preprocessing: {pp_status}")
+
+    def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply luminance-safe preprocessing if enabled.
+
+        Only modifies the L channel in LAB space — hue and saturation
+        are preserved so downstream color matching stays stable.
+        """
+        pp = self.preprocessing_config
+        if not pp.enabled:
+            return frame
+
+        # Optional gamma correction for dark frames
+        gamma = None
+        if pp.gamma_correction:
+            gamma = auto_gamma(frame, dark_threshold=pp.dark_threshold)
+
+        return luminance_normalize(
+            frame,
+            clip_limit=pp.clip_limit,
+            grid_size=pp.grid_size,
+            gamma=gamma,
+        )
 
     def detect_and_track(self, frame: np.ndarray) -> List[Detection]:
         """
@@ -63,11 +95,14 @@ class TrackedDetector:
         Returns:
             List of Detection objects with stable track_id values.
         """
+        # Preprocess for better detection in hard lighting
+        inference_frame = self._preprocess_frame(frame)
+
         # Build tracker config filename — Ultralytics expects e.g. "bytetrack.yaml"
         tracker_cfg = f"{self.tracker_config.type}.yaml"
 
         results = self.model.track(
-            frame,
+            inference_frame,
             conf=self.detector_config.confidence,
             classes=self.detector_config.classes,
             imgsz=self.detector_config.imgsz,

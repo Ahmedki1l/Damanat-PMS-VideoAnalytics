@@ -27,6 +27,8 @@ from src.models.slot import load_slots
 logger = logging.getLogger(__name__)
 
 
+
+
 class ParkingEngine(
     ParkingEngineRuntimeMixin,
     ParkingEngineTrackingMixin,
@@ -47,6 +49,7 @@ class ParkingEngine(
         self.detector = TrackedDetector(
             detector_config=config.detector,
             tracker_config=config.tracker,
+            preprocessing_config=config.preprocessing.detector,
         )
         self.event_bus = EventBus(log_file=config.output.log_file)
 

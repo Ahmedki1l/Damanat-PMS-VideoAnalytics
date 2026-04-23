@@ -62,6 +62,31 @@ class AssignerConfig:
 
 
 @dataclass
+class DetectorPreprocessingConfig:
+    """Luminance normalization settings for the detector path."""
+    enabled: bool = True
+    clip_limit: float = 2.0
+    grid_size: tuple = (8, 8)
+    gamma_correction: bool = True
+    dark_threshold: int = 65
+
+
+@dataclass
+class ReIDPreprocessingConfig:
+    """Luminance normalization settings for the ReID path."""
+    enabled: bool = True
+    clip_limit: float = 2.0
+    grid_size: tuple = (8, 8)
+
+
+@dataclass
+class PreprocessingConfig:
+    """Preprocessing settings for both detector and ReID."""
+    detector: DetectorPreprocessingConfig = field(default_factory=DetectorPreprocessingConfig)
+    reid: ReIDPreprocessingConfig = field(default_factory=ReIDPreprocessingConfig)
+
+
+@dataclass
 class OutputConfig:
     """Output/logging settings."""
     log_file: str = ""
@@ -84,6 +109,7 @@ class AppConfig:
     assigner: AssignerConfig = field(default_factory=AssignerConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
 
     # Legacy single-camera support
     video_source: str = ""
@@ -182,6 +208,38 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.assigner.overlap_threshold = raw["assigner"].get(
             "overlap_threshold", config.assigner.overlap_threshold
         )
+
+    # --- Preprocessing ---
+    if "preprocessing" in raw:
+        pp = raw["preprocessing"]
+        if "detector" in pp:
+            d_pp = pp["detector"]
+            config.preprocessing.detector.enabled = d_pp.get(
+                "enabled", config.preprocessing.detector.enabled
+            )
+            config.preprocessing.detector.clip_limit = d_pp.get(
+                "clip_limit", config.preprocessing.detector.clip_limit
+            )
+            gs = d_pp.get("grid_size", None)
+            if gs is not None:
+                config.preprocessing.detector.grid_size = tuple(gs)
+            config.preprocessing.detector.gamma_correction = d_pp.get(
+                "gamma_correction", config.preprocessing.detector.gamma_correction
+            )
+            config.preprocessing.detector.dark_threshold = d_pp.get(
+                "dark_threshold", config.preprocessing.detector.dark_threshold
+            )
+        if "reid" in pp:
+            r_pp = pp["reid"]
+            config.preprocessing.reid.enabled = r_pp.get(
+                "enabled", config.preprocessing.reid.enabled
+            )
+            config.preprocessing.reid.clip_limit = r_pp.get(
+                "clip_limit", config.preprocessing.reid.clip_limit
+            )
+            gs = r_pp.get("grid_size", None)
+            if gs is not None:
+                config.preprocessing.reid.grid_size = tuple(gs)
 
     # --- Output ---
     if "output" in raw:
