@@ -641,6 +641,11 @@ class VehicleRegistryIdentityMixin:
                         track_id is None
                         or (session.last_seen_camera, session.last_seen_track_id)
                         == (camera_id, track_id)
+                        or (
+                            session.plate
+                            and session.last_seen_camera
+                            and session.last_seen_camera != camera_id
+                        )
                         or (now - session.last_seen_at).total_seconds()
                         >= self.SESSION_HANDOFF_GUARD_SECONDS
                     )
@@ -765,6 +770,10 @@ class VehicleRegistryIdentityMixin:
                     and (
                         (session.last_seen_camera, session.last_seen_track_id)
                         == (camera_id, track_id)
+                        or (
+                            session.last_seen_camera
+                            and session.last_seen_camera != camera_id
+                        )
                         or (datetime.now() - session.last_seen_at).total_seconds()
                         >= self.SESSION_HANDOFF_GUARD_SECONDS
                     )

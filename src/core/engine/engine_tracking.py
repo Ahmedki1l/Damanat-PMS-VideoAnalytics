@@ -169,6 +169,26 @@ class ParkingEngineTrackingMixin:
         overlap_ratio = float(intersection.area) / max(1.0, float(detection_box.area))
         return overlap_ratio >= min_overlap_ratio
 
+    def _zone_overlap_ratio(
+        self,
+        detection,
+        zone_slot: ParkingSlot,
+    ) -> float:
+        """Measure how much of the YOLO bbox overlaps the confirmation zone."""
+        x1, y1, x2, y2 = [float(v) for v in detection.bbox]
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        detection_box = box(x1, y1, x2, y2)
+        if detection_box.is_empty:
+            return 0.0
+
+        intersection = detection_box.intersection(zone_slot.polygon)
+        if intersection.is_empty:
+            return 0.0
+
+        return float(intersection.area) / max(1.0, float(detection_box.area))
+
     def _zone_depth_score(self, detection, zone_slot: ParkingSlot) -> float:
         """Measure how deep the detection is inside a zone."""
         bc_x, bc_y = detection.bottom_center
@@ -434,6 +454,49 @@ class ParkingEngineTrackingMixin:
         area = max(0.0, (x2 - x1) * (y2 - y1))
         return visibility >= min_visibility and area >= min_area
 
+    def _select_primary_zone_detection(
+        self,
+        frame: np.ndarray,
+        detections: List,
+        zone: ParkingSlot,
+    ):
+        """
+        Pick the single best entrance car for this frame and ignore nearby cars.
+        """
+        candidates = []
+        for detection in detections:
+            if detection.track_id == -1:
+                continue
+
+            overlap_ratio = self._zone_overlap_ratio(detection, zone)
+            in_zone = (
+                self._detection_in_zone(detection, zone)
+                or overlap_ratio >= 0.12
+            )
+            if not in_zone:
+                continue
+            if not self._bbox_is_snapshot_ready(frame, detection):
+                continue
+
+            depth = self._zone_depth_score(detection, zone)
+            x1, y1, x2, y2 = [float(v) for v in detection.bbox]
+            area = max(0.0, (x2 - x1) * (y2 - y1))
+            _, bc_y = detection.bottom_center
+
+            score = (
+                overlap_ratio * 100000.0
+                + depth * 1000.0
+                + area * 0.25
+                + float(bc_y)
+            )
+            candidates.append((score, detection))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
     def _process_park_entry_zone(
         self,
         cam_id: str,
@@ -492,9 +555,13 @@ class ParkingEngineTrackingMixin:
         """
         currently_inside = set()
         last_track_ids = self._tracks_inside_zones.get((cam_id, zone.id), set())
+        primary_detection = self._select_primary_zone_detection(frame, detections, zone)
 
         for detection in detections:
             if detection.track_id == -1:
+                continue
+
+            if primary_detection is not None and detection.track_id != primary_detection.track_id:
                 continue
 
             in_confirmation_zone = (
@@ -509,9 +576,6 @@ class ParkingEngineTrackingMixin:
                     continue
 
                 burst_key = (cam_id, detection.track_id)
-                if not self._bbox_is_snapshot_ready(frame, detection):
-                    continue
-
                 crop = self._crop_detection(
                     frame,
                     detection,
