@@ -183,7 +183,7 @@ class VehicleRegistryCoreMixin:
                     if existing.status not in ("pending", "provisional"):
                         continue
                     age = (now - existing.timestamp).total_seconds()
-                    if age <= 10.0:
+                    if age <= 600.0:
                         logger.info(
                             "[ANPR] Duplicate entry ignored for plate=%s (age=%.1fs, status=%s)",
                             plate,
