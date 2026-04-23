@@ -40,6 +40,17 @@ class FakeImageMatcher:
 
 
 class TestMultishotRegistry(unittest.TestCase):
+    def test_duplicate_entry_within_short_window_is_deduped(self):
+        registry = self._make_registry()
+        now = datetime.now()
+
+        first = registry.register_anpr_event("DUP-001", "entry", timestamp=now)
+        second = registry.register_anpr_event("DUP-001", "entry", timestamp=now)
+
+        self.assertEqual(first.event_id, second.event_id)
+        self.assertEqual(len(registry._pending_event_order), 1)
+        self.assertEqual(len(registry.get_pending_entries()), 1)
+
     def test_single_snapshot_behavior_preserved_when_flag_off(self):
         registry = self._make_registry()
         candidate = registry.open_park_entry_candidate("CAM_01", 7)

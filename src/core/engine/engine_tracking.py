@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from shapely.geometry import Point
+from shapely.geometry import Point, box
 
 from src.models.slot import ParkingSlot
 
@@ -146,6 +146,28 @@ class ParkingEngineTrackingMixin:
         """Check if a detection's bottom-center is inside a zone polygon."""
         bc_x, bc_y = detection.bottom_center
         return zone_slot.polygon.contains(Point(bc_x, bc_y))
+
+    def _detection_overlaps_zone(
+        self,
+        detection,
+        zone_slot: ParkingSlot,
+        min_overlap_ratio: float = 0.12,
+    ) -> bool:
+        """Accept fast-moving cars when enough of the bbox overlaps the zone."""
+        x1, y1, x2, y2 = [float(v) for v in detection.bbox]
+        if x2 <= x1 or y2 <= y1:
+            return False
+
+        detection_box = box(x1, y1, x2, y2)
+        if detection_box.is_empty:
+            return False
+
+        intersection = detection_box.intersection(zone_slot.polygon)
+        if intersection.is_empty:
+            return False
+
+        overlap_ratio = float(intersection.area) / max(1.0, float(detection_box.area))
+        return overlap_ratio >= min_overlap_ratio
 
     def _zone_depth_score(self, detection, zone_slot: ParkingSlot) -> float:
         """Measure how deep the detection is inside a zone."""
@@ -321,6 +343,55 @@ class ParkingEngineTrackingMixin:
         crop = frame[y1:y2, x1:x2]
         return crop if crop.size > 0 else None
 
+    def _crop_detection_to_zone(
+        self,
+        frame: np.ndarray,
+        detection,
+        zone: ParkingSlot,
+        padding_ratio: float = 0.0,
+        mask_outside_zone: bool = True,
+    ) -> Optional[np.ndarray]:
+        """Crop only the overlapping detection area inside the configured zone."""
+        if frame is None or frame.size == 0 or zone is None:
+            return None
+
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in detection.bbox]
+        if padding_ratio > 0.0:
+            pad_x = max(0, int((x2 - x1) * padding_ratio))
+            pad_y = max(0, int((y2 - y1) * padding_ratio))
+            x1 -= pad_x
+            y1 -= pad_y
+            x2 += pad_x
+            y2 += pad_y
+
+        minx, miny, maxx, maxy = zone.polygon.bounds
+        zx1, zy1 = max(0, int(minx)), max(0, int(miny))
+        zx2, zy2 = min(w, int(maxx)), min(h, int(maxy))
+
+        x1 = max(0, max(x1, zx1))
+        y1 = max(0, max(y1, zy1))
+        x2 = min(w, min(x2, zx2))
+        y2 = min(h, min(y2, zy2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2].copy()
+        if crop.size == 0 or not mask_outside_zone:
+            return crop if crop.size > 0 else None
+
+        polygon_points = np.array(
+            [[int(px) - x1, int(py) - y1] for px, py in zone.polygon.exterior.coords[:-1]],
+            dtype=np.int32,
+        )
+        if polygon_points.size == 0:
+            return crop
+
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon_points], 255)
+        masked_crop = cv2.bitwise_and(crop, crop, mask=mask)
+        return masked_crop if masked_crop.size > 0 else None
+
     def _visibility_score(self, frame: np.ndarray, detection) -> float:
         """Higher score when the full vehicle box is comfortably inside the frame."""
         h, w = frame.shape[:2]
@@ -344,6 +415,24 @@ class ParkingEngineTrackingMixin:
         sharpness_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         sharpness_factor = min(sharpness_score, 250.0) / 250.0
         return area_score * (1.0 + 0.5 * sharpness_factor)
+
+    def _bbox_is_snapshot_ready(
+        self,
+        frame: np.ndarray,
+        detection,
+        min_visibility: float = 0.035,
+        min_area: float = 14000.0,
+    ) -> bool:
+        """
+        Wait until the YOLO bbox is reasonably formed before taking the snapshot.
+        """
+        if frame is None or detection is None:
+            return False
+
+        visibility = self._visibility_score(frame, detection)
+        x1, y1, x2, y2 = [float(v) for v in detection.bbox]
+        area = max(0.0, (x2 - x1) * (y2 - y1))
+        return visibility >= min_visibility and area >= min_area
 
     def _process_park_entry_zone(
         self,
@@ -408,14 +497,26 @@ class ParkingEngineTrackingMixin:
             if detection.track_id == -1:
                 continue
 
-            if self._detection_in_zone(detection, zone):
+            in_confirmation_zone = (
+                self._detection_in_zone(detection, zone)
+                or self._detection_overlaps_zone(detection, zone, min_overlap_ratio=0.12)
+            )
+            if in_confirmation_zone:
                 currently_inside.add(detection.track_id)
+                entered_now = detection.track_id not in last_track_ids
 
                 if self.vehicle_registry.get_plate_for_track(cam_id, detection.track_id):
                     continue
 
                 burst_key = (cam_id, detection.track_id)
-                crop = self._crop_detection(frame, detection, padding_ratio=0.24)
+                if not self._bbox_is_snapshot_ready(frame, detection):
+                    continue
+
+                crop = self._crop_detection(
+                    frame,
+                    detection,
+                    padding_ratio=0.12,
+                )
                 if crop is None:
                     continue
 
@@ -526,11 +627,17 @@ class ParkingEngineTrackingMixin:
                     }
 
                 should_try_early_confirm = (
-                    not burst.get("confirmed", False)
-                    and burst["frames_collected"] >= 2
-                    and (
-                        burst.get("best_depth", 0.0) >= 4.0
-                        or burst.get("entry_visibility", 0.0) >= 0.08
+                    (
+                        entered_now
+                        and not burst.get("confirmed", False)
+                    )
+                    or (
+                        not burst.get("confirmed", False)
+                        and burst["frames_collected"] >= 2
+                        and (
+                            burst.get("best_depth", 0.0) >= 4.0
+                            or burst.get("entry_visibility", 0.0) >= 0.08
+                        )
                     )
                 )
                 if should_try_early_confirm:

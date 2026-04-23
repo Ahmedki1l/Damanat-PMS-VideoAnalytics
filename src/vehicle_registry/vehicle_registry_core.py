@@ -174,6 +174,24 @@ class VehicleRegistryCoreMixin:
 
         if direction == "entry":
             with self._lock:
+                for event_id in reversed(self._pending_event_order):
+                    existing = self._pending_events.get(event_id)
+                    if not existing:
+                        continue
+                    if existing.direction != "entry" or existing.plate != plate:
+                        continue
+                    if existing.status not in ("pending", "provisional"):
+                        continue
+                    age = (now - existing.timestamp).total_seconds()
+                    if age <= 10.0:
+                        logger.info(
+                            "[ANPR] Duplicate entry ignored for plate=%s (age=%.1fs, status=%s)",
+                            plate,
+                            age,
+                            existing.status,
+                        )
+                        return existing
+
                 self._pending_events[event.event_id] = event
                 self._pending_event_order.append(event.event_id)
                 logger.info("[ANPR] Entry: plate=%s", plate)
@@ -362,8 +380,10 @@ class VehicleRegistryCoreMixin:
             candidate.last_seen_at = now
             existing_images = [img for img in candidate.snapshot_images if img is not None and img.size > 0]
             candidate_images = existing_images + [image.copy()]
+            camera_id = candidate.camera_id
 
-        selected_images = select_best_frames(candidate_images, top_k=3)
+        top_k = 3 if camera_id == "CAM_03" else 1
+        selected_images = select_best_frames(candidate_images, top_k=top_k)
         if not selected_images:
             return None
 

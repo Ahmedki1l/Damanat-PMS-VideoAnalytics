@@ -159,14 +159,62 @@ def create_app(
         plate: str,
         direction: str,
         camera_id: Optional[str] = None,
+        image_bytes: Optional[bytes] = None,
     ) -> bool:
-        if get_park_entry_crop is not None and direction == "entry":
+        if direction != "entry":
+            return False
+
+        if image_bytes:
             import cv2
-            candidate_camera_ids = []
-            if camera_id:
-                candidate_camera_ids.append(camera_id)
-            if "CAM_01" not in candidate_camera_ids:
-                candidate_camera_ids.append("CAM_01")
+            import numpy as np
+            import time
+
+            frame = cv2.imdecode(
+                np.frombuffer(image_bytes, dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            if frame is not None and frame.size > 0:
+                fake_track_id = -int(time.time() * 1000) % 100000
+                candidate = registry.open_park_entry_candidate(
+                    camera_id or "ANPR",
+                    fake_track_id,
+                )
+                registry.update_park_entry_candidate_snapshot(
+                    candidate.candidate_id,
+                    frame,
+                    quality_score=999.0,
+                )
+                transient_snapshot_path = None
+                with registry._lock:
+                    live_candidate = registry._park_entry_candidates.get(candidate.candidate_id)
+                    if live_candidate is not None:
+                        transient_snapshot_path = live_candidate.snapshot_path
+                        live_candidate.snapshot_path = None
+                        live_candidate.snapshot_paths.clear()
+
+                if transient_snapshot_path and os.path.exists(transient_snapshot_path):
+                    try:
+                        os.remove(transient_snapshot_path)
+                    except OSError:
+                        pass
+
+                bound_plate = registry.bind_next_pending_anpr_to_candidate(
+                    candidate.candidate_id
+                )
+                if bound_plate:
+                    print(
+                        f"[API] Instant candidate created & bound from "
+                        f"ANPR image for plate {plate}"
+                    )
+                    return True
+                print(
+                    f"[API] Candidate created from ANPR image but binding failed "
+                    f"for plate {plate}"
+                )
+
+        if get_park_entry_crop is not None:
+            import cv2
+            candidate_camera_ids = ["CAM_03"]
 
             for snapshot_camera_id in candidate_camera_ids:
                 success, crop = get_park_entry_crop(snapshot_camera_id)
@@ -186,14 +234,20 @@ def create_app(
                 registry.update_park_entry_candidate_snapshot(
                     candidate.candidate_id, crop, quality_score=999.0
                 )
-                
-                # 3. Bind this candidate instantly to the ANPR entry that was just created
-                registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id)
-                print(
-                    f"[API] Instant candidate created & bound from "
-                    f"{snapshot_camera_id} for plate {plate}"
+
+                bound_plate = registry.bind_next_pending_anpr_to_candidate(
+                    candidate.candidate_id
                 )
-                return True
+                if bound_plate:
+                    print(
+                        f"[API] Instant candidate created & bound from "
+                        f"{snapshot_camera_id} for plate {plate}"
+                    )
+                    return True
+                print(
+                    f"[API] Candidate created from {snapshot_camera_id} crop but "
+                    f"binding failed for plate {plate}"
+                )
         return False
     # ── SSE Endpoints ───────────────────────────────────────
 
@@ -356,6 +410,7 @@ def create_app(
             record.plate,
             record.direction,
             camera_id=event.camera_id,
+            image_bytes=image_bytes,
         )
 
         return ANPREventResponse(
@@ -399,6 +454,7 @@ def create_app(
         image_saved = _capture_instant_snapshot(
             record.plate,
             record.direction,
+            image_bytes=image_bytes,
         )
 
         return ANPREventResponse(

@@ -6,7 +6,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from src.vehicle_registry.vehicle_registry_models import VehicleSession
+from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
 
 logger = logging.getLogger(__name__)
 REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
@@ -37,6 +37,77 @@ class VehicleRegistryIdentityMixin:
         if candidate.snapshot_path:
             return [candidate.snapshot_path]
         return []
+
+    def _bootstrap_b1_candidate_from_pending_entry(
+        self,
+        image: np.ndarray,
+        now: datetime,
+        feature_vector: Optional[np.ndarray] = None,
+    ) -> Optional[ParkEntryCandidate]:
+        """
+        If B1 sees the car before any Park_Entry candidate exists, create a
+        provisional candidate from the single pending ANPR entry.
+        """
+        if image is None or image.size == 0:
+            return None
+
+        with self._lock:
+            pending_events = []
+            for event_id in self._pending_event_order:
+                event = self._pending_events.get(event_id)
+                if not event or event.direction != "entry" or event.status != "pending":
+                    continue
+                age = (now - event.timestamp).total_seconds()
+                if age <= self.PENDING_ANPR_EXPIRY_SECONDS:
+                    pending_events.append(event)
+                else:
+                    event.status = "expired"
+
+            if len(pending_events) != 1:
+                return None
+
+            event = pending_events[0]
+
+        snapshot_path = self._write_snapshot_file(
+            f"b1_bootstrap_{uuid.uuid4().hex[:12]}",
+            image,
+            timestamp=now,
+        )
+
+        if feature_vector is None:
+            feature_vector = self.reid_matcher.extract_feature(image)
+
+        candidate = ParkEntryCandidate(
+            candidate_id=f"cand_{uuid.uuid4().hex[:12]}",
+            camera_id="CAM_03",
+            track_id=-1,
+            entered_at=event.timestamp,
+            last_seen_at=now,
+            snapshot_path=snapshot_path,
+            snapshot_image=image.copy(),
+            feature_vector=feature_vector,
+            quality_score=999.0,
+            snapshot_paths=[snapshot_path] if snapshot_path else [],
+            feature_vectors=[feature_vector] if feature_vector is not None else [],
+            status="provisional",
+            bound_event_id=event.event_id,
+        )
+
+        with self._lock:
+            live_event = self._pending_events.get(event.event_id)
+            if live_event is None or live_event.status != "pending":
+                return None
+
+            live_event.status = "provisional"
+            live_event.candidate_id = candidate.candidate_id
+            self._park_entry_candidates[candidate.candidate_id] = candidate
+
+        logger.info(
+            "[B1] Bootstrapped provisional candidate %s from pending ANPR plate=%s",
+            candidate.candidate_id,
+            event.plate,
+        )
+        return candidate
 
     def _persist_session_gallery(
         self,
@@ -174,6 +245,15 @@ class VehicleRegistryIdentityMixin:
             if session_reference_features
             else None
         )
+
+        if not provisional_pairs:
+            bootstrapped_candidate = self._bootstrap_b1_candidate_from_pending_entry(
+                image=image,
+                now=now,
+                feature_vector=current_reid_feat,
+            )
+            if bootstrapped_candidate is not None:
+                provisional_pairs = [(now, bootstrapped_candidate)]
 
         query_hsv = None
         if REID_USE_COLOR_FILTER:

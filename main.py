@@ -54,16 +54,11 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         return False, None
 
     def get_park_entry_crop(cam_id: str):
-        snapshot_cam_id = cam_id or "CAM_01"
+        snapshot_cam_id = "CAM_03"
         crop = engine.get_recent_zone_vehicle_crop(
             snapshot_cam_id,
-            zone_name_hint="Park_Entry",
+            zone_name_hint="Entrence",
         )
-        if crop is None or crop.size == 0:
-            crop = engine.get_special_zone_snapshot(
-                snapshot_cam_id,
-                zone_name_hints=("Park_Entry",),
-            )
         if crop is not None and crop.size > 0:
             return True, crop
         return False, None
