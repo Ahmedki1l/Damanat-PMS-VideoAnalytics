@@ -34,18 +34,38 @@ class VehicleRegistryCoreMixin:
         """Refresh the last-seen time for a camera-local track binding."""
         self._track_last_seen[(camera_id, track_id)] = timestamp or datetime.now()
 
-    def _drop_other_track_mappings_for_session(self, session_id: str, keep=None) -> None:
+    def _drop_other_track_mappings_for_session(
+        self,
+        session_id: str,
+        keep=None,
+        same_camera_only: bool = True,
+    ) -> None:
         """
-        Enforce a single active live-track binding for a session.
+        Clean up stale track bindings for a session.
 
-        Old camera/track keys are removed so recycled tracker IDs do not inherit
-        the same confirmed plate on unrelated cars later.
+        By default (same_camera_only=True), only removes old track IDs on the
+        SAME camera — protecting against tracker-ID recycling — while leaving
+        other cameras' bindings intact so a session can be observed by multiple
+        cameras simultaneously.
+
+        Set same_camera_only=False to revert to the old behavior (remove ALL
+        bindings except *keep*).
         """
-        keys_to_remove = [
-            key
-            for key, sid in self._track_session_map.items()
-            if sid == session_id and key != keep
-        ]
+        if keep is None:
+            keep_camera = None
+            keep_track = None
+        else:
+            keep_camera, keep_track = keep
+
+        keys_to_remove = []
+        for key, sid in self._track_session_map.items():
+            if sid != session_id or key == keep:
+                continue
+            if same_camera_only and keep_camera is not None and key[0] != keep_camera:
+                # Different camera — leave it alone
+                continue
+            keys_to_remove.append(key)
+
         for key in keys_to_remove:
             self._track_session_map.pop(key, None)
             self._track_last_seen.pop(key, None)
@@ -256,7 +276,12 @@ class VehicleRegistryCoreMixin:
             ]
             for key in stale_track_keys:
                 self._track_last_seen.pop(key, None)
-                self._track_session_map.pop(key, None)
+                session_id = self._track_session_map.pop(key, None)
+                # Also clean up the session's observing_tracks entry
+                if session_id:
+                    session = self._sessions.get(session_id)
+                    if session and key[0] in session.observing_tracks:
+                        del session.observing_tracks[key[0]]
 
             active_orders = []
             for event_id in self._pending_event_order:

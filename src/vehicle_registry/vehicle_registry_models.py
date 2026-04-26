@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -81,6 +81,10 @@ class VehicleSession:
     reference_feature_vectors: List[np.ndarray] = field(default_factory=list)
     
     gate_snapshot_paths: List[str] = field(default_factory=list)
+
+    # Maps camera_id → track_id for all cameras currently observing this car.
+    # Enables multi-camera simultaneous identity display.
+    observing_tracks: Dict[str, int] = field(default_factory=dict)
 
     new_pipeline_score: float = 0.0
     old_pipeline_score: float = 0.0

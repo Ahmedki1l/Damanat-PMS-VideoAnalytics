@@ -499,6 +499,7 @@ class VehicleRegistryIdentityMixin:
                     keep=(camera_id, track_id),
                 )
                 self._track_session_map[(camera_id, track_id)] = session.session_id
+                session.observing_tracks[camera_id] = track_id
                 self._mark_track_seen(camera_id, track_id, now)
             else:
                 session = VehicleSession(
@@ -528,6 +529,7 @@ class VehicleRegistryIdentityMixin:
                     keep=(camera_id, track_id),
                 )
                 self._track_session_map[(camera_id, track_id)] = session.session_id
+                session.observing_tracks[camera_id] = track_id
                 self._mark_track_seen(camera_id, track_id, now)
 
             event.status = "confirmed"
@@ -601,7 +603,12 @@ class VehicleRegistryIdentityMixin:
         track_id: int,
         session_id: str,
     ) -> None:
-        """Attach a confirmed session to a new camera/track."""
+        """Attach a confirmed session to a new camera/track.
+
+        Only cleans up old track IDs on the SAME camera (track-ID recycling
+        protection). Other cameras keep their own bindings so the session
+        is visible on all cameras that can see the car.
+        """
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -616,6 +623,7 @@ class VehicleRegistryIdentityMixin:
                 keep=(camera_id, track_id),
             )
             self._track_session_map[(camera_id, track_id)] = session_id
+            session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id, now)
 
     def get_plate_for_track(
@@ -688,6 +696,7 @@ class VehicleRegistryIdentityMixin:
                 keep=(camera_id, track_id),
             )
             self._track_session_map[(camera_id, track_id)] = session.session_id
+            session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id, now)
 
             logger.info(
@@ -708,9 +717,15 @@ class VehicleRegistryIdentityMixin:
     ) -> Optional[str]:
         """
         Search for an existing confirmed session that matches this query vector.
+
+        Guard: if a session is already being actively observed by a LIVE track
+        on another camera, it is excluded — the car we are looking at cannot be
+        that session because the real car is already accounted for elsewhere.
         """
         if query_vector is None:
             return None
+
+        ACTIVE_TRACK_STALENESS_SECONDS = 3.0
 
         now = datetime.now()
         with self._lock:
@@ -722,27 +737,31 @@ class VehicleRegistryIdentityMixin:
                     and session.feature_vector is not None
                     and (now - session.last_seen_at).total_seconds()
                     <= max_time_gap_seconds
-                    and (
-                        track_id is None
-                        or (session.last_seen_camera, session.last_seen_track_id)
-                        == (camera_id, track_id)
-                        or (
-                            session.plate
-                            and session.last_seen_camera
-                            and session.last_seen_camera != camera_id
-                        )
-                        or (now - session.last_seen_at).total_seconds()
-                        >= self.SESSION_HANDOFF_GUARD_SECONDS
-                    )
                 )
             ]
 
-        if not potential_sessions:
+            # Active track guard: skip sessions that have a live track on a
+            # DIFFERENT camera (the car we see can't be that one — it's already
+            # being tracked elsewhere).
+            guarded_sessions = []
+            for session in potential_sessions:
+                has_live_track_elsewhere = False
+                for obs_cam, obs_tid in session.observing_tracks.items():
+                    if obs_cam == camera_id:
+                        continue  # Same camera — could be our own track
+                    last_seen = self._track_last_seen.get((obs_cam, obs_tid))
+                    if last_seen and (now - last_seen).total_seconds() < ACTIVE_TRACK_STALENESS_SECONDS:
+                        has_live_track_elsewhere = True
+                        break
+                if not has_live_track_elsewhere:
+                    guarded_sessions.append(session)
+
+        if not guarded_sessions:
             return None
 
         best_sid = None
         best_score = -1.0
-        for session in potential_sessions:
+        for session in guarded_sessions:
             session_vectors = [session.feature_vector] + list(
                 session.reference_feature_vectors
             )
@@ -819,6 +838,8 @@ class VehicleRegistryIdentityMixin:
         self,
         session_id: str,
         smoothed_feature: np.ndarray,
+        camera_id: Optional[str] = None,
+        track_id: Optional[int] = None,
     ) -> None:
         """
         Update the stored feature vector of a session with a smoothed EMA vector.
@@ -827,11 +848,35 @@ class VehicleRegistryIdentityMixin:
             session = self._sessions.get(session_id)
             if session is not None and smoothed_feature is not None:
                 session.feature_vector = smoothed_feature
-                if session.last_seen_camera and session.last_seen_track_id is not None:
+                # Refresh the specific camera's binding if provided
+                if camera_id and track_id is not None:
+                    session.observing_tracks[camera_id] = track_id
+                    self._mark_track_seen(camera_id, track_id)
+                elif session.last_seen_camera and session.last_seen_track_id is not None:
                     self._mark_track_seen(
                         session.last_seen_camera,
                         session.last_seen_track_id,
                     )
+
+    def refresh_track_binding(
+        self,
+        camera_id: str,
+        track_id: int,
+        session_id: str,
+    ) -> None:
+        """
+        Lightweight refresh: update last_seen timestamps and observing_tracks
+        without the full reattach logic.  Used by _process_global_tracking
+        when a track already has a session.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            now = datetime.now()
+            session.last_seen_at = now
+            session.observing_tracks[camera_id] = track_id
+            self._mark_track_seen(camera_id, track_id, now)
 
     def reattach_track_to_confirmed_session(
         self,
@@ -920,6 +965,7 @@ class VehicleRegistryIdentityMixin:
                 keep=(camera_id, track_id),
             )
             self._track_session_map[(camera_id, track_id)] = best_sid
+            target_session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id)
 
             orphan_sid = current_sid
@@ -1030,22 +1076,65 @@ class VehicleRegistryIdentityMixin:
             return plate
 
     def _handle_exit(self, plate: str, timestamp: datetime) -> None:
-        """Close a parked session when ANPR sends an exit event."""
+        """
+        Close a parked session and purge all record of a plate when it exits.
+        Ensures the system 'forgets' the vehicle completely upon exit.
+        """
         with self._lock:
-            slot_to_remove = None
-            for slot_id, session in self._parked.items():
-                if session.plate == plate:
-                    slot_to_remove = slot_id
-                    break
+            # 1. Find and close any active sessions for this plate (parked or driving)
+            sessions_to_remove = [
+                s for s in self._sessions.values() if s.plate == plate
+            ]
+            
+            # Also check _parked dict specifically
+            parked_slots_to_clear = [
+                slot_id for slot_id, sess in self._parked.items() if sess.plate == plate
+            ]
+            for slot_id in parked_slots_to_clear:
+                sess = self._parked.pop(slot_id)
+                if sess not in sessions_to_remove:
+                    sessions_to_remove.append(sess)
 
-            if slot_to_remove is not None:
-                session = self._parked.pop(slot_to_remove)
+            for session in sessions_to_remove:
                 session.status = "exited"
-                self._sessions.pop(session.session_id, None)
-                self._history.append(session)
-
+                # Clean up track bindings across all cameras
+                for obs_cam, obs_tid in list(session.observing_tracks.items()):
+                    self._track_session_map.pop((obs_cam, obs_tid), None)
+                    self._track_last_seen.pop((obs_cam, obs_tid), None)
+                session.observing_tracks.clear()
+                
+                # Legacy cleanup
                 if session.last_seen_camera and session.last_seen_track_id is not None:
                     self._track_session_map.pop(
                         (session.last_seen_camera, session.last_seen_track_id),
                         None,
                     )
+                
+                self._sessions.pop(session.session_id, None)
+                self._history.append(session)
+                logger.info("[REGISTRY] Closed session %s for plate %s (Exit)", session.session_id, plate)
+
+            # 2. Purge any PENDING/PROVISIONAL ANPR events for this plate
+            # This prevents an old entry record from matching a future car
+            events_to_remove = []
+            for event_id, event in self._pending_events.items():
+                if event.plate == plate:
+                    events_to_remove.append(event_id)
+                    # If this event was bound to a candidate, kill the candidate too
+                    if event.candidate_id:
+                        candidate = self._park_entry_candidates.pop(event.candidate_id, None)
+                        if candidate:
+                            candidate.status = "dropped"
+                            self._clear_candidate_references(candidate)
+
+            for event_id in events_to_remove:
+                self._pending_events.pop(event_id, None)
+                if event_id in self._pending_event_order:
+                    try:
+                        self._pending_event_order.remove(event_id)
+                    except ValueError:
+                        pass
+            
+            if sessions_to_remove or events_to_remove:
+                logger.info("[REGISTRY] Purged %d sessions and %d events for plate %s", 
+                            len(sessions_to_remove), len(events_to_remove), plate)

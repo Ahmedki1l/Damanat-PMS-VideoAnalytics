@@ -813,12 +813,25 @@ class ParkingEngineTrackingMixin:
                 if tracking_manager:
                     smoothed = tracking_manager.get_track_feature(detection.track_id)
                     if smoothed is not None:
-                        self.vehicle_registry.update_session_feature(session_id, smoothed)
+                        self.vehicle_registry.update_session_feature(
+                            session_id,
+                            smoothed,
+                            camera_id=cam_id,
+                            track_id=detection.track_id,
+                        )
                         self.vehicle_registry.reattach_track_to_confirmed_session(
                             cam_id,
                             detection.track_id,
                             smoothed,
                         )
+                else:
+                    # No tracking manager — still refresh the binding so this
+                    # camera stays in the session's observing_tracks.
+                    self.vehicle_registry.refresh_track_binding(
+                        cam_id,
+                        detection.track_id,
+                        session_id,
+                    )
 
                 continue
 
