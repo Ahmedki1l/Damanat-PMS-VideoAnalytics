@@ -149,6 +149,49 @@ class VehicleRegistryCoreMixin:
                 paths.append(path)
         return paths
 
+    def add_session_snapshot(
+        self,
+        session_id: str,
+        image: np.ndarray,
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Append a new snapshot image to an existing session's reference gallery.
+        Also extracts and adds a new ReID feature vector to improve matching accuracy.
+        """
+        if image is None or image.size == 0:
+            return None
+
+        now = timestamp or datetime.now()
+        
+        # Extract feature vector to enrich the session's ReID profile
+        feature_vector = self.reid_matcher.extract_feature(image)
+
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+            
+            # Persist the file
+            path = self._write_snapshot_file(
+                f"extra_{session_id[-8:]}",
+                image,
+                timestamp=now,
+            )
+            
+            if path:
+                session.reference_snapshot_paths.append(path)
+                if feature_vector is not None:
+                    session.reference_feature_vectors.append(feature_vector)
+                
+                logger.info(
+                    "[REGISTRY] Added extra snapshot to session %s (total=%d)",
+                    session_id,
+                    len(session.reference_snapshot_paths),
+                )
+                return path
+        return None
+
     def register_anpr_event(
         self,
         plate: str,

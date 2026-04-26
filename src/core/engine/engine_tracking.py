@@ -819,6 +819,7 @@ class ParkingEngineTrackingMixin:
                             detection.track_id,
                             smoothed,
                         )
+
                 continue
 
             if now_ts - self._reid_check_timer.get(track_key, 0) < 1.0:

@@ -184,31 +184,46 @@ def create_app(
                     frame,
                     quality_score=999.0,
                 )
-                transient_snapshot_path = None
+
+                # Mark as ANPR-image sourced so downstream matching can prefer
+                # this candidate's feature vector over zone-crop candidates.
+                # The snapshot file on disk is kept intentionally as a durable
+                # gate reference (gate_snapshot_paths on the session).
                 with registry._lock:
                     live_candidate = registry._park_entry_candidates.get(candidate.candidate_id)
                     if live_candidate is not None:
-                        transient_snapshot_path = live_candidate.snapshot_path
-                        live_candidate.snapshot_path = None
-                        live_candidate.snapshot_paths.clear()
-
-                if transient_snapshot_path and os.path.exists(transient_snapshot_path):
-                    try:
-                        os.remove(transient_snapshot_path)
-                    except OSError:
-                        pass
+                        live_candidate.source = "anpr_image"
 
                 bound_plate = registry.bind_next_pending_anpr_to_candidate(
                     candidate.candidate_id
                 )
                 if bound_plate:
+                    # Retrieve gate snapshot paths and bound event_id from the candidate
+                    # so the direct session is wired to the same ANPR event record.
+                    _gate_paths: list = []
+                    _event_id: str = ""
+                    with registry._lock:
+                        live_cand = registry._park_entry_candidates.get(candidate.candidate_id)
+                        if live_cand is not None:
+                            _gate_paths = list(live_cand.snapshot_paths) or (
+                                [live_cand.snapshot_path] if live_cand.snapshot_path else []
+                            )
+                            _event_id = live_cand.bound_event_id or ""
+
+                    registry.confirm_anpr_session_directly(
+                        plate=bound_plate,
+                        image=frame,
+                        event_id=_event_id,
+                        candidate_id=candidate.candidate_id,
+                        gate_snapshot_paths=_gate_paths,
+                    )
                     print(
-                        f"[API] Instant candidate created & bound from "
-                        f"ANPR image for plate {plate}"
+                        f"[API] ANPR-image candidate created & bound for plate {plate} "
+                        f"(will be used as primary identity reference at B1)"
                     )
                     return True
                 print(
-                    f"[API] Candidate created from ANPR image but binding failed "
+                    f"[API] ANPR-image candidate created but binding failed "
                     f"for plate {plate}"
                 )
 

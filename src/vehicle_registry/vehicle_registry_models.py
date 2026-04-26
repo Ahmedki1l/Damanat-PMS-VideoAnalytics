@@ -44,6 +44,10 @@ class ParkEntryCandidate:
     status: str = "open"  # open, provisional, confirmed, expired, dropped
     bound_event_id: Optional[str] = None
 
+    # "anpr_image"  → candidate was seeded from the image sent by pms_ai on /api/anpr/event
+    # "zone_crop"   → candidate was created from a live Park_Entry / confirmation-zone frame
+    source: str = "zone_crop"
+
 
 @dataclass
 class VehicleSession:

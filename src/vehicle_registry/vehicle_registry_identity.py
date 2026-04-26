@@ -142,6 +142,85 @@ class VehicleRegistryIdentityMixin:
                 session.feature_vector = primary_feature
         return True
 
+    def confirm_anpr_session_directly(
+        self,
+        plate: str,
+        image: np.ndarray,
+        event_id: str,
+        candidate_id: str,
+        gate_snapshot_paths: List[str],
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Create a confirmed VehicleSession directly from an ANPR image, without
+        waiting for the car to pass through the B1_Entrence confirmation zone.
+
+        This session is immediately discoverable by match_global_session on any
+        camera, so the plate label propagates to CAM_07 (and others) as soon as
+        the ReID engine sees the parked car — even if the car bypassed CAM_03.
+
+        Returns the new session_id, or None if the feature vector could not be
+        extracted from the image.
+        """
+        now = timestamp or datetime.now()
+
+        feature_vector = self.reid_matcher.extract_feature(image)
+        if feature_vector is None:
+            logger.warning(
+                "[ANPR] Could not extract feature vector from ANPR image for plate=%s; "
+                "session will not be searchable via global ReID",
+                plate,
+            )
+            return None
+
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        session = VehicleSession(
+            session_id=session_id,
+            plate=plate,
+            feature_vector=feature_vector,
+            first_seen_at=now,
+            last_seen_at=now,
+            last_seen_camera="ANPR",
+            last_seen_track_id=None,
+            event_id=event_id,
+            candidate_id=candidate_id,
+            status="confirmed",
+            gate_snapshot_paths=gate_snapshot_paths,
+        )
+
+        # Persist the ANPR image as the primary gallery reference so it appears
+        # in reference_snapshot_paths (the UI gallery) alongside any future
+        # CAM_03 confirmation images that get added later.
+        self._persist_session_gallery(session, [image], now, primary_snapshot_index=0)
+
+        with self._lock:
+            # Guard: if a session for this plate was already confirmed (e.g. the
+            # car DID pass through B1_Entrence in a race), skip creating a duplicate.
+            for existing in self._sessions.values():
+                if (
+                    existing.plate == plate
+                    and existing.status in ("confirmed", "parked")
+                    and (now - existing.first_seen_at).total_seconds() < 120
+                ):
+                    logger.info(
+                        "[ANPR] Session for plate=%s already confirmed (%s); "
+                        "skipping duplicate ANPR direct-session",
+                        plate,
+                        existing.session_id,
+                    )
+                    return existing.session_id
+
+            self._sessions[session_id] = session
+
+        logger.info(
+            "[ANPR] Direct session %s created for plate=%s — "
+            "immediately searchable via global ReID on all cameras",
+            session_id,
+            plate,
+        )
+        return session_id
+
+
     def bind_next_pending_anpr_to_candidate(
         self,
         candidate_id: str,
@@ -309,13 +388,19 @@ class VehicleRegistryIdentityMixin:
                     )
                     for candidate_vector in candidate_vectors
                 )
+                # ANPR-image candidates were captured by the dedicated ANPR camera
+                # and are a higher-quality, purpose-built reference — prefer them
+                # with a lower acceptance threshold than opportunistic zone crops.
+                is_anpr_candidate = getattr(candidate, "source", "zone_crop") == "anpr_image"
+                match_threshold = 0.47 if is_anpr_candidate else 0.55
                 logger.debug(
-                    "[REID] Candidate %s vector similarity: %.3f (refs=%d)",
+                    "[REID] Candidate %s vector similarity: %.3f (refs=%d, source=%s, threshold=%.2f)",
                     candidate.candidate_id,
                     score,
                     len(candidate_vectors),
+                    getattr(candidate, "source", "zone_crop"),
+                    match_threshold,
                 )
-                match_threshold = 0.55
             else:
                 score = self.matcher.compare(image, snapshot)
                 logger.debug(
@@ -571,7 +656,7 @@ class VehicleRegistryIdentityMixin:
                 session = self._sessions.get(session_id)
                 if session:
                     return session.display_id
-        return f"T:{track_id}"
+        return "0"
 
     def create_appearance_session(
         self,
