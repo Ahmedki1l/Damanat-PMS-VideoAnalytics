@@ -367,26 +367,36 @@ class ParkingEngineRuntimeMixin:
         if not events:
             return
 
-        self.event_bus.emit_batch(events)
         if not self.db_manager:
+            self.event_bus.emit_batch(events)
             return
 
         session = self.db_manager.SessionLocal()
         try:
             for event in events:
-                if event.event_type in ("vehicle_parked", "slot_vacant", "vehicle_violation"):
+                if event.event_type in ("vehicle_parked", "slot_vacant", "vehicle_violation", "vehicle_intrusion"):
                     is_parked = event.event_type in (
                         "vehicle_parked",
                         "vehicle_violation",
+                        "vehicle_intrusion",
                     )
                     plate = getattr(event, "plate_number", None)
-                    log_vehicle_event(
+                    # Capture the alert_id from log_vehicle_event
+                    _, db_alert_id = log_vehicle_event(
                         session,
                         event.slot_id,
                         plate,
                         is_parked,
                         camera_id=event.camera_id,
+                        severity=event.severity
                     )
+                    # Enrich the event with the database-generated ID
+                    if db_alert_id:
+                        event.alert_id = db_alert_id
+
+            # Emit AFTER updating with database IDs
+            self.event_bus.emit_batch(events)
+
         except Exception as exc:
             session.rollback()
             print(f"[ERROR] Failed to update slot DB status: {exc}")
