@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -34,9 +34,19 @@ class ParkEntryCandidate:
     snapshot_image: Optional[np.ndarray] = None
     feature_vector: Optional[np.ndarray] = None
     quality_score: float = 0.0
+    snapshot_images: List[np.ndarray] = field(default_factory=list)
+    snapshot_paths: List[str] = field(default_factory=list)
+    feature_vectors: List[np.ndarray] = field(default_factory=list)
+
+    color_hsv: Optional[Tuple[float, float, float]] = None
+    color_hsv_values: List[Tuple[float, float, float]] = field(default_factory=list)
 
     status: str = "open"  # open, provisional, confirmed, expired, dropped
     bound_event_id: Optional[str] = None
+
+    # "anpr_image"  → candidate was seeded from the image sent by pms_ai on /api/anpr/event
+    # "zone_crop"   → candidate was created from a live Park_Entry / confirmation-zone frame
+    source: str = "zone_crop"
 
 
 @dataclass
@@ -69,6 +79,15 @@ class VehicleSession:
     snapshot_path: Optional[str] = None
     reference_snapshot_paths: List[str] = field(default_factory=list)
     reference_feature_vectors: List[np.ndarray] = field(default_factory=list)
+    
+    gate_snapshot_paths: List[str] = field(default_factory=list)
+
+    # Maps camera_id → track_id for all cameras currently observing this car.
+    # Enables multi-camera simultaneous identity display.
+    observing_tracks: Dict[str, int] = field(default_factory=dict)
+
+    new_pipeline_score: float = 0.0
+    old_pipeline_score: float = 0.0
 
     @property
     def display_id(self) -> str:

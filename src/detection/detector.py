@@ -18,7 +18,8 @@ from typing import List, Tuple
 import numpy as np
 from ultralytics import YOLO
 
-from src.config import DetectorConfig
+from src.config import DetectorConfig, DetectorPreprocessingConfig
+from src.preprocessing import luminance_normalize, auto_gamma
 
 
 @dataclass
@@ -67,17 +68,45 @@ class VehicleDetector:
     Supports .pt (PyTorch), .onnx, and OpenVINO model formats.
     """
 
-    def __init__(self, config: DetectorConfig):
+    def __init__(
+        self,
+        config: DetectorConfig,
+        preprocessing_config: DetectorPreprocessingConfig = None,
+    ):
         """
         Initialize the detector.
 
         Args:
             config: DetectorConfig with model_path, confidence, classes, imgsz.
+            preprocessing_config: Optional luminance normalization settings.
         """
         self.config = config
+        self.preprocessing_config = preprocessing_config or DetectorPreprocessingConfig()
         print(f"[INFO] Loading YOLO model from '{config.model_path}'...")
         self.model = YOLO(config.model_path)
         print(f"[INFO] Model loaded. Classes to detect: {config.classes}")
+
+    def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply luminance-safe preprocessing if enabled.
+
+        Only modifies the L channel in LAB space — hue and saturation
+        are preserved so downstream color matching stays stable.
+        """
+        pp = self.preprocessing_config
+        if not pp.enabled:
+            return frame
+
+        gamma = None
+        if pp.gamma_correction:
+            gamma = auto_gamma(frame, dark_threshold=pp.dark_threshold)
+
+        return luminance_normalize(
+            frame,
+            clip_limit=pp.clip_limit,
+            grid_size=pp.grid_size,
+            gamma=gamma,
+        )
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
         """
@@ -92,9 +121,12 @@ class VehicleDetector:
         Returns:
             List of Detection objects for vehicles found in the frame.
         """
+        # Preprocess for better detection in hard lighting
+        inference_frame = self._preprocess_frame(frame)
+
         # Run inference — verbose=False suppresses per-frame logging
         results = self.model(
-            frame,
+            inference_frame,
             conf=self.config.confidence,
             classes=self.config.classes,
             imgsz=self.config.imgsz,

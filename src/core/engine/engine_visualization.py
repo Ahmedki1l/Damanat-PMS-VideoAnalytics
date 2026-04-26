@@ -16,6 +16,32 @@ COLORS = {
 
 
 class ParkingEngineVisualizationMixin:
+    def _resolve_display_label(self, cam_id: str, track_id: int):
+        """Keep a confirmed plate label visually stable for a short time."""
+        fallback_label = track_id
+        if not self.vehicle_registry:
+            return fallback_label, False
+
+        display_id = self.vehicle_registry.get_display_id_for_track(cam_id, track_id)
+        cache_key = (cam_id, track_id)
+        now_ts = time.time()
+        cache = self._display_label_cache.get(cache_key)
+
+        is_confirmed_label = isinstance(display_id, str) and not display_id.startswith("ID-")
+        if is_confirmed_label:
+            self._display_label_cache[cache_key] = {
+                "label": display_id,
+                "expires_at": now_ts + self._display_label_ttl_seconds,
+            }
+            return display_id, True
+
+        if cache and cache.get("expires_at", 0.0) >= now_ts:
+            return cache.get("label", display_id), True
+
+        if cache_key in self._display_label_cache:
+            del self._display_label_cache[cache_key]
+        return display_id, False
+
     def _emit_full_summary(self):
         """Emit status summary across all cameras."""
         all_statuses = []
@@ -94,8 +120,9 @@ class ParkingEngineVisualizationMixin:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
 
             display_id = track_id
+            is_sticky_confirmed = False
             if self.vehicle_registry:
-                display_id = self.vehicle_registry.get_display_id_for_track(cam_id, track_id)
+                display_id, is_sticky_confirmed = self._resolve_display_label(cam_id, track_id)
 
             cv2.putText(
                 frame,
@@ -103,7 +130,7 @@ class ParkingEngineVisualizationMixin:
                 (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (255, 255, 0),
+                (0, 255, 255) if is_sticky_confirmed else (255, 255, 0),
                 2,
             )
             bc_x, bc_y = detection.bottom_center
@@ -116,8 +143,9 @@ class ParkingEngineVisualizationMixin:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
                 display_id = track_id
+                is_sticky_confirmed = False
                 if self.vehicle_registry:
-                    display_id = self.vehicle_registry.get_display_id_for_track(
+                    display_id, is_sticky_confirmed = self._resolve_display_label(
                         cam_id,
                         track_id,
                     )
@@ -128,7 +156,7 @@ class ParkingEngineVisualizationMixin:
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
-                    (0, 0, 255),
+                    (0, 255, 255) if is_sticky_confirmed else (0, 0, 255),
                     2,
                 )
                 bc_x, bc_y = detection.bottom_center

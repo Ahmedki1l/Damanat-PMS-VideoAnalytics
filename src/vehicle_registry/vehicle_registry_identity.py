@@ -1,16 +1,226 @@
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import List, Optional
 
 import numpy as np
 
-from src.vehicle_registry.vehicle_registry_models import VehicleSession
+from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
 
 logger = logging.getLogger(__name__)
+REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
+REID_USE_LAB_CLAHE = os.getenv("REID_USE_LAB_CLAHE", "false").lower() == "true"
+REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
+match_logger = logging.getLogger("reid_match_perf")
 
 
 class VehicleRegistryIdentityMixin:
+    @staticmethod
+    def _dedupe_valid_images(images: List[np.ndarray]) -> List[np.ndarray]:
+        deduped: List[np.ndarray] = []
+        for image in images:
+            if image is None or image.size == 0:
+                continue
+            if any(
+                existing.shape == image.shape and np.array_equal(existing, image)
+                for existing in deduped
+            ):
+                continue
+            deduped.append(image)
+        return deduped
+
+    @staticmethod
+    def _candidate_snapshot_paths(candidate) -> List[str]:
+        if list(candidate.snapshot_paths):
+            return list(candidate.snapshot_paths)
+        if candidate.snapshot_path:
+            return [candidate.snapshot_path]
+        return []
+
+    def _bootstrap_b1_candidate_from_pending_entry(
+        self,
+        image: np.ndarray,
+        now: datetime,
+        feature_vector: Optional[np.ndarray] = None,
+    ) -> Optional[ParkEntryCandidate]:
+        """
+        If B1 sees the car before any Park_Entry candidate exists, create a
+        provisional candidate from the single pending ANPR entry.
+        """
+        if image is None or image.size == 0:
+            return None
+
+        with self._lock:
+            pending_events = []
+            for event_id in self._pending_event_order:
+                event = self._pending_events.get(event_id)
+                if not event or event.direction != "entry" or event.status != "pending":
+                    continue
+                age = (now - event.timestamp).total_seconds()
+                if age <= self.PENDING_ANPR_EXPIRY_SECONDS:
+                    pending_events.append(event)
+                else:
+                    event.status = "expired"
+
+            if len(pending_events) != 1:
+                return None
+
+            event = pending_events[0]
+
+        snapshot_path = self._write_snapshot_file(
+            f"b1_bootstrap_{uuid.uuid4().hex[:12]}",
+            image,
+            timestamp=now,
+        )
+
+        if feature_vector is None:
+            feature_vector = self.reid_matcher.extract_feature(image)
+
+        candidate = ParkEntryCandidate(
+            candidate_id=f"cand_{uuid.uuid4().hex[:12]}",
+            camera_id="CAM_03",
+            track_id=-1,
+            entered_at=event.timestamp,
+            last_seen_at=now,
+            snapshot_path=snapshot_path,
+            snapshot_image=image.copy(),
+            feature_vector=feature_vector,
+            quality_score=999.0,
+            snapshot_paths=[snapshot_path] if snapshot_path else [],
+            feature_vectors=[feature_vector] if feature_vector is not None else [],
+            status="provisional",
+            bound_event_id=event.event_id,
+        )
+
+        with self._lock:
+            live_event = self._pending_events.get(event.event_id)
+            if live_event is None or live_event.status != "pending":
+                return None
+
+            live_event.status = "provisional"
+            live_event.candidate_id = candidate.candidate_id
+            self._park_entry_candidates[candidate.candidate_id] = candidate
+
+        logger.info(
+            "[B1] Bootstrapped provisional candidate %s from pending ANPR plate=%s",
+            candidate.candidate_id,
+            event.plate,
+        )
+        return candidate
+
+    def _persist_session_gallery(
+        self,
+        session: VehicleSession,
+        images: List[np.ndarray],
+        now: datetime,
+        primary_snapshot_index: int = 0,
+    ) -> bool:
+        ordered_images = self._dedupe_valid_images(images)
+        if not ordered_images:
+            return False
+
+        primary_snapshot_index = max(
+            0,
+            min(primary_snapshot_index, len(ordered_images) - 1),
+        )
+        feature_vectors = self.reid_matcher.extract_features_batch(ordered_images)
+        stored_paths = self._store_session_reference_snapshots(
+            ordered_images,
+            timestamp=now,
+        )
+
+        session.reference_snapshot_paths = stored_paths
+        session.reference_feature_vectors = [
+            feature for feature in feature_vectors if feature is not None
+        ]
+        if stored_paths:
+            session.snapshot_path = stored_paths[primary_snapshot_index]
+        if feature_vectors:
+            primary_feature = feature_vectors[primary_snapshot_index]
+            if primary_feature is not None:
+                session.feature_vector = primary_feature
+        return True
+
+    def confirm_anpr_session_directly(
+        self,
+        plate: str,
+        image: np.ndarray,
+        event_id: str,
+        candidate_id: str,
+        gate_snapshot_paths: List[str],
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Create a confirmed VehicleSession directly from an ANPR image, without
+        waiting for the car to pass through the B1_Entrence confirmation zone.
+
+        This session is immediately discoverable by match_global_session on any
+        camera, so the plate label propagates to CAM_07 (and others) as soon as
+        the ReID engine sees the parked car — even if the car bypassed CAM_03.
+
+        Returns the new session_id, or None if the feature vector could not be
+        extracted from the image.
+        """
+        now = timestamp or datetime.now()
+
+        feature_vector = self.reid_matcher.extract_feature(image)
+        if feature_vector is None:
+            logger.warning(
+                "[ANPR] Could not extract feature vector from ANPR image for plate=%s; "
+                "session will not be searchable via global ReID",
+                plate,
+            )
+            return None
+
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        session = VehicleSession(
+            session_id=session_id,
+            plate=plate,
+            feature_vector=feature_vector,
+            first_seen_at=now,
+            last_seen_at=now,
+            last_seen_camera="ANPR",
+            last_seen_track_id=None,
+            event_id=event_id,
+            candidate_id=candidate_id,
+            status="confirmed",
+            gate_snapshot_paths=gate_snapshot_paths,
+        )
+
+        # Persist the ANPR image as the primary gallery reference so it appears
+        # in reference_snapshot_paths (the UI gallery) alongside any future
+        # CAM_03 confirmation images that get added later.
+        self._persist_session_gallery(session, [image], now, primary_snapshot_index=0)
+
+        with self._lock:
+            # Guard: if a session for this plate was already confirmed (e.g. the
+            # car DID pass through B1_Entrence in a race), skip creating a duplicate.
+            for existing in self._sessions.values():
+                if (
+                    existing.plate == plate
+                    and existing.status in ("confirmed", "parked")
+                    and (now - existing.first_seen_at).total_seconds() < 120
+                ):
+                    logger.info(
+                        "[ANPR] Session for plate=%s already confirmed (%s); "
+                        "skipping duplicate ANPR direct-session",
+                        plate,
+                        existing.session_id,
+                    )
+                    return existing.session_id
+
+            self._sessions[session_id] = session
+
+        logger.info(
+            "[ANPR] Direct session %s created for plate=%s — "
+            "immediately searchable via global ReID on all cameras",
+            session_id,
+            plate,
+        )
+        return session_id
+
+
     def bind_next_pending_anpr_to_candidate(
         self,
         candidate_id: str,
@@ -63,20 +273,34 @@ class VehicleRegistryIdentityMixin:
         reference_images: Optional[List[np.ndarray]] = None,
         similarity_threshold: float = 0.35,
         timestamp: Optional[datetime] = None,
+        ordered_images: Optional[List[np.ndarray]] = None,
+        primary_snapshot_index: int = 0,
     ) -> Optional[str]:
         """
         Confirm that a B1_Entrance car is the same car that was provisionally
         captured at Park_Entry.
         """
         now = timestamp or datetime.now()
-        session_reference_images = [image]
-        if reference_images:
-            for extra in reference_images:
-                if extra is None or extra.size == 0:
-                    continue
-                if extra.shape == image.shape and np.array_equal(extra, image):
-                    continue
-                session_reference_images.append(extra)
+        if ordered_images:
+            session_reference_images = self._dedupe_valid_images(ordered_images)
+        else:
+            session_reference_images = [image]
+            if reference_images:
+                for extra in reference_images:
+                    if extra is None or extra.size == 0:
+                        continue
+                    if extra.shape == image.shape and np.array_equal(extra, image):
+                        continue
+                    session_reference_images.append(extra)
+            session_reference_images = self._dedupe_valid_images(session_reference_images)
+
+        if not session_reference_images:
+            return None
+
+        primary_snapshot_index = max(
+            0,
+            min(primary_snapshot_index, len(session_reference_images) - 1),
+        )
 
         with self._lock:
             provisional_pairs = []
@@ -96,11 +320,28 @@ class VehicleRegistryIdentityMixin:
             session_reference_images
         )
         current_reid_feat = (
-            session_reference_features[0] if session_reference_features else None
+            session_reference_features[primary_snapshot_index]
+            if session_reference_features
+            else None
         )
+
+        if not provisional_pairs:
+            bootstrapped_candidate = self._bootstrap_b1_candidate_from_pending_entry(
+                image=image,
+                now=now,
+                feature_vector=current_reid_feat,
+            )
+            if bootstrapped_candidate is not None:
+                provisional_pairs = [(now, bootstrapped_candidate)]
+
+        query_hsv = None
+        if REID_USE_COLOR_FILTER:
+            from src.reid_matcher import dominant_color_hsv
+            query_hsv = dominant_color_hsv(image)
 
         best_candidate = None
         best_score = 0.0
+        hard_rejected_candidate_ids = set()
 
         for _, candidate in provisional_pairs:
             snapshot = candidate.snapshot_image
@@ -116,17 +357,50 @@ class VehicleRegistryIdentityMixin:
                 )
                 continue
 
-            if current_reid_feat is not None and candidate.feature_vector is not None:
-                score = self.reid_matcher.compute_similarity(
-                    current_reid_feat,
-                    candidate.feature_vector,
+            if REID_USE_COLOR_FILTER:
+                from src.reid_matcher import color_compatible
+                candidate_hsv_values = [hsv for hsv in list(candidate.color_hsv_values) if hsv is not None]
+                if not candidate_hsv_values and candidate.color_hsv is not None:
+                    candidate_hsv_values = [candidate.color_hsv]
+                
+                if candidate_hsv_values and not any(
+                    color_compatible(query_hsv, candidate_hsv)
+                    for candidate_hsv in candidate_hsv_values
+                ):
+                    hard_rejected_candidate_ids.add(candidate.candidate_id)
+                    logger.debug(
+                        "[REID] Candidate %s rejected by HSV color filter",
+                        candidate.candidate_id,
+                    )
+                    continue
+
+            candidate_vectors = [
+                feature for feature in list(candidate.feature_vectors) if feature is not None
+            ]
+            if not candidate_vectors and candidate.feature_vector is not None:
+                candidate_vectors = [candidate.feature_vector]
+
+            if current_reid_feat is not None and candidate_vectors:
+                score = max(
+                    self.reid_matcher.compute_similarity(
+                        current_reid_feat,
+                        candidate_vector,
+                    )
+                    for candidate_vector in candidate_vectors
                 )
+                # ANPR-image candidates were captured by the dedicated ANPR camera
+                # and are a higher-quality, purpose-built reference — prefer them
+                # with a lower acceptance threshold than opportunistic zone crops.
+                is_anpr_candidate = getattr(candidate, "source", "zone_crop") == "anpr_image"
+                match_threshold = 0.47 if is_anpr_candidate else 0.55
                 logger.debug(
-                    "[REID] Candidate %s vector similarity: %.3f",
+                    "[REID] Candidate %s vector similarity: %.3f (refs=%d, source=%s, threshold=%.2f)",
                     candidate.candidate_id,
                     score,
+                    len(candidate_vectors),
+                    getattr(candidate, "source", "zone_crop"),
+                    match_threshold,
                 )
-                match_threshold = 0.55
             else:
                 score = self.matcher.compare(image, snapshot)
                 logger.debug(
@@ -139,10 +413,24 @@ class VehicleRegistryIdentityMixin:
             if score > best_score and score >= match_threshold:
                 best_score = score
                 best_candidate = candidate
+                
+                # Compute old score in parallel for logging (single-shot ReID)
+                if current_reid_feat is not None and candidate.feature_vector is not None:
+                    candidate.old_pipeline_score = self.reid_matcher.compute_similarity(
+                        current_reid_feat,
+                        candidate.feature_vector
+                    )
+                else:
+                    candidate.old_pipeline_score = score # fallback
 
         if best_candidate is None:
-            if len(provisional_pairs) == 1:
-                best_candidate = provisional_pairs[0][1]
+            fallback_pairs = [
+                pair
+                for pair in provisional_pairs
+                if pair[1].candidate_id not in hard_rejected_candidate_ids
+            ]
+            if len(fallback_pairs) == 1:
+                best_candidate = fallback_pairs[0][1]
                 logger.warning(
                     "[B1] Falling back to the only provisional candidate %s "
                     "for track (%s, %d); strict visual threshold was not met",
@@ -179,12 +467,6 @@ class VehicleRegistryIdentityMixin:
                 )
                 return None
 
-            stored_paths = self._store_session_reference_snapshots(
-                session_reference_images,
-                timestamp=now,
-            )
-            cam03_path = stored_paths[0] if stored_paths else None
-
             existing_sid = self._track_session_map.get((camera_id, track_id))
             session = self._sessions.get(existing_sid) if existing_sid else None
 
@@ -200,16 +482,24 @@ class VehicleRegistryIdentityMixin:
                 session.last_seen_at = now
                 session.last_seen_camera = camera_id
                 session.last_seen_track_id = track_id
-                session.snapshot_path = cam03_path
-                session.reference_snapshot_paths = stored_paths
                 if session_feature_vector is not None:
                     session.feature_vector = session_feature_vector
-                session.reference_feature_vectors = reference_feature_vectors
+                self._persist_session_gallery(
+                    session,
+                    session_reference_images,
+                    now,
+                    primary_snapshot_index=primary_snapshot_index,
+                )
+                session.new_pipeline_score = best_score
+                session.old_pipeline_score = getattr(best_candidate, "old_pipeline_score", best_score)
+                session.gate_snapshot_paths = self._candidate_snapshot_paths(live_candidate)
+                
                 self._drop_other_track_mappings_for_session(
                     session.session_id,
                     keep=(camera_id, track_id),
                 )
                 self._track_session_map[(camera_id, track_id)] = session.session_id
+                session.observing_tracks[camera_id] = track_id
                 self._mark_track_seen(camera_id, track_id, now)
             else:
                 session = VehicleSession(
@@ -223,9 +513,15 @@ class VehicleRegistryIdentityMixin:
                     event_id=event.event_id,
                     candidate_id=live_candidate.candidate_id,
                     status="confirmed",
-                    snapshot_path=cam03_path,
-                    reference_snapshot_paths=stored_paths,
-                    reference_feature_vectors=reference_feature_vectors,
+                    new_pipeline_score=best_score,
+                    old_pipeline_score=getattr(best_candidate, "old_pipeline_score", best_score),
+                    gate_snapshot_paths=self._candidate_snapshot_paths(live_candidate),
+                )
+                self._persist_session_gallery(
+                    session,
+                    session_reference_images,
+                    now,
+                    primary_snapshot_index=primary_snapshot_index,
                 )
                 self._sessions[session.session_id] = session
                 self._drop_other_track_mappings_for_session(
@@ -233,6 +529,7 @@ class VehicleRegistryIdentityMixin:
                     keep=(camera_id, track_id),
                 )
                 self._track_session_map[(camera_id, track_id)] = session.session_id
+                session.observing_tracks[camera_id] = track_id
                 self._mark_track_seen(camera_id, track_id, now)
 
             event.status = "confirmed"
@@ -253,6 +550,34 @@ class VehicleRegistryIdentityMixin:
                 best_score,
             )
             return session.plate
+
+    def update_confirmed_session_gallery(
+        self,
+        camera_id: str,
+        track_id: int,
+        ordered_images: List[np.ndarray],
+        primary_snapshot_index: int = 0,
+        timestamp: Optional[datetime] = None,
+    ) -> bool:
+        """
+        Enrich an already confirmed session with the final ordered CAM_03 gallery.
+        """
+        now = timestamp or datetime.now()
+        with self._lock:
+            session_id = self._track_session_map.get((camera_id, track_id))
+            session = self._sessions.get(session_id) if session_id else None
+            if session is None:
+                return False
+
+            session.last_seen_at = now
+            session.last_seen_camera = camera_id
+            session.last_seen_track_id = track_id
+            return self._persist_session_gallery(
+                session,
+                ordered_images,
+                now,
+                primary_snapshot_index=primary_snapshot_index,
+            )
 
     def drop_provisional_binding(self, candidate_id: str) -> None:
         """Remove a failed provisional match."""
@@ -278,7 +603,12 @@ class VehicleRegistryIdentityMixin:
         track_id: int,
         session_id: str,
     ) -> None:
-        """Attach a confirmed session to a new camera/track."""
+        """Attach a confirmed session to a new camera/track.
+
+        Only cleans up old track IDs on the SAME camera (track-ID recycling
+        protection). Other cameras keep their own bindings so the session
+        is visible on all cameras that can see the car.
+        """
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -293,6 +623,7 @@ class VehicleRegistryIdentityMixin:
                 keep=(camera_id, track_id),
             )
             self._track_session_map[(camera_id, track_id)] = session_id
+            session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id, now)
 
     def get_plate_for_track(
@@ -333,7 +664,7 @@ class VehicleRegistryIdentityMixin:
                 session = self._sessions.get(session_id)
                 if session:
                     return session.display_id
-        return f"T:{track_id}"
+        return "0"
 
     def create_appearance_session(
         self,
@@ -365,6 +696,7 @@ class VehicleRegistryIdentityMixin:
                 keep=(camera_id, track_id),
             )
             self._track_session_map[(camera_id, track_id)] = session.session_id
+            session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id, now)
 
             logger.info(
@@ -385,9 +717,15 @@ class VehicleRegistryIdentityMixin:
     ) -> Optional[str]:
         """
         Search for an existing confirmed session that matches this query vector.
+
+        Guard: if a session is already being actively observed by a LIVE track
+        on another camera, it is excluded — the car we are looking at cannot be
+        that session because the real car is already accounted for elsewhere.
         """
         if query_vector is None:
             return None
+
+        ACTIVE_TRACK_STALENESS_SECONDS = 3.0
 
         now = datetime.now()
         with self._lock:
@@ -399,22 +737,31 @@ class VehicleRegistryIdentityMixin:
                     and session.feature_vector is not None
                     and (now - session.last_seen_at).total_seconds()
                     <= max_time_gap_seconds
-                    and (
-                        track_id is None
-                        or (session.last_seen_camera, session.last_seen_track_id)
-                        == (camera_id, track_id)
-                        or (now - session.last_seen_at).total_seconds()
-                        >= self.SESSION_HANDOFF_GUARD_SECONDS
-                    )
                 )
             ]
 
-        if not potential_sessions:
+            # Active track guard: skip sessions that have a live track on a
+            # DIFFERENT camera (the car we see can't be that one — it's already
+            # being tracked elsewhere).
+            guarded_sessions = []
+            for session in potential_sessions:
+                has_live_track_elsewhere = False
+                for obs_cam, obs_tid in session.observing_tracks.items():
+                    if obs_cam == camera_id:
+                        continue  # Same camera — could be our own track
+                    last_seen = self._track_last_seen.get((obs_cam, obs_tid))
+                    if last_seen and (now - last_seen).total_seconds() < ACTIVE_TRACK_STALENESS_SECONDS:
+                        has_live_track_elsewhere = True
+                        break
+                if not has_live_track_elsewhere:
+                    guarded_sessions.append(session)
+
+        if not guarded_sessions:
             return None
 
         best_sid = None
         best_score = -1.0
-        for session in potential_sessions:
+        for session in guarded_sessions:
             session_vectors = [session.feature_vector] + list(
                 session.reference_feature_vectors
             )
@@ -426,7 +773,15 @@ class VehicleRegistryIdentityMixin:
                 ),
                 default=0.0,
             )
-            effective_threshold = 0.52 if session.plate else similarity_threshold
+            effective_threshold = similarity_threshold
+            if session.plate:
+                effective_threshold = 0.46
+                if (
+                    session.last_seen_camera
+                    and camera_id
+                    and session.last_seen_camera != camera_id
+                ):
+                    effective_threshold = 0.43
             if score >= effective_threshold and score > best_score:
                 best_score = score
                 best_sid = session.session_id
@@ -483,6 +838,8 @@ class VehicleRegistryIdentityMixin:
         self,
         session_id: str,
         smoothed_feature: np.ndarray,
+        camera_id: Optional[str] = None,
+        track_id: Optional[int] = None,
     ) -> None:
         """
         Update the stored feature vector of a session with a smoothed EMA vector.
@@ -491,11 +848,35 @@ class VehicleRegistryIdentityMixin:
             session = self._sessions.get(session_id)
             if session is not None and smoothed_feature is not None:
                 session.feature_vector = smoothed_feature
-                if session.last_seen_camera and session.last_seen_track_id is not None:
+                # Refresh the specific camera's binding if provided
+                if camera_id and track_id is not None:
+                    session.observing_tracks[camera_id] = track_id
+                    self._mark_track_seen(camera_id, track_id)
+                elif session.last_seen_camera and session.last_seen_track_id is not None:
                     self._mark_track_seen(
                         session.last_seen_camera,
                         session.last_seen_track_id,
                     )
+
+    def refresh_track_binding(
+        self,
+        camera_id: str,
+        track_id: int,
+        session_id: str,
+    ) -> None:
+        """
+        Lightweight refresh: update last_seen timestamps and observing_tracks
+        without the full reattach logic.  Used by _process_global_tracking
+        when a track already has a session.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            now = datetime.now()
+            session.last_seen_at = now
+            session.observing_tracks[camera_id] = track_id
+            self._mark_track_seen(camera_id, track_id, now)
 
     def reattach_track_to_confirmed_session(
         self,
@@ -527,6 +908,10 @@ class VehicleRegistryIdentityMixin:
                     and (
                         (session.last_seen_camera, session.last_seen_track_id)
                         == (camera_id, track_id)
+                        or (
+                            session.last_seen_camera
+                            and session.last_seen_camera != camera_id
+                        )
                         or (datetime.now() - session.last_seen_at).total_seconds()
                         >= self.SESSION_HANDOFF_GUARD_SECONDS
                     )
@@ -547,7 +932,14 @@ class VehicleRegistryIdentityMixin:
                 ),
                 default=0.0,
             )
-            if score >= similarity_threshold and score > best_score:
+            effective_threshold = similarity_threshold
+            if (
+                session.last_seen_camera
+                and camera_id
+                and session.last_seen_camera != camera_id
+            ):
+                effective_threshold = min(similarity_threshold, 0.43)
+            if score >= effective_threshold and score > best_score:
                 best_score = score
                 best_sid = session.session_id
 
@@ -573,6 +965,7 @@ class VehicleRegistryIdentityMixin:
                 keep=(camera_id, track_id),
             )
             self._track_session_map[(camera_id, track_id)] = best_sid
+            target_session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id)
 
             orphan_sid = current_sid
@@ -605,6 +998,7 @@ class VehicleRegistryIdentityMixin:
         floor: str,
         track_id: Optional[int],
         timestamp: datetime,
+        snapshot_path: Optional[str] = None,
     ) -> Optional[str]:
         """
         Link a slot only from a confirmed session.
@@ -637,6 +1031,27 @@ class VehicleRegistryIdentityMixin:
             session.linked_at = timestamp
             session.status = "parked"
             self._parked[slot_id] = session
+
+            # Detailed Match Performance Logging
+            flags = {
+                "CLAHE": REID_USE_LAB_CLAHE,
+                "MULTISHOT": REID_USE_MULTISHOT,
+                "COLOR_FILTER": REID_USE_COLOR_FILTER
+            }
+            match_logger.info(
+                "MATCH_EVENT | Plate: %s | Slot: %s | Time: %s | "
+                "NewCost: %.4f | OldCost: %.4f | Flags: %s | "
+                "GateSnapshots: %s | SlotSnapshot: %s",
+                session.plate,
+                slot_id,
+                timestamp.isoformat(),
+                session.new_pipeline_score,
+                session.old_pipeline_score,
+                flags,
+                session.gate_snapshot_paths,
+                snapshot_path or "N/A"
+            )
+
             return session.plate
 
     def unlink_slot(self, slot_id: str) -> Optional[str]:
@@ -661,22 +1076,65 @@ class VehicleRegistryIdentityMixin:
             return plate
 
     def _handle_exit(self, plate: str, timestamp: datetime) -> None:
-        """Close a parked session when ANPR sends an exit event."""
+        """
+        Close a parked session and purge all record of a plate when it exits.
+        Ensures the system 'forgets' the vehicle completely upon exit.
+        """
         with self._lock:
-            slot_to_remove = None
-            for slot_id, session in self._parked.items():
-                if session.plate == plate:
-                    slot_to_remove = slot_id
-                    break
+            # 1. Find and close any active sessions for this plate (parked or driving)
+            sessions_to_remove = [
+                s for s in self._sessions.values() if s.plate == plate
+            ]
+            
+            # Also check _parked dict specifically
+            parked_slots_to_clear = [
+                slot_id for slot_id, sess in self._parked.items() if sess.plate == plate
+            ]
+            for slot_id in parked_slots_to_clear:
+                sess = self._parked.pop(slot_id)
+                if sess not in sessions_to_remove:
+                    sessions_to_remove.append(sess)
 
-            if slot_to_remove is not None:
-                session = self._parked.pop(slot_to_remove)
+            for session in sessions_to_remove:
                 session.status = "exited"
-                self._sessions.pop(session.session_id, None)
-                self._history.append(session)
-
+                # Clean up track bindings across all cameras
+                for obs_cam, obs_tid in list(session.observing_tracks.items()):
+                    self._track_session_map.pop((obs_cam, obs_tid), None)
+                    self._track_last_seen.pop((obs_cam, obs_tid), None)
+                session.observing_tracks.clear()
+                
+                # Legacy cleanup
                 if session.last_seen_camera and session.last_seen_track_id is not None:
                     self._track_session_map.pop(
                         (session.last_seen_camera, session.last_seen_track_id),
                         None,
                     )
+                
+                self._sessions.pop(session.session_id, None)
+                self._history.append(session)
+                logger.info("[REGISTRY] Closed session %s for plate %s (Exit)", session.session_id, plate)
+
+            # 2. Purge any PENDING/PROVISIONAL ANPR events for this plate
+            # This prevents an old entry record from matching a future car
+            events_to_remove = []
+            for event_id, event in self._pending_events.items():
+                if event.plate == plate:
+                    events_to_remove.append(event_id)
+                    # If this event was bound to a candidate, kill the candidate too
+                    if event.candidate_id:
+                        candidate = self._park_entry_candidates.pop(event.candidate_id, None)
+                        if candidate:
+                            candidate.status = "dropped"
+                            self._clear_candidate_references(candidate)
+
+            for event_id in events_to_remove:
+                self._pending_events.pop(event_id, None)
+                if event_id in self._pending_event_order:
+                    try:
+                        self._pending_event_order.remove(event_id)
+                    except ValueError:
+                        pass
+            
+            if sessions_to_remove or events_to_remove:
+                logger.info("[REGISTRY] Purged %d sessions and %d events for plate %s", 
+                            len(sessions_to_remove), len(events_to_remove), plate)

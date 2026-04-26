@@ -11,6 +11,8 @@ import numpy as np
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, PendingANPREvent
 
 logger = logging.getLogger(__name__)
+REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
+REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
 
 
 class VehicleRegistryCoreMixin:
@@ -32,18 +34,38 @@ class VehicleRegistryCoreMixin:
         """Refresh the last-seen time for a camera-local track binding."""
         self._track_last_seen[(camera_id, track_id)] = timestamp or datetime.now()
 
-    def _drop_other_track_mappings_for_session(self, session_id: str, keep=None) -> None:
+    def _drop_other_track_mappings_for_session(
+        self,
+        session_id: str,
+        keep=None,
+        same_camera_only: bool = True,
+    ) -> None:
         """
-        Enforce a single active live-track binding for a session.
+        Clean up stale track bindings for a session.
 
-        Old camera/track keys are removed so recycled tracker IDs do not inherit
-        the same confirmed plate on unrelated cars later.
+        By default (same_camera_only=True), only removes old track IDs on the
+        SAME camera — protecting against tracker-ID recycling — while leaving
+        other cameras' bindings intact so a session can be observed by multiple
+        cameras simultaneously.
+
+        Set same_camera_only=False to revert to the old behavior (remove ALL
+        bindings except *keep*).
         """
-        keys_to_remove = [
-            key
-            for key, sid in self._track_session_map.items()
-            if sid == session_id and key != keep
-        ]
+        if keep is None:
+            keep_camera = None
+            keep_track = None
+        else:
+            keep_camera, keep_track = keep
+
+        keys_to_remove = []
+        for key, sid in self._track_session_map.items():
+            if sid != session_id or key == keep:
+                continue
+            if same_camera_only and keep_camera is not None and key[0] != keep_camera:
+                # Different camera — leave it alone
+                continue
+            keys_to_remove.append(key)
+
         for key in keys_to_remove:
             self._track_session_map.pop(key, None)
             self._track_last_seen.pop(key, None)
@@ -147,6 +169,49 @@ class VehicleRegistryCoreMixin:
                 paths.append(path)
         return paths
 
+    def add_session_snapshot(
+        self,
+        session_id: str,
+        image: np.ndarray,
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Append a new snapshot image to an existing session's reference gallery.
+        Also extracts and adds a new ReID feature vector to improve matching accuracy.
+        """
+        if image is None or image.size == 0:
+            return None
+
+        now = timestamp or datetime.now()
+        
+        # Extract feature vector to enrich the session's ReID profile
+        feature_vector = self.reid_matcher.extract_feature(image)
+
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+            
+            # Persist the file
+            path = self._write_snapshot_file(
+                f"extra_{session_id[-8:]}",
+                image,
+                timestamp=now,
+            )
+            
+            if path:
+                session.reference_snapshot_paths.append(path)
+                if feature_vector is not None:
+                    session.reference_feature_vectors.append(feature_vector)
+                
+                logger.info(
+                    "[REGISTRY] Added extra snapshot to session %s (total=%d)",
+                    session_id,
+                    len(session.reference_snapshot_paths),
+                )
+                return path
+        return None
+
     def register_anpr_event(
         self,
         plate: str,
@@ -172,6 +237,24 @@ class VehicleRegistryCoreMixin:
 
         if direction == "entry":
             with self._lock:
+                for event_id in reversed(self._pending_event_order):
+                    existing = self._pending_events.get(event_id)
+                    if not existing:
+                        continue
+                    if existing.direction != "entry" or existing.plate != plate:
+                        continue
+                    if existing.status not in ("pending", "provisional"):
+                        continue
+                    age = (now - existing.timestamp).total_seconds()
+                    if age <= 600.0:
+                        logger.info(
+                            "[ANPR] Duplicate entry ignored for plate=%s (age=%.1fs, status=%s)",
+                            plate,
+                            age,
+                            existing.status,
+                        )
+                        return existing
+
                 self._pending_events[event.event_id] = event
                 self._pending_event_order.append(event.event_id)
                 logger.info("[ANPR] Entry: plate=%s", plate)
@@ -193,7 +276,12 @@ class VehicleRegistryCoreMixin:
             ]
             for key in stale_track_keys:
                 self._track_last_seen.pop(key, None)
-                self._track_session_map.pop(key, None)
+                session_id = self._track_session_map.pop(key, None)
+                # Also clean up the session's observing_tracks entry
+                if session_id:
+                    session = self._sessions.get(session_id)
+                    if session and key[0] in session.observing_tracks:
+                        del session.observing_tracks[key[0]]
 
             active_orders = []
             for event_id in self._pending_event_order:
@@ -209,8 +297,7 @@ class VehicleRegistryCoreMixin:
                             if candidate is not None:
                                 candidate.status = "expired"
                                 candidate.bound_event_id = None
-                                candidate.snapshot_image = None
-                                candidate.feature_vector = None
+                                self._clear_candidate_references(candidate)
                             event.candidate_id = None
                     else:
                         active_orders.append(event_id)
@@ -231,8 +318,7 @@ class VehicleRegistryCoreMixin:
                                 event.status = "expired"
                                 event.candidate_id = None
                         candidate.bound_event_id = None
-                        candidate.snapshot_image = None
-                        candidate.feature_vector = None
+                        self._clear_candidate_references(candidate)
                         candidates_to_delete.append(candidate_id)
                 elif candidate.status in ("confirmed", "dropped", "expired"):
                     candidates_to_delete.append(candidate_id)
@@ -261,6 +347,18 @@ class VehicleRegistryCoreMixin:
 
         return candidate
 
+    @staticmethod
+    def _clear_candidate_references(candidate: ParkEntryCandidate) -> None:
+        candidate.snapshot_image = None
+        candidate.snapshot_path = None
+        candidate.feature_vector = None
+        candidate.quality_score = 0.0
+        candidate.snapshot_images.clear()
+        candidate.snapshot_paths.clear()
+        candidate.feature_vectors.clear()
+        candidate.color_hsv = None
+        candidate.color_hsv_values.clear()
+
     def update_park_entry_candidate_snapshot(
         self,
         candidate_id: str,
@@ -274,6 +372,15 @@ class VehicleRegistryCoreMixin:
         Replace only when the new snapshot is better.
         """
         now = timestamp or datetime.now()
+
+        if REID_USE_MULTISHOT:
+            return self._update_park_entry_candidate_multishot(
+                candidate_id,
+                image,
+                quality_score,
+                feature_vector=feature_vector,
+                timestamp=now,
+            )
 
         with self._lock:
             candidate = self._park_entry_candidates.get(candidate_id)
@@ -301,6 +408,13 @@ class VehicleRegistryCoreMixin:
             candidate.feature_vector = feature_vector
             filepath = self._write_snapshot_file(candidate.candidate_id, image, timestamp=now)
             candidate.snapshot_path = filepath
+            if REID_USE_COLOR_FILTER:
+                from src.reid_matcher import dominant_color_hsv
+
+                candidate.color_hsv = dominant_color_hsv(image)
+                candidate.color_hsv_values = (
+                    [candidate.color_hsv] if candidate.color_hsv is not None else []
+                )
 
             logger.debug(
                 "[PARK_ENTRY] Updated snapshot for %s (score=%.3f)",
@@ -308,3 +422,94 @@ class VehicleRegistryCoreMixin:
                 quality_score,
             )
             return filepath
+
+    def _update_park_entry_candidate_multishot(
+        self,
+        candidate_id: str,
+        image: np.ndarray,
+        quality_score: float,
+        feature_vector: Optional[np.ndarray] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Keep up to three sharp Park_Entry references for this candidate.
+        """
+        if image is None or image.size == 0:
+            return None
+
+        now = timestamp or datetime.now()
+        from src.reid_matcher import select_best_frames
+        from src.reid_matcher.reid_burst import sharpness_score
+
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if not candidate:
+                return None
+            candidate.last_seen_at = now
+            existing_images = [img for img in candidate.snapshot_images if img is not None and img.size > 0]
+            candidate_images = existing_images + [image.copy()]
+            camera_id = candidate.camera_id
+
+        top_k = 3 if camera_id == "CAM_03" else 1
+        selected_images = select_best_frames(candidate_images, top_k=top_k)
+        if not selected_images:
+            return None
+
+        if feature_vector is not None and len(selected_images) == 1 and selected_images[0] is image:
+            feature_vectors = [feature_vector]
+        else:
+            feature_vectors = self.reid_matcher.extract_features_batch(selected_images)
+
+        token = uuid.uuid4().hex[:12]
+        snapshot_paths: List[str] = []
+        for idx, selected_image in enumerate(selected_images):
+            suffix = "" if idx == 0 else f"_ref{idx + 1}"
+            path = self._write_snapshot_file(
+                f"{candidate_id}_{token}{suffix}",
+                selected_image,
+                timestamp=now,
+            )
+            if path:
+                snapshot_paths.append(path)
+
+        primary_image = selected_images[0]
+        primary_vector = feature_vectors[0] if feature_vectors else None
+        primary_path = snapshot_paths[0] if snapshot_paths else None
+        primary_quality = max(float(quality_score), float(sharpness_score(primary_image)))
+        color_hsv_values = []
+        if REID_USE_COLOR_FILTER:
+            from src.reid_matcher import dominant_color_hsv
+
+            color_hsv_values = [
+                hsv
+                for hsv in (dominant_color_hsv(img) for img in selected_images)
+                if hsv is not None
+            ]
+
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if not candidate:
+                return None
+
+            candidate.last_seen_at = now
+            candidate.snapshot_images = [img.copy() for img in selected_images]
+            candidate.snapshot_paths = snapshot_paths
+            candidate.feature_vectors = [
+                vec for vec in feature_vectors if vec is not None
+            ]
+            candidate.snapshot_image = primary_image.copy()
+            candidate.snapshot_path = primary_path
+            candidate.feature_vector = primary_vector
+            candidate.quality_score = primary_quality
+            if REID_USE_COLOR_FILTER:
+                candidate.color_hsv_values = color_hsv_values
+                candidate.color_hsv = (
+                    color_hsv_values[0] if color_hsv_values else None
+                )
+
+            logger.debug(
+                "[PARK_ENTRY] Updated multishot snapshot set for %s (refs=%d)",
+                candidate.candidate_id,
+                len(candidate.snapshot_images),
+            )
+            return primary_path

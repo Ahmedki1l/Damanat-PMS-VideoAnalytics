@@ -13,6 +13,13 @@ class VehicleRegistryQueryMixin:
             return None
         return f"/images/{os.path.basename(path)}"
 
+    def _get_snapshot_urls(self, paths: List[str]) -> List[str]:
+        return [
+            url
+            for url in (self._get_snapshot_url(path) for path in paths)
+            if url is not None
+        ]
+
     def get_plate_location(self, plate: str) -> Optional[Dict]:
         with self._lock:
             for slot_id, session in self._parked.items():
@@ -31,6 +38,12 @@ class VehicleRegistryQueryMixin:
                         else None,
                         "confirmed_at": session.first_seen_at.isoformat(),
                         "snapshot_url": self._get_snapshot_url(session.snapshot_path),
+                        "gate_snapshot_urls": self._get_snapshot_urls(
+                            session.gate_snapshot_paths,
+                        ),
+                        "gallery_snapshot_urls": self._get_snapshot_urls(
+                            session.reference_snapshot_paths,
+                        ),
                     }
             return None
 
@@ -51,6 +64,12 @@ class VehicleRegistryQueryMixin:
                     else None,
                     "confirmed_at": session.first_seen_at.isoformat(),
                     "snapshot_url": self._get_snapshot_url(session.snapshot_path),
+                    "gate_snapshot_urls": self._get_snapshot_urls(
+                        session.gate_snapshot_paths,
+                    ),
+                    "gallery_snapshot_urls": self._get_snapshot_urls(
+                        session.reference_snapshot_paths,
+                    ),
                 }
                 for slot_id, session in self._parked.items()
             ]

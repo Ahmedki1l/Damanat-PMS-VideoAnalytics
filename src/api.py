@@ -73,7 +73,7 @@ class SlotStatus(BaseModel):
 
 
 class VehicleLocation(BaseModel):
-    plate_number: str
+    plate_number: Optional[str] = None
     slot_id: str
     slot_name: Optional[str] = None
     floor: Optional[str] = None
@@ -82,6 +82,8 @@ class VehicleLocation(BaseModel):
     parked_at: Optional[str] = None
     camera_id: Optional[str] = None
     snapshot_url: Optional[str] = None
+    gate_snapshot_urls: List[str] = []
+    gallery_snapshot_urls: List[str] = []
     entry_time: Optional[str] = None
     
 class StreamEventRequest(BaseModel):
@@ -153,31 +155,114 @@ def create_app(
     # Use provided or create new registry
     registry = vehicle_registry or VehicleRegistry()
 
-    def _capture_instant_snapshot(plate: str, direction: str) -> bool:
-        if get_park_entry_crop is not None and direction == "entry":
+    def _capture_instant_snapshot(
+        plate: str,
+        direction: str,
+        camera_id: Optional[str] = None,
+        image_bytes: Optional[bytes] = None,
+    ) -> bool:
+        if direction != "entry":
+            return False
+
+        if image_bytes:
             import cv2
-            success, crop = get_park_entry_crop("CAM_01")
-            if success and crop is not None:
+            import numpy as np
+            import time
+
+            frame = cv2.imdecode(
+                np.frombuffer(image_bytes, dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            if frame is not None and frame.size > 0:
+                fake_track_id = -int(time.time() * 1000) % 100000
+                candidate = registry.open_park_entry_candidate(
+                    camera_id or "ANPR",
+                    fake_track_id,
+                )
+                registry.update_park_entry_candidate_snapshot(
+                    candidate.candidate_id,
+                    frame,
+                    quality_score=999.0,
+                )
+
+                # Mark as ANPR-image sourced so downstream matching can prefer
+                # this candidate's feature vector over zone-crop candidates.
+                # The snapshot file on disk is kept intentionally as a durable
+                # gate reference (gate_snapshot_paths on the session).
+                with registry._lock:
+                    live_candidate = registry._park_entry_candidates.get(candidate.candidate_id)
+                    if live_candidate is not None:
+                        live_candidate.source = "anpr_image"
+
+                bound_plate = registry.bind_next_pending_anpr_to_candidate(
+                    candidate.candidate_id
+                )
+                if bound_plate:
+                    # Retrieve gate snapshot paths and bound event_id from the candidate
+                    # so the direct session is wired to the same ANPR event record.
+                    _gate_paths: list = []
+                    _event_id: str = ""
+                    with registry._lock:
+                        live_cand = registry._park_entry_candidates.get(candidate.candidate_id)
+                        if live_cand is not None:
+                            _gate_paths = list(live_cand.snapshot_paths) or (
+                                [live_cand.snapshot_path] if live_cand.snapshot_path else []
+                            )
+                            _event_id = live_cand.bound_event_id or ""
+
+                    registry.confirm_anpr_session_directly(
+                        plate=bound_plate,
+                        image=frame,
+                        event_id=_event_id,
+                        candidate_id=candidate.candidate_id,
+                        gate_snapshot_paths=_gate_paths,
+                    )
+                    print(
+                        f"[API] ANPR-image candidate created & bound for plate {plate} "
+                        f"(will be used as primary identity reference at B1)"
+                    )
+                    return True
+                print(
+                    f"[API] ANPR-image candidate created but binding failed "
+                    f"for plate {plate}"
+                )
+
+        if get_park_entry_crop is not None:
+            import cv2
+            candidate_camera_ids = ["CAM_03"]
+
+            for snapshot_camera_id in candidate_camera_ids:
+                success, crop = get_park_entry_crop(snapshot_camera_id)
+                if not success or crop is None:
+                    continue
+
                 # 1. Force open an artificial candidate so it can be matched
                 # Give it an arbitrary negative ID so YOLO tracks won't conflict
                 import time
                 fake_track_id = -int(time.time() * 1000) % 100000
-                candidate = registry.open_park_entry_candidate("CAM_01", fake_track_id)
+                candidate = registry.open_park_entry_candidate(
+                    snapshot_camera_id,
+                    fake_track_id,
+                )
                 
                 # 2. Inject our cropped entry zone as the car snapshot
                 registry.update_park_entry_candidate_snapshot(
                     candidate.candidate_id, crop, quality_score=999.0
                 )
-                
-                # 3. Bind this candidate instantly to the ANPR entry that was just created
-                registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id)
-                
-                os.makedirs("vehicle_images", exist_ok=True)
-                timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-                image_path = f"vehicle_images/{plate}_CAM01_bound_{timestamp_str}.jpg"
-                cv2.imwrite(image_path, crop)
-                print(f"[API] Instant candidate created & bound from CAM_01 for plate {plate}")
-                return True
+
+                bound_plate = registry.bind_next_pending_anpr_to_candidate(
+                    candidate.candidate_id
+                )
+                if bound_plate:
+                    print(
+                        f"[API] Instant candidate created & bound from "
+                        f"{snapshot_camera_id} for plate {plate}"
+                    )
+                    return True
+                print(
+                    f"[API] Candidate created from {snapshot_camera_id} crop but "
+                    f"binding failed for plate {plate}"
+                )
         return False
     # ── SSE Endpoints ───────────────────────────────────────
 
@@ -336,7 +421,12 @@ def create_app(
 
         print(f"[API] ✓ Plate {record.plate} registered")
         
-        image_saved = _capture_instant_snapshot(record.plate, record.direction)
+        image_saved = _capture_instant_snapshot(
+            record.plate,
+            record.direction,
+            camera_id=event.camera_id,
+            image_bytes=image_bytes,
+        )
 
         return ANPREventResponse(
             status="ok",
@@ -376,7 +466,11 @@ def create_app(
 
         print(f"[API] ✓ Plate {record.plate} registered")
 
-        image_saved = _capture_instant_snapshot(record.plate, record.direction)
+        image_saved = _capture_instant_snapshot(
+            record.plate,
+            record.direction,
+            image_bytes=image_bytes,
+        )
 
         return ANPREventResponse(
             status="ok",

@@ -7,11 +7,11 @@ robust to changes in lighting, perspective, and camera quality.
 
 import logging
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
 import numpy as np
 import cv2
 from typing import Optional, List
+from src.reid_matcher.reid_preprocessing import normalize_for_reid
+from src.config import ReIDPreprocessingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +35,21 @@ class VehicleReIDMatcher:
     Similarity is computed using Cosine Similarity (dot product of normalized vectors).
     """
 
-    def __init__(self, model_name: str = 'osnet_ain_x1_0', use_gpu: bool = True, batch_size: int = 16):
+    def __init__(
+        self,
+        model_name: str = 'osnet_ain_x1_0',
+        use_gpu: bool = True,
+        batch_size: int = 16,
+        preprocessing_config: ReIDPreprocessingConfig = None,
+    ):
         self.device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
         self.model_name = model_name
         self.batch_size = batch_size
+        self.preprocessing_config = preprocessing_config or ReIDPreprocessingConfig()
         
         logger.info(f"[REID] Initializing {model_name} on {self.device}...")
+        pp_status = "ON" if self.preprocessing_config.enabled else "OFF"
+        logger.info(f"[REID] Preprocessing: {pp_status}")
         
         if build_model is None:
             raise ImportError("torchreid not found. Please install with 'pip install torchreid'")
@@ -69,6 +78,15 @@ class VehicleReIDMatcher:
         Returns:
             Preprocessed tensor (3, H, W).
         """
+        # Apply luminance normalization if enabled
+        pp = self.preprocessing_config
+        if pp.enabled:
+            image = normalize_for_reid(
+                image,
+                clip_limit=pp.clip_limit,
+                grid_size=pp.grid_size,
+            )
+
         # Convert BGR to RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
@@ -170,10 +188,12 @@ class VehicleReIDMatcher:
 _matcher_instance = None
 _matcher_lock = __import__("threading").Lock()
 
-def get_reid_matcher() -> VehicleReIDMatcher:
+def get_reid_matcher(preprocessing_config: ReIDPreprocessingConfig = None) -> VehicleReIDMatcher:
     global _matcher_instance
     if _matcher_instance is None:
         with _matcher_lock:
             if _matcher_instance is None:
-                _matcher_instance = VehicleReIDMatcher()
+                _matcher_instance = VehicleReIDMatcher(
+                    preprocessing_config=preprocessing_config,
+                )
     return _matcher_instance

@@ -27,6 +27,8 @@ from src.models.slot import load_slots
 logger = logging.getLogger(__name__)
 
 
+
+
 class ParkingEngine(
     ParkingEngineRuntimeMixin,
     ParkingEngineTrackingMixin,
@@ -47,6 +49,7 @@ class ParkingEngine(
         self.detector = TrackedDetector(
             detector_config=config.detector,
             tracker_config=config.tracker,
+            preprocessing_config=config.preprocessing.detector,
         )
         self.event_bus = EventBus(log_file=config.output.log_file)
 
@@ -55,6 +58,7 @@ class ParkingEngine(
         self._park_entry_track_to_candidate: Dict[int, str] = {}
         self._tracks_inside_zones: Dict[tuple, set] = {}
         self._confirmation_bursts: Dict[tuple, Dict] = {}
+        self._latest_zone_vehicle_crops: Dict[tuple, Dict] = {}
         self._recent_violators = []
         self._violation_match_threshold = 0.4
         self._violation_history_limit = 30
@@ -68,6 +72,8 @@ class ParkingEngine(
         self._start_time = 0.0
         self._reid_check_timer: Dict[tuple, float] = {}
         self._tracking_managers: Dict[str, object] = {}
+        self._display_label_cache: Dict[tuple, Dict[str, object]] = {}
+        self._display_label_ttl_seconds = 3.0
 
         # Legacy single-camera cooldown state.
         self._last_violation_alert_time = 0.0
