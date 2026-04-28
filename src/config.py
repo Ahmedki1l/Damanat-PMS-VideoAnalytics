@@ -30,6 +30,10 @@ class ProcessingConfig:
     mode: str = "round_robin"
     target_fps_per_camera: int = 1
     stream_channel: int = 102  # 101=main(4K), 102=sub(720p)
+    # Resolution that slot polygons (slots/*.json) were drawn at.
+    # The runtime will scale polygon coords from this to the actual stream resolution.
+    slot_ref_width: int = 640
+    slot_ref_height: int = 360
 
 
 @dataclass
@@ -170,6 +174,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         config.processing.stream_channel = p.get(
             "stream_channel", config.processing.stream_channel
+        )
+        config.processing.slot_ref_width = p.get(
+            "slot_ref_width", config.processing.slot_ref_width
+        )
+        config.processing.slot_ref_height = p.get(
+            "slot_ref_height", config.processing.slot_ref_height
         )
 
     # --- Legacy single-camera support ---

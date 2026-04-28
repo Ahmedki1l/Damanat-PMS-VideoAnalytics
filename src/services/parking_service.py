@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from src.model import ParkingSlot
 from src.repositories import ParkingSlotRepository
 from src.schemas import ParkingSlotUpdate
+from src.services.named_slot_service import is_restricted_slot
 
 
 def get_slot_or_404(db: Session, slot_id: str):
@@ -27,12 +28,13 @@ def sync_slots_from_config(
 
         existing = ParkingSlotRepository.get_by_id(db, slot.id)
         if existing:
-            # Keep the restriction flag stable while refreshing geometry and metadata.
+            # Preserve existing manual restrictions and force named reserved slots on.
             existing.slot_name = slot.label or slot.id
             existing.floor = floor
             existing.zone_id = zone_id
             existing.zone_name = zone_name
             existing.polygon = polygon_json
+            existing.is_violation_zone = bool(existing.is_violation_zone or is_restricted_slot(slot.id))
         else:
             new_slot = ParkingSlot(
                 slot_id=slot.id,
@@ -42,7 +44,7 @@ def sync_slots_from_config(
                 zone_name=zone_name,
                 polygon=polygon_json,
                 is_available=True,
-                is_violation_zone="violation" in slot.id.lower(),
+                is_violation_zone=is_restricted_slot(slot.id),
             )
             ParkingSlotRepository.create(db, new_slot)
     db.commit()

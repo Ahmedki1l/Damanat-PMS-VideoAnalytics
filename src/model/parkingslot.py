@@ -10,6 +10,7 @@ class ParkingSlot(Base):
     zone_id = Column(String(100), nullable=True)
     zone_name = Column(String(100), nullable=True)
     polygon = Column(JSON)
+    last_snapshot_path = Column(String(255), nullable=True)
     is_available = Column(Boolean, default=True)
     is_violation_zone = Column(Boolean, default=False)
 

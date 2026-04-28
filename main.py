@@ -25,6 +25,7 @@ import threading
 from src.config import load_config
 from src.core.engine import ParkingEngine
 from src.database import init_db
+from src.services.config_service import ensure_config_initialized, sync_app_config_from_db
 
 def start_api_server(engine, registry, host="0.0.0.0", port=8000):
     """Start the FastAPI server in a background thread."""
@@ -53,6 +54,18 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
             return engine.cam_manager.read_camera(cam_id)
         return False, None
 
+    def get_slot_snapshot_source(slot_id: str):
+        for cam_id, pipeline in engine.pipelines.items():
+            for slot in pipeline.slots:
+                if slot.id == slot_id:
+                    return {
+                        "camera_id": cam_id,
+                        "slot": slot,
+                        "state_machine": pipeline.state_machines.get(slot_id),
+                        "floor": pipeline.floor,
+                    }
+        return None
+
     def get_park_entry_crop(cam_id: str):
         snapshot_cam_id = "CAM_03"
         crop = engine.get_recent_zone_vehicle_crop(
@@ -67,6 +80,7 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         vehicle_registry=registry,
         get_slot_statuses=get_slot_statuses,
         get_camera_frame=get_camera_frame,
+        get_slot_snapshot_source=get_slot_snapshot_source,
         get_park_entry_crop=get_park_entry_crop,
         get_engine_status=engine.get_engine_status,
         event_bus=engine.event_bus,
@@ -148,6 +162,15 @@ Examples:
     config = load_config(args.config)
     db = init_db(config.database.url)
     db.create_tables()
+    
+    # Initialize Config table if empty
+    session = db.SessionLocal()
+    try:
+        ensure_config_initialized(session, config)
+        # Link DB config to runtime app_config
+        sync_app_config_from_db(session, config)
+    finally:
+        session.close()
 
     # Apply CLI overrides
     if args.show:
@@ -172,47 +195,6 @@ Examples:
     # --- Start API server if requested ---
     if args.api:
         start_api_server(engine, registry, port=args.port)
-
-    # --- [PHASE 4] Bridge Engine Events to Database Persistence ---
-    def db_event_subscriber(event):
-        """Persistent subscriber that saves vision events to SQL Server."""
-        try:
-            from src.services.slot_status_service import log_vehicle_event
-            from src.database import get_db
-            
-            # Persist status changes
-            if event.event_type in ("vehicle_parked", "slot_vacant", "vehicle_violation", "vehicle_intrusion"):
-                db_gen = get_db()
-                db_session = next(db_gen)
-                
-                is_parked = event.event_type != "slot_vacant"
-                plate = getattr(event, "plate_number", "")
-                
-                log_vehicle_event(
-                    db=db_session,
-                    slot_id=event.slot_id,
-                    plate=plate,
-                    is_parked=is_parked,
-                    camera_id=event.camera_id,
-                    severity=getattr(event, "severity", None)
-                )
-
-                # Special case: Log to camera_feeds table for security monitoring
-                if event.event_type in ("vehicle_violation", "vehicle_intrusion"):
-                    from src.services.slot_status_service import log_camera_feed_event
-                    log_camera_feed_event(
-                        db=db_session,
-                        event_type=event.event_type,
-                        camera_id=event.camera_id,
-                        plate=plate,
-                        slot_id=event.slot_id,
-                        snapshot_path=getattr(event, "snapshot_url", None)
-                    )
-                db_session.close()
-        except Exception as e:
-            print(f"[DB ERROR] Failed to persist event {event.event_type}: {e}")
-
-    engine.event_bus.subscribe(db_event_subscriber)
 
     # --- Decide which mode to run ---
     if args.video:

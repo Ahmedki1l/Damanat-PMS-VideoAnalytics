@@ -61,6 +61,8 @@ class CameraStream:
         self.config = config
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_open = False
+        self.frame_width: int = 0
+        self.frame_height: int = 0
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_lock = threading.Lock()
         self._grab_thread: Optional[threading.Thread] = None
@@ -84,7 +86,13 @@ class CameraStream:
 
             self.is_open = self.cap.isOpened()
             if self.is_open:
-                print(f"  [OK] {self.config.id} ({self.config.name}) — connected")
+                # Read actual frame dimensions from the stream
+                self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                print(
+                    f"  [OK] {self.config.id} ({self.config.name}) "
+                    f"— connected [{self.frame_width}×{self.frame_height}]"
+                )
                 # Start the background grabber thread
                 self._stop_event.clear()
                 self._grab_thread = threading.Thread(
@@ -228,6 +236,19 @@ class CameraManager:
             attempts += 1
 
         return None, None
+
+    def get_resolution(self, camera_id: str) -> Tuple[int, int]:
+        """
+        Return the (width, height) of a camera's stream.
+
+        Returns (0, 0) if the camera is not found or not yet open.
+        Used by the engine to scale slot polygons from their reference
+        resolution to the actual stream resolution.
+        """
+        stream = self.cameras.get(camera_id)
+        if stream and stream.is_open:
+            return (stream.frame_width, stream.frame_height)
+        return (0, 0)
 
     def read_camera(self, camera_id: str) -> Tuple[bool, Optional[np.ndarray]]:
         """Read a specific camera's latest frame."""

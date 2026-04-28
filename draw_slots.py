@@ -33,7 +33,9 @@ import sys
 import cv2
 import numpy as np
 
-from src.config import load_config
+from src.config import load_config, AppConfig
+from src.database import init_db
+from src.services.config_service import sync_app_config_from_db
 
 
 class SlotDrawer:
@@ -279,7 +281,7 @@ def capture_frame(rtsp_url: str) -> np.ndarray:
     return frame
 
 
-def process_camera(cam_id: str, rtsp_url: str, slots_file: str, camera_label: str):
+def process_camera(cam_id: str, rtsp_url: str, slots_file: str, camera_label: str, config: 'AppConfig'):
     """Run the slot drawing tool for a single camera."""
     print(f"\n{'='*60}")
     print(f"  Camera: {camera_label}")
@@ -298,7 +300,21 @@ def process_camera(cam_id: str, rtsp_url: str, slots_file: str, camera_label: st
     if os.path.exists(slots_file):
         with open(slots_file, "r") as f:
             existing = json.load(f)
-        print(f"  Loaded {len(existing)} existing slots")
+        print(f"  Loaded {len(existing)} existing slots from '{slots_file}'")
+        
+        # --- SCALE ON LOAD ---
+        ref_w = config.processing.slot_ref_width
+        ref_h = config.processing.slot_ref_height
+        act_w = image.shape[1]
+        act_h = image.shape[0]
+
+        if ref_w > 0 and ref_h > 0 and (ref_w != act_w or ref_h != act_h):
+            sx = act_w / ref_w
+            sy = act_h / ref_h
+            print(f"  [INFO] Scaling existing polygons for display: {ref_w}x{ref_h} → {act_w}x{act_h} (sx={sx:.4f}, sy={sy:.4f})")
+            for slot in existing:
+                slot["polygon"] = [[int(p[0] * sx), int(p[1] * sy)] for p in slot["polygon"]]
+
         resp = input("  Keep existing slots? (y/n): ").strip().lower()
         if resp != 'y':
             existing = []
@@ -307,6 +323,19 @@ def process_camera(cam_id: str, rtsp_url: str, slots_file: str, camera_label: st
     result = drawer.run()
 
     if result is not None:
+        # --- SCALE ON SAVE ---
+        ref_w = config.processing.slot_ref_width
+        ref_h = config.processing.slot_ref_height
+        act_w = image.shape[1]
+        act_h = image.shape[0]
+
+        if ref_w > 0 and ref_h > 0 and (ref_w != act_w or ref_h != act_h):
+            sx = ref_w / act_w
+            sy = ref_h / act_h
+            print(f"  [INFO] Scaling polygons back to reference resolution ({ref_w}x{ref_h}) for saving...")
+            for slot in result:
+                slot["polygon"] = [[round(p[0] * sx, 1), round(p[1] * sy, 1)] for p in slot["polygon"]]
+
         os.makedirs(os.path.dirname(slots_file) or ".", exist_ok=True)
         with open(slots_file, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
@@ -327,13 +356,23 @@ def main():
 
     if args.camera:
         config = load_config(args.config)
+        
+        # Try to sync with database for latest settings (ref resolution, etc.)
+        try:
+            db = init_db(config.database.url)
+            session = db.SessionLocal()
+            sync_app_config_from_db(session, config)
+            session.close()
+        except Exception as e:
+            print(f"[WARN] Could not sync with database: {e}. Using YAML/defaults.")
+
         channel = config.processing.stream_channel
 
         if args.camera.lower() == "all":
             for cam in config.cameras:
                 rtsp_url = f"rtsp://{cam.user}:{cam.password}@{cam.ip}:554/Streaming/Channels/{channel}"
                 label = f"{cam.id} — {cam.name} ({cam.floor})"
-                process_camera(cam.id, rtsp_url, cam.slots_file, label)
+                process_camera(cam.id, rtsp_url, cam.slots_file, label, config)
         else:
             cam_entry = None
             for c in config.cameras:
@@ -347,7 +386,7 @@ def main():
 
             rtsp_url = f"rtsp://{cam_entry.user}:{cam_entry.password}@{cam_entry.ip}:554/Streaming/Channels/{channel}"
             label = f"{cam_entry.id} — {cam_entry.name} ({cam_entry.floor})"
-            process_camera(cam_entry.id, rtsp_url, cam_entry.slots_file, label)
+            process_camera(cam_entry.id, rtsp_url, cam_entry.slots_file, label, config)
 
     elif args.rtsp or args.image:
         if args.rtsp:

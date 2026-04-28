@@ -1,7 +1,8 @@
 import os
+import re
 import time
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -13,10 +14,143 @@ from src.model.parkingslot import ParkingSlot as DB_ParkingSlot
 from src.models.slot import load_slots
 from src.models.state_machine import SlotState
 from src.services.parking_service import sync_slots_from_config
-from src.services.slot_status_service import log_vehicle_event
+from src.services.named_slot_service import get_named_slot_title, is_named_slot
+from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
 
 
 class ParkingEngineRuntimeMixin:
+    def _build_slot_snapshot_url(self, slot_id: str) -> str:
+        return f"/api/slots/{slot_id}/snapshot/live"
+
+    def _crop_vehicle_bbox_snapshot(
+        self,
+        frame,
+        detection=None,
+        bbox: Optional[tuple[float, float, float, float]] = None,
+        padding_ratio: float = 0.12,
+    ) -> Optional[np.ndarray]:
+        if frame is None or frame.size == 0:
+            return None
+
+        source_bbox = bbox
+        if source_bbox is None and detection is not None:
+            source_bbox = tuple(float(v) for v in detection.bbox)
+        if source_bbox is None:
+            return None
+
+        x1, y1, x2, y2 = [int(v) for v in source_bbox]
+        h, w = frame.shape[:2]
+        pad_x = max(12, int((x2 - x1) * padding_ratio))
+        pad_y = max(12, int((y2 - y1) * padding_ratio))
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(w, x2 + pad_x)
+        y2 = min(h, y2 + pad_y)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2].copy()
+        return crop if crop.size > 0 else None
+
+    def _crop_slot_snapshot(self, frame, slot) -> Optional[np.ndarray]:
+        if frame is None or slot is None or frame.size == 0:
+            return None
+
+        polygon_points = np.array(
+            [[int(x), int(y)] for x, y in slot.polygon.exterior.coords[:-1]],
+            dtype=np.int32,
+        )
+        if polygon_points.size == 0:
+            return None
+
+        h, w = frame.shape[:2]
+        x, y, width, height = cv2.boundingRect(polygon_points)
+        x = max(0, x)
+        y = max(0, y)
+        width = min(width, w - x)
+        height = min(height, h - y)
+        if width <= 0 or height <= 0:
+            return None
+
+        crop = frame[y:y + height, x:x + width].copy()
+        shifted_points = polygon_points - np.array([x, y])
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(mask, [shifted_points], 255)
+        masked_crop = cv2.bitwise_and(crop, crop, mask=mask)
+        return masked_crop if masked_crop.size > 0 else None
+
+    def _save_slot_snapshot(
+        self,
+        frame,
+        slot,
+        detection=None,
+        bbox: Optional[tuple[float, float, float, float]] = None,
+    ) -> Optional[str]:
+        crop = self._crop_vehicle_bbox_snapshot(frame, detection=detection, bbox=bbox)
+        if crop is None or crop.size == 0:
+            crop = self._crop_slot_snapshot(frame, slot)
+        if crop is None or crop.size == 0:
+            return None
+
+        try:
+            os.makedirs("vehicle_images", exist_ok=True)
+            filename = f"slot_{slot.id}_latest.jpg"
+            full_path = os.path.join("vehicle_images", filename)
+            cv2.imwrite(full_path, crop)
+            return filename
+        except Exception as exc:
+            print(f"[WARN] Failed to save slot snapshot for {slot.id}: {exc}")
+            return None
+
+    def _safe_snapshot_token(self, value: str, fallback: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "").strip("._")
+        return cleaned or fallback
+
+    def _save_alert_snapshot(self, crop, alert_type: str, slot_id: str, camera_id: str) -> Optional[str]:
+        if crop is None or crop.size == 0:
+            return None
+
+        try:
+            directory = os.path.join("vehicle_images", "alerts")
+            os.makedirs(directory, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = (
+                f"{self._safe_snapshot_token(alert_type, 'alert')}_"
+                f"{self._safe_snapshot_token(slot_id, 'slot')}_"
+                f"{self._safe_snapshot_token(camera_id, 'camera')}_"
+                f"{timestamp}.jpg"
+            )
+            relative_path = os.path.join("vehicle_images", "alerts", filename)
+            full_path = os.path.join(directory, filename)
+            if not cv2.imwrite(full_path, crop):
+                raise RuntimeError("cv2.imwrite returned False")
+            return relative_path
+        except Exception as exc:
+            print(
+                f"[WARN] Failed to save alert snapshot for {alert_type} "
+                f"({camera_id} / {slot_id}): {exc}"
+            )
+            return None
+
+    def _persist_slot_snapshot_path(self, slot_id: str, snapshot_filename: str) -> None:
+        if not self.db_manager or not snapshot_filename:
+            return
+
+        session = self.db_manager.SessionLocal()
+        try:
+            from src.repositories import ParkingSlotRepository
+
+            db_slot = ParkingSlotRepository.get_by_id(session, slot_id)
+            if db_slot is None:
+                return
+            db_slot.last_snapshot_path = snapshot_filename
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            print(f"[ERROR] Failed to persist slot snapshot path for {slot_id}: {exc}")
+        finally:
+            session.close()
+
     def _build_camera_configs(self) -> List[CameraConfig]:
         camera_configs: List[CameraConfig] = []
         for camera in self.config.cameras:
@@ -53,12 +187,28 @@ class ParkingEngineRuntimeMixin:
     def _build_camera_pipeline(self, camera_config: CameraConfig, all_active_slot_ids: set):
         all_slots = []
         roi_polygon = None
+
+        # Reference resolution (what the slot JSONs were drawn at)
+        ref_res = (
+            self.config.processing.slot_ref_width,
+            self.config.processing.slot_ref_height,
+        )
+
+        # Actual stream resolution — read from the camera stream if available
+        actual_res = None
+        if hasattr(self, "cam_manager"):
+            w, h = self.cam_manager.get_resolution(camera_config.id)
+            if w > 0 and h > 0:
+                actual_res = (w, h)
+
         if camera_config.slots_file:
             if os.path.exists(camera_config.slots_file):
                 all_slots, roi_polygon = load_slots(
                     camera_config.slots_file,
                     default_zone_id=camera_config.name,
                     default_zone_name=camera_config.name,
+                    ref_resolution=ref_res,
+                    actual_resolution=actual_res,
                 )
             else:
                 print(
@@ -224,13 +374,20 @@ class ParkingEngineRuntimeMixin:
         all_events = []
 
         for slot in pipeline.slots:
+            state_machine = pipeline.state_machines[slot.id]
             vehicle_in_slot = slot.id in assignment.slot_vehicle_map
             track_id = None
             detection = None
             if vehicle_in_slot:
                 track_id, detection = assignment.slot_vehicle_map[slot.id]
+                if detection is not None:
+                    state_machine.latest_detection_bbox = tuple(
+                        float(v) for v in detection.bbox
+                    )
+            elif state_machine.state == SlotState.VACANT:
+                state_machine.latest_detection_bbox = None
 
-            events = pipeline.state_machines[slot.id].update(
+            events = state_machine.update(
                 vehicle_present=vehicle_in_slot,
                 track_id=track_id,
             )
@@ -241,6 +398,16 @@ class ParkingEngineRuntimeMixin:
                 event.slot_name = slot.label
                 event.zone_id = slot.zone_id
                 event.zone_name = slot.zone_name
+
+                if event.event_type == "vehicle_parked":
+                    snapshot_filename = self._save_slot_snapshot(
+                        frame,
+                        slot,
+                        detection=detection,
+                        bbox=state_machine.latest_detection_bbox,
+                    )
+                    if snapshot_filename:
+                        self._persist_slot_snapshot_path(slot.id, snapshot_filename)
 
                 if event.event_type == "vehicle_parked" and self.vehicle_registry:
                     # Attempt to get plate first to save crop with correct filename
@@ -265,9 +432,14 @@ class ParkingEngineRuntimeMixin:
                         location = self.vehicle_registry.get_plate_location(linked_plate)
                         if location:
                             event.snapshot_url = location.get("snapshot_url", "")
-                        pipeline.state_machines[slot.id].bind_identity(
+                        state_machine.bind_identity(
                             linked_plate,
-                            event.snapshot_url,
+                            self._build_slot_snapshot_url(slot.id),
+                        )
+                    else:
+                        state_machine.bind_identity(
+                            None,
+                            self._build_slot_snapshot_url(slot.id),
                         )
                 elif event.event_type == "slot_vacant" and self.vehicle_registry:
                     plate = self.vehicle_registry.unlink_slot(slot.id)
@@ -292,9 +464,10 @@ class ParkingEngineRuntimeMixin:
                     timestamp=datetime.now(),
                 )
                 if plate:
-                    location = self.vehicle_registry.get_plate_location(plate)
-                    snapshot_url = location.get("snapshot_url", "") if location else ""
-                    pipeline.state_machines[slot.id].bind_identity(plate, snapshot_url)
+                    state_machine.bind_identity(
+                        plate,
+                        self._build_slot_snapshot_url(slot.id),
+                    )
                     if self.db_manager and plate != previous_plate:
                         self._persist_late_slot_plate(slot.id, plate, cam_id)
 
@@ -305,7 +478,12 @@ class ParkingEngineRuntimeMixin:
     def _persist_late_slot_plate(self, slot_id: str, plate: str, camera_id: str) -> None:
         session = self.db_manager.SessionLocal()
         try:
-            log_vehicle_event(session, slot_id, plate, True, camera_id=camera_id)
+            update_current_slot_plate(
+                session,
+                slot_id=slot_id,
+                plate=plate,
+                camera_id=camera_id,
+            )
         except Exception as exc:
             session.rollback()
             print(f"[ERROR] Failed to persist late slot plate for {slot_id}: {exc}")
@@ -316,7 +494,11 @@ class ParkingEngineRuntimeMixin:
         final_events = []
         for event in events:
             slot_state_machine = self.pipelines[cam_id].state_machines.get(event.slot_id)
-            if not slot_state_machine or not slot_state_machine.is_violation_zone:
+            is_named_reserved_slot = is_named_slot(event.slot_id)
+            if (
+                not slot_state_machine
+                or (not slot_state_machine.is_violation_zone and not is_named_reserved_slot)
+            ):
                 final_events.append(event)
                 continue
 
@@ -329,9 +511,9 @@ class ParkingEngineRuntimeMixin:
                 final_events.append(event)
                 continue
 
-            x1, y1, x2, y2 = [int(v) for v in detection.bbox]
-            h, w = frame.shape[:2]
-            crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            crop = self._crop_vehicle_bbox_snapshot(frame, detection=detection)
+            if crop is None:
+                crop = np.empty((0, 0, 3), dtype=np.uint8)
 
             now_ts = time.time()
             self._recent_violators = [
@@ -341,7 +523,7 @@ class ParkingEngineRuntimeMixin:
             ]
 
             is_duplicate = False
-            if crop.size > 0:
+            if crop.size > 0 and self.vehicle_registry:
                 for violator in self._recent_violators:
                     score = self.vehicle_registry.matcher.compare(crop, violator["crop"])
                     if score > self._violation_match_threshold:
@@ -349,14 +531,19 @@ class ParkingEngineRuntimeMixin:
                         break
 
             if not is_duplicate:
-                alert_type = (
-                    "vehicle_violation"
-                    if "violation" in event.slot_id.lower()
-                    else "vehicle_intrusion"
-                )
+                alert_type = self._get_slot_alert_type(event.slot_id, getattr(event, "plate_number", ""))
+                if alert_type is None:
+                    final_events.append(event)
+                    continue
                 event.event_type = alert_type
                 event.is_alert = True
                 event.severity = "critical"
+                event.snapshot_path = self._save_alert_snapshot(
+                    crop,
+                    alert_type=alert_type,
+                    slot_id=event.slot_id,
+                    camera_id=cam_id,
+                )
                 if crop.size > 0:
                     self._recent_violators.append(
                         {"crop": crop.copy(), "timestamp": now_ts, "camera_id": cam_id}
@@ -367,6 +554,38 @@ class ParkingEngineRuntimeMixin:
                 final_events.append(event)
 
         return final_events
+
+    def _get_slot_alert_type(self, slot_id: str, plate_number: str) -> str | None:
+        named_slot_title = get_named_slot_title(slot_id)
+        if named_slot_title:
+            if self._is_named_slot_vehicle_allowed(plate_number, named_slot_title):
+                return None
+            return "named_slot_violation"
+
+        return (
+            "vehicle_violation"
+            if "violation" in slot_id.lower()
+            else "vehicle_intrusion"
+        )
+
+    def _is_named_slot_vehicle_allowed(self, plate_number: str, expected_title: str) -> bool:
+        if not self.db_manager or not plate_number or not expected_title:
+            return False
+
+        session = self.db_manager.SessionLocal()
+        try:
+            from src.repositories import VehicleRepository
+
+            vehicle = VehicleRepository.get_by_plate(session, plate_number)
+            return bool(vehicle and vehicle.title == expected_title)
+        except Exception as exc:
+            print(
+                f"[ERROR] Failed to validate named-slot ownership for plate "
+                f"{plate_number}: {exc}"
+            )
+            return False
+        finally:
+            session.close()
 
     def _persist_final_events(self, events) -> None:
         if not events:
@@ -379,11 +598,18 @@ class ParkingEngineRuntimeMixin:
         session = self.db_manager.SessionLocal()
         try:
             for event in events:
-                if event.event_type in ("vehicle_parked", "slot_vacant", "vehicle_violation", "vehicle_intrusion"):
+                if event.event_type in (
+                    "vehicle_parked",
+                    "slot_vacant",
+                    "vehicle_violation",
+                    "vehicle_intrusion",
+                    "named_slot_violation",
+                ):
                     is_parked = event.event_type in (
                         "vehicle_parked",
                         "vehicle_violation",
                         "vehicle_intrusion",
+                        "named_slot_violation",
                     )
                     plate = getattr(event, "plate_number", None)
                     # Capture the alert_id from log_vehicle_event
@@ -393,7 +619,8 @@ class ParkingEngineRuntimeMixin:
                         plate,
                         is_parked,
                         camera_id=event.camera_id,
-                        severity=event.severity
+                        severity=event.severity,
+                        snapshot_path=getattr(event, "snapshot_path", None),
                     )
                     # Enrich the event with the database-generated ID
                     if db_alert_id:

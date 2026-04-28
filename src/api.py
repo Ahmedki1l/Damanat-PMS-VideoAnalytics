@@ -24,11 +24,11 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, AsyncIterable
+from typing import Any, Dict, List, Optional, AsyncIterable
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.sse import EventSourceResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -36,6 +36,8 @@ from pydantic import BaseModel
 from src.vehicle_registry import VehicleRegistry
 from src.events.event_bus import EventBus
 from src.models.state_machine import SlotEvent
+from src.services.alert_service import get_alert_type_for_slot
+from src.services.named_slot_service import get_slot_restriction_type
 
 
 # --- Pydantic Models ---
@@ -70,6 +72,7 @@ class SlotStatus(BaseModel):
     camera_id: Optional[str] = None
     is_restricted: bool = False
     restriction_type: Optional[str] = None
+    snapshot_url: Optional[str] = None
 
 
 class VehicleLocation(BaseModel):
@@ -117,6 +120,7 @@ def create_app(
     vehicle_registry: Optional[VehicleRegistry] = None,
     get_slot_statuses=None,
     get_camera_frame=None,
+    get_slot_snapshot_source=None,
     get_park_entry_crop=None,
     get_engine_status=None,
     event_bus: Optional[EventBus] = None,
@@ -129,6 +133,8 @@ def create_app(
         vehicle_registry: Shared VehicleRegistry instance.
         get_slot_statuses: Callback function that returns current slot statuses
                           as a list of dicts. Provided by the engine.
+        get_slot_snapshot_source: Callback returning slot runtime metadata
+                                 (camera ownership + polygon) for snapshots.
         get_engine_status: Callback function for health metrics.
         event_bus: Optional EventBus instance for real-time alerts.
         db_manager: Optional DB manager for querying slot restriction status.
@@ -154,6 +160,117 @@ def create_app(
 
     # Use provided or create new registry
     registry = vehicle_registry or VehicleRegistry()
+
+    def _build_slot_snapshot_url(slot_id: str) -> str:
+        return f"/api/slots/{slot_id}/snapshot/live"
+
+    def _resolve_slot_snapshot_source(slot_id: str) -> Dict[str, Any]:
+        if get_slot_snapshot_source is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Slot snapshot source lookup is not enabled on this server.",
+            )
+
+        source = get_slot_snapshot_source(slot_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail=f"Slot '{slot_id}' not found.")
+
+        camera_id = source.get("camera_id")
+        slot = source.get("slot")
+        if not camera_id or slot is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Slot '{slot_id}' is missing live snapshot metadata.",
+            )
+        return source
+
+    def _crop_slot_snapshot(frame, slot):
+        import cv2
+        import numpy as np
+
+        if frame is None or slot is None or frame.size == 0:
+            return None
+
+        polygon_points = np.array(
+            [[int(x), int(y)] for x, y in slot.polygon.exterior.coords[:-1]],
+            dtype=np.int32,
+        )
+        if polygon_points.size == 0:
+            return None
+
+        frame_h, frame_w = frame.shape[:2]
+        x, y, width, height = cv2.boundingRect(polygon_points)
+        x = max(0, x)
+        y = max(0, y)
+        width = min(width, frame_w - x)
+        height = min(height, frame_h - y)
+        if width <= 0 or height <= 0:
+            return None
+
+        crop = frame[y:y + height, x:x + width].copy()
+        shifted_points = polygon_points - np.array([x, y])
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(mask, [shifted_points], 255)
+        masked_crop = cv2.bitwise_and(crop, crop, mask=mask)
+        return masked_crop if masked_crop.size > 0 else None
+
+    def _crop_vehicle_bbox_snapshot(
+        frame,
+        bbox: Optional[tuple[float, float, float, float]] = None,
+        padding_ratio: float = 0.12,
+    ):
+        if frame is None or bbox is None or frame.size == 0:
+            return None
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        frame_h, frame_w = frame.shape[:2]
+        pad_x = max(12, int((x2 - x1) * padding_ratio))
+        pad_y = max(12, int((y2 - y1) * padding_ratio))
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(frame_w, x2 + pad_x)
+        y2 = min(frame_h, y2 + pad_y)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2].copy()
+        return crop if crop.size > 0 else None
+
+    def _jpeg_response_for_crop(crop):
+        import cv2
+
+        if crop is None or crop.size == 0:
+            raise HTTPException(status_code=503, detail="Unable to generate slot snapshot.")
+
+        success, encoded = cv2.imencode(".jpg", crop)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to encode slot snapshot.")
+        return Response(content=encoded.tobytes(), media_type="image/jpeg")
+
+    def _build_live_slot_snapshot_response(slot_id: str):
+        source = _resolve_slot_snapshot_source(slot_id)
+        camera_id = source["camera_id"]
+        slot = source["slot"]
+        state_machine = source.get("state_machine")
+
+        if get_camera_frame is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Live camera frame access is not enabled on this server.",
+            )
+
+        success, frame = get_camera_frame(camera_id)
+        if not success or frame is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Live camera frame unavailable for slot '{slot_id}'.",
+            )
+
+        bbox = getattr(state_machine, "latest_detection_bbox", None) if state_machine else None
+        crop = _crop_vehicle_bbox_snapshot(frame, bbox=bbox)
+        if crop is None or crop.size == 0:
+            crop = _crop_slot_snapshot(frame, slot)
+        return _jpeg_response_for_crop(crop)
 
     def _capture_instant_snapshot(
         plate: str,
@@ -329,7 +446,7 @@ def create_app(
         Simulate a real parking event for a given slot_id.
 
         Queries the database to check if the slot is restricted (is_violation_zone=True).
-        - Restricted slot → is_alert=true, severity=critical, alert_type=vehicle_violation
+        - Restricted slot → is_alert=true, severity=critical, alert_type derived from slot policy
         - Normal slot    → is_alert=false, severity=info,     alert_type=vehicle_parked
 
         Try with a restricted slot (e.g. B11_CFO, G1) or a normal slot (e.g. A1, G4).
@@ -353,9 +470,14 @@ def create_app(
             finally:
                 session.close()
 
-        # Build event based on real DB flag — distinguish violation vs intrusion
+        # Build event based on real DB flag and slot policy
         if is_restricted:
-            alert_type = "vehicle_violation" if "violation" in slot_id.lower() else "vehicle_intrusion"
+            session = db_manager.SessionLocal() if db_manager is not None else None
+            try:
+                alert_type = get_alert_type_for_slot(session, slot_id) if session else "vehicle_violation"
+            finally:
+                if session is not None:
+                    session.close()
         else:
             alert_type = "vehicle_parked"
 
@@ -506,9 +628,33 @@ def create_app(
                 plate_number=plate,
                 camera_id=s.get("camera_id"),
                 is_restricted=s.get("is_violation_zone", False),
-                restriction_type="violation" if s.get("is_violation_zone") else None
+                restriction_type=get_slot_restriction_type(slot_id) if s.get("is_violation_zone") else None,
+                snapshot_url=_build_slot_snapshot_url(slot_id),
             ))
         return result
+
+    @app.get("/api/slots/{slot_id}/snapshot/live")
+    async def get_live_slot_snapshot(slot_id: str):
+        """Return a live JPEG crop for the requested slot."""
+        return _build_live_slot_snapshot_response(slot_id)
+
+    @app.get("/api/slots/{slot_id}/snapshot/latest")
+    async def get_latest_slot_snapshot(slot_id: str):
+        """Return the latest saved slot snapshot, falling back to a live crop."""
+        if db_manager is not None:
+            from src.repositories import ParkingSlotRepository
+
+            session = db_manager.SessionLocal()
+            try:
+                db_slot = ParkingSlotRepository.get_by_id(session, slot_id)
+                if db_slot is not None and db_slot.last_snapshot_path:
+                    image_path = os.path.join("vehicle_images", db_slot.last_snapshot_path)
+                    if os.path.exists(image_path):
+                        return FileResponse(image_path, media_type="image/jpeg")
+            finally:
+                session.close()
+
+        return _build_live_slot_snapshot_response(slot_id)
 
     @app.get("/api/slots/{floor}", response_model=List[SlotStatus])
     async def get_floor_slots(floor: str):
@@ -533,7 +679,8 @@ def create_app(
                     plate_number=plate,
                     camera_id=s.get("camera_id"),
                     is_restricted=s.get("is_violation_zone", False),
-                    restriction_type="violation" if s.get("is_violation_zone") else None
+                    restriction_type=get_slot_restriction_type(slot_id) if s.get("is_violation_zone") else None,
+                    snapshot_url=_build_slot_snapshot_url(slot_id),
                 ))
         return result
 
