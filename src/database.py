@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.engine.url import make_url
@@ -54,3 +54,22 @@ class DatabaseManager:
 
     def create_tables(self):
         Base.metadata.create_all(bind=self.engine)
+        self._ensure_schema_updates()
+
+    def _ensure_schema_updates(self):
+        inspector = inspect(self.engine)
+        try:
+            table_names = set(inspector.get_table_names())
+        except Exception:
+            return
+
+        if "parking_slots" in table_names:
+            columns = {column["name"] for column in inspector.get_columns("parking_slots")}
+            if "last_snapshot_path" not in columns:
+                with self.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE parking_slots "
+                            "ADD last_snapshot_path VARCHAR(255) NULL"
+                        )
+                    )

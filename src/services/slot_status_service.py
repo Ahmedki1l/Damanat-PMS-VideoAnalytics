@@ -24,6 +24,7 @@ def log_camera_feed_event(db: Session, event_type: str, camera_id: str, plate: s
     description_map = {
         "vehicle_violation": "Unauthorized Parking Violation",
         "vehicle_intrusion": "Security Intrusion Detected",
+        "named_slot_violation": "Reserved Slot Ownership Violation",
     }
     event_description = description_map.get(event_type, event_type.replace("_", " ").title())
 
@@ -41,7 +42,15 @@ def log_camera_feed_event(db: Session, event_type: str, camera_id: str, plate: s
     db.commit()
     return new_feed
 
-def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, camera_id: str = None, severity: str = None):
+def log_vehicle_event(
+    db: Session,
+    slot_id: str,
+    plate: str,
+    is_parked: bool,
+    camera_id: str = None,
+    severity: str = None,
+    snapshot_path: str = None,
+):
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
     if slot:
         slot.is_available = not is_parked
@@ -54,7 +63,14 @@ def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, ca
     
     alert_id = None
     if is_parked:
-        alert = alert_service.report_alert(db, slot_id, plate, camera_id=camera_id, severity=severity)
+        alert = alert_service.report_alert(
+            db,
+            slot_id,
+            plate,
+            camera_id=camera_id,
+            severity=severity,
+            snapshot_path=snapshot_path,
+        )
         if alert:
             alert_id = alert.id
     else:
@@ -86,6 +102,53 @@ def log_vehicle_event(db: Session, slot_id: str, plate: str, is_parked: bool, ca
             )
 
     return created, alert_id
+
+
+def update_current_slot_plate(
+    db: Session,
+    slot_id: str,
+    plate: str,
+    camera_id: str = None,
+):
+    """
+    Update the latest occupied slot_status row with the recognized plate.
+
+    This is used when the slot becomes occupied first and ANPR/ReID resolves
+    the identity slightly later. In that case we should enrich the current
+    occupied record instead of creating another duplicate occupied row.
+    """
+    if not plate:
+        return None
+
+    latest_status = SlotStatusRepository.get_latest_by_slot(db, slot_id)
+    if latest_status and latest_status.status == "occupied":
+        previous_plate = latest_status.plate_number
+        latest_status.plate_number = plate
+        db.commit()
+        db.refresh(latest_status)
+
+        slot = ParkingSlotRepository.get_by_id(db, slot_id)
+        if slot and plate != previous_plate:
+            pms_api_client.bind_slot_session(
+                plate_number=plate,
+                slot_id=slot.slot_id,
+                slot_number=slot.slot_name or slot.slot_id,
+                zone_id=slot.zone_id,
+                zone_name=slot.zone_name,
+                floor=slot.floor,
+                camera_id=camera_id,
+                parked_at=latest_status.time.isoformat() if latest_status.time else None,
+            )
+        return latest_status
+
+    created, _ = log_vehicle_event(
+        db=db,
+        slot_id=slot_id,
+        plate=plate,
+        is_parked=True,
+        camera_id=camera_id,
+    )
+    return created
 
 
 def get_vehicle_current_location(db: Session, plate: str):

@@ -58,6 +58,7 @@ class SlotEvent:
     zone_id: str = ""
     zone_name: str = ""
     snapshot_url: str = ""
+    snapshot_path: str = ""
     alert_id: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -113,6 +114,7 @@ class SlotStateMachine:
         # Current state
         self.state: SlotState = initial_state
         self.assigned_track_id: Optional[int] = None
+        self.latest_detection_bbox: Optional[tuple[float, float, float, float]] = None
         self.plate_number: str = ""
         self.snapshot_url: str = ""
         self.last_update_time: str = datetime.now().isoformat()
@@ -140,6 +142,7 @@ class SlotStateMachine:
             "slot_id": self.slot_id,
             "state": self.state.value,
             "assigned_track_id": self.assigned_track_id,
+            "latest_detection_bbox": self.latest_detection_bbox,
             "occupied": self.is_occupied,
             "last_update_time": self.last_update_time,
             "is_violation_zone": self.is_violation_zone,
@@ -158,6 +161,7 @@ class SlotStateMachine:
         """Clear the persisted identity after the slot is confirmed vacant."""
         self.plate_number = ""
         self.snapshot_url = ""
+        self.latest_detection_bbox = None
 
     def update(
         self,

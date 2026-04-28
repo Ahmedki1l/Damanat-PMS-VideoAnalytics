@@ -23,6 +23,7 @@ from src.core.engine.engine_visualization import ParkingEngineVisualizationMixin
 from src.detection.tracker import TrackedDetector
 from src.events.event_bus import EventBus
 from src.models.slot import load_slots
+from src.services.named_slot_service import is_named_slot
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ class ParkingEngine(
                 self.last_processed_at = datetime.now()
 
                 pipeline = self.pipelines.get(cam_id)
-                if pipeline is None or pipeline.slot_count == 0:
+                if pipeline is None:
                     if show:
                         self._store_passthrough_frame(frame, cam_id, grid_frames)
                     continue
@@ -255,27 +256,32 @@ class ParkingEngine(
                     final_events = []
                     for event in all_events:
                         slot_state_machine = pipeline.state_machines.get(event.slot_id)
-                        if slot_state_machine and slot_state_machine.is_violation_zone:
+                        if (
+                            slot_state_machine
+                            and (slot_state_machine.is_violation_zone or is_named_slot(event.slot_id))
+                        ):
                             if event.event_type == "vehicle_parked":
                                 now_ts = time.time()
                                 if (
                                     now_ts - self._last_violation_alert_time
                                     >= self._violation_cooldown_seconds
                                 ):
-                                    alert_type = (
-                                        "vehicle_violation"
-                                        if "violation" in event.slot_id.lower()
-                                        else "vehicle_intrusion"
+                                    alert_type = self._get_slot_alert_type(
+                                        event.slot_id,
+                                        getattr(event, "plate_number", ""),
                                     )
-                                    event.event_type = alert_type
-                                    event.is_alert = True
-                                    event.severity = "critical"
-                                    self._last_violation_alert_time = now_ts
-                                    final_events.append(event)
-                                    print(
-                                        f"[ALERT] {alert_type.replace('_', ' ').title()} "
-                                        f"in {event.slot_id}!"
-                                    )
+                                    if alert_type is None:
+                                        final_events.append(event)
+                                    else:
+                                        event.event_type = alert_type
+                                        event.is_alert = True
+                                        event.severity = "critical"
+                                        self._last_violation_alert_time = now_ts
+                                        final_events.append(event)
+                                        print(
+                                            f"[ALERT] {alert_type.replace('_', ' ').title()} "
+                                            f"in {event.slot_id}!"
+                                        )
                                 else:
                                     final_events.append(event)
                             else:

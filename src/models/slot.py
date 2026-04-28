@@ -48,7 +48,9 @@ def load_slots(
     json_path: str,
     default_zone_id: str = "",
     default_zone_name: str = "",
-) -> Tuple[List[ParkingSlot], Optional[Polygon]]:
+    ref_resolution: Optional[Tuple[int, int]] = None,
+    actual_resolution: Optional[Tuple[int, int]] = None,
+) -> Tuple[List["ParkingSlot"], Optional[Polygon]]:
     """
     Load parking slot definitions from a JSON file.
 
@@ -68,6 +70,10 @@ def load_slots(
 
     Args:
         json_path: Path to the parking slots JSON file.
+        ref_resolution: (width, height) that polygon coords were drawn at.
+        actual_resolution: (width, height) of the live stream frame.
+            When both are provided and differ, all polygon vertices are
+            scaled proportionally:  x' = x * (actual_w / ref_w)
 
     Returns:
         Tuple containing:
@@ -76,6 +82,20 @@ def load_slots(
     """
     with open(json_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
+
+    # --- Compute scale factors ---
+    sx, sy = 1.0, 1.0
+    if ref_resolution and actual_resolution:
+        ref_w, ref_h = ref_resolution
+        act_w, act_h = actual_resolution
+        if ref_w > 0 and ref_h > 0 and (ref_w != act_w or ref_h != act_h):
+            sx = act_w / ref_w
+            sy = act_h / ref_h
+            print(
+                f"[INFO] Scaling polygons in '{json_path}': "
+                f"{ref_w}×{ref_h} → {act_w}×{act_h} "
+                f"(sx={sx:.4f}, sy={sy:.4f})"
+            )
 
     slots = []
     roi_polygon = None
@@ -94,7 +114,9 @@ def load_slots(
             print(f"[WARN] Entry '{slot_id}' has {len(points)} points — skipping.")
             continue
 
-        polygon = Polygon(points)
+        # Apply resolution scaling (no-op when sx=sy=1.0)
+        scaled_points = [[p[0] * sx, p[1] * sy] for p in points]
+        polygon = Polygon(scaled_points)
 
         # Check if this is the global ROI definition
         if slot_id.lower() == "roi":
@@ -115,4 +137,4 @@ def load_slots(
         slots.append(slot)
 
     print(f"[INFO] Loaded {len(slots)} slots from '{json_path}'")
-    return slots, roi_polygon
+    return slots, roi_polygon
