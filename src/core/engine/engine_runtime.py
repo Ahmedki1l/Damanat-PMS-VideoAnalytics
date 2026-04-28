@@ -10,10 +10,11 @@ import numpy as np
 from src.camera_manager import CameraConfig
 from src.core.engine.camera_pipeline import CameraPipeline
 from src.detection.tracking_manager import TrackingManager
-from src.model.parkingslot import ParkingSlot as DB_ParkingSlot
-from src.models.slot import load_slots
 from src.models.state_machine import SlotState
-from src.services.parking_service import sync_slots_from_config
+from src.services.parking_service import (
+    bootstrap_camera_slots_from_json,
+    load_camera_slots,
+)
 from src.services.named_slot_service import get_named_slot_title, is_named_slot
 from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
 
@@ -181,13 +182,9 @@ class ParkingEngineRuntimeMixin:
             for slot in parking_slots:
                 all_active_slot_ids.add(slot.id)
 
-        self._purge_stale_slots(all_active_slot_ids)
         return total_slots
 
     def _build_camera_pipeline(self, camera_config: CameraConfig, all_active_slot_ids: set):
-        all_slots = []
-        roi_polygon = None
-
         # Reference resolution (what the slot JSONs were drawn at)
         ref_res = (
             self.config.processing.slot_ref_width,
@@ -201,22 +198,24 @@ class ParkingEngineRuntimeMixin:
             if w > 0 and h > 0:
                 actual_res = (w, h)
 
-        if camera_config.slots_file:
-            if os.path.exists(camera_config.slots_file):
-                all_slots, roi_polygon = load_slots(
-                    camera_config.slots_file,
-                    default_zone_id=camera_config.name,
-                    default_zone_name=camera_config.name,
+        parking_slots = []
+        special_zones = []
+        roi_polygon = None
+        self._bootstrap_camera_slots_if_needed(camera_config)
+        if self.db_manager:
+            session = self.db_manager.SessionLocal()
+            try:
+                parking_slots, special_zones, roi_polygon = load_camera_slots(
+                    session,
+                    camera_id=camera_config.id,
                     ref_resolution=ref_res,
                     actual_resolution=actual_res,
                 )
-            else:
-                print(
-                    f"[WARN] Slots file not found for {camera_config.id}: "
-                    f"'{camera_config.slots_file}'"
-                )
+            except Exception as exc:
+                print(f"[ERROR] Failed to load slots from database for {camera_config.id}: {exc}")
+            finally:
+                session.close()
 
-        parking_slots, special_zones = self._split_special_zones(all_slots)
         self.special_zones[camera_config.id] = {zone.id: zone for zone in special_zones}
         if special_zones:
             print(
@@ -224,7 +223,6 @@ class ParkingEngineRuntimeMixin:
                 f"{[zone.id for zone in special_zones]}"
             )
 
-        self._sync_slots_for_camera(camera_config, parking_slots, special_zones)
         violation_slots, initial_statuses = self._load_camera_db_state(
             parking_slots,
             all_active_slot_ids,
@@ -241,28 +239,34 @@ class ParkingEngineRuntimeMixin:
         )
         return pipeline, parking_slots
 
-    def _sync_slots_for_camera(self, camera_config, parking_slots, special_zones) -> None:
-        if not self.db_manager or not parking_slots:
+    def _bootstrap_camera_slots_if_needed(self, camera_config) -> None:
+        if not self.db_manager:
             return
 
         session = self.db_manager.SessionLocal()
         try:
-            sync_slots_from_config(
+            from src.repositories import ParkingSlotRepository
+
+            existing_rows = ParkingSlotRepository.filter_camera_slots(session, camera_config.id)
+            if existing_rows:
+                return
+
+            migrated = bootstrap_camera_slots_from_json(
                 session,
-                parking_slots,
-                camera_config.floor,
+                camera_id=camera_config.id,
+                floor=camera_config.floor,
+                slots_file=camera_config.slots_file,
                 default_zone_id=camera_config.name,
                 default_zone_name=camera_config.name,
             )
-            sync_msg = (
-                f"[DB] Synced {len(parking_slots)} parking slots for {camera_config.id}"
-            )
-            if special_zones:
-                sync_msg += f" ({len(special_zones)} special zones excluded)"
-            print(sync_msg)
+            if migrated:
+                print(
+                    f"[DB] Bootstrapped slot definitions for {camera_config.id} "
+                    f"from legacy JSON '{camera_config.slots_file}'"
+                )
         except Exception as exc:
             session.rollback()
-            print(f"[ERROR] Failed to save slots to database: {exc}")
+            print(f"[ERROR] Failed to bootstrap slots for {camera_config.id}: {exc}")
         finally:
             session.close()
 
@@ -292,30 +296,6 @@ class ParkingEngineRuntimeMixin:
             session.close()
 
         return violation_slots, initial_statuses
-
-    def _purge_stale_slots(self, all_active_slot_ids: set) -> None:
-        if not self.db_manager:
-            return
-
-        session = self.db_manager.SessionLocal()
-        try:
-            db_all_slots = session.query(DB_ParkingSlot).all()
-            stale_slots = [
-                slot for slot in db_all_slots if slot.slot_id not in all_active_slot_ids
-            ]
-            if stale_slots:
-                print(
-                    f"[DB] Purging {len(stale_slots)} stale slots from database: "
-                    f"{[slot.slot_id for slot in stale_slots]}"
-                )
-                for slot in stale_slots:
-                    session.delete(slot)
-                session.commit()
-        except Exception as exc:
-            session.rollback()
-            print(f"[ERROR] Failed to purge stale slots: {exc}")
-        finally:
-            session.close()
 
     def _build_floor_camera_groups(self, camera_configs: List[CameraConfig]) -> Dict[str, List[str]]:
         floor_cameras: Dict[str, List[str]] = {}

@@ -65,8 +65,23 @@ class DatabaseManager:
 
         if "parking_slots" in table_names:
             columns = {column["name"] for column in inspector.get_columns("parking_slots")}
-            if "last_snapshot_path" not in columns:
-                with self.engine.begin() as conn:
+            with self.engine.begin() as conn:
+                if "camera_id" not in columns:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE parking_slots "
+                            "ADD camera_id VARCHAR(50) NULL"
+                        )
+                    )
+                if "slot_type" not in columns:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE parking_slots "
+                            "ADD slot_type VARCHAR(30) NOT NULL "
+                            "CONSTRAINT DF_parking_slots_slot_type DEFAULT 'parking'"
+                        )
+                    )
+                if "last_snapshot_path" not in columns:
                     conn.execute(
                         text(
                             "ALTER TABLE parking_slots "
