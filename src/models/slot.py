@@ -137,4 +137,22 @@ def load_slots(
         slots.append(slot)
 
     print(f"[INFO] Loaded {len(slots)} slots from '{json_path}'")
-    return slots, roi_polygon
+    return slots, roi_polygon
+
+
+def build_polygon(
+    points: List[List[float]],
+    ref_resolution: Optional[Tuple[int, int]] = None,
+    actual_resolution: Optional[Tuple[int, int]] = None,
+) -> Polygon:
+    """Create a polygon and scale it from reference to actual resolution if needed."""
+    sx, sy = 1.0, 1.0
+    if ref_resolution and actual_resolution:
+        ref_w, ref_h = ref_resolution
+        act_w, act_h = actual_resolution
+        if ref_w > 0 and ref_h > 0 and (ref_w != act_w or ref_h != act_h):
+            sx = act_w / ref_w
+            sy = act_h / ref_h
+
+    scaled_points = [[p[0] * sx, p[1] * sy] for p in points]
+    return Polygon(scaled_points)

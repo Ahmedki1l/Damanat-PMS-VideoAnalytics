@@ -23,6 +23,7 @@ from src.core.engine.engine_visualization import ParkingEngineVisualizationMixin
 from src.detection.tracker import TrackedDetector
 from src.events.event_bus import EventBus
 from src.models.slot import load_slots
+from src.services.parking_service import load_camera_slots
 from src.services.named_slot_service import is_named_slot
 
 logger = logging.getLogger(__name__)
@@ -189,7 +190,13 @@ class ParkingEngine(
             self.event_bus.close()
             print("[INFO] Engine stopped.")
 
-    def run_single_camera(self, video_source: str, slots_file: str = "") -> None:
+    def run_single_camera(
+        self,
+        video_source: str,
+        slots_file: str = "",
+        camera_id: str = "SINGLE",
+        floor: str = "",
+    ) -> None:
         """Single-camera mode for legacy/testing flows."""
         print(f"[INFO] Single-camera mode: {video_source}")
 
@@ -198,17 +205,43 @@ class ParkingEngine(
             print(f"[ERROR] Cannot open video source: {video_source}")
             return
 
-        slots_path = slots_file or self.config.slots_file
-        slots, roi_polygon = load_slots(slots_path) if os.path.exists(slots_path) else ([], None)
+        slots = []
+        special_zones = []
+        roi_polygon = None
+        if self.db_manager and camera_id != "SINGLE":
+            matching_camera = next((cam for cam in self.config.cameras if cam.id == camera_id), None)
+            if matching_camera is not None:
+                self._bootstrap_camera_slots_if_needed(matching_camera)
+            source_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            source_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            actual_res = (source_w, source_h) if source_w > 0 and source_h > 0 else None
+            ref_res = (
+                self.config.processing.slot_ref_width,
+                self.config.processing.slot_ref_height,
+            )
+            session = self.db_manager.SessionLocal()
+            try:
+                slots, special_zones, roi_polygon = load_camera_slots(
+                    session,
+                    camera_id=camera_id,
+                    ref_resolution=ref_res,
+                    actual_resolution=actual_res,
+                )
+            finally:
+                session.close()
+            self.special_zones[camera_id] = {zone.id: zone for zone in special_zones}
+        else:
+            slots_path = slots_file or self.config.slots_file
+            slots, roi_polygon = load_slots(slots_path) if os.path.exists(slots_path) else ([], None)
 
         pipeline = CameraPipeline(
-            camera_id="SINGLE",
-            floor="",
+            camera_id=camera_id,
+            floor=floor,
             slots=slots,
             config=self.config,
             roi_polygon=roi_polygon,
         )
-        self.pipelines["SINGLE"] = pipeline
+        self.pipelines[camera_id] = pipeline
 
         source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         target_fps = self.config.video_target_fps or 2
@@ -238,6 +271,7 @@ class ParkingEngine(
                 self.last_processed_at = datetime.now()
                 detection_frame = pipeline.apply_roi_mask(frame)
                 detections = self.detector.detect_and_track(detection_frame)
+                self._process_special_zones(camera_id, frame, detections)
                 assignment = pipeline.assigner.assign(detections)
 
                 all_events = []
@@ -301,7 +335,7 @@ class ParkingEngine(
                     self.event_bus.emit_status_summary(statuses)
 
                 if show:
-                    self._draw_frame(frame, pipeline, assignment, "SINGLE", detections)
+                    self._draw_frame(frame, pipeline, assignment, camera_id, detections)
                     cv2.imshow("Parking Management System", frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break

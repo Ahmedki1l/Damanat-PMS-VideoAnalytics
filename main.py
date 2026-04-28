@@ -234,6 +234,8 @@ Examples:
         engine.run_single_camera(
             video_source=rtsp_url,
             slots_file=cam_entry.slots_file,
+            camera_id=cam_entry.id,
+            floor=cam_entry.floor,
         )
 
     else:

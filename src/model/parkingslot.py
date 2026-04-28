@@ -6,9 +6,11 @@ class ParkingSlot(Base):
     __tablename__ = "parking_slots"
     slot_id = Column(String(50), primary_key=True, index=True, nullable=False)
     slot_name = Column(String(100), index=True)
+    camera_id = Column(String(50), index=True, nullable=True)
     floor = Column(String(50), index=True)
     zone_id = Column(String(100), nullable=True)
     zone_name = Column(String(100), nullable=True)
+    slot_type = Column(String(30), nullable=False, default="parking")
     polygon = Column(JSON)
     last_snapshot_path = Column(String(255), nullable=True)
     is_available = Column(Boolean, default=True)
