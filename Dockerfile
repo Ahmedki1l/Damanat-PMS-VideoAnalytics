@@ -13,9 +13,18 @@ RUN apt-get update && apt-get install -y \
     git \
 && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
+# Install Python build-time requirements
+# We pin numpy < 2.0.0 because older ML libraries (like torchreid) often break on numpy 2.x
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir "numpy<2.0.0" Cython scipy torch torchvision
+
+# Copy requirements and install to /install
 COPY requirements.txt .
-RUN pip install --upgrade pip && \
+
+# Install torchreid separately to handle its build isolation/numpy requirements
+# We use --no-build-isolation because we already installed numpy globally in this stage
+RUN pip install --no-cache-dir --prefix=/install "numpy<2.0.0" && \
+    pip install --no-cache-dir --prefix=/install --no-build-isolation "git+https://github.com/KaiyangZhou/deep-person-reid.git" && \
     pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 
