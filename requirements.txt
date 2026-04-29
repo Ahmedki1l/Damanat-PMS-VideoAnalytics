@@ -3,7 +3,7 @@ ultralytics>=8.1.0        # YOLO11 inference + built-in tracking
 opencv-python-headless>=4.8.0  # Video I/O without GUI overhead
 shapely>=2.0.0            # Polygon geometry for slot assignment
 pyyaml>=6.0               # Config file parsing
-torchreid>=1.4.0          # Deep ReID models (OSNet)
+torchreid @ git+https://github.com/KaiyangZhou/deep-person-reid.git          # Deep ReID models (OSNet)
 gdown>=5.1.0              # Download model weights
 tensorboard>=2.15.0       # Required by torchreid
 pandas>=2.0.0             # Data processing
