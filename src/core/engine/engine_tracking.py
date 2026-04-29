@@ -897,13 +897,15 @@ class ParkingEngineTrackingMixin:
 
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
-                os.makedirs("vehicle_images", exist_ok=True)
+                base_dir = self.config.output.snapshot_base_dir
+                os.makedirs(base_dir, exist_ok=True)
                 filename = (
-                    f"vehicle_images/{plate}_{cam_id}_"
+                    f"{plate}_{cam_id}_"
                     f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
                 )
-                cv2.imwrite(filename, crop)
-                print(f"[CROP] Saved car image: {filename}")
+                full_path = os.path.join(base_dir, filename)
+                cv2.imwrite(full_path, crop)
+                print(f"[CROP] Saved car image: {full_path}")
                 return filename
         except Exception as exc:
             print(f"[WARN] Failed to save car crop: {exc}")

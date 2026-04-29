@@ -87,7 +87,7 @@ def test_named_slot_violation_creates_permanent_alert_snapshot(monkeypatch):
 
     assert len(result) == 1
     assert result[0].event_type == "named_slot_violation"
-    assert result[0].snapshot_path.startswith(os.path.join("vehicle_images", "alerts"))
+    assert result[0].snapshot_path.startswith("alerts")
     assert os.path.exists(temp_dir / result[0].snapshot_path)
 
 
@@ -113,7 +113,7 @@ def test_violation_slot_creates_permanent_alert_snapshot(monkeypatch):
 
     assert len(result) == 1
     assert result[0].event_type == "vehicle_violation"
-    assert result[0].snapshot_path.startswith(os.path.join("vehicle_images", "alerts"))
+    assert result[0].snapshot_path.startswith("alerts")
     assert os.path.exists(temp_dir / result[0].snapshot_path)
 
 

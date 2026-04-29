@@ -11,7 +11,8 @@ class VehicleRegistryQueryMixin:
     def _get_snapshot_url(self, path: Optional[str]) -> Optional[str]:
         if not path:
             return None
-        return f"/images/{os.path.basename(path)}"
+        # Preserve relative path for subdirectories (e.g., alerts/)
+        return f"/images/{path.replace(os.sep, '/')}"
 
     def _get_snapshot_urls(self, paths: List[str]) -> List[str]:
         return [

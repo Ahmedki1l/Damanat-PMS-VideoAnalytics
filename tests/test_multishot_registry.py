@@ -253,7 +253,7 @@ class TestMultishotRegistry(unittest.TestCase):
         event.status = "provisional"
         event.candidate_id = candidate.candidate_id
         candidate.snapshot_image = self._image(80)
-        candidate.snapshot_path = "vehicle_images/gate.jpg"
+        candidate.snapshot_path = "gate.jpg"
         candidate.feature_vector = np.array([1.0, 0.0], dtype=np.float32)
 
         entry = self._image(70)
@@ -273,7 +273,7 @@ class TestMultishotRegistry(unittest.TestCase):
         session = registry._sessions[session_id]
         self.assertEqual(len(session.reference_snapshot_paths), 3)
         self.assertEqual(len(session.reference_feature_vectors), 3)
-        self.assertEqual(session.gate_snapshot_paths, ["vehicle_images/gate.jpg"])
+        self.assertEqual(session.gate_snapshot_paths, ["gate.jpg"])
         np.testing.assert_array_equal(
             session.feature_vector,
             registry._reid_matcher.extract_feature(deep),
@@ -336,12 +336,12 @@ class TestMultishotRegistry(unittest.TestCase):
             vehicle_session.linked_zone_id = "ZONE-A"
             vehicle_session.linked_zone_name = "Zone A"
             vehicle_session.linked_at = datetime.now()
-            vehicle_session.snapshot_path = "vehicle_images/session_primary.jpg"
-            vehicle_session.gate_snapshot_paths = ["vehicle_images/gate_1.jpg"]
+            vehicle_session.snapshot_path = "session_primary.jpg"
+            vehicle_session.gate_snapshot_paths = ["gate_1.jpg"]
             vehicle_session.reference_snapshot_paths = [
-                "vehicle_images/cam3_entry.jpg",
-                "vehicle_images/cam3_deep.jpg",
-                "vehicle_images/cam3_exit.jpg",
+                "cam3_entry.jpg",
+                "cam3_deep.jpg",
+                "cam3_exit.jpg",
             ]
             registry._parked["SLOT-1"] = vehicle_session
 

@@ -125,6 +125,7 @@ def create_app(
     get_engine_status=None,
     event_bus: Optional[EventBus] = None,
     db_manager=None,
+    snapshot_base_dir: str = "vehicle_images",
 ) -> FastAPI:
     """
     Create the FastAPI application.
@@ -155,11 +156,11 @@ def create_app(
     )
 
     # Mount static assets for vehicle images
-    os.makedirs("vehicle_images", exist_ok=True)
-    app.mount("/images", StaticFiles(directory="vehicle_images"), name="images")
+    os.makedirs(snapshot_base_dir, exist_ok=True)
+    app.mount("/images", StaticFiles(directory=snapshot_base_dir), name="images")
 
     # Use provided or create new registry
-    registry = vehicle_registry or VehicleRegistry()
+    registry = vehicle_registry or VehicleRegistry(image_dir=snapshot_base_dir)
 
     def _build_slot_snapshot_url(slot_id: str) -> str:
         return f"/api/slots/{slot_id}/snapshot/live"
@@ -648,7 +649,7 @@ def create_app(
             try:
                 db_slot = ParkingSlotRepository.get_by_id(session, slot_id)
                 if db_slot is not None and db_slot.last_snapshot_path:
-                    image_path = os.path.join("vehicle_images", db_slot.last_snapshot_path)
+                    image_path = os.path.join(snapshot_base_dir, db_slot.last_snapshot_path)
                     if os.path.exists(image_path):
                         return FileResponse(image_path, media_type="image/jpeg")
             finally:

@@ -94,9 +94,10 @@ class ParkingEngineRuntimeMixin:
             return None
 
         try:
-            os.makedirs("vehicle_images", exist_ok=True)
+            base_dir = self.config.output.snapshot_base_dir
+            os.makedirs(base_dir, exist_ok=True)
             filename = f"slot_{slot.id}_latest.jpg"
-            full_path = os.path.join("vehicle_images", filename)
+            full_path = os.path.join(base_dir, filename)
             cv2.imwrite(full_path, crop)
             return filename
         except Exception as exc:
@@ -112,7 +113,8 @@ class ParkingEngineRuntimeMixin:
             return None
 
         try:
-            directory = os.path.join("vehicle_images", "alerts")
+            base_dir = self.config.output.snapshot_base_dir
+            directory = os.path.join(base_dir, "alerts")
             os.makedirs(directory, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = (
@@ -121,7 +123,7 @@ class ParkingEngineRuntimeMixin:
                 f"{self._safe_snapshot_token(camera_id, 'camera')}_"
                 f"{timestamp}.jpg"
             )
-            relative_path = os.path.join("vehicle_images", "alerts", filename)
+            relative_path = os.path.join("alerts", filename)
             full_path = os.path.join(directory, filename)
             if not cv2.imwrite(full_path, crop):
                 raise RuntimeError("cv2.imwrite returned False")

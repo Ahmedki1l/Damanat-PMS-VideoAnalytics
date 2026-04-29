@@ -96,6 +96,7 @@ class OutputConfig:
     log_file: str = ""
     show_video: bool = False
     show_camera: str = ""  # Which camera to visualize (e.g., "CAM_04")
+    snapshot_base_dir: str = "vehicle_images"
 
 @dataclass
 class DatabaseConfig:
@@ -257,5 +258,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.output.log_file = o.get("log_file", config.output.log_file)
         config.output.show_video = o.get("show_video", config.output.show_video)
         config.output.show_camera = o.get("show_camera", config.output.show_camera)
+        config.output.snapshot_base_dir = o.get(
+            "snapshot_base_dir", 
+            os.environ.get("SNAPSHOT_PATH", config.output.snapshot_base_dir)
+        )
 
     return config

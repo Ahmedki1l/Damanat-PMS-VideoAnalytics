@@ -11,21 +11,26 @@ RUN apt-get update && apt-get install -y \
     g++ \
     unixodbc-dev \
     git \
-&& rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Python build-time requirements
-# We pin numpy < 2.0.0 because older ML libraries (like torchreid) often break on numpy 2.x
+# Create a virtual environment for the app
+# This avoids --prefix issues and ensures a clean, portable environment.
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python build-time requirements (CPU-optimized)
+# We pin numpy < 2.0.0 for compatibility.
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir "numpy<2.0.0" Cython scipy torch torchvision
+    pip install --no-cache-dir "numpy<2.0.0" Cython scipy opencv-python-headless && \
+    pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-# Copy requirements and install to /install
+# Copy requirements and install
 COPY requirements.txt .
 
-# Install torchreid separately to handle its build isolation/numpy requirements
-# We use --no-build-isolation because we already installed numpy globally in this stage
-RUN pip install --no-cache-dir --prefix=/install "numpy<2.0.0" && \
-    pip install --no-cache-dir --prefix=/install --no-build-isolation "git+https://github.com/KaiyangZhou/deep-person-reid.git" && \
-    pip install --no-cache-dir --prefix=/install -r requirements.txt
+# Install torchreid separately to handle its build isolation requirements.
+# Since we are in a venv, all dependencies installed above are available here.
+RUN pip install --no-cache-dir --no-build-isolation "git+https://github.com/KaiyangZhou/deep-person-reid.git" && \
+    pip install --no-cache-dir -r requirements.txt
 
 
 # =========================
@@ -52,14 +57,15 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed Python packages from builder to system path
-COPY --from=builder /install /usr/local
+# Copy the virtual environment from the builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV SNAPSHOT_PATH=vehicle_images
 
 # Copy app code (excluding files in .dockerignore)
 COPY . .
 
 EXPOSE 8000
 
-# Using system python directly. 
 # We run the migration script first, then start the main application in API mode.
 ENTRYPOINT ["sh", "-c", "python migrate_parking_slots_to_db.py --import-json && python main.py --api"]

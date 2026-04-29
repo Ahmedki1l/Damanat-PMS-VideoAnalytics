@@ -145,7 +145,7 @@ class VehicleRegistryCoreMixin:
         filename = f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
         filepath = os.path.join(self._image_dir, filename)
         cv2.imwrite(filepath, enhanced)
-        return filepath
+        return filename
 
     def _store_session_reference_snapshots(
         self,
