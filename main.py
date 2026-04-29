@@ -86,6 +86,7 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         event_bus=engine.event_bus,
         db_manager=engine.db_manager,
         snapshot_base_dir=engine.config.output.snapshot_base_dir,
+        public_base_url=engine.config.output.public_base_url,
     )
 
     # Include routers
@@ -189,7 +190,10 @@ Examples:
     registry = None
     if args.api:
         from src.vehicle_registry import VehicleRegistry
-        registry = VehicleRegistry(image_dir=config.output.snapshot_base_dir)
+        registry = VehicleRegistry(
+            image_dir=config.output.snapshot_base_dir,
+            public_base_url=config.output.public_base_url,
+        )
 
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)
 

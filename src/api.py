@@ -126,6 +126,7 @@ def create_app(
     event_bus: Optional[EventBus] = None,
     db_manager=None,
     snapshot_base_dir: str = "vehicle_images",
+    public_base_url: str = "",
 ) -> FastAPI:
     """
     Create the FastAPI application.
@@ -160,7 +161,10 @@ def create_app(
     app.mount("/images", StaticFiles(directory=snapshot_base_dir), name="images")
 
     # Use provided or create new registry
-    registry = vehicle_registry or VehicleRegistry(image_dir=snapshot_base_dir)
+    registry = vehicle_registry or VehicleRegistry(
+        image_dir=snapshot_base_dir,
+        public_base_url=public_base_url,
+    )
 
     def _build_slot_snapshot_url(slot_id: str) -> str:
         return f"/api/slots/{slot_id}/snapshot/live"

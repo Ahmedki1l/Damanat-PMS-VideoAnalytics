@@ -97,6 +97,10 @@ class OutputConfig:
     show_video: bool = False
     show_camera: str = ""  # Which camera to visualize (e.g., "CAM_04")
     snapshot_base_dir: str = "vehicle_images"
+    # Externally-reachable origin used to build full snapshot URLs (e.g.
+    # "http://localhost:8000"). Empty → emits site-relative `/images/...`
+    # URLs (legacy behaviour).
+    public_base_url: str = "http://localhost:8000"
 
 @dataclass
 class DatabaseConfig:
@@ -259,8 +263,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.output.show_video = o.get("show_video", config.output.show_video)
         config.output.show_camera = o.get("show_camera", config.output.show_camera)
         config.output.snapshot_base_dir = o.get(
-            "snapshot_base_dir", 
+            "snapshot_base_dir",
             os.environ.get("SNAPSHOT_PATH", config.output.snapshot_base_dir)
+        )
+        config.output.public_base_url = o.get(
+            "public_base_url",
+            os.environ.get("PUBLIC_BASE_URL", config.output.public_base_url),
         )
 
     return config
