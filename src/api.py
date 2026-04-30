@@ -127,6 +127,8 @@ def create_app(
     db_manager=None,
     snapshot_base_dir: str = "vehicle_images",
     public_base_url: str = "",
+    snapshot_url_prefix: str = "/snapshots",
+    gateway_path_prefix: str = "",
 ) -> FastAPI:
     """
     Create the FastAPI application.
@@ -158,12 +160,15 @@ def create_app(
 
     # Mount static assets for vehicle images
     os.makedirs(snapshot_base_dir, exist_ok=True)
-    app.mount("/images", StaticFiles(directory=snapshot_base_dir), name="images")
+    mount_prefix = "/" + snapshot_url_prefix.strip("/")
+    app.mount(mount_prefix, StaticFiles(directory=snapshot_base_dir), name="snapshots")
 
     # Use provided or create new registry
     registry = vehicle_registry or VehicleRegistry(
         image_dir=snapshot_base_dir,
         public_base_url=public_base_url,
+        snapshot_url_prefix=snapshot_url_prefix,
+        gateway_path_prefix=gateway_path_prefix,
     )
 
     def _build_slot_snapshot_url(slot_id: str) -> str:

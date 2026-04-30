@@ -87,6 +87,8 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         db_manager=engine.db_manager,
         snapshot_base_dir=engine.config.output.snapshot_base_dir,
         public_base_url=engine.config.output.public_base_url,
+        snapshot_url_prefix=engine.config.output.snapshot_url_prefix,
+        gateway_path_prefix=engine.config.output.gateway_path_prefix,
     )
 
     # Include routers
@@ -193,6 +195,8 @@ Examples:
         registry = VehicleRegistry(
             image_dir=config.output.snapshot_base_dir,
             public_base_url=config.output.public_base_url,
+            snapshot_url_prefix=config.output.snapshot_url_prefix,
+            gateway_path_prefix=config.output.gateway_path_prefix,
         )
 
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)

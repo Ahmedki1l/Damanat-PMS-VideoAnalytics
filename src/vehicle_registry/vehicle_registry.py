@@ -44,6 +44,8 @@ class VehicleRegistry(
         image_dir: str = "vehicle_images",
         reid_preprocessing_config: ReIDPreprocessingConfig = None,
         public_base_url: str = "",
+        snapshot_url_prefix: str = "/snapshots",
+        gateway_path_prefix: str = "",
     ):
         self._lock = threading.RLock()
         self._matcher_lock = threading.Lock()
@@ -61,6 +63,8 @@ class VehicleRegistry(
         self._reid_matcher = None
         self._image_dir = image_dir
         self._public_base_url = public_base_url
+        self._snapshot_url_prefix = snapshot_url_prefix.strip("/")
+        self._gateway_path_prefix = gateway_path_prefix.strip("/")
         self._reid_preprocessing_config = (
             reid_preprocessing_config or ReIDPreprocessingConfig()
         )

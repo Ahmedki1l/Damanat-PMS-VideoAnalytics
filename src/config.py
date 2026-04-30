@@ -98,9 +98,16 @@ class OutputConfig:
     show_camera: str = ""  # Which camera to visualize (e.g., "CAM_04")
     snapshot_base_dir: str = "vehicle_images"
     # Externally-reachable origin used to build full snapshot URLs (e.g.
-    # "http://localhost:8000"). Empty → emits site-relative `/images/...`
-    # URLs (legacy behaviour).
+    # "http://localhost:8000"). Empty → emits site-relative URLs (legacy behaviour).
     public_base_url: str = "http://localhost:8000"
+    # URL path prefix used for serving and referencing snapshot images
+    # (e.g. "/snapshots" → URLs become "{public_base_url}/snapshots/{file}").
+    snapshot_url_prefix: str = "/snapshots"
+    # Optional gateway routing prefix prepended to all generated URLs.
+    # Only needed when the service sits behind a reverse-proxy / API gateway
+    # (e.g. "/pms-ai" → URLs become "/pms-ai/snapshots/{file}").
+    # Leave empty when accessing the service directly.
+    gateway_path_prefix: str = ""
 
 @dataclass
 class DatabaseConfig:
@@ -269,6 +276,14 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.output.public_base_url = o.get(
             "public_base_url",
             os.environ.get("PUBLIC_BASE_URL", config.output.public_base_url),
+        )
+        config.output.snapshot_url_prefix = o.get(
+            "snapshot_url_prefix",
+            config.output.snapshot_url_prefix,
+        )
+        config.output.gateway_path_prefix = o.get(
+            "gateway_path_prefix",
+            os.environ.get("GATEWAY_PATH_PREFIX", config.output.gateway_path_prefix),
         )
 
     return config

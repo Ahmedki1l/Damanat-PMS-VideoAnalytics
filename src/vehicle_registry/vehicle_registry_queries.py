@@ -14,7 +14,11 @@ class VehicleRegistryQueryMixin:
         # Preserve relative path for subdirectories (e.g., alerts/)
         rel = path.replace(os.sep, "/")
         base = (getattr(self, "_public_base_url", "") or "").rstrip("/")
-        return f"{base}/images/{rel}" if base else f"/images/{rel}"
+        gateway = getattr(self, "_gateway_path_prefix", "").strip("/")
+        prefix = getattr(self, "_snapshot_url_prefix", "snapshots").strip("/")
+        # Build path: /{gateway}/{prefix}/{file} — gateway may be empty
+        path_parts = "/".join(part for part in [gateway, prefix, rel] if part)
+        return f"{base}/{path_parts}" if base else f"/{path_parts}"
 
     def _get_snapshot_urls(self, paths: List[str]) -> List[str]:
         return [
