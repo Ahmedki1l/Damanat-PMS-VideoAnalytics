@@ -35,7 +35,8 @@ class VehicleRegistry(
 
     PENDING_ANPR_EXPIRY_SECONDS = 30
     CANDIDATE_EXPIRY_SECONDS = 30
-    TRACK_MAPPING_EXPIRY_SECONDS = 60
+    # Effectively infinite; track mappings are now primarily cleared via the ANPR Exit event.
+    TRACK_MAPPING_EXPIRY_SECONDS = 86400 * 30 
     SESSION_HANDOFF_GUARD_SECONDS = 10
     _GC_INTERVAL_SECONDS = 5
 
