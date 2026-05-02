@@ -810,6 +810,14 @@ class ParkingEngineTrackingMixin:
             )
 
             if session_id:
+                # If this track already has a confirmed plate, the car is
+                # already identified — skip all ReID computation.
+                # Only refresh timestamps to keep the binding alive.
+                plate = self.vehicle_registry.get_plate_for_track(cam_id, detection.track_id)
+                if plate:
+                    self.vehicle_registry.refresh_track_binding(cam_id, detection.track_id, session_id)
+                    continue
+
                 if tracking_manager:
                     smoothed = tracking_manager.get_track_feature(detection.track_id)
                     if smoothed is not None:
