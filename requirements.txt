@@ -21,3 +21,8 @@ sqlalchemy==2.0.47
 psycopg2-binary==2.9.11
 pyodbc>=5.0.0
 
+# Runtime dependencies required by Ultralytics/OpenVINO
+lap>=0.5.12
+openvino>=2024.0.0
+openvino-telemetry>=2023.2.1
+

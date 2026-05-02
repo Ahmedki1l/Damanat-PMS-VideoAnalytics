@@ -147,7 +147,23 @@ def create_app(
         title="Damanat PMS Video Analytics API",
         description="Parking management system with ANPR integration and slot monitoring.",
         version="1.0.0",
+        root_path=gateway_path_prefix,
     )
+
+    @app.get("/")
+    async def root():
+        """Root endpoint providing service overview."""
+        return {
+            "status": "online",
+            "service": "Damanat PMS Video Analytics",
+            "version": "1.0.0",
+            "message": "AI-powered parking management system is running.",
+            "endpoints": {
+                "docs": "/docs",
+                "health": "/api/health",
+                "slots": "/api/slots"
+            }
+        }
 
     # CORS
     app.add_middleware(

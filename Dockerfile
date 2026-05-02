@@ -34,6 +34,9 @@ COPY requirements.txt .
 # 🔥 IMPORTANT: استخدم نسخة stable بدل Git
 RUN pip install --no-cache-dir torchreid==0.2.5
 
+# Install build-heavy dependencies separately to cache layers
+RUN pip install --no-cache-dir "lap>=0.5.12" "openvino>=2024.0.0"
+
 # Install remaining requirements
 RUN pip install --no-cache-dir -r requirements.txt
 
