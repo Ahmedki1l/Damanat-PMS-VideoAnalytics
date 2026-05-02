@@ -11,26 +11,31 @@ RUN apt-get update && apt-get install -y \
     g++ \
     unixodbc-dev \
     git \
-    && rm -rf /var/lib/apt/lists/*
+&& rm -rf /var/lib/apt/lists/*
 
-# Create a virtual environment for the app
-# This avoids --prefix issues and ensures a clean, portable environment.
+# Create virtual environment
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install Python build-time requirements (CPU-optimized)
-# We pin numpy < 2.0.0 for compatibility.
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir "numpy<2.0.0" Cython scipy opencv-python-headless && \
-    pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Upgrade pip tools
+RUN pip install --upgrade pip setuptools wheel
 
-# Copy requirements and install
+# Install core dependencies FIRST (important ترتيب)
+RUN pip install --no-cache-dir "numpy<2.0.0"
+RUN pip install --no-cache-dir Cython scipy
+RUN pip install --no-cache-dir opencv-python-headless
+
+# Install PyTorch CPU
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Copy requirements
 COPY requirements.txt .
 
-# Install torchreid separately to handle its build isolation requirements.
-# Since we are in a venv, all dependencies installed above are available here.
-RUN pip install --no-cache-dir --no-build-isolation "git+https://github.com/KaiyangZhou/deep-person-reid.git" && \
-    pip install --no-cache-dir -r requirements.txt
+# 🔥 IMPORTANT: استخدم نسخة stable بدل Git
+RUN pip install --no-cache-dir torchreid==0.2.5
+
+# Install remaining requirements
+RUN pip install --no-cache-dir -r requirements.txt
 
 
 # =========================
@@ -40,7 +45,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install runtime dependencies (ODBC + OpenCV system libs)
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
@@ -48,24 +53,23 @@ RUN apt-get update && apt-get install -y \
     libxcb1 \
     libgl1 \
     libglib2.0-0 \
-    && mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
-    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
-    > /etc/apt/sources.list.d/mssql-release.list \
-    && apt-get update \
-    && ACCEPT_EULA=Y apt-get install -y msodbcsql18 \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+&& mkdir -p /etc/apt/keyrings \
+&& curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
+&& echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+> /etc/apt/sources.list.d/mssql-release.list \
+&& apt-get update \
+&& ACCEPT_EULA=Y apt-get install -y msodbcsql18 \
+&& apt-get clean \
+&& rm -rf /var/lib/apt/lists/*
 
-# Copy the virtual environment from the builder
+# Copy virtual environment
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-ENV SNAPSHOT_PATH=vehicle_images
 
-# Copy app code (excluding files in .dockerignore)
+# Copy app code
 COPY . .
 
 EXPOSE 8000
 
-# We run the migration script first, then start the main application in API mode.
+# Run migrations then API
 ENTRYPOINT ["sh", "-c", "python migrate_parking_slots_to_db.py --import-json && python main.py --api"]

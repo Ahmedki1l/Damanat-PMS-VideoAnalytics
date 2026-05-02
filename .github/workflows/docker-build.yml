@@ -1,0 +1,116 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+
+env:
+  # Dockerfile path
+  DOCKERFILE_PATH: "."
+  # Docker image name
+  IMAGE_NAME: "damanat-pms-video-analytics"
+  # Image tag starting number (will increment by 1 per push)
+  TAG_START_NUMBER: "1030"
+  # Exclude these emails from notifications (comma-separated)
+  EXCLUDE_EMAILS: ""
+
+jobs:
+  build:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Write runtime config from secret
+        env:
+          APP_CONFIG_YAML: ${{ secrets.APP_CONFIG_YAML }}
+        run: |
+          if [ -z "$APP_CONFIG_YAML" ]; then
+            echo "Missing required secret: APP_CONFIG_YAML"
+            exit 1
+          fi
+
+          printf '%s' "$APP_CONFIG_YAML" > config.yaml
+
+      - name: Calculate image tag
+        id: calc_tag
+        run: |
+          TAG_NUMBER=$((${{ env.TAG_START_NUMBER }} + ${{ github.run_number }} - 1))
+          echo "image_tag=${TAG_NUMBER}" >> $GITHUB_OUTPUT
+          echo "Image tag will be: ${TAG_NUMBER}"
+
+      - name: Login to Nexus Docker Registry
+        run: echo "${{ secrets.NEXUS_PASSWORD }}" | docker login ${{ secrets.NEXUS_REGISTRY }} -u "${{ secrets.NEXUS_USERNAME }}" --password-stdin
+
+      - name: Build Docker image
+        id: build_image
+        run: |
+          docker build -t ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }} ${{ env.DOCKERFILE_PATH }}
+
+      - name: Notify build success
+        if: always() && steps.build_image.outcome == 'success'
+        run: |
+          echo "✅ Docker build succeeded for ${{ github.repository }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        shell: bash
+
+      - name: Notify build failure
+        if: always() && steps.build_image.outcome == 'failure'
+        run: |
+          echo "❌ Docker build failed for ${{ github.repository }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        shell: bash
+
+      - name: Push Docker image
+        id: push_image
+        run: |
+          docker push ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }}
+
+      - name: Tag as latest
+        id: push_latest
+        run: |
+          docker tag ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }} \
+                     ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:latest
+
+          docker push ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Remove runtime config
+        if: always()
+        run: rm -f config.yaml
+
+      - name: Notify docker push success
+        if: always() && steps.push_image.outcome == 'success' && steps.push_latest.outcome == 'success'
+        run: |
+          echo "✅ Docker push succeeded for ${{ github.repository }}"
+          echo "Image: ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }}"
+          echo "Also pushed: latest"
+          echo "Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        shell: bash
+
+      - name: Notify docker push failure
+        if: always() && (steps.push_image.outcome == 'failure' || steps.push_latest.outcome == 'failure')
+        run: |
+          echo "❌ Docker push failed for ${{ github.repository }}"
+          echo "Image: ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }}"
+          echo "Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        shell: bash
+
+  notify-release:
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Notify new release
+        run: |
+          echo "🚀 New release published for ${{ github.repository }}"
+          echo "Release: ${{ github.event.release.tag_name }}"
+          echo "URL: ${{ github.event.release.html_url }}"
+        shell: bash
