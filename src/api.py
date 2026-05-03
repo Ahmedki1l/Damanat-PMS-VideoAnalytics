@@ -30,7 +30,6 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.sse import EventSourceResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.vehicle_registry import VehicleRegistry
@@ -174,10 +173,29 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Mount static assets for vehicle images
+    # Serve vehicle/snapshot images from snapshot_base_dir via a regular
+    # GET endpoint instead of a StaticFiles mount. Lets us validate
+    # filenames and gives a normal place to add logging or swap the
+    # storage backend later.
     os.makedirs(snapshot_base_dir, exist_ok=True)
     mount_prefix = "/" + snapshot_url_prefix.strip("/")
-    app.mount(mount_prefix, StaticFiles(directory=snapshot_base_dir), name="snapshots")
+
+    @app.get(
+        mount_prefix + "/{filename}",
+        summary="Serve a saved snapshot JPEG",
+        response_class=FileResponse,
+        name="snapshots",
+    )
+    def serve_snapshot(filename: str):
+        # Reject anything that isn't a bare filename — blocks ../ traversal,
+        # absolute paths, and Windows drive specs.
+        safe_name = os.path.basename(filename)
+        if not safe_name or safe_name != filename:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        filepath = os.path.join(snapshot_base_dir, safe_name)
+        if not os.path.isfile(filepath):
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        return FileResponse(filepath, media_type="image/jpeg")
 
     # Use provided or create new registry
     registry = vehicle_registry or VehicleRegistry(
