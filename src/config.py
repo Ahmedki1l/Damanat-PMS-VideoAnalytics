@@ -100,9 +100,11 @@ class OutputConfig:
     # Externally-reachable origin used to build full snapshot URLs (e.g.
     # "http://localhost:8000"). Empty → emits site-relative URLs (legacy behaviour).
     public_base_url: str = "http://localhost:8000"
-    # URL path prefix used for serving and referencing snapshot images
-    # (e.g. "/snapshots" → URLs become "{public_base_url}/snapshots/{file}").
-    snapshot_url_prefix: str = "/snapshots"
+    # URL path prefix used for serving and referencing snapshot images.
+    # Must match the route registered in src/api.py::create_app, which is
+    # the static "/pms-video-analytics/snapshots" — overriding this in
+    # yaml/env will make registry-emitted URLs miss the served route.
+    snapshot_url_prefix: str = "/pms-video-analytics/snapshots"
     # Optional gateway routing prefix prepended to all generated URLs.
     # Only needed when the service sits behind a reverse-proxy / API gateway
     # (e.g. "/pms-ai" → URLs become "/pms-ai/snapshots/{file}").

@@ -45,7 +45,7 @@ class VehicleRegistry(
         image_dir: str = "vehicle_images",
         reid_preprocessing_config: ReIDPreprocessingConfig = None,
         public_base_url: str = "",
-        snapshot_url_prefix: str = "/snapshots",
+        snapshot_url_prefix: str = "/pms-video-analytics/snapshots",
         gateway_path_prefix: str = "",
     ):
         self._lock = threading.RLock()

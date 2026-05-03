@@ -452,6 +452,15 @@ class ParkingEngineRuntimeMixin:
                     )
                     if self.db_manager and plate != previous_plate:
                         self._persist_late_slot_plate(slot.id, plate, cam_id)
+                elif previous_plate:
+                    # Registry says no plate (moved or unlinked), but machine has one.
+                    # Clear it to avoid ghost labels in the UI.
+                    state_machine.bind_identity(
+                        None,
+                        self._build_slot_snapshot_url(slot.id),
+                    )
+                    if self.db_manager:
+                        self._persist_late_slot_plate(slot.id, None, cam_id)
 
             all_events.extend(events)
 
