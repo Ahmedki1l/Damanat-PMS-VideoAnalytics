@@ -347,14 +347,14 @@ class TestMultishotRegistry(unittest.TestCase):
 
         location = registry.get_plate_location("URL-001")
 
-        self.assertEqual(location["snapshot_url"], "/snapshots/session_primary.jpg")
-        self.assertEqual(location["gate_snapshot_urls"], ["/snapshots/gate_1.jpg"])
+        self.assertEqual(location["snapshot_url"], "/pms-video-analytics/snapshots/session_primary.jpg")
+        self.assertEqual(location["gate_snapshot_urls"], ["/pms-video-analytics/snapshots/gate_1.jpg"])
         self.assertEqual(
             location["gallery_snapshot_urls"],
             [
-                "/snapshots/cam3_entry.jpg",
-                "/snapshots/cam3_deep.jpg",
-                "/snapshots/cam3_exit.jpg",
+                "/pms-video-analytics/snapshots/cam3_entry.jpg",
+                "/pms-video-analytics/snapshots/cam3_deep.jpg",
+                "/pms-video-analytics/snapshots/cam3_exit.jpg",
             ],
         )
 

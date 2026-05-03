@@ -126,7 +126,7 @@ def create_app(
     db_manager=None,
     snapshot_base_dir: str = "vehicle_images",
     public_base_url: str = "",
-    snapshot_url_prefix: str = "/snapshots",
+    snapshot_url_prefix: str = "/pms-video-analytics/snapshots",
     gateway_path_prefix: str = "",
 ) -> FastAPI:
     """
@@ -174,28 +174,29 @@ def create_app(
     )
 
     # Serve vehicle/snapshot images from snapshot_base_dir via a regular
-    # GET endpoint instead of a StaticFiles mount. Lets us validate
-    # filenames and gives a normal place to add logging or swap the
-    # storage backend later.
+    # GET endpoint at a fixed public path. {filepath:path} is required
+    # because alert snapshots are written under alerts/<file>.jpg by
+    # engine_runtime._save_alert_snapshot and exposed with that nested
+    # shape by vehicle_registry_queries._get_snapshot_url.
     os.makedirs(snapshot_base_dir, exist_ok=True)
-    mount_prefix = "/" + snapshot_url_prefix.strip("/")
+    _snapshot_base_abs = os.path.abspath(snapshot_base_dir)
 
     @app.get(
-        mount_prefix + "/{filename}",
+        "/pms-video-analytics/snapshots/{filepath:path}",
         summary="Serve a saved snapshot JPEG",
         response_class=FileResponse,
         name="snapshots",
     )
-    def serve_snapshot(filename: str):
-        # Reject anything that isn't a bare filename — blocks ../ traversal,
-        # absolute paths, and Windows drive specs.
-        safe_name = os.path.basename(filename)
-        if not safe_name or safe_name != filename:
+    def serve_snapshot(filepath: str):
+        # Resolve and require the result to live inside snapshot_base_dir.
+        # Catches `..` traversal, absolute paths, and Windows drive specs
+        # in one check, and still allows legitimate subfolders like alerts/.
+        requested_abs = os.path.abspath(os.path.join(_snapshot_base_abs, filepath))
+        if not requested_abs.startswith(_snapshot_base_abs + os.sep):
             raise HTTPException(status_code=404, detail="Snapshot not found")
-        filepath = os.path.join(snapshot_base_dir, safe_name)
-        if not os.path.isfile(filepath):
+        if not os.path.isfile(requested_abs):
             raise HTTPException(status_code=404, detail="Snapshot not found")
-        return FileResponse(filepath, media_type="image/jpeg")
+        return FileResponse(requested_abs, media_type="image/jpeg")
 
     # Use provided or create new registry
     registry = vehicle_registry or VehicleRegistry(
