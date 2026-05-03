@@ -30,7 +30,6 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.sse import EventSourceResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.vehicle_registry import VehicleRegistry
@@ -127,7 +126,7 @@ def create_app(
     db_manager=None,
     snapshot_base_dir: str = "vehicle_images",
     public_base_url: str = "",
-    snapshot_url_prefix: str = "/snapshots",
+    snapshot_url_prefix: str = "/pms-video-analytics/snapshots",
     gateway_path_prefix: str = "",
 ) -> FastAPI:
     """
@@ -174,10 +173,30 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Mount static assets for vehicle images
+    # Serve vehicle/snapshot images from snapshot_base_dir via a regular
+    # GET endpoint at a fixed public path. {filepath:path} is required
+    # because alert snapshots are written under alerts/<file>.jpg by
+    # engine_runtime._save_alert_snapshot and exposed with that nested
+    # shape by vehicle_registry_queries._get_snapshot_url.
     os.makedirs(snapshot_base_dir, exist_ok=True)
-    mount_prefix = "/" + snapshot_url_prefix.strip("/")
-    app.mount(mount_prefix, StaticFiles(directory=snapshot_base_dir), name="snapshots")
+    _snapshot_base_abs = os.path.abspath(snapshot_base_dir)
+
+    @app.get(
+        "/pms-video-analytics/snapshots/{filepath:path}",
+        summary="Serve a saved snapshot JPEG",
+        response_class=FileResponse,
+        name="snapshots",
+    )
+    def serve_snapshot(filepath: str):
+        # Resolve and require the result to live inside snapshot_base_dir.
+        # Catches `..` traversal, absolute paths, and Windows drive specs
+        # in one check, and still allows legitimate subfolders like alerts/.
+        requested_abs = os.path.abspath(os.path.join(_snapshot_base_abs, filepath))
+        if not requested_abs.startswith(_snapshot_base_abs + os.sep):
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        if not os.path.isfile(requested_abs):
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        return FileResponse(requested_abs, media_type="image/jpeg")
 
     # Use provided or create new registry
     registry = vehicle_registry or VehicleRegistry(
