@@ -117,9 +117,6 @@ def update_current_slot_plate(
     the identity slightly later. In that case we should enrich the current
     occupied record instead of creating another duplicate occupied row.
     """
-    if not plate:
-        return None
-
     latest_status = SlotStatusRepository.get_latest_by_slot(db, slot_id)
     if latest_status and latest_status.status == "occupied":
         previous_plate = latest_status.plate_number
@@ -129,17 +126,30 @@ def update_current_slot_plate(
 
         slot = ParkingSlotRepository.get_by_id(db, slot_id)
         if slot and plate != previous_plate:
-            pms_api_client.bind_slot_session(
-                plate_number=plate,
-                slot_id=slot.slot_id,
-                slot_number=slot.slot_name or slot.slot_id,
-                zone_id=slot.zone_id,
-                zone_name=slot.zone_name,
-                floor=slot.floor,
-                camera_id=camera_id,
-                parked_at=latest_status.time.isoformat() if latest_status.time else None,
-            )
+            if plate:
+                pms_api_client.bind_slot_session(
+                    plate_number=plate,
+                    slot_id=slot.slot_id,
+                    slot_number=slot.slot_name or slot.slot_id,
+                    zone_id=slot.zone_id,
+                    zone_name=slot.zone_name,
+                    floor=slot.floor,
+                    camera_id=camera_id,
+                    parked_at=latest_status.time.isoformat() if latest_status.time else None,
+                )
+            elif previous_plate:
+                # Clear the session in PMS API as well
+                pms_api_client.unbind_slot_session(
+                    plate_number=previous_plate,
+                    slot_id=slot.slot_id,
+                    slot_number=slot.slot_name or slot.slot_id,
+                    camera_id=camera_id,
+                    left_at=datetime.now().isoformat(),
+                )
         return latest_status
+
+    if not plate:
+        return None
 
     created, _ = log_vehicle_event(
         db=db,

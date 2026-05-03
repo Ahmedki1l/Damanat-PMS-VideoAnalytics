@@ -1022,6 +1022,19 @@ class VehicleRegistryIdentityMixin:
                     return existing.plate
                 return existing.plate
 
+            # Enforce one-slot-per-vehicle rule: if this session is already
+            # linked to a different slot, remove that old linkage first.
+            if session.linked_slot and session.linked_slot != slot_id:
+                old_slot_id = session.linked_slot
+                logger.info(
+                    "[REGISTRY] Vehicle session %s (plate %s) moving from slot %s to %s",
+                    session.session_id,
+                    session.plate,
+                    old_slot_id,
+                    slot_id,
+                )
+                self._parked.pop(old_slot_id, None)
+
             session.linked_slot = slot_id
             session.linked_slot_name = slot_name
             session.linked_camera = camera_id
