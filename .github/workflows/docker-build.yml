@@ -13,7 +13,7 @@ env:
   # Docker image name
   IMAGE_NAME: "damanat-pms-video-analytics"
   # Image tag starting number (will increment by 1 per push)
-  TAG_START_NUMBER: "1030"
+  TAG_START_NUMBER: "1031"
   # Exclude these emails from notifications (comma-separated)
   EXCLUDE_EMAILS: ""
 
