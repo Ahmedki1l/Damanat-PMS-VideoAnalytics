@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from src.database import Base
-from datetime import datetime
+from src.utils.datetime_helper import facility_now_naive
 
 
 class SlotStatus(Base):
@@ -10,7 +10,7 @@ class SlotStatus(Base):
     slot_id = Column(String(50), ForeignKey("parking_slots.slot_id"),nullable=False)
     plate_number = Column(String(20), index=True)
     status = Column(String(20))
-    time = Column(DateTime, default=datetime.utcnow)
+    time = Column(DateTime, default=facility_now_naive)
 
     slot = relationship(
         "ParkingSlot",

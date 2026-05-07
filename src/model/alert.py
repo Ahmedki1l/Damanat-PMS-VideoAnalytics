@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
-from datetime import datetime
 from src.database import Base
+from src.utils.datetime_helper import facility_now_naive
 
 class Alert(Base):
     __tablename__ = "alerts"
@@ -19,7 +19,7 @@ class Alert(Base):
     snapshot_path = Column(Text, nullable=True)
     is_test = Column(Boolean, default=False, nullable=False)
     is_resolved = Column(Boolean, default=False, nullable=False)
-    triggered_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    triggered_at = Column(DateTime, default=facility_now_naive, nullable=False, index=True)
     resolved_at = Column(DateTime, nullable=True)
     
     # Custom addition to track plates natively
