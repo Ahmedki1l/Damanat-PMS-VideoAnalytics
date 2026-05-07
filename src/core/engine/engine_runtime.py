@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import time
@@ -17,6 +18,9 @@ from src.services.parking_service import (
 )
 from src.services.named_slot_service import get_named_slot_title, is_named_slot
 from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
+
+
+logger = logging.getLogger(__name__)
 
 
 class ParkingEngineRuntimeMixin:
@@ -343,28 +347,30 @@ class ParkingEngineRuntimeMixin:
 
         session = self.db_manager.SessionLocal()
         try:
-            from src.model.vehicle import Vehicle
             from sqlalchemy import text as _text
 
-            vehicle = session.query(Vehicle).filter(Vehicle.plate_number == plate).first()
-            if vehicle is None:
+            # Check if vehicle exists (raw SQL — VA has no Vehicle ORM model;
+            # the vehicles table is owned by the Gateway's schema).
+            row = session.execute(
+                _text("SELECT id, floor FROM dbo.vehicles WHERE plate_number = :p"),
+                {"p": plate},
+            ).first()
+            if row is None:
                 # No registry row yet — VA's Park_Entry pipeline will create
                 # it once ANPR matches. Don't create a partial row here.
                 return
 
-            updated = False
-            if floor and vehicle.floor != floor:
-                vehicle.floor = floor
-                # Resolve floor_id from the floors lookup table via raw SQL
-                # (VA has no Floor SQLAlchemy model; the floors table is owned
-                # by the Gateway's schema). Idempotent: floors.name is unique.
+            vehicle_id, current_floor = row
+            if floor and current_floor != floor:
+                # Resolve floor_id from the floors lookup table.
                 fid = session.execute(
                     _text("SELECT id FROM dbo.floors WHERE name = :n"),
                     {"n": floor},
                 ).scalar()
-                vehicle.floor_id = fid
-                updated = True
-            if updated:
+                session.execute(
+                    _text("UPDATE dbo.vehicles SET floor = :f, floor_id = :fid WHERE id = :vid"),
+                    {"f": floor, "fid": fid, "vid": vehicle_id},
+                )
                 session.commit()
                 logger.debug(
                     "[presence] plate=%s floor=%s camera=%s",
