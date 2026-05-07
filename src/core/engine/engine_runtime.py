@@ -319,17 +319,26 @@ class ParkingEngineRuntimeMixin:
         floor: Optional[str] = None,
         camera_id: Optional[str] = None,
     ) -> None:
-        """Write `vehicles.floor` / `floor_id` so the Gateway and any other
-        consumer can answer "where is this car right now" without JOINing
-        parking_sessions. Called from every track-confirmation path
-        (Park_Entry capture, B1_Entrence confirmation, slot bind, plus the
-        per-frame TrackingManager observation). The slot-bind side is also
-        written by PMS-AI's parking_session_service.bind_slot — both
-        sources are idempotent so they can race safely.
+        """Write `vehicles.floor` / `floor_id` AND mirror the same value onto
+        the OPEN `parking_sessions` row so the Gateway's entry-exit endpoint
+        (which JOINs parking_sessions for floor / floor_id / parked_at) shows
+        the live floor even before a slot is bound.
+
+        Called from every track-confirmation path (Park_Entry capture,
+        B1_Entrence confirmation, slot bind, plus the per-frame
+        TrackingManager observation). The slot-bind path is also written by
+        PMS-AI's parking_session_service.bind_slot — both sources are
+        idempotent so they can race safely.
 
         Rate-gated to once per plate per ~5s so per-frame callers don't
         hammer the DB. Safe to call with floor=None — only updates fields
         that are actually known.
+
+        `parked_at` semantics: set ONLY when currently NULL on the open
+        session (i.e. the session has no slot-bind timestamp yet). This
+        marks "first floor observation" for sessions that arrive at the
+        slot detection cameras before any slot bind, while preserving the
+        slot-bind timestamp once bind_slot has set it.
         """
         if not plate or not self.db_manager:
             return
@@ -361,21 +370,46 @@ class ParkingEngineRuntimeMixin:
                 return
 
             vehicle_id, current_floor = row
-            if floor and current_floor != floor:
-                # Resolve floor_id from the floors lookup table.
-                fid = session.execute(
-                    _text("SELECT id FROM dbo.floors WHERE name = :n"),
-                    {"n": floor},
-                ).scalar()
-                session.execute(
-                    _text("UPDATE dbo.vehicles SET floor = :f, floor_id = :fid WHERE id = :vid"),
-                    {"f": floor, "fid": fid, "vid": vehicle_id},
-                )
-                session.commit()
-                logger.debug(
-                    "[presence] plate=%s floor=%s camera=%s",
-                    plate, floor, camera_id,
-                )
+            if not floor or current_floor == floor:
+                return
+
+            # Resolve floor_id from the floors lookup table once; reused for
+            # both the vehicles UPDATE and the parking_sessions UPDATE.
+            fid = session.execute(
+                _text("SELECT id FROM dbo.floors WHERE name = :n"),
+                {"n": floor},
+            ).scalar()
+
+            # 1. vehicles row (canonical "where is the car right now").
+            session.execute(
+                _text("UPDATE dbo.vehicles SET floor = :f, floor_id = :fid WHERE id = :vid"),
+                {"f": floor, "fid": fid, "vid": vehicle_id},
+            )
+
+            # 2. open parking_sessions row (drives the Gateway's entry-exit
+            #    response shape via JOIN). Only one open session per plate
+            #    by invariant (UC1 dedup + close_session). Update the latest
+            #    open row; no-op if the plate isn't currently inside.
+            #    parked_at is COALESCE so a slot-bind timestamp from
+            #    parking_session_service.bind_slot wins; we only fill it in
+            #    the gap where VA observed the car on a floor before the
+            #    slot detection camera reported a bind.
+            session.execute(
+                _text(
+                    "UPDATE dbo.parking_sessions "
+                    "SET floor = :f, floor_id = :fid, "
+                    "    parked_at = COALESCE(parked_at, SYSUTCDATETIME()), "
+                    "    updated_at = SYSUTCDATETIME() "
+                    "WHERE plate_number = :p AND status = 'open'"
+                ),
+                {"f": floor, "fid": fid, "p": plate},
+            )
+
+            session.commit()
+            logger.debug(
+                "[presence] plate=%s floor=%s camera=%s (vehicles + parking_sessions)",
+                plate, floor, camera_id,
+            )
         except Exception as exc:
             session.rollback()
             logger.warning("[presence] write failed for plate=%s: %r", plate, exc)
