@@ -394,15 +394,21 @@ class ParkingEngineRuntimeMixin:
             #    parking_session_service.bind_slot wins; we only fill it in
             #    the gap where VA observed the car on a floor before the
             #    slot detection camera reported a bind.
+            # Bind a Python facility-local naive datetime instead of using
+            # MSSQL's SYSUTCDATETIME() — the DB convention is naive facility-
+            # local (operator wall clock), and SYSUTCDATETIME() returns UTC
+            # which would land 3h behind the wall clock.
+            from src.utils.datetime_helper import facility_now_naive
+            now_naive = facility_now_naive()
             session.execute(
                 _text(
                     "UPDATE dbo.parking_sessions "
                     "SET floor = :f, floor_id = :fid, "
-                    "    parked_at = COALESCE(parked_at, SYSUTCDATETIME()), "
-                    "    updated_at = SYSUTCDATETIME() "
+                    "    parked_at = COALESCE(parked_at, :now), "
+                    "    updated_at = :now "
                     "WHERE plate_number = :p AND status = 'open'"
                 ),
-                {"f": floor, "fid": fid, "p": plate},
+                {"f": floor, "fid": fid, "p": plate, "now": now_naive},
             )
 
             session.commit()

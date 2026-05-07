@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 from src.model import SlotStatus, CameraFeed
 from src.repositories import SlotStatusRepository, ParkingSlotRepository
-from datetime import datetime
+from src.utils.datetime_helper import facility_now_naive
 from . import alert_service
 from . import pms_api_client
 
@@ -38,7 +38,7 @@ def log_camera_feed_event(db: Session, event_type: str, camera_id: str, plate: s
         detection_source="Vision Detection",
         plate_number=plate,
         snapshot_path=snapshot_path,
-        timestamp=datetime.now()
+        timestamp=facility_now_naive()
     )
     
     db.add(new_feed)
@@ -147,7 +147,7 @@ def update_current_slot_plate(
                     slot_id=slot.slot_id,
                     slot_number=slot.slot_name or slot.slot_id,
                     camera_id=camera_id,
-                    left_at=datetime.now().isoformat(),
+                    left_at=facility_now_naive().isoformat(),
                 )
         return latest_status
 

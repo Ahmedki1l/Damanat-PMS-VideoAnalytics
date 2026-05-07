@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 from src.model.alert import Alert
 from src.repositories import AlertRepository, ParkingSlotRepository
-from datetime import datetime
+from src.utils.datetime_helper import facility_now_naive
 from src.services.named_slot_service import is_named_slot
 
 def check_slot_restricted(db: Session, slot_id: str) -> bool:
@@ -78,7 +78,7 @@ def report_alert(
         ),
         snapshot_path=resolved_snapshot_path,
         is_resolved=False,
-        triggered_at=datetime.utcnow(),
+        triggered_at=facility_now_naive(),
         plate_number=plate_number,
         severity=severity
     )

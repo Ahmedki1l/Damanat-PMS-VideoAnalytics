@@ -1,7 +1,7 @@
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from src.model import Alert
-from datetime import datetime
+from src.utils.datetime_helper import facility_now_naive
 from typing import Optional
 
 class AlertRepository:
@@ -42,7 +42,7 @@ class AlertRepository:
         alert = db.query(Alert).filter(Alert.id == alert_id).first()
         if alert and not alert.is_resolved:
             alert.is_resolved = True
-            alert.resolved_at = datetime.utcnow()
+            alert.resolved_at = facility_now_naive()
             db.commit()
             db.refresh(alert)
         return alert
