@@ -9,7 +9,7 @@ router = APIRouter(prefix="/api/alerts", tags=["Alerts"])
 
 @router.get("", response_model=List[AlertResponse])
 def get_alerts(alert_type: str = None, db: Session = Depends(get_db)):
-    """Get all active alerts, optionally filtered by type ('violation', 'intrusion', 'named_slot_violation')."""
+    """Get all active alerts, optionally filtered by type ('vehicle_violation', 'vehicle_intrusion', 'intrusion', 'violence')."""
     return alert_service.get_active_alerts(db, alert_type)
 
 @router.get("/history/{slot_id}", response_model=List[AlertResponse])

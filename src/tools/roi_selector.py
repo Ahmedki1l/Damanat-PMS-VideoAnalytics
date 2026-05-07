@@ -108,7 +108,7 @@ class ROISelector:
 if __name__ == "__main__":
     config = load_config()
     db = init_db(config.database.url)
-    target_cams = ["CAM_01", "CAM_02"]
+    target_cams = ["CAM-01", "CAM-02"]
 
     raw_config = {"cameras": [], "processing": {"stream_channel": config.processing.stream_channel}}
     for cam in config.cameras:
@@ -128,7 +128,7 @@ if __name__ == "__main__":
         if cam["id"] in target_cams:
             print(f" - {cam['id']}: {cam['name']} ({cam['floor']})")
 
-    cam_id = input("\nEnter Camera ID to configure (or press Enter for CAM_01): ").strip() or "CAM_01"
+    cam_id = input("\nEnter Camera ID to configure (or press Enter for CAM-01): ").strip() or "CAM-01"
 
     selected_cam = next((c for c in raw_config["cameras"] if c["id"] == cam_id), None)
     if not selected_cam:

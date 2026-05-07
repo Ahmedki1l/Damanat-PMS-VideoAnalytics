@@ -816,6 +816,16 @@ class ParkingEngineTrackingMixin:
                 plate = self.vehicle_registry.get_plate_for_track(cam_id, detection.track_id)
                 if plate:
                     self.vehicle_registry.refresh_track_binding(cam_id, detection.track_id, session_id)
+                    # Persist "where is this car right now" — vehicles.floor /
+                    # last_seen_at — so the Gateway can answer presence queries
+                    # for cars driving across the floor without parking. The
+                    # writer is rate-gated (see _PRESENCE_MIN_INTERVAL_S),
+                    # so calling it on every frame is cheap.
+                    pipeline = self.pipelines.get(cam_id)
+                    if pipeline is not None:
+                        self.update_vehicle_presence(
+                            plate, floor=pipeline.floor, camera_id=cam_id,
+                        )
                     continue
 
                 if tracking_manager:

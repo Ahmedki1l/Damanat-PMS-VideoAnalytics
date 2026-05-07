@@ -16,6 +16,44 @@ match_logger = logging.getLogger("reid_match_perf")
 
 
 class VehicleRegistryIdentityMixin:
+    def is_plate_inside(self, plate: Optional[str]) -> bool:
+        """Returns True iff `plate` has an open `parking_sessions` row in the
+        shared DB. Single source of truth — avoids in-memory drift between VA
+        and PMS-AI when the gate's exit-ANPR event was missed.
+
+        Returns True if VA has no DB binding (legacy/test env) or no plate is
+        passed; the guard fails open so unrelated logic still runs.
+        """
+        if not plate:
+            return True
+        db_manager = getattr(self, "db_manager", None)
+        if db_manager is None:
+            return True
+        try:
+            from sqlalchemy import text as _text
+
+            session = db_manager.SessionLocal()
+            try:
+                row = session.execute(
+                    _text(
+                        "SELECT TOP 1 status FROM dbo.parking_sessions "
+                        "WHERE plate_number = :p ORDER BY entry_time DESC"
+                    ),
+                    {"p": plate},
+                ).first()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning("[is_plate_inside] DB probe failed for %s: %r", plate, exc)
+            return True  # fail-open so a transient DB blip doesn't block re-id
+
+        if row is None:
+            # No session ever recorded — could be fresh-arrival before ANPR
+            # has fired, so allow the link to proceed (registry-side gates
+            # cover the "never entered" case).
+            return True
+        return row[0] == "open"
+
     @staticmethod
     def _dedupe_valid_images(images: List[np.ndarray]) -> List[np.ndarray]:
         deduped: List[np.ndarray] = []
@@ -79,7 +117,7 @@ class VehicleRegistryIdentityMixin:
 
         candidate = ParkEntryCandidate(
             candidate_id=f"cand_{uuid.uuid4().hex[:12]}",
-            camera_id="CAM_03",
+            camera_id="CAM-03",
             track_id=-1,
             entered_at=event.timestamp,
             last_seen_at=now,
@@ -464,6 +502,18 @@ class VehicleRegistryIdentityMixin:
                 logger.debug(
                     "[B1] Bound event for candidate %s is no longer provisional; discarding match",
                     live_candidate.candidate_id,
+                )
+                return None
+
+            # Refuse to confirm a plate whose latest parking_sessions row is
+            # closed — the car has already exited per PMS-AI. Without this,
+            # a re-id match against a stale gate snapshot can resurrect a
+            # ghost session for a car that's no longer in the garage.
+            if not self.is_plate_inside(event.plate):
+                logger.warning(
+                    "[B1] refused: plate=%s already exited "
+                    "(no open parking_sessions row); discarding confirmation",
+                    event.plate,
                 )
                 return None
 
@@ -1014,6 +1064,18 @@ class VehicleRegistryIdentityMixin:
 
             session = self._sessions.get(session_id)
             if session is None:
+                return None
+
+            # Refuse to bind a plate whose latest parking_sessions row is
+            # closed — the car has exited the garage (per PMS-AI) and any
+            # further re-id match would be ghost activity. The check fails
+            # open if the DB is unreachable so a blip doesn't strand traffic.
+            if not self.is_plate_inside(session.plate):
+                logger.warning(
+                    "[try_link_to_slot] refused: plate=%s already exited "
+                    "(no open parking_sessions row); skipping bind to %s",
+                    session.plate, slot_id,
+                )
                 return None
 
             existing = self._parked.get(slot_id)

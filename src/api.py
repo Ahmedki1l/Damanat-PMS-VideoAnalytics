@@ -391,7 +391,7 @@ def create_app(
 
         if get_park_entry_crop is not None:
             import cv2
-            candidate_camera_ids = ["CAM_03"]
+            candidate_camera_ids = ["CAM-03"]
 
             for snapshot_camera_id in candidate_camera_ids:
                 success, crop = get_park_entry_crop(snapshot_camera_id)
@@ -693,7 +693,18 @@ def create_app(
             try:
                 db_slot = ParkingSlotRepository.get_by_id(session, slot_id)
                 if db_slot is not None and db_slot.last_snapshot_path:
-                    image_path = os.path.join(snapshot_base_dir, db_slot.last_snapshot_path)
+                    raw = db_slot.last_snapshot_path
+                    # `last_snapshot_path` is now a public URL (e.g.
+                    # http://host/pms-video-analytics/snapshots/slot_X_latest.jpg)
+                    # built by engine_runtime._build_snapshot_url. Strip back to
+                    # the snapshot_base_dir-relative path before joining onto
+                    # disk. Tolerate legacy rows that hold a bare filename or a
+                    # site-relative path with no scheme.
+                    if "/snapshots/" in raw:
+                        rel = raw.split("/snapshots/", 1)[1]
+                    else:
+                        rel = raw.lstrip("/")
+                    image_path = os.path.join(snapshot_base_dir, rel)
                     if os.path.exists(image_path):
                         return FileResponse(image_path, media_type="image/jpeg")
             finally:

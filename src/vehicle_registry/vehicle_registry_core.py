@@ -450,7 +450,7 @@ class VehicleRegistryCoreMixin:
             candidate_images = existing_images + [image.copy()]
             camera_id = candidate.camera_id
 
-        top_k = 3 if camera_id == "CAM_03" else 1
+        top_k = 3 if camera_id == "CAM-03" else 1
         selected_images = select_best_frames(candidate_images, top_k=top_k)
         if not selected_images:
             return None
