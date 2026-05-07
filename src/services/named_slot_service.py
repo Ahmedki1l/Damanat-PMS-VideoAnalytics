@@ -2,6 +2,7 @@ NAMED_SLOT_TITLE_BY_SLOT_ID = {
     "B10_CTO": "B10_CTO",
     "B1_CRO": "B1_CRO",
     "B3_CEO": "B3_CEO",
+    "GMIA": "GMIA",
     "B6_Reserved": "B6_Reserved",
     "B11_CFO": "B11_CFO",
     "B13_COO": "B13_COO",
