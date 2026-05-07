@@ -1,9 +1,21 @@
 # Core dependencies for Damanat PMS Video Analytics
+#
+# torch + torchreid notes:
+#   torchreid (vehicle re-ID model) needs torch + torchvision. We pull them
+#   from PyTorch's CPU-only index — without --extra-index-url pip resolves
+#   to the GPU build (~2GB) which we don't need on the inference boxes.
+#   Order matters: numpy<2 first, then torch/torchvision, then torchreid.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+numpy<2.0.0               # torch/torchreid not yet compatible with NumPy 2.x
+torch>=2.2,<2.5           # CPU-only build (see --extra-index-url above)
+torchvision>=0.17,<0.20   # Pinned to match the supported torch range
+torchreid==0.2.5          # Vehicle re-ID matcher (used by tracking_manager)
+
 ultralytics>=8.1.0        # YOLO11 inference + built-in tracking
 opencv-python-headless>=4.8.0  # Video I/O without GUI overhead
 shapely>=2.0.0            # Polygon geometry for slot assignment
 pyyaml>=6.0               # Config file parsing
-# torchreid is installed separately in Dockerfile to handle build isolation issues
 gdown>=5.1.0              # Download model weights
 tensorboard>=2.15.0       # Required by torchreid
 pandas>=2.0.0             # Data processing

@@ -99,7 +99,11 @@ class ParkingEngineRuntimeMixin:
             filename = f"slot_{slot.id}_latest.jpg"
             full_path = os.path.join(base_dir, filename)
             cv2.imwrite(full_path, crop)
-            return filename
+            # Return the externally-reachable URL so the alerts table /
+            # parking_slots.last_snapshot_path / Gateway responses all
+            # carry full URLs instead of bare relative filenames that
+            # frontends can't render directly.
+            return self._build_snapshot_url(filename)
         except Exception as exc:
             print(f"[WARN] Failed to save slot snapshot for {slot.id}: {exc}")
             return None
@@ -108,8 +112,68 @@ class ParkingEngineRuntimeMixin:
         cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "").strip("._")
         return cleaned or fallback
 
-    def _save_alert_snapshot(self, crop, alert_type: str, slot_id: str, camera_id: str) -> Optional[str]:
-        if crop is None or crop.size == 0:
+    def _build_snapshot_url(self, relative_path: str) -> str:
+        """Turn a snapshot_base_dir-relative path (e.g. 'alerts/foo.jpg' or
+        'slot_B11_CFO_latest.jpg') into the externally-reachable URL served
+        by api.py's `/pms-video-analytics/snapshots/{filepath:path}` route.
+
+        Reads `output.public_base_url`, `output.snapshot_url_prefix`, and
+        `output.gateway_path_prefix` from config (same precedence as
+        VehicleRegistryQueryMixin._get_snapshot_url) so the URL shape stays
+        consistent across every consumer of VA snapshots — alerts, vehicle
+        registry queries, and the API's own slot views.
+
+        When `public_base_url` is empty, returns a site-relative URL
+        (legacy behaviour, lets dev environments without an external host
+        keep working).
+        """
+        if not relative_path:
+            return ""
+        rel = relative_path.replace(os.sep, "/").lstrip("/")
+        out = self.config.output
+        base = (getattr(out, "public_base_url", "") or "").rstrip("/")
+        gateway = (getattr(out, "gateway_path_prefix", "") or "").strip("/")
+        prefix = (getattr(out, "snapshot_url_prefix", "snapshots") or "snapshots").strip("/")
+        path_parts = "/".join(part for part in [gateway, prefix, rel] if part)
+        return f"{base}/{path_parts}" if base else f"/{path_parts}"
+
+    def _save_alert_snapshot(self, crop, alert_type: str, slot_id: str, camera_id: str,
+                             fallback_frame=None) -> Optional[str]:
+        """Save the alert evidence image to disk, return its public URL.
+
+        Prefers the vehicle-bbox `crop` (tighter framing for the operator).
+        If the crop is empty/None — which happens when the vehicle's bbox is
+        missing for the frame the alert fired on (Bug #v0-1 in Version 0:
+        intrusion alerts landing without an evidence snapshot) — falls back
+        to `fallback_frame` (the full camera frame). The full frame is wider
+        but always meaningful, so the alert never lands snapshot-less.
+
+        The returned value is the externally-reachable URL (e.g.
+        ``http://localhost:8000/pms-video-analytics/snapshots/alerts/<file>.jpg``)
+        built from `output.public_base_url` + `output.snapshot_url_prefix`,
+        so callers can persist it directly to `alerts.snapshot_path` and
+        downstream consumers (Gateway, frontend) render it without further
+        rewriting. When `public_base_url` is empty, returns a site-relative
+        URL — legacy behaviour for dev environments.
+
+        Returns None only if BOTH crop and fallback_frame are empty/None, or
+        if cv2.imwrite fails on disk.
+        """
+        # Decide which image to save: crop preferred, full frame as fallback.
+        image = None
+        if crop is not None and crop.size > 0:
+            image = crop
+        elif fallback_frame is not None and fallback_frame.size > 0:
+            image = fallback_frame
+            print(
+                f"[INFO] Alert snapshot fallback: full frame for "
+                f"{alert_type} ({camera_id} / {slot_id}); vehicle bbox crop was empty."
+            )
+        else:
+            print(
+                f"[WARN] Alert snapshot UNAVAILABLE: no crop and no fallback frame for "
+                f"{alert_type} ({camera_id} / {slot_id})."
+            )
             return None
 
         try:
@@ -125,9 +189,12 @@ class ParkingEngineRuntimeMixin:
             )
             relative_path = os.path.join("alerts", filename)
             full_path = os.path.join(directory, filename)
-            if not cv2.imwrite(full_path, crop):
+            if not cv2.imwrite(full_path, image):
                 raise RuntimeError("cv2.imwrite returned False")
-            return relative_path
+            # Return the externally-reachable URL so consumers can render
+            # the snapshot directly without rewriting the path. The same
+            # file is still available on disk under snapshot_base_dir/alerts.
+            return self._build_snapshot_url(relative_path)
         except Exception as exc:
             print(
                 f"[WARN] Failed to save alert snapshot for {alert_type} "
@@ -151,6 +218,161 @@ class ParkingEngineRuntimeMixin:
         except Exception as exc:
             session.rollback()
             print(f"[ERROR] Failed to persist slot snapshot path for {slot_id}: {exc}")
+        finally:
+            session.close()
+
+    # In-process rate gate: at most one vehicles-row write per plate per
+    # _PRESENCE_MIN_INTERVAL_S seconds. Without this, the per-frame loop
+    # would issue an UPDATE every camera tick (~14/s across all cameras)
+    # for every actively-tracked plate, which is pointless DB churn.
+    _PRESENCE_MIN_INTERVAL_S = 5.0
+
+    # Exit-janitor cadence — how often the engine sweeps the registry to
+    # purge plates whose parking_sessions row has been closed by PMS-AI
+    # without VA seeing the corresponding ANPR exit event.
+    _EXIT_JANITOR_INTERVAL_S = 30.0
+
+    def _exit_janitor_tick(self) -> None:
+        """Once per `_EXIT_JANITOR_INTERVAL_S`, find plates VA still has in
+        memory whose latest parking_sessions row is closed (per PMS-AI), and
+        call vehicle_registry._handle_exit(plate, now) to purge the in-memory
+        tracking state. Catches missed CAM-EXIT ANPR events and stops VA from
+        re-id-matching cars that have already left the garage.
+
+        Called from the main loop (next to _cleanup_stale_data). The gate
+        ensures it doesn't run on every frame.
+        """
+        if not self.db_manager or not self.vehicle_registry:
+            return
+        now_ts = time.time()
+        last = getattr(self, "_exit_janitor_last_run_at", 0.0)
+        if now_ts - last < self._EXIT_JANITOR_INTERVAL_S:
+            return
+        self._exit_janitor_last_run_at = now_ts
+
+        # Snapshot the plates the registry currently holds. Done under the
+        # registry's lock-protected accessor (or via a stable copy) so we
+        # don't iterate a dict that another thread is mutating.
+        try:
+            tracked_plates = self.vehicle_registry.get_tracked_plates()
+        except AttributeError:
+            # Older registry without the helper — fall back to _parked +
+            # session map plates.
+            tracked_plates = set()
+            for sess in getattr(self.vehicle_registry, "_parked", {}).values():
+                if sess.plate:
+                    tracked_plates.add(sess.plate)
+            for sess in getattr(self.vehicle_registry, "_sessions", {}).values():
+                if sess.plate:
+                    tracked_plates.add(sess.plate)
+        if not tracked_plates:
+            return
+
+        try:
+            from sqlalchemy import bindparam, text as _text
+
+            session = self.db_manager.SessionLocal()
+            try:
+                # One round-trip: get the latest status per plate. Plates
+                # with no rows aren't in the result — those are fine, they
+                # haven't entered yet. `expanding=True` lets SQLAlchemy
+                # turn the IN binding into a parameterized list at execute time.
+                stmt = _text(
+                    "SELECT plate_number, status FROM ("
+                    "  SELECT plate_number, status, "
+                    "         ROW_NUMBER() OVER (PARTITION BY plate_number ORDER BY entry_time DESC) AS rn "
+                    "  FROM dbo.parking_sessions "
+                    "  WHERE plate_number IN :plates"
+                    ") t WHERE rn = 1"
+                ).bindparams(bindparam("plates", expanding=True))
+                rows = session.execute(stmt, {"plates": list(tracked_plates)}).fetchall()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning("[exit_janitor] DB probe failed: %r", exc)
+            return
+
+        closed = [r[0] for r in rows if r[1] == "closed"]
+        if not closed:
+            return
+
+        purged_at = datetime.now()
+        for plate in closed:
+            try:
+                self.vehicle_registry._handle_exit(plate, purged_at)
+                logger.info(
+                    "[exit_janitor] purged in-memory state for plate=%s "
+                    "(parking_sessions.status=closed)",
+                    plate,
+                )
+            except Exception as exc:
+                logger.warning("[exit_janitor] _handle_exit(%s) failed: %r", plate, exc)
+
+    def update_vehicle_presence(
+        self,
+        plate: str,
+        *,
+        floor: Optional[str] = None,
+        camera_id: Optional[str] = None,
+    ) -> None:
+        """Write `vehicles.floor` / `floor_id` so the Gateway and any other
+        consumer can answer "where is this car right now" without JOINing
+        parking_sessions. Called from every track-confirmation path
+        (Park_Entry capture, B1_Entrence confirmation, slot bind, plus the
+        per-frame TrackingManager observation). The slot-bind side is also
+        written by PMS-AI's parking_session_service.bind_slot — both
+        sources are idempotent so they can race safely.
+
+        Rate-gated to once per plate per ~5s so per-frame callers don't
+        hammer the DB. Safe to call with floor=None — only updates fields
+        that are actually known.
+        """
+        if not plate or not self.db_manager:
+            return
+
+        # Lazy-init the per-plate gate map.
+        gate = getattr(self, "_presence_last_write_at", None)
+        if gate is None:
+            gate = {}
+            self._presence_last_write_at = gate
+        now_ts = time.time()
+        last = gate.get(plate, 0.0)
+        if now_ts - last < self._PRESENCE_MIN_INTERVAL_S:
+            return
+        gate[plate] = now_ts
+
+        session = self.db_manager.SessionLocal()
+        try:
+            from src.model.vehicle import Vehicle
+            from sqlalchemy import text as _text
+
+            vehicle = session.query(Vehicle).filter(Vehicle.plate_number == plate).first()
+            if vehicle is None:
+                # No registry row yet — VA's Park_Entry pipeline will create
+                # it once ANPR matches. Don't create a partial row here.
+                return
+
+            updated = False
+            if floor and vehicle.floor != floor:
+                vehicle.floor = floor
+                # Resolve floor_id from the floors lookup table via raw SQL
+                # (VA has no Floor SQLAlchemy model; the floors table is owned
+                # by the Gateway's schema). Idempotent: floors.name is unique.
+                fid = session.execute(
+                    _text("SELECT id FROM dbo.floors WHERE name = :n"),
+                    {"n": floor},
+                ).scalar()
+                vehicle.floor_id = fid
+                updated = True
+            if updated:
+                session.commit()
+                logger.debug(
+                    "[presence] plate=%s floor=%s camera=%s",
+                    plate, floor, camera_id,
+                )
+        except Exception as exc:
+            session.rollback()
+            logger.warning("[presence] write failed for plate=%s: %r", plate, exc)
         finally:
             session.close()
 
@@ -324,7 +546,7 @@ class ParkingEngineRuntimeMixin:
 
         camera_special_zones = self.special_zones.get(cam_id, {})
 
-        if cam_id == "CAM_01" and "Park_Entry" in camera_special_zones:
+        if cam_id == "CAM-01" and "Park_Entry" in camera_special_zones:
             self._process_park_entry_zone(
                 cam_id,
                 frame,
@@ -345,7 +567,7 @@ class ParkingEngineRuntimeMixin:
                     confirmation_zone,
                 )
 
-        if cam_id not in ["CAM_01", "CAM_02"] and detections:
+        if cam_id not in ["CAM-01", "CAM-02"] and detections:
             if cam_id not in self._tracking_managers:
                 self._tracking_managers[cam_id] = TrackingManager(cam_id)
             tracking_manager = self._tracking_managers[cam_id]
@@ -498,12 +720,18 @@ class ParkingEngineRuntimeMixin:
                 continue
 
             _, detection = assignment.slot_vehicle_map.get(event.slot_id, (None, None))
-            if not detection:
-                final_events.append(event)
-                continue
-
-            crop = self._crop_vehicle_bbox_snapshot(frame, detection=detection)
-            if crop is None:
+            # Don't early-return when detection is missing — that bypasses
+            # _save_alert_snapshot and the alert ends up either with the rolling
+            # `slot_<id>_latest.jpg` (stale) or no snapshot at all. Carry an
+            # empty crop instead; _save_alert_snapshot's fallback_frame=frame
+            # path will save the full camera frame as evidence (Bug fix:
+            # production audit 2026-05-05 showed 49/151 intrusion alerts
+            # using the rolling fallback path purely because of this branch).
+            if detection:
+                crop = self._crop_vehicle_bbox_snapshot(frame, detection=detection)
+                if crop is None:
+                    crop = np.empty((0, 0, 3), dtype=np.uint8)
+            else:
                 crop = np.empty((0, 0, 3), dtype=np.uint8)
 
             now_ts = time.time()
@@ -529,11 +757,16 @@ class ParkingEngineRuntimeMixin:
                 event.event_type = alert_type
                 event.is_alert = True
                 event.severity = "critical"
+                # Pass the full frame as fallback so the alert always carries an
+                # evidence image even when the per-vehicle crop is empty
+                # (Version 0 / Issue #v0-1 fix). Operators previously got
+                # intrusion alerts with no snapshot when the bbox was missing.
                 event.snapshot_path = self._save_alert_snapshot(
                     crop,
                     alert_type=alert_type,
                     slot_id=event.slot_id,
                     camera_id=cam_id,
+                    fallback_frame=frame,
                 )
                 if crop.size > 0:
                     self._recent_violators.append(
@@ -551,7 +784,7 @@ class ParkingEngineRuntimeMixin:
         if named_slot_title:
             if self._is_named_slot_vehicle_allowed(plate_number, named_slot_title):
                 return None
-            return "named_slot_violation"
+            return "vehicle_intrusion"
 
         return (
             "vehicle_violation"
@@ -594,7 +827,6 @@ class ParkingEngineRuntimeMixin:
                     "slot_vacant",
                     "vehicle_violation",
                     "vehicle_intrusion",
-                    "named_slot_violation",
                 ):
                     is_parked = event.event_type in (
                         "vehicle_parked",

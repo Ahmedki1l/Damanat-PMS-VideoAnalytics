@@ -139,6 +139,11 @@ class ParkingEngine(
                     continue
 
                 self._cleanup_stale_data()
+                # Periodic sweep (gated to once per ~30s) that purges
+                # in-memory tracking state for plates whose parking_sessions
+                # row has been closed by PMS-AI without VA observing the
+                # ANPR exit event. Catches missed CAM-EXIT triggers.
+                self._exit_janitor_tick()
                 self.last_processed_at = datetime.now()
 
                 pipeline = self.pipelines.get(cam_id)

@@ -81,6 +81,20 @@ class DatabaseManager:
                             "CONSTRAINT DF_parking_slots_slot_type DEFAULT 'parking'"
                         )
                     )
+                if "zone_id" not in columns:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE parking_slots "
+                            "ADD zone_id VARCHAR(100) NULL"
+                        )
+                    )
+                if "zone_name" not in columns:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE parking_slots "
+                            "ADD zone_name VARCHAR(100) NULL"
+                        )
+                    )
                 if "last_snapshot_path" not in columns:
                     conn.execute(
                         text(

@@ -12,7 +12,11 @@ def check_slot_restricted(db: Session, slot_id: str) -> bool:
 def get_alert_type_for_slot(db: Session, slot_id: str) -> str:
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
     if is_named_slot(slot_id):
-        return "named_slot_violation"
+        # Standardized to `vehicle_intrusion` (was `named_slot_violation`).
+        # Operator-facing terminology aligns with the Alerts page filter
+        # vocabulary; the Gateway's severity map at routers/alerts.py:103
+        # already counts `vehicle_intrusion` as critical.
+        return "vehicle_intrusion"
     # Determine type of alert based on slot name, or fallback
     if slot and "violation" in (slot.slot_name or "").lower():
         return "violation"
@@ -63,8 +67,13 @@ def report_alert(
         event_type="vehicle_detected",
         slot_number=slot_name,
         description=(
+            # vehicle_intrusion now covers what was once "named_slot_violation"
+            # (the rename happened in T26). The reserved-slot phrasing only
+            # applies when the slot is named — get_alert_type_for_slot above
+            # uses is_named_slot() to decide between vehicle_intrusion (named)
+            # and the generic violation/intrusion paths.
             f"Unauthorized vehicle detected in reserved slot {slot_name}"
-            if alert_type == "named_slot_violation"
+            if alert_type == "vehicle_intrusion" and is_named_slot(slot_id)
             else f"Unauthorized vehicle detected in {slot_name}"
         ),
         snapshot_path=resolved_snapshot_path,

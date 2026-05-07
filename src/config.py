@@ -43,7 +43,7 @@ class DetectorConfig:
     confidence: float = 0.35
     classes: List[int] = field(default_factory=lambda: [2])  # 2 = car
     imgsz: int = 480
-    device: str = "cuda"  # "auto", "cpu", or "cuda"
+    device: str = "auto"  # "auto", "cpu", or "cuda"
 
 
 @dataclass
@@ -95,7 +95,7 @@ class OutputConfig:
     """Output/logging settings."""
     log_file: str = ""
     show_video: bool = False
-    show_camera: str = ""  # Which camera to visualize (e.g., "CAM_04")
+    show_camera: str = ""  # Which camera to visualize (e.g., "CAM-04")
     snapshot_base_dir: str = "vehicle_images"
     # Externally-reachable origin used to build full snapshot URLs (e.g.
     # "http://localhost:8000"). Empty → emits site-relative URLs (legacy behaviour).
