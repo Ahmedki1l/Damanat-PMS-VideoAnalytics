@@ -24,7 +24,6 @@ from src.detection.tracker import TrackedDetector
 from src.events.event_bus import EventBus
 from src.models.slot import load_slots
 from src.services.parking_service import load_camera_slots
-from src.services.named_slot_service import is_named_slot
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +63,8 @@ class ParkingEngine(
         self._recent_violators = []
         self._violation_match_threshold = 0.4
         self._violation_history_limit = 30
+        self._reserved_for_map: dict[str, str | None] = {}
+        self._special_slots: set[str] = set()
 
         self.is_running = False
         self.start_time = 0.0
@@ -297,7 +298,9 @@ class ParkingEngine(
                         slot_state_machine = pipeline.state_machines.get(event.slot_id)
                         if (
                             slot_state_machine
-                            and (slot_state_machine.is_violation_zone or is_named_slot(event.slot_id))
+                            and (slot_state_machine.is_violation_zone
+                             or event.slot_id in self._reserved_for_map
+                             or event.slot_id in self._special_slots)
                         ):
                             if event.event_type == "vehicle_parked":
                                 now_ts = time.time()

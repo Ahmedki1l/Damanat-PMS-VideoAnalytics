@@ -10,6 +10,8 @@ class ParkingSlotCreate(BaseModel):
     polygon: Optional[list] = None
     is_available: Optional[bool] = True
     is_violation_zone: Optional[bool] = False
+    parking_category: Optional[str] = "general"
+    reserved_for: Optional[str] = None
 
 class ParkingSlotUpdate(BaseModel):
     slot_name: Optional[str] = None
@@ -19,6 +21,8 @@ class ParkingSlotUpdate(BaseModel):
     polygon: Optional[list] = None
     is_available: Optional[bool] = None
     is_violation_zone: Optional[bool] = None
+    parking_category: Optional[str] = None
+    reserved_for: Optional[str] = None
 
 class ParkingSlotResponse(BaseModel):
     slot_id: str
@@ -29,6 +33,8 @@ class ParkingSlotResponse(BaseModel):
     polygon: Optional[list]
     is_available: bool
     is_violation_zone: bool
+    parking_category: str
+    reserved_for: Optional[str]
 
     class Config:
         from_attributes = True

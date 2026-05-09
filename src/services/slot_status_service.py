@@ -23,11 +23,8 @@ def log_camera_feed_event(db: Session, event_type: str, camera_id: str, plate: s
     # Map Event Type to Description
     description_map = {
         "vehicle_violation": "Unauthorized Parking Violation",
-        # `vehicle_intrusion` covers both general intrusion and reserved-slot
-        # intrusion now that `named_slot_violation` was renamed (see
-        # services/alert_service.py:15). Description text below favours the
-        # reserved-slot phrasing since that's the most operator-relevant case.
         "vehicle_intrusion": "Reserved Slot Ownership Violation",
+        "special_needs_violation": "Special-Needs Slot Violation",
     }
     event_description = description_map.get(event_type, event_type.replace("_", " ").title())
 
