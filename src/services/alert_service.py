@@ -2,22 +2,20 @@ from sqlalchemy.orm import Session
 from src.model.alert import Alert
 from src.repositories import AlertRepository, ParkingSlotRepository
 from src.utils.datetime_helper import facility_now_naive
-from src.services.named_slot_service import is_named_slot
 
 def check_slot_restricted(db: Session, slot_id: str) -> bool:
-    """Check if a slot has the is_violation_zone flag enabled in the DB."""
+    """True when a slot should trigger alerts (violation zone, employee, or special-needs)."""
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
-    return slot.is_violation_zone if slot else False
+    if not slot:
+        return False
+    return slot.is_violation_zone or slot.parking_category in ("employee", "special")
 
 def get_alert_type_for_slot(db: Session, slot_id: str) -> str:
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
-    if is_named_slot(slot_id):
-        # Standardized to `vehicle_intrusion` (was `named_slot_violation`).
-        # Operator-facing terminology aligns with the Alerts page filter
-        # vocabulary; the Gateway's severity map at routers/alerts.py:103
-        # already counts `vehicle_intrusion` as critical.
+    if slot and slot.parking_category == "special":
+        return "special_needs_violation"
+    if slot and slot.parking_category == "employee":
         return "vehicle_intrusion"
-    # Determine type of alert based on slot name, or fallback
     if slot and "violation" in (slot.slot_name or "").lower():
         return "violation"
     if "violation" in slot_id.lower():
@@ -67,13 +65,10 @@ def report_alert(
         event_type="vehicle_detected",
         slot_number=slot_name,
         description=(
-            # vehicle_intrusion now covers what was once "named_slot_violation"
-            # (the rename happened in T26). The reserved-slot phrasing only
-            # applies when the slot is named — get_alert_type_for_slot above
-            # uses is_named_slot() to decide between vehicle_intrusion (named)
-            # and the generic violation/intrusion paths.
-            f"Unauthorized vehicle detected in reserved slot {slot_name}"
-            if alert_type == "vehicle_intrusion" and is_named_slot(slot_id)
+            f"Vehicle detected in special-needs reserved slot {slot_name}"
+            if alert_type == "special_needs_violation"
+            else f"Unauthorized vehicle detected in reserved slot {slot_name}"
+            if alert_type == "vehicle_intrusion" and slot and slot.parking_category == "employee"
             else f"Unauthorized vehicle detected in {slot_name}"
         ),
         snapshot_path=resolved_snapshot_path,

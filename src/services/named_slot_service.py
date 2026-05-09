@@ -1,33 +1,38 @@
-NAMED_SLOT_TITLE_BY_SLOT_ID = {
-    "B10_CTO": "B10_CTO",
-    "B1_CRO": "B1_CRO",
-    "B3_CEO": "B3_CEO",
-    "GMIA": "GMIA",
-    "B6_Reserved": "B6_Reserved",
-    "B11_CFO": "B11_CFO",
-    "B13_COO": "B13_COO",
-    "B8_BDM": "B8_BDM",
-    "G1": "G1_SN",
-}
+"""
+Named/reserved slot helpers.
+
+All logic is driven by the `parking_category` and `reserved_for` columns on
+the `parking_slots` DB table. Functions accept a ParkingSlot ORM object so
+callers never maintain an external mapping.
+
+parking_category values:
+  "general"  — normal public parking
+  "employee" — named slot reserved for a specific person (reserved_for = vehicles.title)
+  "special"  — special-needs / handicap slot
+"""
 
 
-def get_named_slot_title(slot_id: str) -> str | None:
-    return NAMED_SLOT_TITLE_BY_SLOT_ID.get(slot_id)
+def is_named_slot(slot) -> bool:
+    return bool(slot and slot.parking_category == "employee")
 
 
-def is_named_slot(slot_id: str) -> bool:
-    return slot_id in NAMED_SLOT_TITLE_BY_SLOT_ID
+def get_named_slot_title(slot) -> str | None:
+    return slot.reserved_for if (slot and slot.parking_category == "employee") else None
 
 
-def is_restricted_slot(slot_id: str) -> bool:
-    if not slot_id:
+def is_restricted_slot(slot) -> bool:
+    if not slot:
         return False
-    return is_named_slot(slot_id) or "violation" in slot_id.lower()
+    return slot.parking_category != "general" or slot.is_violation_zone
 
 
-def get_slot_restriction_type(slot_id: str) -> str | None:
-    if is_named_slot(slot_id):
-        return "named_slot"
-    if slot_id and "violation" in slot_id.lower():
+def get_slot_restriction_type(slot) -> str | None:
+    if not slot:
+        return None
+    if slot.parking_category == "employee":
+        return "employee"
+    if slot.parking_category == "special":
+        return "special"
+    if slot.is_violation_zone:
         return "violation"
     return None

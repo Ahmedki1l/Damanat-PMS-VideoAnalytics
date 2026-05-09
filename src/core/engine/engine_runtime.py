@@ -16,7 +16,6 @@ from src.services.parking_service import (
     bootstrap_camera_slots_from_json,
     load_camera_slots,
 )
-from src.services.named_slot_service import get_named_slot_title, is_named_slot
 from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
 
 
@@ -543,6 +542,8 @@ class ParkingEngineRuntimeMixin:
     def _load_camera_db_state(self, parking_slots, all_active_slot_ids: set):
         violation_slots = set()
         initial_statuses = {}
+        reserved_for_map = getattr(self, "_reserved_for_map", {})
+        special_slots = getattr(self, "_special_slots", set())
 
         if not self.db_manager or not parking_slots:
             return violation_slots, initial_statuses
@@ -558,6 +559,12 @@ class ParkingEngineRuntimeMixin:
                     continue
                 if db_slot.is_violation_zone:
                     violation_slots.add(db_slot.slot_id)
+                if db_slot.parking_category == "employee":
+                    violation_slots.add(db_slot.slot_id)
+                    reserved_for_map[db_slot.slot_id] = db_slot.reserved_for
+                elif db_slot.parking_category == "special":
+                    violation_slots.add(db_slot.slot_id)
+                    special_slots.add(db_slot.slot_id)
                 initial_statuses[db_slot.slot_id] = db_slot.is_available
                 all_active_slot_ids.add(db_slot.slot_id)
         except Exception as exc:
@@ -565,6 +572,8 @@ class ParkingEngineRuntimeMixin:
         finally:
             session.close()
 
+        self._reserved_for_map = reserved_for_map
+        self._special_slots = special_slots
         return violation_slots, initial_statuses
 
     def _build_floor_camera_groups(self, camera_configs: List[CameraConfig]) -> Dict[str, List[str]]:
@@ -753,7 +762,10 @@ class ParkingEngineRuntimeMixin:
         final_events = []
         for event in events:
             slot_state_machine = self.pipelines[cam_id].state_machines.get(event.slot_id)
-            is_named_reserved_slot = is_named_slot(event.slot_id)
+            is_named_reserved_slot = (
+                event.slot_id in self._reserved_for_map
+                or event.slot_id in self._special_slots
+            )
             if (
                 not slot_state_machine
                 or (not slot_state_machine.is_violation_zone and not is_named_reserved_slot)
@@ -826,12 +838,13 @@ class ParkingEngineRuntimeMixin:
         return final_events
 
     def _get_slot_alert_type(self, slot_id: str, plate_number: str) -> str | None:
-        named_slot_title = get_named_slot_title(slot_id)
+        if slot_id in self._special_slots:
+            return "special_needs_violation"
+        named_slot_title = self._reserved_for_map.get(slot_id)
         if named_slot_title:
             if self._is_named_slot_vehicle_allowed(plate_number, named_slot_title):
                 return None
             return "vehicle_intrusion"
-
         return (
             "vehicle_violation"
             if "violation" in slot_id.lower()
@@ -873,12 +886,13 @@ class ParkingEngineRuntimeMixin:
                     "slot_vacant",
                     "vehicle_violation",
                     "vehicle_intrusion",
+                    "special_needs_violation",
                 ):
                     is_parked = event.event_type in (
                         "vehicle_parked",
                         "vehicle_violation",
                         "vehicle_intrusion",
-                        "named_slot_violation",
+                        "special_needs_violation",
                     )
                     plate = getattr(event, "plate_number", None)
                     # Capture the alert_id from log_vehicle_event

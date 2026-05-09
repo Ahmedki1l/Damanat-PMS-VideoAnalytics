@@ -36,7 +36,7 @@ from src.vehicle_registry import VehicleRegistry
 from src.events.event_bus import EventBus
 from src.models.state_machine import SlotEvent
 from src.services.alert_service import get_alert_type_for_slot
-from src.services.named_slot_service import get_slot_restriction_type
+from src.services.named_slot_service import get_slot_restriction_type  # now takes a slot ORM object
 
 
 # --- Pydantic Models ---
@@ -656,12 +656,23 @@ def create_app(
             return []
 
         statuses = get_slot_statuses()
+        db_slots = {}
+        if db_manager:
+            _session = db_manager.SessionLocal()
+            try:
+                from src.repositories import ParkingSlotRepository
+                db_slots = {s.slot_id: s for s in ParkingSlotRepository.get_all(_session)}
+            finally:
+                _session.close()
         result = []
         for s in statuses:
             slot_id = s.get("slot_id", "")
             plate = registry.get_slot_plate(slot_id)
-            
-            # Map existing state structure to standardized SlotStatus
+            db_slot = db_slots.get(slot_id)
+            is_restricted = bool(
+                (db_slot.parking_category != "general" or db_slot.is_violation_zone)
+                if db_slot else s.get("is_violation_zone", False)
+            )
             result.append(SlotStatus(
                 slot_id=slot_id,
                 slot_name=s.get("slot_name") or s.get("label", slot_id),
@@ -672,8 +683,8 @@ def create_app(
                 state=s.get("state", "UNKNOWN"),
                 plate_number=plate,
                 camera_id=s.get("camera_id"),
-                is_restricted=s.get("is_violation_zone", False),
-                restriction_type=get_slot_restriction_type(slot_id) if s.get("is_violation_zone") else None,
+                is_restricted=is_restricted,
+                restriction_type=get_slot_restriction_type(db_slot) if db_slot else None,
                 snapshot_url=_build_slot_snapshot_url(slot_id),
             ))
         return result
@@ -719,11 +730,24 @@ def create_app(
             return []
 
         statuses = get_slot_statuses()
+        db_slots = {}
+        if db_manager:
+            _session = db_manager.SessionLocal()
+            try:
+                from src.repositories import ParkingSlotRepository
+                db_slots = {s.slot_id: s for s in ParkingSlotRepository.get_all(_session)}
+            finally:
+                _session.close()
         result = []
         for s in statuses:
             if s.get("floor", "").upper() == floor.upper():
                 slot_id = s.get("slot_id", "")
                 plate = registry.get_slot_plate(slot_id)
+                db_slot = db_slots.get(slot_id)
+                is_restricted = bool(
+                    (db_slot.parking_category != "general" or db_slot.is_violation_zone)
+                    if db_slot else s.get("is_violation_zone", False)
+                )
                 result.append(SlotStatus(
                     slot_id=slot_id,
                     slot_name=s.get("slot_name") or s.get("label", slot_id),
@@ -734,8 +758,8 @@ def create_app(
                     state=s.get("state", "UNKNOWN"),
                     plate_number=plate,
                     camera_id=s.get("camera_id"),
-                    is_restricted=s.get("is_violation_zone", False),
-                    restriction_type=get_slot_restriction_type(slot_id) if s.get("is_violation_zone") else None,
+                    is_restricted=is_restricted,
+                    restriction_type=get_slot_restriction_type(db_slot) if db_slot else None,
                     snapshot_url=_build_slot_snapshot_url(slot_id),
                 ))
         return result

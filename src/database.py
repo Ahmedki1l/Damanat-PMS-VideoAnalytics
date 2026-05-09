@@ -102,3 +102,18 @@ class DatabaseManager:
                             "ADD last_snapshot_path VARCHAR(255) NULL"
                         )
                     )
+                if "parking_category" not in columns:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE parking_slots "
+                            "ADD parking_category VARCHAR(20) NOT NULL "
+                            "CONSTRAINT DF_parking_slots_parking_category DEFAULT 'general'"
+                        )
+                    )
+                if "reserved_for" not in columns:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE parking_slots "
+                            "ADD reserved_for VARCHAR(255) NULL"
+                        )
+                    )

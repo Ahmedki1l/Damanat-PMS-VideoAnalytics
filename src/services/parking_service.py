@@ -11,7 +11,6 @@ from src.models.slot import ParkingSlot as RuntimeParkingSlot
 from src.models.slot import build_polygon
 from src.repositories import ParkingSlotRepository
 from src.schemas import ParkingSlotUpdate
-from src.services.named_slot_service import is_restricted_slot
 
 SLOT_TYPE_PARKING = "parking"
 SLOT_TYPE_SPECIAL_ZONE = "special_zone"
@@ -173,7 +172,7 @@ def sync_camera_slot_definitions(
             "zone_name": zone_name,
             "slot_type": slot_type,
             "polygon": polygon_json,
-            "is_violation_zone": is_restricted_slot(slot_id),
+            "is_violation_zone": "violation" in slot_id.lower(),
         }
 
     existing_rows = ParkingSlotRepository.filter_camera_slots_by_types(
@@ -193,9 +192,14 @@ def sync_camera_slot_definitions(
             existing.zone_name = payload["zone_name"]
             existing.slot_type = payload["slot_type"]
             existing.polygon = payload["polygon"]
-            existing.is_violation_zone = bool(
-                existing.is_violation_zone or payload["is_violation_zone"]
-            )
+            # Only set is_violation_zone when the slot is actually a violation zone.
+            # Employee/special slots must NOT be flagged as violation zones — their
+            # parking_category is the source of truth for restriction behaviour.
+            if existing.parking_category == "general":
+                existing.is_violation_zone = bool(
+                    existing.is_violation_zone or payload["is_violation_zone"]
+                )
+            # parking_category and reserved_for are managed via API — never overwrite on sync
         else:
             db.add(
                 ParkingSlot(
