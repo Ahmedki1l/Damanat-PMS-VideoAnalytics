@@ -195,7 +195,7 @@ def sync_camera_slot_definitions(
             # Only set is_violation_zone when the slot is actually a violation zone.
             # Employee/special slots must NOT be flagged as violation zones — their
             # parking_category is the source of truth for restriction behaviour.
-            if existing.parking_category == "general":
+            if existing.parking_category == "GENERAL":
                 existing.is_violation_zone = bool(
                     existing.is_violation_zone or payload["is_violation_zone"]
                 )

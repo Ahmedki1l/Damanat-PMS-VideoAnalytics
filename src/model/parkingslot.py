@@ -15,7 +15,7 @@ class ParkingSlot(Base):
     last_snapshot_path = Column(String(255), nullable=True)
     is_available = Column(Boolean, default=True)
     is_violation_zone = Column(Boolean, default=False)
-    parking_category = Column(String(20), nullable=False, default="general")
+    parking_category = Column(String(20), nullable=False, default="GENERAL")
     reserved_for = Column(String(255), nullable=True)
 
     statuses = relationship(

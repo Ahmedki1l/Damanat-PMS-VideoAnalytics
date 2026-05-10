@@ -63,7 +63,7 @@ with engine.begin() as conn:
         rows = conn.execute(
             text(
                 "UPDATE parking_slots "
-                "SET parking_category = 'EMPLOYEE', reserved_for = :rf, is_violation_zone = FALSE "
+                "SET parking_category = 'EMPLOYEE', reserved_for = :rf, is_violation_zone = 0 "
                 "WHERE slot_id = :sid"
             ),
             {"rf": reserved_for, "sid": slot_id},
@@ -75,7 +75,7 @@ with engine.begin() as conn:
         rows = conn.execute(
             text(
                 "UPDATE parking_slots "
-                "SET parking_category = 'SPECIAL', slot_name = :sn, is_violation_zone = FALSE "
+                "SET parking_category = 'SPECIAL', slot_name = :sn, is_violation_zone = 0 "
                 "WHERE slot_id = :sid"
             ),
             {"sn": slot_name, "sid": slot_id},

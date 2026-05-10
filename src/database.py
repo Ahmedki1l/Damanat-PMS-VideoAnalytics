@@ -107,7 +107,7 @@ class DatabaseManager:
                         text(
                             "ALTER TABLE parking_slots "
                             "ADD parking_category VARCHAR(20) NOT NULL "
-                            "CONSTRAINT DF_parking_slots_parking_category DEFAULT 'general'"
+                            "CONSTRAINT DF_parking_slots_parking_category DEFAULT 'GENERAL'"
                         )
                     )
                 if "reserved_for" not in columns:
