@@ -10,7 +10,7 @@ class ParkingSlotCreate(BaseModel):
     polygon: Optional[list] = None
     is_available: Optional[bool] = True
     is_violation_zone: Optional[bool] = False
-    parking_category: Optional[str] = "general"
+    parking_category: Optional[str] = "GENERAL"
     reserved_for: Optional[str] = None
 
 class ParkingSlotUpdate(BaseModel):

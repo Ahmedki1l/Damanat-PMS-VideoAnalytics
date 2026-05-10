@@ -670,7 +670,7 @@ def create_app(
             plate = registry.get_slot_plate(slot_id)
             db_slot = db_slots.get(slot_id)
             is_restricted = bool(
-                (db_slot.parking_category != "general" or db_slot.is_violation_zone)
+                (db_slot.parking_category != "GENERAL" or db_slot.is_violation_zone)
                 if db_slot else s.get("is_violation_zone", False)
             )
             result.append(SlotStatus(
@@ -745,7 +745,7 @@ def create_app(
                 plate = registry.get_slot_plate(slot_id)
                 db_slot = db_slots.get(slot_id)
                 is_restricted = bool(
-                    (db_slot.parking_category != "general" or db_slot.is_violation_zone)
+                    (db_slot.parking_category != "GENERAL" or db_slot.is_violation_zone)
                     if db_slot else s.get("is_violation_zone", False)
                 )
                 result.append(SlotStatus(
