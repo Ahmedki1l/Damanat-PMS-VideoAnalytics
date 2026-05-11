@@ -75,4 +75,4 @@ COPY . .
 EXPOSE 8000
 
 # Run migrations then API
-ENTRYPOINT ["sh", "-c", "python migrate_parking_slots_to_db.py --import-json && python migrate_parking_categories.py && python main.py --api"]
+ENTRYPOINT ["sh", "-c", "python migrate_parking_slots_to_db.py --import-json && python main.py --api"]

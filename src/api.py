@@ -36,7 +36,7 @@ from src.vehicle_registry import VehicleRegistry
 from src.events.event_bus import EventBus
 from src.models.state_machine import SlotEvent
 from src.services.alert_service import get_alert_type_for_slot
-from src.services.named_slot_service import get_slot_restriction_type  # now takes a slot ORM object
+from src.services.named_slot_service import get_slot_restriction_type, is_restricted_slot  # now takes a slot ORM object
 
 
 # --- Pydantic Models ---
@@ -509,7 +509,7 @@ def create_app(
                 db_slot = ParkingSlotRepository.get_by_id(session, slot_id)
                 if db_slot:
                     slot_found = True
-                    is_restricted = bool(db_slot.is_violation_zone)
+                    is_restricted = is_restricted_slot(db_slot)
             except Exception as e:
                 print(f"[API] DB query failed in trigger: {e}")
             finally:
@@ -526,6 +526,19 @@ def create_app(
         else:
             alert_type = "vehicle_parked"
 
+        db_alert_id = None
+        if is_restricted and db_manager is not None:
+            from src.services.alert_service import report_alert
+            session = db_manager.SessionLocal()
+            try:
+                alert = report_alert(session, slot_id, severity="critical", camera_id="SIM_CAM")
+                if alert:
+                    db_alert_id = alert.id
+            except Exception as e:
+                print(f"[API] Failed to persist test alert: {e}")
+            finally:
+                session.close()
+
         test_evt = SlotEvent(
             event_type=alert_type,
             slot_id=slot_id,
@@ -534,7 +547,8 @@ def create_app(
             camera_id="SIM_CAM",
             floor="Simulation",
             is_alert=is_restricted,
-            severity="critical" if is_restricted else "info"
+            severity="critical" if is_restricted else "info",
+            alert_id=db_alert_id,
         )
 
         event_bus.emit(test_evt)
