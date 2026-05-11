@@ -826,6 +826,7 @@ class ParkingEngineRuntimeMixin:
                     camera_id=cam_id,
                     fallback_frame=frame,
                 )
+                event.snapshot_url = event.snapshot_path
                 if crop.size > 0:
                     self._recent_violators.append(
                         {"crop": crop.copy(), "timestamp": now_ts, "camera_id": cam_id}
