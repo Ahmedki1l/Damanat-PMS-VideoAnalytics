@@ -194,12 +194,12 @@ def sync_camera_slot_definitions(
             existing.polygon = payload["polygon"]
             # Only set is_violation_zone when the slot is actually a violation zone.
             # Employee/special slots must NOT be flagged as violation zones — their
-            # parking_category is the source of truth for restriction behaviour.
-            if existing.parking_category == "GENERAL":
+            # reservation_type is the source of truth for restriction behaviour.
+            if existing.reservation_type == "GENERAL":
                 existing.is_violation_zone = bool(
                     existing.is_violation_zone or payload["is_violation_zone"]
                 )
-            # parking_category and reserved_for are managed via API — never overwrite on sync
+            # reservation_type and reserved_for are managed via API — never overwrite on sync
         else:
             db.add(
                 ParkingSlot(
