@@ -8,13 +8,13 @@ def check_slot_restricted(db: Session, slot_id: str) -> bool:
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
     if not slot:
         return False
-    return slot.is_violation_zone or slot.parking_category in ("EMPLOYEE", "SPECIAL")
+    return slot.is_violation_zone or slot.reservation_type in ("EMPLOYEE", "SPECIAL")
 
 def get_alert_type_for_slot(db: Session, slot_id: str) -> str:
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
-    if slot and slot.parking_category == "SPECIAL":
+    if slot and slot.reservation_type == "SPECIAL":
         return "special_needs_violation"
-    if slot and slot.parking_category == "EMPLOYEE":
+    if slot and slot.reservation_type == "EMPLOYEE":
         return "vehicle_intrusion"
     if slot and "violation" in (slot.slot_name or "").lower():
         return "violation"
@@ -68,7 +68,7 @@ def report_alert(
             f"Vehicle detected in special-needs reserved slot {slot_name}"
             if alert_type == "special_needs_violation"
             else f"Unauthorized vehicle detected in reserved slot {slot_name}"
-            if alert_type == "vehicle_intrusion" and slot and slot.parking_category == "EMPLOYEE"
+            if alert_type == "vehicle_intrusion" and slot and slot.reservation_type == "EMPLOYEE"
             else f"Unauthorized vehicle detected in {slot_name}"
         ),
         snapshot_path=resolved_snapshot_path,

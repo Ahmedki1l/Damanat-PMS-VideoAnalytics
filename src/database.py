@@ -102,12 +102,12 @@ class DatabaseManager:
                             "ADD last_snapshot_path VARCHAR(255) NULL"
                         )
                     )
-                if "parking_category" not in columns:
+                if "reservation_type" not in columns:
                     conn.execute(
                         text(
                             "ALTER TABLE parking_slots "
-                            "ADD parking_category VARCHAR(20) NOT NULL "
-                            "CONSTRAINT DF_parking_slots_parking_category DEFAULT 'GENERAL'"
+                            "ADD reservation_type VARCHAR(20) NOT NULL "
+                            "CONSTRAINT DF_parking_slots_reservation_type DEFAULT 'GENERAL'"
                         )
                     )
                 if "reserved_for" not in columns:

@@ -559,10 +559,10 @@ class ParkingEngineRuntimeMixin:
                     continue
                 if db_slot.is_violation_zone:
                     violation_slots.add(db_slot.slot_id)
-                if db_slot.parking_category == "EMPLOYEE":
+                if db_slot.reservation_type == "EMPLOYEE":
                     violation_slots.add(db_slot.slot_id)
                     reserved_for_map[db_slot.slot_id] = db_slot.reserved_for
-                elif db_slot.parking_category == "SPECIAL":
+                elif db_slot.reservation_type == "SPECIAL":
                     violation_slots.add(db_slot.slot_id)
                     special_slots.add(db_slot.slot_id)
                 initial_statuses[db_slot.slot_id] = db_slot.is_available

@@ -1,11 +1,11 @@
 """
-One-time migration: back-fill parking_category / reserved_for on named slots.
+One-time migration: back-fill reservation_type / reserved_for on named slots.
 
-Run once after deploying the parking_category schema change:
+Run once after deploying the reservation_type schema change:
     python migrate_parking_categories.py
 
 The script is idempotent — it skips if any slot already has a non-general
-parking_category (meaning the migration already ran).
+reservation_type (meaning the migration already ran).
 
 reserved_for must match the exact string stored in vehicles.title so that
 _is_named_slot_vehicle_allowed() can authorise the slot owner.
@@ -53,17 +53,17 @@ engine = create_engine(DATABASE_URL)
 
 with engine.begin() as conn:
     already = conn.execute(
-        text("SELECT COUNT(*) FROM parking_slots WHERE parking_category != 'GENERAL'")
+        text("SELECT COUNT(*) FROM parking_slots WHERE reservation_type != 'GENERAL'")
     ).scalar()
     if already > 0:
-        print(f"[SKIP] {already} slot(s) already have a non-GENERAL parking_category — migration already applied.")
+        print(f"[SKIP] {already} slot(s) already have a non-GENERAL reservation_type — migration already applied.")
         sys.exit(0)
 
     for slot_id, reserved_for in EMPLOYEE_SLOTS:
         rows = conn.execute(
             text(
                 "UPDATE parking_slots "
-                "SET parking_category = 'EMPLOYEE', reserved_for = :rf, is_violation_zone = 0 "
+                "SET reservation_type = 'EMPLOYEE', reserved_for = :rf, is_violation_zone = 0 "
                 "WHERE slot_id = :sid"
             ),
             {"rf": reserved_for, "sid": slot_id},
@@ -75,7 +75,7 @@ with engine.begin() as conn:
         rows = conn.execute(
             text(
                 "UPDATE parking_slots "
-                "SET parking_category = 'SPECIAL', slot_name = :sn, is_violation_zone = 0 "
+                "SET reservation_type = 'SPECIAL', slot_name = :sn, is_violation_zone = 0 "
                 "WHERE slot_id = :sid"
             ),
             {"sn": slot_name, "sid": slot_id},
