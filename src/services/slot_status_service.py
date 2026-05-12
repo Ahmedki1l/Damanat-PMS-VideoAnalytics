@@ -57,7 +57,7 @@ def log_vehicle_event(
     
     new_log = SlotStatus(
         slot_id=slot_id,
-        plate_number=plate,
+        plate_number=plate if is_parked else None,
         status="occupied" if is_parked else "available"
     )
     
