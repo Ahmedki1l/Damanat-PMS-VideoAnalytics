@@ -274,6 +274,9 @@ class VehicleRegistryIdentityMixin:
                     return existing.session_id
 
             self._sessions[session_id] = session
+            # Phase 3 / T3.2 — track the new confirmed session in the FAISS
+            # gallery (no-op when use_faiss_index is False).
+            self._gallery_index_upsert(session)
 
         logger.info(
             "[ANPR] Direct session %s created for plate=%s — "
@@ -677,6 +680,9 @@ class VehicleRegistryIdentityMixin:
                 self._track_session_map[(camera_id, track_id)] = session.session_id
                 session.observing_tracks[camera_id] = track_id
                 self._mark_track_seen(camera_id, track_id, now)
+                # Phase 3 / T3.2 — track the new B1-confirmed session in
+                # the FAISS gallery (no-op when use_faiss_index is False).
+                self._gallery_index_upsert(session)
 
             event.status = "confirmed"
             event.session_id = session.session_id
@@ -844,6 +850,9 @@ class VehicleRegistryIdentityMixin:
             self._track_session_map[(camera_id, track_id)] = session.session_id
             session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id, now)
+            # Phase 3 / T3.2 — appearance-only sessions are also "confirmed"
+            # status so the gallery indexer upserts them too.
+            self._gallery_index_upsert(session)
 
             logger.info(
                 "[REGISTRY] Created appearance-only session %s for track (%s, %d)",
@@ -867,24 +876,60 @@ class VehicleRegistryIdentityMixin:
         Guard: if a session is already being actively observed by a LIVE track
         on another camera, it is excluded — the car we are looking at cannot be
         that session because the real car is already accounted for elsewhere.
+
+        Phase 3 / T3.2: when ``MatchingConfig.use_faiss_index`` is True the
+        candidate pool is pre-narrowed to the top-K nearest neighbours via
+        :class:`GalleryIndex` for an O(log n) lookup; the active-track
+        guard, ``check_modalities`` cascade and ``MatchDecision.decide_global``
+        verdict still apply on the surviving candidates.
         """
         if query_vector is None:
             return None
 
         ACTIVE_TRACK_STALENESS_SECONDS = 3.0
+        FAISS_TOPK = 10
 
         now = self._clock()
-        with self._lock:
-            potential_sessions = [
-                session
-                for session in self._sessions.values()
-                if (
-                    session.status in ("confirmed", "parked")
-                    and session.feature_vector is not None
-                    and (now - session.last_seen_at).total_seconds()
-                    <= max_time_gap_seconds
+        use_faiss = bool(getattr(self._matching_config, "use_faiss_index", False))
+        faiss_topk_ids = None
+        if use_faiss and len(self._gallery_index) > 0:
+            try:
+                hits = self._gallery_index.search(query_vector, k=FAISS_TOPK)
+                faiss_topk_ids = {sid for sid, _ in hits}
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "[GLOBAL] gallery_index.search raised %r — falling back to linear scan.",
+                    exc,
                 )
-            ]
+                faiss_topk_ids = None
+
+        with self._lock:
+            if faiss_topk_ids is not None:
+                # Pre-narrow to the FAISS top-K. Preserve all the existing
+                # invariants on the pool (confirmed/parked, feature present,
+                # within max_time_gap_seconds).
+                potential_sessions = [
+                    session
+                    for sid, session in self._sessions.items()
+                    if (
+                        sid in faiss_topk_ids
+                        and session.status in ("confirmed", "parked")
+                        and session.feature_vector is not None
+                        and (now - session.last_seen_at).total_seconds()
+                        <= max_time_gap_seconds
+                    )
+                ]
+            else:
+                potential_sessions = [
+                    session
+                    for session in self._sessions.values()
+                    if (
+                        session.status in ("confirmed", "parked")
+                        and session.feature_vector is not None
+                        and (now - session.last_seen_at).total_seconds()
+                        <= max_time_gap_seconds
+                    )
+                ]
 
             # Active track guard: skip sessions that have a live track on a
             # DIFFERENT camera (the car we see can't be that one — it's already
@@ -990,6 +1035,9 @@ class VehicleRegistryIdentityMixin:
             session.plate = plate
             if feature_vector is not None:
                 session.feature_vector = feature_vector
+            # Phase 3 / T3.2 — the session may have been added to the index
+            # without a plate; refresh so the index sees the latest vector.
+            self._gallery_index_upsert(session)
 
             logger.info(
                 "[FUSION] Linked plate=%s to session %s (appearance-only -> plate-confirmed)",
@@ -1021,6 +1069,10 @@ class VehicleRegistryIdentityMixin:
                         session.last_seen_camera,
                         session.last_seen_track_id,
                     )
+                # Phase 3 / T3.2 — EMA-smoothed feature update; sync the
+                # gallery index so the next FAISS search reflects the new
+                # vector. No-op when the feature flag is False.
+                self._gallery_index_upsert(session)
 
     def refresh_track_binding(
         self,
@@ -1147,6 +1199,9 @@ class VehicleRegistryIdentityMixin:
             target_session.last_seen_track_id = track_id
             if query_vector is not None:
                 target_session.feature_vector = query_vector
+                # Phase 3 / T3.2 — refresh the gallery index with the new
+                # query vector so subsequent FAISS searches see this view.
+                self._gallery_index_upsert(target_session)
             self._drop_other_track_mappings_for_session(
                 best_sid,
                 keep=(camera_id, track_id),
@@ -1168,6 +1223,8 @@ class VehicleRegistryIdentityMixin:
                     and current_session.linked_slot is None
                 ):
                     self._sessions.pop(orphan_sid, None)
+                    # Phase 3 / T3.2 — drop orphan from the FAISS gallery.
+                    self._gallery_index_remove(orphan_sid)
 
             logger.info(
                 "[GLOBAL] Reattached track (%s, %d) from anonymous session %s to confirmed session %s (score=%.3f)",
@@ -1358,6 +1415,10 @@ class VehicleRegistryIdentityMixin:
                     )
                 
                 self._sessions.pop(session.session_id, None)
+                # Phase 3 / T3.2 — drop exited session from the FAISS
+                # gallery so a future query never matches against a car
+                # that has already left the facility.
+                self._gallery_index_remove(session.session_id)
                 self._history.append(session)
                 logger.info("[REGISTRY] Closed session %s for plate %s (Exit)", session.session_id, plate)
 

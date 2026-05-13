@@ -65,3 +65,9 @@ nncf>=2.10.0
 # the plugin sets FLAGS_use_mkldnn=0 by default to avoid it.
 paddleocr>=2.7.0
 paddlepaddle>=2.6.0
+
+# Phase 3 / T3.2 — FAISS-CPU gallery index. Optional at runtime: when
+# absent the GalleryIndex falls back to a pure-numpy brute-force search
+# with identical semantics (slower above ~5000 sessions). Pinning at
+# 1.7+ for IndexIVFFlat parity across platforms.
+faiss-cpu>=1.7.0

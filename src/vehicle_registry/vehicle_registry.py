@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from src.config import MatchingConfig, ReIDPreprocessingConfig
-from src.matching import MatchDecision, MatchVoter
+from src.matching import GalleryIndex, MatchDecision, MatchVoter
 from src.vehicle_registry.vehicle_registry_core import VehicleRegistryCoreMixin
 from src.vehicle_registry.vehicle_registry_identity import VehicleRegistryIdentityMixin
 from src.vehicle_registry.vehicle_registry_models import (
@@ -95,6 +95,18 @@ class VehicleRegistry(
         # ``matching_config.voting_enabled`` is True.
         self._match_voter: MatchVoter = MatchVoter(self._matching_config)
 
+        # Phase 3 / T3.2 — FAISS-CPU gallery index for O(log n) global
+        # session lookup. Always instantiated so callers can probe its
+        # state; ``match_global_session`` only routes through it when
+        # ``matching_config.use_faiss_index`` is True. The index is rebuilt
+        # from ``self._sessions`` at boot, so no on-disk persistence is
+        # required — see src.matching.gallery_index for the design notes.
+        self._gallery_index: GalleryIndex = GalleryIndex(
+            dimension=self._matching_config.faiss_index_dimension,
+            nlist=self._matching_config.faiss_index_nlist,
+            metric="cosine",
+        )
+
         # DI seams (T0.5). ``db_checker`` lets tests replace the SQL probe in
         # is_plate_inside; ``clock`` lets tests advance time deterministically.
         # Both default to None — callsites still use the real
@@ -129,6 +141,63 @@ class VehicleRegistry(
     def match_voter(self) -> MatchVoter:
         """Temporal vote aggregator used by ``try_link_to_slot``."""
         return self._match_voter
+
+    @property
+    def gallery_index(self) -> GalleryIndex:
+        """Phase 3 / T3.2 FAISS-CPU gallery index.
+
+        Returns the live :class:`GalleryIndex` instance regardless of
+        whether ``matching_config.use_faiss_index`` is True — callers can
+        inspect its state for diagnostics. ``match_global_session`` only
+        consults the index when the feature flag is True.
+        """
+        return self._gallery_index
+
+    # ------------------------------------------------------------------ #
+    # Gallery-index sync (Phase 3 / T3.2)
+    # ------------------------------------------------------------------ #
+
+    def _gallery_index_upsert(self, session) -> None:
+        """Push the session's current feature vector into the gallery index.
+
+        Idempotent and silently no-op when the session is anonymous, has no
+        feature vector, or the index is disabled by config. The check is in
+        one place so the identity-mixin callsites stay readable.
+        """
+        if not self._matching_config.use_faiss_index:
+            return
+        if session is None:
+            return
+        if session.status not in ("confirmed", "parked"):
+            return
+        vec = getattr(session, "feature_vector", None)
+        if vec is None:
+            return
+        try:
+            self._gallery_index.add(session.session_id, vec)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "[gallery_index] add(%s) raised %r — skipping.",
+                session.session_id,
+                exc,
+            )
+
+    def _gallery_index_remove(self, session_id: str) -> None:
+        """Drop ``session_id`` from the gallery index.
+
+        Skipped when the index is feature-flagged off; that keeps the
+        index empty so any later toggle starts from a clean rebuild.
+        """
+        if not self._matching_config.use_faiss_index:
+            return
+        try:
+            self._gallery_index.remove(session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "[gallery_index] remove(%s) raised %r — skipping.",
+                session_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------ #
     # Plugin instantiation (Phase 2 T2.1)

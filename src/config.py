@@ -211,6 +211,18 @@ class MatchingConfig:
     reid_input_size: tuple = (192, 96)
     reid_openvino_model_dir: str = "models/osnet_openvino_int8"
 
+    # --- Phase 3 / T3.2 — FAISS-CPU gallery index ---
+    # ``match_global_session`` defaults to the legacy O(n) linear scan
+    # over ``self._sessions``. When ``use_faiss_index`` is True and the
+    # ``faiss-cpu`` package is importable, the registry instead routes the
+    # query through ``src.matching.GalleryIndex`` for an O(log n) IVF
+    # search. Default is False until the production rollout completes its
+    # shadow-mode benchmarking. ``faiss_index_dimension`` MUST match the
+    # ReID feature length (512 for OSNet-AIN).
+    use_faiss_index: bool = False
+    faiss_index_dimension: int = 512
+    faiss_index_nlist: int = 8
+
 
 @dataclass
 class AppConfig:
@@ -446,6 +458,13 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.reid_openvino_model_dir = m.get(
             "reid_openvino_model_dir", cm.reid_openvino_model_dir
         )
+
+        # FAISS-CPU gallery index (Phase 3 / T3.2)
+        cm.use_faiss_index = m.get("use_faiss_index", cm.use_faiss_index)
+        cm.faiss_index_dimension = m.get(
+            "faiss_index_dimension", cm.faiss_index_dimension
+        )
+        cm.faiss_index_nlist = m.get("faiss_index_nlist", cm.faiss_index_nlist)
 
     # --- Output ---
     if "output" in raw:
