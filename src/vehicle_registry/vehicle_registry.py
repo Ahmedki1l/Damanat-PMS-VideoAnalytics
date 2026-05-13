@@ -278,16 +278,23 @@ class VehicleRegistry(
         # The OCR plugin is heavy (PaddleOCR pulls ~50 MB of weights on first
         # use); only instantiate when ``plate_ocr_model`` is configured non-
         # empty so a fresh checkout boots without paddle installed.
+        # Config semantics:
+        #   ""                 -> NoopPlateOCR (disabled)
+        #   <path-to-dir>      -> PaddlePlateOCR with that PaddleOCR home dir
+        #   <anything-else>    -> PaddlePlateOCR with default cache
+        #                         (~/.paddlex/official_models, auto-download)
         ocr_plugin = None
         ocr_path = (config.plate_ocr_model or "").strip()
         if ocr_path:
             try:
+                from pathlib import Path as _P
                 from src.ocr.plate_ocr import PaddlePlateOCR
 
-                ocr_plugin = PaddlePlateOCR(model_dir=ocr_path or None)
+                model_dir = ocr_path if _P(ocr_path).is_dir() else None
+                ocr_plugin = PaddlePlateOCR(model_dir=model_dir)
                 logger.info(
                     "[MatchDecision] plate OCR plugin loaded (model_dir=%s)",
-                    ocr_path or "<default>",
+                    model_dir or "<paddleocr default cache>",
                 )
             except Exception as exc:
                 logger.warning(

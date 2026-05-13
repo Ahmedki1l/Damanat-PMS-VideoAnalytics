@@ -198,6 +198,17 @@ class PaddlePlateOCR(PlateOCR):
         defaults were chosen from a 626-crop diagnostic sweep on this facility
         where PaddleOCR was returning confident "CAM01GFFRONTR" / "103446"
         readings from the HUD instead of the actual plate text.
+    plate_roi_*:
+        Geometric heuristic plate-region crop applied AFTER HUD masking but
+        BEFORE OCR. Vehicle plates sit in the bottom-centre of a standard
+        vehicle bbox: roughly ``[plate_roi_top:plate_roi_bottom]`` rows and
+        ``[plate_roi_left:plate_roi_right]`` columns. Defaults are
+        ``top=0.50, bottom=0.95, left=0.20, right=0.80`` — keeps the bottom
+        ~half of the crop and the central 60 % horizontally, which captures
+        the plate on head-on/angled vehicle crops while dropping windshield
+        stickers, branding, and the wider chassis background. Set
+        ``plate_roi_enabled=False`` when feeding an already-tight plate ROI
+        (e.g., from a future plate-detection model).
     """
 
     DEFAULT_LANG = "en"
@@ -211,6 +222,10 @@ class PaddlePlateOCR(PlateOCR):
     DEFAULT_REC_V3_EN = "en_PP-OCRv5_mobile_rec"
     DEFAULT_HUD_TOP_RATIO = 0.08
     DEFAULT_HUD_BOTTOM_RATIO = 0.08
+    DEFAULT_PLATE_ROI_TOP = 0.50      # plate band starts at 50% from top
+    DEFAULT_PLATE_ROI_BOTTOM = 0.95   # ends at 95% (drop very-bottom shadow)
+    DEFAULT_PLATE_ROI_LEFT = 0.20     # plate sits centre-horizontally
+    DEFAULT_PLATE_ROI_RIGHT = 0.80
 
     def __init__(
         self,
@@ -225,6 +240,11 @@ class PaddlePlateOCR(PlateOCR):
         rec_model_name: Optional[str] = None,
         hud_top_mask_ratio: float = DEFAULT_HUD_TOP_RATIO,
         hud_bottom_mask_ratio: float = DEFAULT_HUD_BOTTOM_RATIO,
+        plate_roi_enabled: bool = True,
+        plate_roi_top: float = DEFAULT_PLATE_ROI_TOP,
+        plate_roi_bottom: float = DEFAULT_PLATE_ROI_BOTTOM,
+        plate_roi_left: float = DEFAULT_PLATE_ROI_LEFT,
+        plate_roi_right: float = DEFAULT_PLATE_ROI_RIGHT,
     ) -> None:
         # Fail fast at construction so callers know whether the plugin is
         # usable before the first frame arrives. The actual heavy model load
@@ -259,6 +279,17 @@ class PaddlePlateOCR(PlateOCR):
         # Clamp HUD mask ratios into [0, 0.49] so we never blank the whole crop.
         self._hud_top_mask_ratio = max(0.0, min(0.49, float(hud_top_mask_ratio)))
         self._hud_bottom_mask_ratio = max(0.0, min(0.49, float(hud_bottom_mask_ratio)))
+
+        # Plate-ROI heuristic. Sanity-check the bounds so we never invert them.
+        self._plate_roi_enabled = bool(plate_roi_enabled)
+        rt = max(0.0, min(0.99, float(plate_roi_top)))
+        rb = max(rt + 0.01, min(1.0, float(plate_roi_bottom)))
+        rl = max(0.0, min(0.99, float(plate_roi_left)))
+        rr = max(rl + 0.01, min(1.0, float(plate_roi_right)))
+        self._plate_roi_top = rt
+        self._plate_roi_bottom = rb
+        self._plate_roi_left = rl
+        self._plate_roi_right = rr
 
         self._engine = None
         self._api_version: Optional[int] = None  # 2 or 3, resolved at first use
@@ -356,14 +387,38 @@ class PaddlePlateOCR(PlateOCR):
             out[h - bottom_px:, :] = 0
         return out
 
+    def _extract_plate_roi(self, crop_bgr: np.ndarray) -> np.ndarray:
+        """Crop the geometric plate region (bottom-centre band of a vehicle).
+
+        Plates sit in the lower-middle of a standard vehicle bbox.
+        Returns a *view* of the original (no copy) for performance; callers
+        that mutate the result should `.copy()` it themselves.
+        """
+        if not self._plate_roi_enabled or crop_bgr is None or crop_bgr.size == 0:
+            return crop_bgr
+        h, w = crop_bgr.shape[:2]
+        y0 = max(0, int(round(h * self._plate_roi_top)))
+        y1 = min(h, int(round(h * self._plate_roi_bottom)))
+        x0 = max(0, int(round(w * self._plate_roi_left)))
+        x1 = min(w, int(round(w * self._plate_roi_right)))
+        if y1 - y0 < 8 or x1 - x0 < 16:
+            # ROI degenerate (crop too small) — fall back to the full input.
+            return crop_bgr
+        return crop_bgr[y0:y1, x0:x1]
+
     def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
-        """Mask HUD bands, then upsample if the crop is tiny."""
+        """Mask HUD bands, crop the geometric plate ROI, then upsample tiny crops."""
         if crop_bgr is None or crop_bgr.size == 0:
             return crop_bgr
 
-        # Apply HUD masking FIRST so the upsample doesn't smear timestamp
-        # pixels into the plate region.
+        # 1. Mask HUD bands FIRST so the ROI crop doesn't pull in timestamp
+        #    pixels from a corner.
         crop_bgr = self._mask_hud(crop_bgr)
+
+        # 2. Geometric plate-ROI crop. Drops windshield stickers, branding,
+        #    wide chassis background — leaves the bottom-centre region where
+        #    license plates live on head-on / angled vehicle bboxes.
+        crop_bgr = self._extract_plate_roi(crop_bgr)
 
         h, w = crop_bgr.shape[:2]
         if h >= self._min_crop_h and w >= self._min_crop_w:

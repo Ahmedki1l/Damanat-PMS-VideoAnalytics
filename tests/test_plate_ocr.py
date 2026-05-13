@@ -155,7 +155,11 @@ class TestPaddlePlateOCR(unittest.TestCase):
         cls.np = np
 
         try:
-            cls.ocr = PaddlePlateOCR()
+            # Tests feed synthetic plate images directly — these are *already*
+            # tight plate crops, so the vehicle-bbox plate-ROI heuristic must
+            # be disabled or it would crop the plate text itself. Production
+            # callsites pass vehicle crops and keep the default (enabled).
+            cls.ocr = PaddlePlateOCR(plate_roi_enabled=False)
         except ImportError as exc:
             raise unittest.SkipTest(str(exc))
         except Exception as exc:  # backend-construction failures
