@@ -6,6 +6,7 @@ from typing import List, Optional
 
 import numpy as np
 
+from src.matching.match_decision import Decision
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
 
 logger = logging.getLogger(__name__)
@@ -1221,6 +1222,36 @@ class VehicleRegistryIdentityMixin:
                 if existing.session_id == session.session_id:
                     return existing.plate
                 return existing.plate
+
+            # Phase 2 / T2.2 — temporal voting. When enabled, the commit
+            # is gated by ``MatchVoter`` so a single noisy frame cannot
+            # parked-flip a session on its own. The voter returns ``None``
+            # while the buffer is still filling or no plate has won the
+            # K-of-N vote yet; callers in engine_runtime.py:678 / :715
+            # already tolerate ``None`` (rate-gated retry next frame).
+            voter = getattr(self, "_match_voter", None)
+            if voter is not None and self.matching_config.voting_enabled:
+                vote_input = Decision(
+                    verdict="confirm",
+                    reason="try_link_to_slot",
+                    scores={
+                        "plate": session.plate,
+                        "session_id": session.session_id,
+                        "slot_id": slot_id,
+                        "camera_id": camera_id,
+                        "track_id": int(track_id) if track_id is not None else None,
+                    },
+                )
+                commit = voter.submit(camera_id, track_id, vote_input)
+                if commit is None:
+                    logger.debug(
+                        "[try_link_to_slot] voter deferred commit for plate=%s "
+                        "session=%s slot=%s (window not yet decisive)",
+                        session.plate,
+                        session.session_id,
+                        slot_id,
+                    )
+                    return None
 
             # Enforce one-slot-per-vehicle rule: if this session is already
             # linked to a different slot, remove that old linkage first.

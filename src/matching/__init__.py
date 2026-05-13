@@ -21,6 +21,7 @@ Public surface:
 """
 
 from .match_decision import ColorCheck, Decision, MatchDecision
+from .match_voter import MatchVoter
 from .plugins import (
     ColorClassifier,
     NoopColorClassifier,
@@ -34,6 +35,7 @@ __all__ = [
     "ColorCheck",
     "Decision",
     "MatchDecision",
+    "MatchVoter",
     "ColorClassifier",
     "TypeClassifier",
     "PlateOCR",

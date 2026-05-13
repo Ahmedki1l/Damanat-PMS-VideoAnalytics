@@ -326,6 +326,20 @@ class VehicleRegistryCoreMixin:
             for candidate_id in candidates_to_delete:
                 self._park_entry_candidates.pop(candidate_id, None)
 
+        # Phase 2 / T2.2 — drop stale per-track vote buffers. Held outside
+        # the registry lock so the voter's own RLock is the only contention
+        # point. ``match_voter`` is always present (constructed in
+        # ``VehicleRegistry.__init__``); the no-op guard is defensive against
+        # subclasses that bypass the standard constructor.
+        voter = getattr(self, "_match_voter", None)
+        if voter is not None:
+            try:
+                voter.cleanup_stale()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "[VOTER] cleanup_stale raised: %r", exc
+                )
+
     def open_park_entry_candidate(
         self,
         camera_id: str,

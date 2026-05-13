@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from src.config import MatchingConfig, ReIDPreprocessingConfig
-from src.matching import MatchDecision
+from src.matching import MatchDecision, MatchVoter
 from src.vehicle_registry.vehicle_registry_core import VehicleRegistryCoreMixin
 from src.vehicle_registry.vehicle_registry_identity import VehicleRegistryIdentityMixin
 from src.vehicle_registry.vehicle_registry_models import (
@@ -90,6 +90,11 @@ class VehicleRegistry(
                 lambda: self.matcher,
             )
 
+        # Phase 2 / T2.2 — temporal voting. Feature-flagged off by default;
+        # ``try_link_to_slot`` routes its commit through this voter when
+        # ``matching_config.voting_enabled`` is True.
+        self._match_voter: MatchVoter = MatchVoter(self._matching_config)
+
         # DI seams (T0.5). ``db_checker`` lets tests replace the SQL probe in
         # is_plate_inside; ``clock`` lets tests advance time deterministically.
         # Both default to None — callsites still use the real
@@ -119,6 +124,11 @@ class VehicleRegistry(
     def match_decision(self) -> MatchDecision:
         """Centralised match decision chokepoint."""
         return self._match_decision
+
+    @property
+    def match_voter(self) -> MatchVoter:
+        """Temporal vote aggregator used by ``try_link_to_slot``."""
+        return self._match_voter
 
     # ------------------------------------------------------------------ #
     # Plugin instantiation (Phase 2 T2.1)
