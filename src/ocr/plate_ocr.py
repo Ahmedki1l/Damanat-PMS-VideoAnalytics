@@ -189,6 +189,15 @@ class PaddlePlateOCR(PlateOCR):
     rec_score_thresh:
         Minimum per-line recognition confidence kept. Lines below this are
         discarded before aggregation.
+    hud_top_mask_ratio, hud_bottom_mask_ratio:
+        Fraction of the crop height to blank out (filled with black) before
+        running OCR. Defaults to 0.08 each — eliminates the burned-in camera
+        name overlay (top corner) and the HH:MM:SS timestamp band (bottom)
+        that surveillance recorders typically render. Set both to ``0.0`` when
+        feeding pre-cropped plate ROIs (otherwise you'll mask the plate). The
+        defaults were chosen from a 626-crop diagnostic sweep on this facility
+        where PaddleOCR was returning confident "CAM01GFFRONTR" / "103446"
+        readings from the HUD instead of the actual plate text.
     """
 
     DEFAULT_LANG = "en"
@@ -200,6 +209,8 @@ class PaddlePlateOCR(PlateOCR):
     # band the cascade will gate this OCR to.
     DEFAULT_DET_V3 = "PP-OCRv5_mobile_det"
     DEFAULT_REC_V3_EN = "en_PP-OCRv5_mobile_rec"
+    DEFAULT_HUD_TOP_RATIO = 0.08
+    DEFAULT_HUD_BOTTOM_RATIO = 0.08
 
     def __init__(
         self,
@@ -212,6 +223,8 @@ class PaddlePlateOCR(PlateOCR):
         rec_score_thresh: float = 0.5,
         det_model_name: Optional[str] = None,
         rec_model_name: Optional[str] = None,
+        hud_top_mask_ratio: float = DEFAULT_HUD_TOP_RATIO,
+        hud_bottom_mask_ratio: float = DEFAULT_HUD_BOTTOM_RATIO,
     ) -> None:
         # Fail fast at construction so callers know whether the plugin is
         # usable before the first frame arrives. The actual heavy model load
@@ -242,6 +255,10 @@ class PaddlePlateOCR(PlateOCR):
         else:
             # For other languages let PaddleOCR pick the matching mobile rec.
             self._rec_model_name = None
+
+        # Clamp HUD mask ratios into [0, 0.49] so we never blank the whole crop.
+        self._hud_top_mask_ratio = max(0.0, min(0.49, float(hud_top_mask_ratio)))
+        self._hud_bottom_mask_ratio = max(0.0, min(0.49, float(hud_bottom_mask_ratio)))
 
         self._engine = None
         self._api_version: Optional[int] = None  # 2 or 3, resolved at first use
@@ -316,10 +333,37 @@ class PaddlePlateOCR(PlateOCR):
 
     # ----- Preprocessing -------------------------------------------------- #
 
-    def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
-        """Light upsample for tiny crops; no-op otherwise."""
+    def _mask_hud(self, crop_bgr: np.ndarray) -> np.ndarray:
+        """Blank the top/bottom HUD bands so PaddleOCR ignores burned-in text.
+
+        Surveillance recorders typically render the camera name in the top
+        corner and a HH:MM:SS timestamp in the bottom band. PaddleOCR reads
+        both at 0.95+ confidence and treats them as plate text. We blank
+        those bands with solid black before OCR runs.
+        """
         if crop_bgr is None or crop_bgr.size == 0:
             return crop_bgr
+        if self._hud_top_mask_ratio <= 0.0 and self._hud_bottom_mask_ratio <= 0.0:
+            return crop_bgr
+
+        out = crop_bgr.copy()
+        h = out.shape[0]
+        top_px = int(round(h * self._hud_top_mask_ratio))
+        bottom_px = int(round(h * self._hud_bottom_mask_ratio))
+        if top_px > 0:
+            out[:top_px, :] = 0
+        if bottom_px > 0:
+            out[h - bottom_px:, :] = 0
+        return out
+
+    def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
+        """Mask HUD bands, then upsample if the crop is tiny."""
+        if crop_bgr is None or crop_bgr.size == 0:
+            return crop_bgr
+
+        # Apply HUD masking FIRST so the upsample doesn't smear timestamp
+        # pixels into the plate region.
+        crop_bgr = self._mask_hud(crop_bgr)
 
         h, w = crop_bgr.shape[:2]
         if h >= self._min_crop_h and w >= self._min_crop_w:

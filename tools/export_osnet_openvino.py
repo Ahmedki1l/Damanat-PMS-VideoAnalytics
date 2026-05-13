@@ -180,6 +180,22 @@ def build_torchreid_osnet(model_name: str):
     """Build the OSNet-AIN model with pretrained weights.
 
     Mirrors the construction path used by ``VehicleReIDMatcher.__init__``.
+
+    InstanceNorm fix
+    ----------------
+    OSNet-AIN initialises its 5 ``InstanceNorm2d`` layers with the torchreid
+    default ``track_running_stats=True``. ONNX's ``InstanceNormalization`` op
+    does NOT accept ``running_mean`` / ``running_var`` inputs, so
+    ``torch.onnx.export`` silently strips those buffers and falls back to
+    per-instance statistics at inference time. See pytorch/pytorch issues
+    #53887, #72057, #94604, #123158. The result is a ~0.06 cosine-similarity
+    drift between the torchreid reference path (which uses running stats)
+    and the exported ONNX/OpenVINO path (which uses per-instance stats).
+
+    Fix: set ``track_running_stats=False`` on every InstanceNorm2d *before*
+    export. This makes torch eval use per-instance stats too, so the
+    torchreid baseline and the OpenVINO export agree on the same
+    normalisation strategy and the cosine drift collapses.
     """
     import torch  # local import — keeps the CLI usable without torch installed
     import torchreid
@@ -191,6 +207,21 @@ def build_torchreid_osnet(model_name: str):
         pretrained=True,
     )
     model.eval()
+
+    in_layers = 0
+    for m in model.modules():
+        if isinstance(m, torch.nn.InstanceNorm2d):
+            m.track_running_stats = False
+            # Drop the buffers so torch can't accidentally use them.
+            m.running_mean = None
+            m.running_var = None
+            m.num_batches_tracked = None
+            in_layers += 1
+    logger.info(
+        "Disabled track_running_stats on %d InstanceNorm2d layers "
+        "(fixes ONNX export drift — see pytorch/pytorch#53887).",
+        in_layers,
+    )
     return model
 
 
@@ -434,12 +465,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                     len(used_paths),
                 )
                 t0 = time.perf_counter()
+                # Keep MVN ops (the OpenVINO mapping of ONNX
+                # InstanceNormalization) in FP32. Following the OpenVINO CGD
+                # image-retrieval reference, this retains ~0.16 % accuracy
+                # drop vs ~1.2 % when InstanceNorm is also quantised. The
+                # InstanceNorm parameter count in OSNet is tiny (~50 K
+                # total) so the FP32 fallback has negligible latency cost.
+                ignored_scope = _nncf.IgnoredScope(types=["MVN"])
                 ov_quantised = _nncf.quantize(
                     ov_model,
                     dataset,
                     subset_size=min(args.subset_size, len(used_paths)),
                     preset=_nncf.QuantizationPreset.PERFORMANCE,
                     fast_bias_correction=True,
+                    ignored_scope=ignored_scope,
                 )
                 import openvino as ov
                 ov.save_model(ov_quantised, str(ir_xml), compress_to_fp16=False)

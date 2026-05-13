@@ -143,9 +143,22 @@ def preprocess_crop(
     Convert a single BGR crop to the NCHW float32 tensor the model expects.
 
     Returns a contiguous ``np.ndarray`` of shape ``(1, 3, H, W)``.
+
+    Must match ``tools/train_color_classifier.py``'s torchvision pipeline:
+    ``transforms.ToPILImage() -> Resize((H, W)) -> ToTensor -> Normalize``.
+    PIL's ``Resize((H, W))`` is a *squish* (no aspect preservation), so the
+    plugin uses a straight ``cv2.resize`` here. Earlier this code used
+    ``letterbox`` with grey padding — that matched typical detector
+    preprocessing but caused a ~17 pp train/runtime accuracy gap because
+    the model was trained on squished/distorted crops, not letterboxed
+    ones. If you change one, change the other.
     """
-    boxed = letterbox(crop_bgr, size)
-    rgb = cv2.cvtColor(boxed, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    if crop_bgr is None or crop_bgr.size == 0:
+        crop_bgr = np.full((size[0], size[1], 3), 114, dtype=np.uint8)
+    target_h, target_w = size
+    # cv2.resize takes (w, h), torchvision Resize takes (h, w) — same effect.
+    resized = cv2.resize(crop_bgr, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     rgb -= IMAGENET_MEAN
     rgb /= IMAGENET_STD
     # HWC -> CHW, add batch dim

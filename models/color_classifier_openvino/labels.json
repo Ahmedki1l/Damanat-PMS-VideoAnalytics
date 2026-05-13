@@ -13,8 +13,8 @@
     "other"
   ],
   "input_size": [
-    96,
-    96
+    224,
+    224
   ],
   "preprocessing": {
     "mean": [

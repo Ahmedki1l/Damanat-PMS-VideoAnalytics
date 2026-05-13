@@ -1,36 +1,39 @@
-# Type Classifier (OpenVINO IR) — placeholder
+# Type Classifier (OpenVINO IR)
 
-This directory will hold the OpenVINO IR for the 6-class body-type
-classifier (sedan, SUV, hatchback, pickup, van, bus).
+MobileNetV3-Small body-type classifier — 6 classes.
 
-The artifact is produced by:
+## Classes (in IR output order)
 
-```
-python tools/train_type_classifier.py
-```
+  0. sedan
+  1. suv
+  2. hatchback
+  3. pickup
+  4. van
+  5. bus
 
-That command writes:
+## Data dependency
+
+This artifact was trained on real labelled crops produced by `tools/prepare_type_dataset.py` (data track D-3).
+
+## Training metrics
+
+- best_val_acc: 0.8973
+- test_acc: 0.9070
+- train_seconds: 229.7652
+
+## Files
 
 - `model.xml` / `model.bin` — OpenVINO IR (FP32).
 - `model.onnx` — intermediate ONNX export.
 - `labels.json` — class index → label map plus preprocessing constants.
-- `README.md` — auto-generated, replaces this placeholder.
-- `best.pt` — torch checkpoint used to export the IR.
+- `README.md` — this file.
 
-## Data dependency
-
-`tools/train_type_classifier.py` consumes confirmed labels from
-`tests/data/type_classifier/{train,val,test}.csv` produced by
-`tools/prepare_type_dataset.py`. When real labels are sparse, the trainer
-falls back to a synthetic geometric-primitives dataset so Phase 2 still has
-a working IR to integrate against. The fallback model is intentionally
-degraded — replace it once data-track D-3 lands.
-
-## Loading from Python
+## Loading
 
 ```python
 from src.classifiers.type_classifier import OpenVINOTypeClassifier
-
-clf = OpenVINOTypeClassifier()  # defaults to models/type_classifier_openvino/model.xml
+clf = OpenVINOTypeClassifier('models/type_classifier_openvino/model.xml')
 label, conf = clf.predict(crop_bgr)
 ```
+
+Retrain via `python tools/train_type_classifier.py --help`.

@@ -34,6 +34,10 @@ class ProcessingConfig:
     # The runtime will scale polygon coords from this to the actual stream resolution.
     slot_ref_width: int = 640
     slot_ref_height: int = 360
+    # When True, each camera gets its own TrackedDetector so ByteTrack state
+    # is not corrupted by round-robin (Ultralytics' persist=True is per-model).
+    # False reverts to the legacy single shared tracker (lower RAM, worse IDs).
+    per_camera_tracker: bool = True
 
 
 @dataclass
@@ -304,6 +308,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.processing.slot_ref_height = p.get(
             "slot_ref_height", config.processing.slot_ref_height
         )
+        config.processing.per_camera_tracker = bool(p.get(
+            "per_camera_tracker", config.processing.per_camera_tracker
+        ))
 
     # --- Legacy single-camera support ---
     if "video" in raw:
