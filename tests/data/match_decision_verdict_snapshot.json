@@ -1,0 +1,318 @@
+[
+  {
+    "case": {
+      "args": {
+        "candidate_count": 3,
+        "is_anpr_candidate": true,
+        "score_reid": 0.5
+      },
+      "fn": "decide_b1"
+    },
+    "reason": "b1_anpr",
+    "scores": {
+      "candidate_count": 3,
+      "is_anpr_candidate": true,
+      "reid": 0.5,
+      "threshold": 0.47
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "candidate_count": 3,
+        "is_anpr_candidate": true,
+        "score_reid": 0.47
+      },
+      "fn": "decide_b1"
+    },
+    "reason": "b1_anpr",
+    "scores": {
+      "candidate_count": 3,
+      "is_anpr_candidate": true,
+      "reid": 0.47,
+      "threshold": 0.47
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "candidate_count": 3,
+        "is_anpr_candidate": true,
+        "score_reid": 0.3
+      },
+      "fn": "decide_b1"
+    },
+    "reason": "below_threshold",
+    "scores": {
+      "candidate_count": 3,
+      "is_anpr_candidate": true,
+      "reid": 0.3,
+      "threshold": 0.47
+    },
+    "verdict": "reject"
+  },
+  {
+    "case": {
+      "args": {
+        "candidate_count": 3,
+        "is_anpr_candidate": false,
+        "score_reid": 0.6
+      },
+      "fn": "decide_b1"
+    },
+    "reason": "b1_zone",
+    "scores": {
+      "candidate_count": 3,
+      "is_anpr_candidate": false,
+      "reid": 0.6,
+      "threshold": 0.55
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "candidate_count": 3,
+        "is_anpr_candidate": false,
+        "score_reid": 0.55
+      },
+      "fn": "decide_b1"
+    },
+    "reason": "b1_zone",
+    "scores": {
+      "candidate_count": 3,
+      "is_anpr_candidate": false,
+      "reid": 0.55,
+      "threshold": 0.55
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "candidate_count": 3,
+        "is_anpr_candidate": false,
+        "score_reid": 0.5
+      },
+      "fn": "decide_b1"
+    },
+    "reason": "below_threshold",
+    "scores": {
+      "candidate_count": 3,
+      "is_anpr_candidate": false,
+      "reid": 0.5,
+      "threshold": 0.55
+    },
+    "verdict": "reject"
+  },
+  {
+    "case": {
+      "args": {
+        "candidate_count": 1,
+        "is_anpr_candidate": false,
+        "score_reid": 0.0
+      },
+      "fn": "decide_b1"
+    },
+    "reason": "single_candidate_fallback",
+    "scores": {
+      "candidate_count": 1,
+      "is_anpr_candidate": false,
+      "reid": 0.0,
+      "threshold": 0.55
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "candidate_count": 1,
+        "is_anpr_candidate": true,
+        "score_reid": 0.1
+      },
+      "fn": "decide_b1"
+    },
+    "reason": "single_candidate_fallback",
+    "scores": {
+      "candidate_count": 1,
+      "is_anpr_candidate": true,
+      "reid": 0.1,
+      "threshold": 0.47
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": false,
+        "has_plate": false,
+        "score_reid": 0.6
+      },
+      "fn": "decide_global"
+    },
+    "reason": "global_default",
+    "scores": {
+      "cross_camera": false,
+      "has_plate": false,
+      "reid": 0.6,
+      "threshold": 0.55
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": false,
+        "has_plate": false,
+        "score_reid": 0.5
+      },
+      "fn": "decide_global"
+    },
+    "reason": "below_threshold",
+    "scores": {
+      "cross_camera": false,
+      "has_plate": false,
+      "reid": 0.5,
+      "threshold": 0.55
+    },
+    "verdict": "reject"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": false,
+        "has_plate": true,
+        "score_reid": 0.46
+      },
+      "fn": "decide_global"
+    },
+    "reason": "global_with_plate",
+    "scores": {
+      "cross_camera": false,
+      "has_plate": true,
+      "reid": 0.46,
+      "threshold": 0.46
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": false,
+        "has_plate": true,
+        "score_reid": 0.45
+      },
+      "fn": "decide_global"
+    },
+    "reason": "below_threshold",
+    "scores": {
+      "cross_camera": false,
+      "has_plate": true,
+      "reid": 0.45,
+      "threshold": 0.46
+    },
+    "verdict": "reject"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": true,
+        "has_plate": true,
+        "score_reid": 0.43
+      },
+      "fn": "decide_global"
+    },
+    "reason": "global_cross_camera",
+    "scores": {
+      "cross_camera": true,
+      "has_plate": true,
+      "reid": 0.43,
+      "threshold": 0.43
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": true,
+        "has_plate": true,
+        "score_reid": 0.42
+      },
+      "fn": "decide_global"
+    },
+    "reason": "below_threshold",
+    "scores": {
+      "cross_camera": true,
+      "has_plate": true,
+      "reid": 0.42,
+      "threshold": 0.43
+    },
+    "verdict": "reject"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": false,
+        "score_reid": 0.52
+      },
+      "fn": "decide_reattach"
+    },
+    "reason": "reattach_default",
+    "scores": {
+      "cross_camera": false,
+      "reid": 0.52,
+      "threshold": 0.52
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": false,
+        "score_reid": 0.51
+      },
+      "fn": "decide_reattach"
+    },
+    "reason": "below_threshold",
+    "scores": {
+      "cross_camera": false,
+      "reid": 0.51,
+      "threshold": 0.52
+    },
+    "verdict": "reject"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": true,
+        "score_reid": 0.43
+      },
+      "fn": "decide_reattach"
+    },
+    "reason": "reattach_cross_camera",
+    "scores": {
+      "cross_camera": true,
+      "reid": 0.43,
+      "threshold": 0.43
+    },
+    "verdict": "confirm"
+  },
+  {
+    "case": {
+      "args": {
+        "cross_camera": true,
+        "score_reid": 0.42
+      },
+      "fn": "decide_reattach"
+    },
+    "reason": "below_threshold",
+    "scores": {
+      "cross_camera": true,
+      "reid": 0.42,
+      "threshold": 0.43
+    },
+    "verdict": "reject"
+  }
+]

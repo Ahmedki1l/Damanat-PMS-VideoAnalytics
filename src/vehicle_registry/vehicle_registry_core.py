@@ -21,7 +21,7 @@ class VehicleRegistryCoreMixin:
         while True:
             time.sleep(self._GC_INTERVAL_SECONDS)
             try:
-                self._cleanup_stale_data(datetime.now())
+                self._cleanup_stale_data(self._clock())
             except Exception:
                 logger.exception("Unhandled error in VehicleRegistry GC loop")
 
@@ -32,7 +32,7 @@ class VehicleRegistryCoreMixin:
         timestamp: Optional[datetime] = None,
     ) -> None:
         """Refresh the last-seen time for a camera-local track binding."""
-        self._track_last_seen[(camera_id, track_id)] = timestamp or datetime.now()
+        self._track_last_seen[(camera_id, track_id)] = timestamp or self._clock()
 
     def _drop_other_track_mappings_for_session(
         self,
@@ -140,7 +140,7 @@ class VehicleRegistryCoreMixin:
         if image is None or image.size == 0:
             return None
 
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         enhanced = self._enhance_snapshot_for_storage(image)
         filename = f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
         filepath = os.path.join(self._image_dir, filename)
@@ -153,7 +153,7 @@ class VehicleRegistryCoreMixin:
         timestamp: Optional[datetime] = None,
     ) -> List[str]:
         """Persist one or more CAM_03 reference snapshots for a confirmed session."""
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         token = uuid.uuid4().hex[:12]
         paths: List[str] = []
         for idx, image in enumerate(images):
@@ -182,7 +182,7 @@ class VehicleRegistryCoreMixin:
         if image is None or image.size == 0:
             return None
 
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         
         # Extract feature vector to enrich the session's ReID profile
         feature_vector = self.reid_matcher.extract_feature(image)
@@ -225,7 +225,7 @@ class VehicleRegistryCoreMixin:
         Entry events become pending ANPR records.
         Exit events close an existing confirmed session if found.
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
 
         event = PendingANPREvent(
             event_id=f"anpr_{uuid.uuid4().hex[:12]}",
@@ -333,7 +333,7 @@ class VehicleRegistryCoreMixin:
         timestamp: Optional[datetime] = None,
     ) -> ParkEntryCandidate:
         """Create a candidate for a car entering the Park_Entry zone."""
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         candidate = ParkEntryCandidate(
             candidate_id=f"cand_{uuid.uuid4().hex[:12]}",
             camera_id=camera_id,
@@ -371,7 +371,7 @@ class VehicleRegistryCoreMixin:
         Keep the best Park_Entry snapshot for this candidate.
         Replace only when the new snapshot is better.
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
 
         if REID_USE_MULTISHOT:
             return self._update_park_entry_candidate_multishot(
@@ -437,7 +437,7 @@ class VehicleRegistryCoreMixin:
         if image is None or image.size == 0:
             return None
 
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         from src.reid_matcher import select_best_frames
         from src.reid_matcher.reid_burst import sharpness_score
 

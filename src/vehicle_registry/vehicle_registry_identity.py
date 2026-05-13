@@ -9,6 +9,11 @@ import numpy as np
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
 
 logger = logging.getLogger(__name__)
+
+# Legacy module-level flags retained for backward compatibility with any
+# external code that imports them. The matching cascade now reads
+# ``self.matching_config.use_*`` so tests / configs can override them at
+# runtime without monkey-patching this module.
 REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
 REID_USE_LAB_CLAHE = os.getenv("REID_USE_LAB_CLAHE", "false").lower() == "true"
 REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
@@ -23,9 +28,26 @@ class VehicleRegistryIdentityMixin:
 
         Returns True if VA has no DB binding (legacy/test env) or no plate is
         passed; the guard fails open so unrelated logic still runs.
+
+        Tests can inject an alternate predicate via the ``db_checker`` DI
+        seam on ``VehicleRegistry.__init__``; when set, it is consulted
+        instead of the SQL probe.
         """
         if not plate:
             return True
+
+        db_checker = getattr(self, "_db_checker", None)
+        if db_checker is not None:
+            try:
+                return bool(db_checker(plate))
+            except Exception as exc:
+                logger.warning(
+                    "[is_plate_inside] injected db_checker raised for %s: %r",
+                    plate,
+                    exc,
+                )
+                return True  # fail-open
+
         db_manager = getattr(self, "db_manager", None)
         if db_manager is None:
             return True
@@ -200,7 +222,7 @@ class VehicleRegistryIdentityMixin:
         Returns the new session_id, or None if the feature vector could not be
         extracted from the image.
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
 
         feature_vector = self.reid_matcher.extract_feature(image)
         if feature_vector is None:
@@ -268,7 +290,7 @@ class VehicleRegistryIdentityMixin:
         FIFO rule:
         the first pending ANPR entry is provisionally bound to the first Park_Entry candidate.
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
 
         with self._lock:
             candidate = self._park_entry_candidates.get(candidate_id)
@@ -318,7 +340,7 @@ class VehicleRegistryIdentityMixin:
         Confirm that a B1_Entrance car is the same car that was provisionally
         captured at Park_Entry.
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         if ordered_images:
             session_reference_images = self._dedupe_valid_images(ordered_images)
         else:
@@ -372,13 +394,24 @@ class VehicleRegistryIdentityMixin:
             if bootstrapped_candidate is not None:
                 provisional_pairs = [(now, bootstrapped_candidate)]
 
+        cfg = self.matching_config
+        decision = self.match_decision
+
+        # Honour both the new MatchingConfig flag AND the legacy module-level
+        # global so existing tests that ``patch.object(vehicle_registry_identity,
+        # "REID_USE_COLOR_FILTER", True)`` keep working unchanged. The module
+        # global will be removed once the rest of the codebase / tests stop
+        # patching it (tracked separately).
+        use_color_filter = cfg.use_color_filter or REID_USE_COLOR_FILTER
+
         query_hsv = None
-        if REID_USE_COLOR_FILTER:
+        if use_color_filter:
             from src.reid_matcher import dominant_color_hsv
             query_hsv = dominant_color_hsv(image)
 
         best_candidate = None
         best_score = 0.0
+        best_decision = None
         hard_rejected_candidate_ids = set()
 
         for _, candidate in provisional_pairs:
@@ -386,31 +419,39 @@ class VehicleRegistryIdentityMixin:
             if snapshot is None:
                 continue
 
-            color_similarity = self.matcher._compare_dominant_colors(image, snapshot)
-            if color_similarity < 0.45:
+            # --- Color predicate ---------------------------------------- #
+            # Folds the historical _compare_dominant_colors + color_compatible
+            # blocks (identity:389-413). dominant-color failure causes a plain
+            # ``continue`` (candidate stays eligible for the single-candidate
+            # fallback); HSV failure HARD-REJECTS the candidate so the
+            # fallback also discards it.
+            candidate_hsv_values = [
+                hsv for hsv in list(candidate.color_hsv_values) if hsv is not None
+            ]
+            if not candidate_hsv_values and candidate.color_hsv is not None:
+                candidate_hsv_values = [candidate.color_hsv]
+
+            color = decision.color_check(
+                image,
+                snapshot,
+                query_hsv=query_hsv,
+                candidate_hsvs=candidate_hsv_values,
+                use_color_filter=use_color_filter,
+            )
+            if not color.passes_dominant:
                 logger.debug(
                     "[REID] Candidate %s rejected by color filter (score=%.2f)",
                     candidate.candidate_id,
-                    color_similarity,
+                    color.dominant_score,
                 )
                 continue
-
-            if REID_USE_COLOR_FILTER:
-                from src.reid_matcher import color_compatible
-                candidate_hsv_values = [hsv for hsv in list(candidate.color_hsv_values) if hsv is not None]
-                if not candidate_hsv_values and candidate.color_hsv is not None:
-                    candidate_hsv_values = [candidate.color_hsv]
-                
-                if candidate_hsv_values and not any(
-                    color_compatible(query_hsv, candidate_hsv)
-                    for candidate_hsv in candidate_hsv_values
-                ):
-                    hard_rejected_candidate_ids.add(candidate.candidate_id)
-                    logger.debug(
-                        "[REID] Candidate %s rejected by HSV color filter",
-                        candidate.candidate_id,
-                    )
-                    continue
+            if color.hard_reject:
+                hard_rejected_candidate_ids.add(candidate.candidate_id)
+                logger.debug(
+                    "[REID] Candidate %s rejected by HSV color filter",
+                    candidate.candidate_id,
+                )
+                continue
 
             candidate_vectors = [
                 feature for feature in list(candidate.feature_vectors) if feature is not None
@@ -426,11 +467,18 @@ class VehicleRegistryIdentityMixin:
                     )
                     for candidate_vector in candidate_vectors
                 )
-                # ANPR-image candidates were captured by the dedicated ANPR camera
-                # and are a higher-quality, purpose-built reference — prefer them
-                # with a lower acceptance threshold than opportunistic zone crops.
-                is_anpr_candidate = getattr(candidate, "source", "zone_crop") == "anpr_image"
-                match_threshold = 0.47 if is_anpr_candidate else 0.55
+                # ANPR-image candidates were captured by the dedicated ANPR
+                # camera and are a higher-quality reference — give them the
+                # lower bar via MatchingConfig.b1_anpr; zone crops use b1_zone.
+                is_anpr_candidate = (
+                    getattr(candidate, "source", "zone_crop") == "anpr_image"
+                )
+                verdict = decision.decide_b1(
+                    score,
+                    is_anpr_candidate=is_anpr_candidate,
+                    candidate_count=0,  # per-candidate pass; fallback handled below
+                )
+                match_threshold = verdict.scores["threshold"]
                 logger.debug(
                     "[REID] Candidate %s vector similarity: %.3f (refs=%d, source=%s, threshold=%.2f)",
                     candidate.candidate_id,
@@ -447,11 +495,13 @@ class VehicleRegistryIdentityMixin:
                     score,
                 )
                 match_threshold = similarity_threshold
+                verdict = None
 
             if score > best_score and score >= match_threshold:
                 best_score = score
                 best_candidate = candidate
-                
+                best_decision = verdict
+
                 # Compute old score in parallel for logging (single-shot ReID)
                 if current_reid_feat is not None and candidate.feature_vector is not None:
                     candidate.old_pipeline_score = self.reid_matcher.compute_similarity(
@@ -467,7 +517,19 @@ class VehicleRegistryIdentityMixin:
                 for pair in provisional_pairs
                 if pair[1].candidate_id not in hard_rejected_candidate_ids
             ]
-            if len(fallback_pairs) == 1:
+            # Re-ask MatchDecision with the surviving candidate count so the
+            # "single-candidate fallback" branch fires identically to the
+            # historical implementation. We feed it a 0.0 score so only the
+            # candidate_count==1 fallback path can produce a 'confirm'.
+            fallback_verdict = decision.decide_b1(
+                0.0,
+                is_anpr_candidate=False,
+                candidate_count=len(fallback_pairs),
+            )
+            if (
+                fallback_verdict.verdict == "confirm"
+                and fallback_verdict.reason == "single_candidate_fallback"
+            ):
                 best_candidate = fallback_pairs[0][1]
                 logger.warning(
                     "[B1] Falling back to the only provisional candidate %s "
@@ -612,7 +674,7 @@ class VehicleRegistryIdentityMixin:
         """
         Enrich an already confirmed session with the final ordered CAM_03 gallery.
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         with self._lock:
             session_id = self._track_session_map.get((camera_id, track_id))
             session = self._sessions.get(session_id) if session_id else None
@@ -664,7 +726,7 @@ class VehicleRegistryIdentityMixin:
             if session is None:
                 return
 
-            now = datetime.now()
+            now = self._clock()
             session.last_seen_at = now
             session.last_seen_camera = camera_id
             session.last_seen_track_id = track_id
@@ -726,7 +788,7 @@ class VehicleRegistryIdentityMixin:
         """
         Create a new session for a vehicle based only on its appearance (ReID).
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         session_id = f"sess_{uuid.uuid4().hex[:12]}"
 
         with self._lock:
@@ -777,7 +839,7 @@ class VehicleRegistryIdentityMixin:
 
         ACTIVE_TRACK_STALENESS_SECONDS = 3.0
 
-        now = datetime.now()
+        now = self._clock()
         with self._lock:
             potential_sessions = [
                 session
@@ -811,6 +873,7 @@ class VehicleRegistryIdentityMixin:
 
         best_sid = None
         best_score = -1.0
+        decision = self.match_decision
         for session in guarded_sessions:
             session_vectors = [session.feature_vector] + list(
                 session.reference_feature_vectors
@@ -823,16 +886,19 @@ class VehicleRegistryIdentityMixin:
                 ),
                 default=0.0,
             )
-            effective_threshold = similarity_threshold
-            if session.plate:
-                effective_threshold = 0.46
-                if (
-                    session.last_seen_camera
-                    and camera_id
-                    and session.last_seen_camera != camera_id
-                ):
-                    effective_threshold = 0.43
-            if score >= effective_threshold and score > best_score:
+            cross_camera = bool(
+                session.plate
+                and session.last_seen_camera
+                and camera_id
+                and session.last_seen_camera != camera_id
+            )
+            verdict = decision.decide_global(
+                score,
+                has_plate=bool(session.plate),
+                cross_camera=cross_camera,
+                similarity_threshold=similarity_threshold,
+            )
+            if verdict.verdict == "confirm" and score > best_score:
                 best_score = score
                 best_sid = session.session_id
 
@@ -923,7 +989,7 @@ class VehicleRegistryIdentityMixin:
             session = self._sessions.get(session_id)
             if session is None:
                 return
-            now = datetime.now()
+            now = self._clock()
             session.last_seen_at = now
             session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id, now)
@@ -934,9 +1000,16 @@ class VehicleRegistryIdentityMixin:
         track_id: int,
         query_vector: Optional[np.ndarray],
         similarity_threshold: float = 0.52,
+        reattach_dry_run: bool = False,
     ) -> Optional[str]:
         """
         Upgrade an anonymous appearance-only track to an already confirmed session.
+
+        Args:
+            reattach_dry_run: when True, skip the destructive orphan-session
+                cleanup at the end of the function. Used by Phase 2's
+                ``MatchVoter`` so a not-yet-committed vote does not delete the
+                anonymous session before the vote is in.
         """
         if query_vector is None:
             return None
@@ -962,7 +1035,7 @@ class VehicleRegistryIdentityMixin:
                             session.last_seen_camera
                             and session.last_seen_camera != camera_id
                         )
-                        or (datetime.now() - session.last_seen_at).total_seconds()
+                        or (self._clock() - session.last_seen_at).total_seconds()
                         >= self.SESSION_HANDOFF_GUARD_SECONDS
                     )
                 )
@@ -970,6 +1043,7 @@ class VehicleRegistryIdentityMixin:
 
         best_sid = None
         best_score = -1.0
+        decision = self.match_decision
         for session in candidates:
             session_vectors = [session.feature_vector] + list(
                 session.reference_feature_vectors
@@ -982,14 +1056,17 @@ class VehicleRegistryIdentityMixin:
                 ),
                 default=0.0,
             )
-            effective_threshold = similarity_threshold
-            if (
+            cross_camera = bool(
                 session.last_seen_camera
                 and camera_id
                 and session.last_seen_camera != camera_id
-            ):
-                effective_threshold = min(similarity_threshold, 0.43)
-            if score >= effective_threshold and score > best_score:
+            )
+            verdict = decision.decide_reattach(
+                score,
+                cross_camera=cross_camera,
+                similarity_threshold=similarity_threshold,
+            )
+            if verdict.verdict == "confirm" and score > best_score:
                 best_score = score
                 best_sid = session.session_id
 
@@ -1005,7 +1082,7 @@ class VehicleRegistryIdentityMixin:
             if current_session.plate:
                 return current_sid
 
-            target_session.last_seen_at = datetime.now()
+            target_session.last_seen_at = self._clock()
             target_session.last_seen_camera = camera_id
             target_session.last_seen_track_id = track_id
             if query_vector is not None:
@@ -1019,7 +1096,11 @@ class VehicleRegistryIdentityMixin:
             self._mark_track_seen(camera_id, track_id)
 
             orphan_sid = current_sid
-            if orphan_sid != best_sid:
+            if orphan_sid != best_sid and not reattach_dry_run:
+                # Phase 2's MatchVoter passes reattach_dry_run=True so a
+                # not-yet-committed vote does not delete the anonymous session
+                # before the vote is in. Default behaviour (False) removes the
+                # orphan immediately, matching pre-refactor semantics.
                 still_used = orphan_sid in self._track_session_map.values()
                 if (
                     not still_used
@@ -1108,10 +1189,11 @@ class VehicleRegistryIdentityMixin:
             self._parked[slot_id] = session
 
             # Detailed Match Performance Logging
+            cfg = self.matching_config
             flags = {
-                "CLAHE": REID_USE_LAB_CLAHE,
-                "MULTISHOT": REID_USE_MULTISHOT,
-                "COLOR_FILTER": REID_USE_COLOR_FILTER
+                "CLAHE": cfg.use_lab_clahe,
+                "MULTISHOT": cfg.use_multishot,
+                "COLOR_FILTER": cfg.use_color_filter,
             }
             match_logger.info(
                 "MATCH_EVENT | Plate: %s | Slot: %s | Time: %s | "

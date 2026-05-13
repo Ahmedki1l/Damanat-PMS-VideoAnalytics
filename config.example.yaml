@@ -133,6 +133,69 @@ state_machine:
 assigner:
   overlap_threshold: 0.3
 
+# --- Matching / ReID Decision Configuration ---
+# Centralises every threshold and feature flag used by the matching cascade.
+# All values below are the defaults; this block is OPTIONAL — omit any key to
+# keep the default. Defaults mirror the previous hard-coded values in
+# src/vehicle_registry/vehicle_registry_identity.py so behaviour is preserved.
+#
+# matching:
+#   # --- Cosine similarity thresholds ---
+#   # B1_Entrance confirmation: ANPR-image candidates use the lower bar, zone
+#   # crops use the higher one, cross-camera handoffs drop to b1_cross_camera.
+#   b1_anpr: 0.47
+#   b1_zone: 0.55
+#   b1_cross_camera: 0.43
+#
+#   # match_global_session thresholds. global_with_plate kicks in when the
+#   # candidate session already has a plate; global_cross_camera applies when
+#   # the session was last seen on a different camera.
+#   global_default: 0.55
+#   global_with_plate: 0.46
+#   global_cross_camera: 0.43
+#
+#   # reattach_track_to_confirmed_session
+#   reattach_default: 0.52
+#   reattach_cross_camera: 0.43
+#
+#   # Legacy multi-feature fallback (image_matcher.VehicleImageMatcher)
+#   legacy_color_fallback: 0.35
+#
+#   # Dominant-color predicate floor — candidates below this are hard-rejected
+#   # before any ReID cosine is computed.
+#   color_dominant_filter: 0.45
+#
+#   # OCR marginal band (Phase 1 WS-D). ReID scores within
+#   # [ocr_marginal_low, ocr_marginal_high] trigger a plate-OCR cross-check.
+#   ocr_marginal_low: 0.40
+#   ocr_marginal_high: 0.55
+#
+#   # If ReID cosine clears this bar on its own, ensemble agreement is
+#   # optional (a "solo confirm"). Used by Phase 2 ensemble wiring.
+#   reid_solo_confirm: 0.70
+#
+#   # --- HSV tolerances (color_compatible()) ---
+#   hsv_h_tol: 25
+#   hsv_s_tol: 80
+#   hsv_v_tol: 80
+#
+#   # --- Feature flags (previously env vars REID_USE_*) ---
+#   use_color_filter: false
+#   use_lab_clahe: false
+#   use_multishot: false
+#
+#   # --- Ensemble / voting (Phase 2; defaults make them inert) ---
+#   ensemble_min_modalities_agree: 2
+#   reid_solo_confirm_threshold: 0.70
+#   voting_enabled: false
+#   voting_window_frames: 5
+#   voting_min_agree: 3
+#
+#   # --- Plugin model paths (Phase 1) ---
+#   color_classifier_model: ""
+#   type_classifier_model: ""
+#   plate_ocr_model: ""
+
 # --- Output Settings ---
 output:
   log_file: ""                  # Optional: path to event log file

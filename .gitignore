@@ -34,6 +34,10 @@ events.jsonl
 vehicle_images/
 vehicle_images_p3/
 
+# Per-test runtime snapshots (created by VehicleRegistry tests)
+tests/test_images/*.jpg
+tests/vehicle_images_test/
+
 # Test videos
 *.mp4
 *.avi
