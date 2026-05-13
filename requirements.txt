@@ -37,15 +37,11 @@ pyodbc>=5.0.0
 lap>=0.5.12
 openvino>=2024.0.0
 openvino-telemetry>=2023.2.1
-# Export-only deps (WS-A fast ReID): used by tools/export_osnet_openvino.py
-# to convert torchreid OSNet to ONNX and apply INT8 calibration. The
-# inference runtime itself only needs ``openvino`` above.
-onnx>=1.16.0
-nncf>=2.10.0
 
 # Phase 1 / WS-A OpenVINO INT8 export pipeline for OSNet ReID.
 # ``onnx`` is needed at export time only; the inference path uses OpenVINO
 # Runtime directly. ``nncf`` performs post-training INT8 quantisation.
+# Also used by WS-B (color) and WS-C (type) classifier export pipelines.
 onnx>=1.16.0
 nncf>=2.10.0
 
