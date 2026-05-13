@@ -85,17 +85,9 @@ class VehicleRegistry(
         if match_decision is not None:
             self._match_decision = match_decision
         else:
-            from src.matching import NoopColorClassifier
-
-            color_plugin = NoopColorClassifier(
-                image_matcher=lambda: self.matcher,
-                hsv_h_tol=self._matching_config.hsv_h_tol,
-                hsv_s_tol=self._matching_config.hsv_s_tol,
-                hsv_v_tol=self._matching_config.hsv_v_tol,
-            )
-            self._match_decision = MatchDecision(
+            self._match_decision = self._build_match_decision(
                 self._matching_config,
-                color_classifier=color_plugin,
+                lambda: self.matcher,
             )
 
         # DI seams (T0.5). ``db_checker`` lets tests replace the SQL probe in
@@ -127,3 +119,110 @@ class VehicleRegistry(
     def match_decision(self) -> MatchDecision:
         """Centralised match decision chokepoint."""
         return self._match_decision
+
+    # ------------------------------------------------------------------ #
+    # Plugin instantiation (Phase 2 T2.1)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_match_decision(
+        config: MatchingConfig,
+        image_matcher_factory,
+    ) -> MatchDecision:
+        """Construct a :class:`MatchDecision` with real plugins when their
+        model files exist on disk; otherwise fall back to Noop plugins.
+
+        Path resolution is explicit (no magic auto-discovery): each plugin's
+        path is taken from ``MatchingConfig`` and the file is probed with
+        ``os.path.exists`` before the heavy import happens. Missing models
+        produce a log line and a Noop instance — never a hard import error
+        at boot. This keeps test bootstrap fast and prevents a fresh checkout
+        from crashing before any model is trained.
+        """
+        from src.matching import NoopColorClassifier, NoopPlateOCR, NoopTypeClassifier
+
+        # --- Color classifier -------------------------------------------- #
+        color_plugin = None
+        color_path = (config.color_classifier_model or "").strip()
+        if color_path and os.path.exists(color_path):
+            try:
+                from src.classifiers.color_classifier import OpenVINOColorClassifier
+
+                color_plugin = OpenVINOColorClassifier(
+                    model_path=color_path,
+                    config=config,
+                )
+                logger.info(
+                    "[MatchDecision] color classifier loaded from %s",
+                    color_path,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "[MatchDecision] failed to load color classifier at %s: %r — "
+                    "falling back to NoopColorClassifier",
+                    color_path,
+                    exc,
+                )
+                color_plugin = None
+        if color_plugin is None:
+            color_plugin = NoopColorClassifier(
+                image_matcher=image_matcher_factory,
+                hsv_h_tol=config.hsv_h_tol,
+                hsv_s_tol=config.hsv_s_tol,
+                hsv_v_tol=config.hsv_v_tol,
+            )
+
+        # --- Type classifier --------------------------------------------- #
+        type_plugin = None
+        type_path = (config.type_classifier_model or "").strip()
+        if type_path and os.path.exists(type_path):
+            try:
+                from src.classifiers.type_classifier import OpenVINOTypeClassifier
+
+                type_plugin = OpenVINOTypeClassifier(model_path=type_path)
+                logger.info(
+                    "[MatchDecision] type classifier loaded from %s",
+                    type_path,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "[MatchDecision] failed to load type classifier at %s: %r — "
+                    "falling back to NoopTypeClassifier",
+                    type_path,
+                    exc,
+                )
+                type_plugin = None
+        if type_plugin is None:
+            type_plugin = NoopTypeClassifier()
+
+        # --- Plate OCR ---------------------------------------------------- #
+        # The OCR plugin is heavy (PaddleOCR pulls ~50 MB of weights on first
+        # use); only instantiate when ``plate_ocr_model`` is configured non-
+        # empty so a fresh checkout boots without paddle installed.
+        ocr_plugin = None
+        ocr_path = (config.plate_ocr_model or "").strip()
+        if ocr_path:
+            try:
+                from src.ocr.plate_ocr import PaddlePlateOCR
+
+                ocr_plugin = PaddlePlateOCR(model_dir=ocr_path or None)
+                logger.info(
+                    "[MatchDecision] plate OCR plugin loaded (model_dir=%s)",
+                    ocr_path or "<default>",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[MatchDecision] failed to load plate OCR plugin (%r); "
+                    "falling back to NoopPlateOCR",
+                    exc,
+                )
+                ocr_plugin = None
+        if ocr_plugin is None:
+            ocr_plugin = NoopPlateOCR()
+
+        return MatchDecision(
+            config,
+            color_classifier=color_plugin,
+            type_classifier=type_plugin,
+            plate_ocr=ocr_plugin,
+        )

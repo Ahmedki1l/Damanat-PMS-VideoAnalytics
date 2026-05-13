@@ -169,7 +169,13 @@ class MatchingConfig:
     reid_solo_confirm: float = 0.70
 
     # --- HSV tolerances for color_compatible() ---
-    hsv_h_tol: float = 25.0
+    # Tightened from 25 -> 12 in Phase 2 / T2.1: the learned 11-class color
+    # classifier is now the primary path. The legacy HSV gate is kept as a
+    # belt-and-braces fallback for the noop path (when no IR is loaded), so
+    # the tolerance can be much tighter without dropping legitimate matches —
+    # the rare colour-classifier-confused case is now covered by the K-of-N
+    # ensemble rule rather than a wide HSV envelope.
+    hsv_h_tol: float = 12.0
     hsv_s_tol: float = 80.0
     hsv_v_tol: float = 80.0
 

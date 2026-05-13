@@ -473,10 +473,29 @@ class VehicleRegistryIdentityMixin:
                 is_anpr_candidate = (
                     getattr(candidate, "source", "zone_crop") == "anpr_image"
                 )
+
+                # Phase 2 T2.1 — populate modality inputs for the ensemble.
+                # Pull the pending ANPR plate from the bound event so OCR
+                # has something to cross-check against. Skip the modality
+                # pass for the legacy fallback path (no current_reid_feat).
+                pending_plate = None
+                if candidate.bound_event_id:
+                    bound_event = self._pending_events.get(candidate.bound_event_id)
+                    if bound_event is not None:
+                        pending_plate = bound_event.plate
+                modalities = decision.check_modalities(
+                    query_crop=image,
+                    candidate_crop=snapshot,
+                    candidate=candidate,
+                    pending_plate=pending_plate,
+                    score_reid=score,
+                )
+
                 verdict = decision.decide_b1(
                     score,
                     is_anpr_candidate=is_anpr_candidate,
                     candidate_count=0,  # per-candidate pass; fallback handled below
+                    modalities=modalities,
                 )
                 match_threshold = verdict.scores["threshold"]
                 logger.debug(
@@ -497,7 +516,19 @@ class VehicleRegistryIdentityMixin:
                 match_threshold = similarity_threshold
                 verdict = None
 
-            if score > best_score and score >= match_threshold:
+            # Phase 2 T2.1: the ensemble rule can produce a 'confirm' even
+            # when the ReID score does not clear ``match_threshold`` (e.g.
+            # OCR plate-match in the marginal band). We accept any verdict
+            # that the decision chokepoint says is a 'confirm'; the legacy
+            # threshold gate is only consulted when we have no verdict
+            # (the legacy image-matcher fallback path).
+            ensemble_confirm = bool(
+                verdict is not None
+                and verdict.verdict == "confirm"
+                and verdict.reason.startswith("ensemble_")
+            )
+            score_pass = score >= match_threshold
+            if score > best_score and (score_pass or ensemble_confirm):
                 best_score = score
                 best_candidate = candidate
                 best_decision = verdict
@@ -892,11 +923,25 @@ class VehicleRegistryIdentityMixin:
                 and camera_id
                 and session.last_seen_camera != camera_id
             )
+            # Phase 2 T2.1 — global-match has no live query crop available
+            # at this callsite (we receive a feature vector, not an image),
+            # so we pass only the cached metadata on the session and let
+            # MatchDecision treat the rest as "no signal". When the caller
+            # extends this signature to pass a crop in a future revision the
+            # plumbing here is unchanged.
+            modalities = decision.check_modalities(
+                query_crop=None,
+                candidate_crop=None,
+                candidate=session,
+                pending_plate=session.plate,
+                score_reid=score,
+            )
             verdict = decision.decide_global(
                 score,
                 has_plate=bool(session.plate),
                 cross_camera=cross_camera,
                 similarity_threshold=similarity_threshold,
+                modalities=modalities,
             )
             if verdict.verdict == "confirm" and score > best_score:
                 best_score = score
@@ -1061,10 +1106,22 @@ class VehicleRegistryIdentityMixin:
                 and camera_id
                 and session.last_seen_camera != camera_id
             )
+            # Phase 2 T2.1 — reattach has no live crop here (the caller
+            # only supplies a feature vector). Re-use cached session
+            # metadata so the ensemble can still see whatever the cascade
+            # has previously committed about this session.
+            modalities = decision.check_modalities(
+                query_crop=None,
+                candidate_crop=None,
+                candidate=session,
+                pending_plate=session.plate,
+                score_reid=score,
+            )
             verdict = decision.decide_reattach(
                 score,
                 cross_camera=cross_camera,
                 similarity_threshold=similarity_threshold,
+                modalities=modalities,
             )
             if verdict.verdict == "confirm" and score > best_score:
                 best_score = score

@@ -3,12 +3,22 @@ from unittest.mock import patch
 
 import numpy as np
 
+from src.config import ReIDPreprocessingConfig
 from src.reid_matcher import reid_matcher
-from src.reid_matcher import VehicleReIDMatcher
+from src.reid_matcher.reid_matcher import _TorchreidBackend
 from src.reid_matcher.reid_preprocessing import normalize_for_reid
 
 
 class TestReIDPreprocessing(unittest.TestCase):
+    """Phase 2 cleanup — the legacy ``USE_LAB_CLAHE`` module global is gone;
+    the CLAHE toggle now lives on ``ReIDPreprocessingConfig.enabled`` (which
+    feeds ``self.preprocessing_config.enabled`` on the torchreid backend).
+
+    The OpenVINO backend has its own preprocessing pipeline; CLAHE is only
+    invoked on the legacy ``_TorchreidBackend`` so we exercise that backend
+    directly here.
+    """
+
     def test_normalize_none_returns_none(self):
         self.assertIsNone(normalize_for_reid(None))
 
@@ -43,40 +53,48 @@ class TestReIDPreprocessing(unittest.TestCase):
         np.testing.assert_array_equal(image, original)
 
     def test_preprocess_skips_clahe_when_flag_disabled(self):
-        matcher = self._make_lightweight_matcher()
+        backend = self._make_lightweight_backend(enabled=False)
         image = np.zeros((24, 32, 3), dtype=np.uint8)
 
-        with patch.object(reid_matcher, "USE_LAB_CLAHE", False), patch.object(
+        with patch.object(
             reid_matcher,
             "normalize_for_reid",
             wraps=normalize_for_reid,
         ) as normalize_mock:
-            tensor = matcher._preprocess(image)
+            tensor = backend._preprocess(image)
 
         normalize_mock.assert_not_called()
         self.assertEqual(tuple(tensor.shape), (3, 128, 256))
 
     def test_preprocess_applies_clahe_when_flag_enabled(self):
-        matcher = self._make_lightweight_matcher()
+        backend = self._make_lightweight_backend(enabled=True)
         image = np.zeros((24, 32, 3), dtype=np.uint8)
 
-        with patch.object(reid_matcher, "USE_LAB_CLAHE", True), patch.object(
+        with patch.object(
             reid_matcher,
             "normalize_for_reid",
             wraps=normalize_for_reid,
         ) as normalize_mock:
-            tensor = matcher._preprocess(image)
+            tensor = backend._preprocess(image)
 
         normalize_mock.assert_called_once()
         self.assertEqual(tuple(tensor.shape), (3, 128, 256))
 
     @staticmethod
-    def _make_lightweight_matcher():
-        matcher = VehicleReIDMatcher.__new__(VehicleReIDMatcher)
-        matcher.input_size = (128, 256)
-        matcher.norm_mean = [0.485, 0.456, 0.406]
-        matcher.norm_std = [0.229, 0.224, 0.225]
-        return matcher
+    def _make_lightweight_backend(*, enabled: bool):
+        """Build a partial torchreid backend without invoking ``__init__``
+        so torchreid weights are never loaded. Only the attributes
+        ``_preprocess`` reads are populated.
+        """
+        backend = _TorchreidBackend.__new__(_TorchreidBackend)
+        backend.input_size = (128, 256)
+        backend.norm_mean = [0.485, 0.456, 0.406]
+        backend.norm_std = [0.229, 0.224, 0.225]
+        # New API: the CLAHE toggle is read from
+        # ``self.preprocessing_config.enabled`` rather than the legacy
+        # ``reid_matcher.USE_LAB_CLAHE`` module global (Phase 2 cleanup).
+        backend.preprocessing_config = ReIDPreprocessingConfig(enabled=enabled)
+        return backend
 
 
 if __name__ == "__main__":
