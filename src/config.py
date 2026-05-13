@@ -186,7 +186,11 @@ class MatchingConfig:
     voting_min_agree: int = 3
 
     # --- Plugin model paths (Phase 1) ---
-    color_classifier_model: str = ""
+    # ``color_classifier_model``: Path to the OpenVINO IR (``model.xml``) for
+    # the WS-B color classifier. Default points at the artifact directory
+    # written by ``tools/train_color_classifier.py``. When the file is
+    # missing, the plugin raises a clear RuntimeError on first predict().
+    color_classifier_model: str = "models/color_classifier_openvino/model.xml"
     type_classifier_model: str = ""
     plate_ocr_model: str = ""
 

@@ -38,6 +38,12 @@ lap>=0.5.12
 openvino>=2024.0.0
 openvino-telemetry>=2023.2.1
 
+# Phase 1 / WS-A OpenVINO INT8 export pipeline for OSNet ReID.
+# ``onnx`` is needed at export time only; the inference path uses OpenVINO
+# Runtime directly. ``nncf`` performs post-training INT8 quantisation.
+onnx>=1.16.0
+nncf>=2.10.0
+
 # Plate-OCR cross-check (Wave 1 / WS-D).
 #
 # PaddleOCR-mobile reads license plates from floor crops at the marginal
@@ -58,4 +64,3 @@ openvino-telemetry>=2023.2.1
 # the plugin sets FLAGS_use_mkldnn=0 by default to avoid it.
 paddleocr>=2.7.0
 paddlepaddle>=2.6.0
-

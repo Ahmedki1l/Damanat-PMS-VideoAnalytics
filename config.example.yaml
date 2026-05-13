@@ -192,7 +192,10 @@ assigner:
 #   voting_min_agree: 3
 #
 #   # --- Plugin model paths (Phase 1) ---
-#   color_classifier_model: ""
+#   # color_classifier_model: path to the OpenVINO IR for the WS-B 11-class
+#   # color head. Default points at the artifact directory written by
+#   # tools/train_color_classifier.py; empty string disables the plugin.
+#   color_classifier_model: "models/color_classifier_openvino/model.xml"
 #   type_classifier_model: ""
 #   plate_ocr_model: ""
 

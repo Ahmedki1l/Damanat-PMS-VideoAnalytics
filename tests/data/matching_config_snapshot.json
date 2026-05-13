@@ -2,7 +2,7 @@
   "b1_anpr": 0.47,
   "b1_cross_camera": 0.43,
   "b1_zone": 0.55,
-  "color_classifier_model": "",
+  "color_classifier_model": "models/color_classifier_openvino/model.xml",
   "color_dominant_filter": 0.45,
   "ensemble_min_modalities_agree": 2,
   "global_cross_camera": 0.43,
