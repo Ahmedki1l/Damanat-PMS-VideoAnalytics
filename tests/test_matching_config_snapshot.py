@@ -37,9 +37,15 @@ VERDICT_SNAPSHOT_PATH = DATA_DIR / "match_decision_verdict_snapshot.json"
 
 
 def _matching_config_dict() -> dict:
-    """Serialise default ``MatchingConfig`` to a JSON-stable dict."""
+    """Serialise default ``MatchingConfig`` to a JSON-stable dict.
+
+    JSON has no tuple type, so we round-trip the dataclass dict through
+    ``json.dumps``/``json.loads`` to coerce tuple fields (e.g.
+    ``reid_input_size``) into the list form that ``json.load`` will
+    re-hydrate from the snapshot file.
+    """
     cfg = MatchingConfig()
-    return dataclasses.asdict(cfg)
+    return json.loads(json.dumps(dataclasses.asdict(cfg)))
 
 
 # 18 representative inputs covering each fork of the three decide_* methods.

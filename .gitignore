@@ -52,6 +52,16 @@ vehicle_images_p3/
 tests/test_images/*.jpg
 tests/vehicle_images_test/
 
+# Calibration crops for the OpenVINO ReID export (data dependency D-1).
+# Populated by tools/build_calibration_set.py; tracked README only.
+tests/data/calibration_crops/*.jpg
+tests/data/calibration_crops/*.jpeg
+tests/data/calibration_crops/*.png
+tests/data/calibration_crops/*.bmp
+
+# Intermediate ONNX from the OSNet export — regenerable, no need to track.
+models/osnet_openvino_int8/model.onnx
+
 # Test videos
 *.mp4
 *.avi

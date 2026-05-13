@@ -194,6 +194,17 @@ class MatchingConfig:
     type_classifier_model: str = ""
     plate_ocr_model: str = ""
 
+    # --- Fast ReID backend (Phase 1 / WS-A) ---
+    # When ``use_openvino_reid`` is on AND an OpenVINO IR for OSNet exists at
+    # ``models/osnet_openvino_int8/model.xml`` the matcher uses the OpenVINO
+    # runtime path (target ≤40 ms/image on CPU). When the file is missing or
+    # the flag is off the matcher falls back to the legacy torchreid path
+    # (~1 s/image on CPU). ``reid_input_size`` is ``(height, width)`` and
+    # must agree with the size baked into the exported IR.
+    use_openvino_reid: bool = True
+    reid_input_size: tuple = (192, 96)
+    reid_openvino_model_dir: str = "models/osnet_openvino_int8"
+
 
 @dataclass
 class AppConfig:
@@ -415,6 +426,20 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             "type_classifier_model", cm.type_classifier_model
         )
         cm.plate_ocr_model = m.get("plate_ocr_model", cm.plate_ocr_model)
+
+        # Fast ReID backend (WS-A)
+        cm.use_openvino_reid = m.get("use_openvino_reid", cm.use_openvino_reid)
+        ris = m.get("reid_input_size", None)
+        if ris is not None:
+            # Accept "HxW" string or [H, W] list/tuple. Stored as (H, W).
+            if isinstance(ris, str) and "x" in ris.lower():
+                h_str, w_str = ris.lower().split("x", 1)
+                cm.reid_input_size = (int(h_str), int(w_str))
+            elif isinstance(ris, (list, tuple)) and len(ris) == 2:
+                cm.reid_input_size = (int(ris[0]), int(ris[1]))
+        cm.reid_openvino_model_dir = m.get(
+            "reid_openvino_model_dir", cm.reid_openvino_model_dir
+        )
 
     # --- Output ---
     if "output" in raw:

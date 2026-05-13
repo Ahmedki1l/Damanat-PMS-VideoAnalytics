@@ -17,12 +17,18 @@
   "plate_ocr_model": "",
   "reattach_cross_camera": 0.43,
   "reattach_default": 0.52,
+  "reid_input_size": [
+    192,
+    96
+  ],
+  "reid_openvino_model_dir": "models/osnet_openvino_int8",
   "reid_solo_confirm": 0.7,
   "reid_solo_confirm_threshold": 0.7,
   "type_classifier_model": "",
   "use_color_filter": false,
   "use_lab_clahe": false,
   "use_multishot": false,
+  "use_openvino_reid": true,
   "voting_enabled": false,
   "voting_min_agree": 3,
   "voting_window_frames": 5
