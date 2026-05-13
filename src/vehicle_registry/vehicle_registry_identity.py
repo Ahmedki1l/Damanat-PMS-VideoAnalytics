@@ -11,13 +11,15 @@ from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, Veh
 
 logger = logging.getLogger(__name__)
 
-# Legacy module-level flags retained for backward compatibility with any
-# external code that imports them. The matching cascade now reads
-# ``self.matching_config.use_*`` so tests / configs can override them at
-# runtime without monkey-patching this module.
+# Legacy module-level flag retained for backward compatibility — Phase 2
+# cleanup drops ``REID_USE_LAB_CLAHE`` and ``REID_USE_MULTISHOT`` from this
+# module (they were never read from here in the post-Phase-0 code; the
+# cascade now reads ``self.matching_config.use_*``). ``REID_USE_COLOR_FILTER``
+# remains as a shim because ``tests/test_multishot_registry.py`` still
+# monkey-patches it via ``patch.object(vehicle_registry_identity, ...)``.
+# Drop this once that test is rewritten to mutate the MatchingConfig
+# directly.
 REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
-REID_USE_LAB_CLAHE = os.getenv("REID_USE_LAB_CLAHE", "false").lower() == "true"
-REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
 match_logger = logging.getLogger("reid_match_perf")
 
 

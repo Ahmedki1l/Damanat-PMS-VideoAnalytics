@@ -11,6 +11,14 @@ import numpy as np
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, PendingANPREvent
 
 logger = logging.getLogger(__name__)
+
+# Phase 2 cleanup audit: these env-driven flags are kept here because
+# ``tests/test_multishot_registry.py`` patches them via
+# ``patch.object(vehicle_registry_core, "REID_USE_MULTISHOT", ...)`` etc.
+# The matching cascade itself now reads ``self.matching_config.use_*`` and
+# does not consult these globals — they are pure backward-compatibility
+# shims. When the multishot tests migrate to mutating ``MatchingConfig``
+# directly, these can be removed.
 REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
 REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
 
