@@ -62,6 +62,24 @@ tests/data/calibration_crops/*.bmp
 # Intermediate ONNX from the OSNet export — regenerable, no need to track.
 models/osnet_openvino_int8/model.onnx
 
+# Facility top-20 dataset: image splits are large and fully regenerable
+# from the source dataset via tools/curate_facility_dataset.py +
+# tools/split_facility_dataset.py. The JSON reports are kept so the bench
+# numbers stay reviewable in git, and the OpenVINO IR is committed
+# separately under models/osnet_facility_int8_256x128/.
+data/facility_top20/all/
+data/facility_top20/train/
+data/facility_top20/eval/
+data/facility_top20/pairs_eval.csv
+data/facility_top20_curation.log
+data/facility_top20_split.log
+data/facility_top20_finetune.log
+data/facility_top20_export.log
+data/facility_top20_bench.log
+
+# Intermediate ONNX from the facility fine-tune re-export — regenerable.
+models/osnet_facility_int8_256x128/model.onnx
+
 # Test videos
 *.mp4
 *.avi

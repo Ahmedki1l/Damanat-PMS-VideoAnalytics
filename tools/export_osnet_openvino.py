@@ -139,6 +139,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="torchreid backbone name (must match the runtime path).",
     )
     parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional fine-tuned checkpoint to load on top of the pretrained "
+            "backbone before export. Expected format: dict with state_dict "
+            "key (Top-20 finetune layout: state_dict['backbone']) OR a flat "
+            "torch.nn.Module state_dict. Use this to export a fine-tuned IR "
+            "to a separate output directory."
+        ),
+    )
+    parser.add_argument(
         "--opset",
         type=int,
         default=14,
@@ -176,7 +188,7 @@ def parse_input_size(spec: str) -> Tuple[int, int]:
 # --------------------------------------------------------------------------- #
 
 
-def build_torchreid_osnet(model_name: str):
+def build_torchreid_osnet(model_name: str, checkpoint: Optional[Path] = None):
     """Build the OSNet-AIN model with pretrained weights.
 
     Mirrors the construction path used by ``VehicleReIDMatcher.__init__``.
@@ -196,6 +208,17 @@ def build_torchreid_osnet(model_name: str):
     export. This makes torch eval use per-instance stats too, so the
     torchreid baseline and the OpenVINO export agree on the same
     normalisation strategy and the cosine drift collapses.
+
+    Checkpoint loading
+    ------------------
+    When ``checkpoint`` is provided, the saved weights override the
+    pretrained ones. Two layouts are accepted:
+
+      * Top-20 finetune layout: ``{"state_dict": {"backbone": ..., "classifier": ...}, ...}``.
+        The backbone state is loaded; the classifier head is ignored (it has
+        the wrong num_classes for the deployed inference path).
+      * Flat layout: a torch ``state_dict`` dict mapping parameter names to
+        tensors. Loaded directly.
     """
     import torch  # local import — keeps the CLI usable without torch installed
     import torchreid
@@ -222,6 +245,45 @@ def build_torchreid_osnet(model_name: str):
         "(fixes ONNX export drift — see pytorch/pytorch#53887).",
         in_layers,
     )
+
+    if checkpoint is not None:
+        logger.info("Loading fine-tuned weights from %s", checkpoint)
+        # weights_only=False is required because the Top-20 checkpoint stores
+        # the plate_names list (a Python object) alongside the state_dict.
+        # The checkpoint is a project-trusted artifact written by
+        # tools/finetune_osnet_top20.py.
+        ckpt = torch.load(str(checkpoint), map_location="cpu", weights_only=False)
+        backbone_sd = None
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+                inner = ckpt["state_dict"]
+                if "backbone" in inner and isinstance(inner["backbone"], dict):
+                    backbone_sd = inner["backbone"]
+                else:
+                    backbone_sd = inner
+            else:
+                # Flat state_dict
+                backbone_sd = ckpt
+        if backbone_sd is None:
+            raise RuntimeError(
+                f"Could not extract a backbone state_dict from {checkpoint}"
+            )
+        missing, unexpected = model.load_state_dict(backbone_sd, strict=False)
+        logger.info(
+            "Loaded fine-tuned state_dict: %d missing, %d unexpected keys.",
+            len(missing), len(unexpected),
+        )
+        if missing:
+            logger.debug("Missing keys (first 10): %s", missing[:10])
+        if unexpected:
+            logger.debug("Unexpected keys (first 10): %s", unexpected[:10])
+        # Re-zero the InstanceNorm buffers in case the checkpoint reintroduced them.
+        for m in model.modules():
+            if isinstance(m, torch.nn.InstanceNorm2d):
+                m.track_running_stats = False
+                m.running_mean = None
+                m.running_var = None
+                m.num_batches_tracked = None
     return model
 
 
@@ -293,7 +355,13 @@ def _list_calibration_images(calibration_dir: Path) -> List[Path]:
     if not calibration_dir.exists() or not calibration_dir.is_dir():
         return []
     exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    return sorted(p for p in calibration_dir.iterdir() if p.suffix.lower() in exts)
+    # Search recursively so the calibration dir may contain either a flat
+    # set of crops (legacy layout in tests/data/calibration_crops/) or a
+    # per-identity nested layout (data/facility_top20/eval/<plate>/*.jpg).
+    return sorted(
+        p for p in calibration_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in exts
+    )
 
 
 def _letterbox_preprocess(
@@ -419,7 +487,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 1. Build torchreid model -------------------------------------------------
     t0 = time.perf_counter()
-    model = build_torchreid_osnet(args.model_name)
+    model = build_torchreid_osnet(args.model_name, checkpoint=args.checkpoint)
     logger.info("Built torchreid model in %.2fs", time.perf_counter() - t0)
 
     # 2. Export to ONNX --------------------------------------------------------

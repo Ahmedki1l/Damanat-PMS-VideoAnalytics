@@ -1,0 +1,346 @@
+{
+  "started_at": "2026-05-15T07:03:36+00:00",
+  "source_root": "D:\\Work\\Spectech\\Projects\\Damanat PMS Cameras\\PS AI Training Dataset\\detection_images\\detection_images",
+  "output_root": "data\\facility_top20\\all",
+  "detector_model": "models/yolo11s_openvino_model",
+  "confidence_threshold": 0.4,
+  "imgsz": 640,
+  "padding_ratio": 0.1,
+  "min_crop_side": 32,
+  "min_area_fraction": 0.05,
+  "dry_run": false,
+  "per_plate": {
+    "LRS-9439": {
+      "kept": 172,
+      "skipped": 10
+    },
+    "NDD-4141": {
+      "kept": 48,
+      "skipped": 0
+    },
+    "HBR-4920": {
+      "kept": 21,
+      "skipped": 21
+    },
+    "RDJ-9640": {
+      "kept": 33,
+      "skipped": 0
+    },
+    "ZDR-8501": {
+      "kept": 23,
+      "skipped": 0
+    },
+    "XRD-6663": {
+      "kept": 15,
+      "skipped": 7
+    },
+    "ERD-7800": {
+      "kept": 14,
+      "skipped": 1
+    },
+    "HUD-9444": {
+      "kept": 8,
+      "skipped": 1
+    },
+    "SDD-6707": {
+      "kept": 6,
+      "skipped": 2
+    },
+    "HVA-77": {
+      "kept": 3,
+      "skipped": 4
+    },
+    "NXR-2727": {
+      "kept": 7,
+      "skipped": 0
+    },
+    "LNV-94": {
+      "kept": 7,
+      "skipped": 0
+    },
+    "AGA-6649": {
+      "kept": 4,
+      "skipped": 2
+    },
+    "ZVH-337": {
+      "kept": 6,
+      "skipped": 0
+    },
+    "NJS-7894": {
+      "kept": 6,
+      "skipped": 0
+    },
+    "ZRS-6511": {
+      "kept": 6,
+      "skipped": 0
+    },
+    "XBD-5588": {
+      "kept": 6,
+      "skipped": 0
+    },
+    "HGD-2926": {
+      "kept": 5,
+      "skipped": 0
+    },
+    "EEB-80": {
+      "kept": 5,
+      "skipped": 0
+    },
+    "RTB-2016": {
+      "kept": 4,
+      "skipped": 0
+    }
+  },
+  "skipped": [
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260505_110549_192684.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_073617_213862.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_073630_711809.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_085318_650446.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_100016_948206.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_100115_487984.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_100420_696736.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_100941_190098.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_111509_420390.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "LRS-9439",
+      "file": "vehicle_intrusion_B6_Reserved_CAM-06_20260507_144233_503441.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "part_fielddetection_CAM-04_20260311_072118_115240.jpg",
+      "reason": "low_area_fraction",
+      "area_fraction": 0.0028
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "part_fielddetection_CAM-04_20260311_072119_440835.jpg",
+      "reason": "low_area_fraction",
+      "area_fraction": 0.0029
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "part_fielddetection_CAM-04_20260311_072124_219726.jpg",
+      "reason": "low_area_fraction",
+      "area_fraction": 0.0029
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_075721_752938.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_080000_251001.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_153012_438668.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_153141_612916.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_153221_403542.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_153243_687782.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_153415_982450.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_153445_001212.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_153448_061863.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_153539_217420.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260507_162030_315264.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260513_160603_042423.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260513_161207_477278.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260513_162446_530630.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260513_162531_187591.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260513_162930_767008.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260513_163045_729032.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HBR-4920",
+      "file": "vehicle_intrusion_B3_CEO_CAM-04_20260513_163238_672818.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "XRD-6663",
+      "file": "part_ANPR_CAM-ENTRY_20260311_063915_840576.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "XRD-6663",
+      "file": "vehicle_intrusion_G1_CAM-01_20260514_071256_901500.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "XRD-6663",
+      "file": "vehicle_intrusion_G1_CAM-01_20260514_071543_706194.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "XRD-6663",
+      "file": "vehicle_intrusion_G1_CAM-01_20260514_071620_464514.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "XRD-6663",
+      "file": "vehicle_intrusion_G1_CAM-01_20260514_071719_511168.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "XRD-6663",
+      "file": "vehicle_intrusion_G1_CAM-01_20260514_072546_283005.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "XRD-6663",
+      "file": "vehicle_intrusion_G1_CAM-01_20260514_073354_678207.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "ERD-7800",
+      "file": "part_fielddetection_CAM-07_20260312_105310_956633.jpg",
+      "reason": "low_area_fraction",
+      "area_fraction": 0.0214
+    },
+    {
+      "plate": "HUD-9444",
+      "file": "snapshot_linedetection_CAM-03_20260514_070320_249364.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "SDD-6707",
+      "file": "part_ANPR_CAM-ENTRY_20260311_070640_750914.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "SDD-6707",
+      "file": "SDD-6707_CAM-07_20260514_100722.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HVA-77",
+      "file": "vehicle_intrusion_B11_CFO_CAM-07_20260507_150631_033908.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HVA-77",
+      "file": "vehicle_intrusion_B11_CFO_CAM-07_20260507_151202_259847.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HVA-77",
+      "file": "vehicle_intrusion_B11_CFO_CAM-07_20260507_151724_545129.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "HVA-77",
+      "file": "vehicle_intrusion_B11_CFO_CAM-07_20260507_151831_585812.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "AGA-6649",
+      "file": "vehicle_intrusion_G1_CAM-01_20260507_065644_563278.jpg",
+      "reason": "no_detection"
+    },
+    {
+      "plate": "AGA-6649",
+      "file": "vehicle_intrusion_G1_CAM-01_20260507_065935_608985.jpg",
+      "reason": "low_area_fraction",
+      "area_fraction": 0.0035
+    }
+  ],
+  "totals": {
+    "kept": 399,
+    "skipped": 48
+  },
+  "finished_at": "2026-05-15T07:04:56+00:00"
+}
