@@ -364,29 +364,36 @@ def _list_calibration_images(calibration_dir: Path) -> List[Path]:
     )
 
 
-def _letterbox_preprocess(
+def _squish_preprocess(
     bgr: np.ndarray,
     target_size: Tuple[int, int],
 ) -> np.ndarray:
     """Preprocess a BGR crop into a CHW float32 tensor (NCHW with batch 1).
 
-    Must match ``OpenVINOReIDBackend._preprocess`` so the quantisation
-    statistics are representative of the runtime distribution.
+    Uses straight ``cv2.resize`` to (target_w, target_h) without aspect
+    preservation — must match ``OpenVINOReIDBackend._preprocess`` AND the
+    training transform in ``tools/finetune_osnet_top20.py``
+    (``torchvision.transforms.Resize((H, W))`` semantics).
+
+    The previous letterbox version was replaced on 2026-05-15 after the
+    CARLA-pretrained fine-tune bench revealed a 0.16 rank-1 drop traceable
+    to squish-trained weights receiving letterboxed inputs at INT8
+    inference. Both the runtime backend and this calibration preprocess
+    are now squish-consistent with the training pipeline.
     """
     target_h, target_w = target_size
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-    scale = min(target_w / max(w, 1), target_h / max(h, 1))
-    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-    resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((target_h, target_w, 3), 127, dtype=np.uint8)
-    dw, dh = (target_w - nw) // 2, (target_h - nh) // 2
-    canvas[dh:dh + nh, dw:dw + nw, :] = resized
-    chw = canvas.astype(np.float32).transpose(2, 0, 1) / 255.0
+    resized = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    chw = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
     mean = np.array(NORM_MEAN, dtype=np.float32).reshape(3, 1, 1)
     std = np.array(NORM_STD, dtype=np.float32).reshape(3, 1, 1)
     chw = (chw - mean) / std
     return chw[np.newaxis, ...].astype(np.float32)
+
+
+# Backwards-compatible alias so external callers that imported the old
+# helper name continue to work.
+_letterbox_preprocess = _squish_preprocess
 
 
 def build_calibration_dataset(
@@ -411,7 +418,7 @@ def build_calibration_dataset(
         if img is None:
             logger.warning("Skipping unreadable calibration image: %s", p)
             continue
-        tensors.append(_letterbox_preprocess(img, input_size))
+        tensors.append(_squish_preprocess(img, input_size))
     if not tensors:
         return None, []
 

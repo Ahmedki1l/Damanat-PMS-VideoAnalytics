@@ -150,10 +150,19 @@ class OpenVINOReIDBackend:
         clip_limit: float = 2.0,
         grid_size: Tuple[int, int] = (8, 8),
     ) -> np.ndarray:
-        """BGR uint8 -> NCHW float32 (1, 3, H, W) using letterbox + mean/std.
+        """BGR uint8 -> NCHW float32 (1, 3, H, W) using squish-resize + mean/std.
 
-        Matches `_letterbox_preprocess` in tools/export_osnet_openvino.py
-        (which is the distribution NNCF calibrated against).
+        Uses ``cv2.resize`` straight to (target_w, target_h) — no aspect
+        preservation, no padding — to match the training transform in
+        ``tools/finetune_osnet_top20.py`` (``torchvision.transforms.Resize
+        ((H, W))``) and the CARLA pretrain pipeline.
+
+        Earlier versions of this backend used a letterbox preprocess. That
+        was changed on 2026-05-15 after the CARLA-pretrained fine-tune
+        bench revealed a 0.16 rank-1 drop traceable to the squish-trained
+        weights being fed letterboxed inputs at inference. The exporter's
+        calibration preprocess (``_squish_preprocess`` in
+        ``tools/export_osnet_openvino.py``) was updated to match.
         """
         if normalise_luminance:
             from src.reid_matcher.reid_preprocessing import normalize_for_reid
@@ -162,16 +171,9 @@ class OpenVINOReIDBackend:
             )
 
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
         target_h, target_w = self.input_size
-        scale = min(target_w / max(w, 1), target_h / max(h, 1))
-        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-        resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((target_h, target_w, 3), 127, dtype=np.uint8)
-        dw = (target_w - nw) // 2
-        dh = (target_h - nh) // 2
-        canvas[dh:dh + nh, dw:dw + nw, :] = resized
-        chw = canvas.astype(np.float32).transpose(2, 0, 1) / 255.0
+        resized = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        chw = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
         chw = (chw - NORM_MEAN) / NORM_STD
         return chw[np.newaxis, ...].astype(np.float32)
 
