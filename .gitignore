@@ -77,6 +77,13 @@ data/facility_top20_finetune.log
 data/facility_top20_export.log
 data/facility_top20_bench.log
 
+# External datasets (downloaded for pretraining; license-bound, redownloadable).
+# VeRi-CARLA is Apache-2.0 (sekilab/VehicleReIdentificationDataset).
+data/external/
+data/unmatched_predictions/
+data/unmatched_predictions_run2/
+data/eval_verification/
+
 # Intermediate ONNX from the facility fine-tune re-export — regenerable.
 models/osnet_facility_int8_256x128/model.onnx
 

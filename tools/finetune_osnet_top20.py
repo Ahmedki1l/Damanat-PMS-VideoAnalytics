@@ -91,6 +91,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--freeze-stem", action="store_true", default=True)
     p.add_argument("--no-freeze-stem", dest="freeze_stem", action="store_false")
+    p.add_argument("--init-from", type=Path, default=None,
+                   help="Optional checkpoint to load as the backbone init instead of "
+                        "torchreid's ImageNet pretrain. Use the .pt produced by "
+                        "tools/pretrain_osnet_carla.py for CARLA-pretrained init.")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -474,6 +478,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     backbone = _build_backbone(args.arch)
+    if args.init_from is not None:
+        if not args.init_from.exists():
+            raise FileNotFoundError(args.init_from)
+        logger.info("Loading backbone init from %s", args.init_from)
+        ckpt = torch.load(str(args.init_from), map_location="cpu", weights_only=False)
+        backbone_sd = None
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+                inner = ckpt["state_dict"]
+                if "backbone" in inner and isinstance(inner["backbone"], dict):
+                    backbone_sd = inner["backbone"]
+                else:
+                    backbone_sd = inner
+            elif "backbone" in ckpt and isinstance(ckpt["backbone"], dict):
+                backbone_sd = ckpt["backbone"]
+            else:
+                backbone_sd = ckpt
+        if backbone_sd is None:
+            raise RuntimeError(f"Could not extract backbone state_dict from {args.init_from}")
+        missing, unexpected = backbone.load_state_dict(backbone_sd, strict=False)
+        logger.info(
+            "Loaded init weights: %d missing, %d unexpected keys.",
+            len(missing), len(unexpected),
+        )
+        # Re-zero InstanceNorm buffers in case the init reintroduced them.
+        for m in backbone.modules():
+            if isinstance(m, torch.nn.InstanceNorm2d):
+                m.track_running_stats = False
+                m.running_mean = None
+                m.running_var = None
+                m.num_batches_tracked = None
     model = _Finetuner(backbone, num_classes=len(train_plates))
     if args.freeze_stem:
         model.freeze_stem()
