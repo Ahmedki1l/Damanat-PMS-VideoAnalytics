@@ -1,0 +1,141 @@
+{
+  "started_at": "2026-05-15T07:07:59+00:00",
+  "input_root": "data\\facility_top20\\all",
+  "output_root": "data\\facility_top20",
+  "cap": 30,
+  "min_train": 10,
+  "eval_fraction": 0.2,
+  "seed": 42,
+  "per_plate": {
+    "AGA-6649": {
+      "train": 10,
+      "eval": 1,
+      "augmented": 7,
+      "mode": "random_fallback"
+    },
+    "EEB-80": {
+      "train": 10,
+      "eval": 4,
+      "augmented": 9,
+      "mode": "temporal"
+    },
+    "ERD-7800": {
+      "train": 11,
+      "eval": 3,
+      "augmented": 0,
+      "mode": "random_fallback"
+    },
+    "HBR-4920": {
+      "train": 10,
+      "eval": 19,
+      "augmented": 8,
+      "mode": "temporal"
+    },
+    "HGD-2926": {
+      "train": 10,
+      "eval": 3,
+      "augmented": 8,
+      "mode": "temporal"
+    },
+    "HUD-9444": {
+      "train": 10,
+      "eval": 6,
+      "augmented": 8,
+      "mode": "temporal"
+    },
+    "HVA-77": {
+      "train": 10,
+      "eval": 1,
+      "augmented": 8,
+      "mode": "random_fallback"
+    },
+    "LNV-94": {
+      "train": 10,
+      "eval": 1,
+      "augmented": 4,
+      "mode": "random_fallback"
+    },
+    "LRS-9439": {
+      "train": 24,
+      "eval": 6,
+      "augmented": 0,
+      "mode": "random_fallback"
+    },
+    "NDD-4141": {
+      "train": 24,
+      "eval": 6,
+      "augmented": 0,
+      "mode": "random_fallback"
+    },
+    "NJS-7894": {
+      "train": 10,
+      "eval": 1,
+      "augmented": 5,
+      "mode": "random_fallback"
+    },
+    "NXR-2727": {
+      "train": 10,
+      "eval": 1,
+      "augmented": 4,
+      "mode": "random_fallback"
+    },
+    "RDJ-9640": {
+      "train": 24,
+      "eval": 6,
+      "augmented": 0,
+      "mode": "random_fallback"
+    },
+    "RTB-2016": {
+      "train": 10,
+      "eval": 1,
+      "augmented": 7,
+      "mode": "random_fallback"
+    },
+    "SDD-6707": {
+      "train": 10,
+      "eval": 5,
+      "augmented": 9,
+      "mode": "temporal"
+    },
+    "XBD-5588": {
+      "train": 10,
+      "eval": 1,
+      "augmented": 5,
+      "mode": "random_fallback"
+    },
+    "XRD-6663": {
+      "train": 12,
+      "eval": 3,
+      "augmented": 0,
+      "mode": "random_fallback"
+    },
+    "ZDR-8501": {
+      "train": 18,
+      "eval": 5,
+      "augmented": 0,
+      "mode": "random_fallback"
+    },
+    "ZRS-6511": {
+      "train": 10,
+      "eval": 5,
+      "augmented": 9,
+      "mode": "temporal"
+    },
+    "ZVH-337": {
+      "train": 10,
+      "eval": 1,
+      "augmented": 5,
+      "mode": "random_fallback"
+    }
+  },
+  "totals": {
+    "train": 253,
+    "eval": 79,
+    "augmented": 96
+  },
+  "pairs": {
+    "positives": 95,
+    "negatives": 1000
+  },
+  "finished_at": "2026-05-15T07:08:08+00:00"
+}

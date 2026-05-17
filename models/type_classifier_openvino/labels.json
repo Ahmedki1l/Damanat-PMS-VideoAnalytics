@@ -1,0 +1,30 @@
+{
+  "classes": [
+    "sedan",
+    "suv",
+    "hatchback",
+    "pickup",
+    "van",
+    "bus"
+  ],
+  "fallback": false,
+  "input_size": [
+    224,
+    224
+  ],
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "metrics": {
+    "best_val_acc": 0.8972602739726028,
+    "test_acc": 0.9069767441860465,
+    "train_seconds": 229.7652382850647
+  },
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ]
+}

@@ -19,6 +19,12 @@ class PendingANPREvent:
     candidate_id: Optional[str] = None
     session_id: Optional[str] = None
 
+    # Optional metadata published by Phase-1 WS-B / WS-C plugins. Phase 0
+    # writes never set these — they exist so the data flows without a
+    # follow-up schema migration.
+    detected_color: Optional[str] = None
+    vehicle_type: Optional[str] = None
+
 
 @dataclass
 class ParkEntryCandidate:
@@ -47,6 +53,16 @@ class ParkEntryCandidate:
     # "anpr_image"  → candidate was seeded from the image sent by pms_ai on /api/anpr/event
     # "zone_crop"   → candidate was created from a live Park_Entry / confirmation-zone frame
     source: str = "zone_crop"
+
+    # Optional metadata published by Phase-1 plugins. Phase 0 leaves these
+    # untouched; the fields exist so WS-B / WS-C / WS-D can persist their
+    # predictions without an additional schema migration.
+    color_class: Optional[str] = None
+    color_class_conf: float = 0.0
+    type_class: Optional[str] = None
+    type_class_conf: float = 0.0
+    ocr_plate: Optional[str] = None
+    ocr_plate_conf: float = 0.0
 
 
 @dataclass
@@ -88,6 +104,12 @@ class VehicleSession:
 
     new_pipeline_score: float = 0.0
     old_pipeline_score: float = 0.0
+
+    # Optional Phase-1 metadata. Plugins (WS-B/C/D) may populate these on
+    # confirmation; Phase 0 leaves them as defaults.
+    color_class: Optional[str] = None
+    type_class: Optional[str] = None
+    ocr_plate_variants: List[str] = field(default_factory=list)
 
     @property
     def display_id(self) -> str:

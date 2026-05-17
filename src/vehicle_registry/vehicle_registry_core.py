@@ -11,6 +11,14 @@ import numpy as np
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, PendingANPREvent
 
 logger = logging.getLogger(__name__)
+
+# Phase 2 cleanup audit: these env-driven flags are kept here because
+# ``tests/test_multishot_registry.py`` patches them via
+# ``patch.object(vehicle_registry_core, "REID_USE_MULTISHOT", ...)`` etc.
+# The matching cascade itself now reads ``self.matching_config.use_*`` and
+# does not consult these globals — they are pure backward-compatibility
+# shims. When the multishot tests migrate to mutating ``MatchingConfig``
+# directly, these can be removed.
 REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
 REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
 
@@ -21,7 +29,7 @@ class VehicleRegistryCoreMixin:
         while True:
             time.sleep(self._GC_INTERVAL_SECONDS)
             try:
-                self._cleanup_stale_data(datetime.now())
+                self._cleanup_stale_data(self._clock())
             except Exception:
                 logger.exception("Unhandled error in VehicleRegistry GC loop")
 
@@ -32,7 +40,7 @@ class VehicleRegistryCoreMixin:
         timestamp: Optional[datetime] = None,
     ) -> None:
         """Refresh the last-seen time for a camera-local track binding."""
-        self._track_last_seen[(camera_id, track_id)] = timestamp or datetime.now()
+        self._track_last_seen[(camera_id, track_id)] = timestamp or self._clock()
 
     def _drop_other_track_mappings_for_session(
         self,
@@ -140,7 +148,7 @@ class VehicleRegistryCoreMixin:
         if image is None or image.size == 0:
             return None
 
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         enhanced = self._enhance_snapshot_for_storage(image)
         filename = f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
         filepath = os.path.join(self._image_dir, filename)
@@ -153,7 +161,7 @@ class VehicleRegistryCoreMixin:
         timestamp: Optional[datetime] = None,
     ) -> List[str]:
         """Persist one or more CAM_03 reference snapshots for a confirmed session."""
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         token = uuid.uuid4().hex[:12]
         paths: List[str] = []
         for idx, image in enumerate(images):
@@ -182,7 +190,7 @@ class VehicleRegistryCoreMixin:
         if image is None or image.size == 0:
             return None
 
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         
         # Extract feature vector to enrich the session's ReID profile
         feature_vector = self.reid_matcher.extract_feature(image)
@@ -225,7 +233,7 @@ class VehicleRegistryCoreMixin:
         Entry events become pending ANPR records.
         Exit events close an existing confirmed session if found.
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
 
         event = PendingANPREvent(
             event_id=f"anpr_{uuid.uuid4().hex[:12]}",
@@ -326,6 +334,20 @@ class VehicleRegistryCoreMixin:
             for candidate_id in candidates_to_delete:
                 self._park_entry_candidates.pop(candidate_id, None)
 
+        # Phase 2 / T2.2 — drop stale per-track vote buffers. Held outside
+        # the registry lock so the voter's own RLock is the only contention
+        # point. ``match_voter`` is always present (constructed in
+        # ``VehicleRegistry.__init__``); the no-op guard is defensive against
+        # subclasses that bypass the standard constructor.
+        voter = getattr(self, "_match_voter", None)
+        if voter is not None:
+            try:
+                voter.cleanup_stale()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "[VOTER] cleanup_stale raised: %r", exc
+                )
+
     def open_park_entry_candidate(
         self,
         camera_id: str,
@@ -333,7 +355,7 @@ class VehicleRegistryCoreMixin:
         timestamp: Optional[datetime] = None,
     ) -> ParkEntryCandidate:
         """Create a candidate for a car entering the Park_Entry zone."""
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         candidate = ParkEntryCandidate(
             candidate_id=f"cand_{uuid.uuid4().hex[:12]}",
             camera_id=camera_id,
@@ -371,7 +393,7 @@ class VehicleRegistryCoreMixin:
         Keep the best Park_Entry snapshot for this candidate.
         Replace only when the new snapshot is better.
         """
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
 
         if REID_USE_MULTISHOT:
             return self._update_park_entry_candidate_multishot(
@@ -437,7 +459,7 @@ class VehicleRegistryCoreMixin:
         if image is None or image.size == 0:
             return None
 
-        now = timestamp or datetime.now()
+        now = timestamp or self._clock()
         from src.reid_matcher import select_best_frames
         from src.reid_matcher.reid_burst import sharpness_score
 

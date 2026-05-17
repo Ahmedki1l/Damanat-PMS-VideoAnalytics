@@ -1,0 +1,13 @@
+backbone: osnet_ain_x1_0
+input_size: [192, 96]   # [height, width]
+normalisation:
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+quantisation: int8
+calibration_image_count: 269
+source_weights_hash: osnet_ain_x1_0_imagenet.pth:b8a578eacc122c16
+onnx_opset: 14
+export_timestamp: 2026-05-13T12:47:31+00:00
+input_name: images
+output_name: features
+calibration_dir: "tests\\data\\calibration_crops"

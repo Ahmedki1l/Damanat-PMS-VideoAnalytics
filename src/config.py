@@ -34,6 +34,10 @@ class ProcessingConfig:
     # The runtime will scale polygon coords from this to the actual stream resolution.
     slot_ref_width: int = 640
     slot_ref_height: int = 360
+    # When True, each camera gets its own TrackedDetector so ByteTrack state
+    # is not corrupted by round-robin (Ultralytics' persist=True is per-model).
+    # False reverts to the legacy single shared tracker (lower RAM, worse IDs).
+    per_camera_tracker: bool = True
 
 
 @dataclass
@@ -116,6 +120,114 @@ class DatabaseConfig:
     """Database configuration."""
     url: str = ""
 
+
+@dataclass
+class MatchingConfig:
+    """
+    Matching / ReID decision configuration.
+
+    Centralises every numeric threshold and feature flag used by the matching
+    cascade (see src/matching/match_decision.py). Defaults intentionally
+    mirror the previously hard-coded values at
+    src/vehicle_registry/vehicle_registry_identity.py so the
+    matching: section is optional and behaviour is unchanged when it is
+    absent from config.yaml.
+    """
+
+    # --- Cosine similarity thresholds for the B1 / global / reattach forks ---
+    # B1_Entrance confirmation thresholds (lower bar for ANPR-image candidates;
+    # zone-crop candidates need a higher bar).
+    b1_anpr: float = 0.47
+    b1_zone: float = 0.55
+    # When the same plate has been seen on another camera in the gallery, drop
+    # the threshold to recover cross-camera handoffs.
+    b1_cross_camera: float = 0.43
+
+    # match_global_session: default threshold callers pass in is preserved as
+    # global_default. global_with_plate kicks in when the candidate session
+    # already has a plate; global_cross_camera further drops the bar when the
+    # session was last seen on a different camera.
+    global_default: float = 0.55
+    global_with_plate: float = 0.46
+    global_cross_camera: float = 0.43
+
+    # reattach_track_to_confirmed_session: default 0.52, dropped to 0.43 on
+    # cross-camera reattach.
+    reattach_default: float = 0.52
+    reattach_cross_camera: float = 0.43
+
+    # Legacy multi-feature fallback path (image_matcher.VehicleImageMatcher).
+    legacy_color_fallback: float = 0.35
+
+    # Dominant-color predicate floor (LAB k-means) — candidates below this
+    # are hard-rejected before any ReID cosine is computed.
+    color_dominant_filter: float = 0.45
+
+    # OCR marginal band — Phase 1 WS-D wires this in. ReID scores within
+    # [ocr_marginal_low, ocr_marginal_high] trigger a plate-OCR cross-check.
+    ocr_marginal_low: float = 0.40
+    ocr_marginal_high: float = 0.55
+
+    # If ReID cosine clears this bar on its own, ensemble agreement is
+    # optional (a "solo confirm"). Used by Phase 2 ensemble wiring.
+    reid_solo_confirm: float = 0.70
+
+    # --- HSV tolerances for color_compatible() ---
+    # Tightened from 25 -> 12 in Phase 2 / T2.1: the learned 11-class color
+    # classifier is now the primary path. The legacy HSV gate is kept as a
+    # belt-and-braces fallback for the noop path (when no IR is loaded), so
+    # the tolerance can be much tighter without dropping legitimate matches —
+    # the rare colour-classifier-confused case is now covered by the K-of-N
+    # ensemble rule rather than a wide HSV envelope.
+    hsv_h_tol: float = 12.0
+    hsv_s_tol: float = 80.0
+    hsv_v_tol: float = 80.0
+
+    # --- Feature flags (previously env vars) ---
+    use_color_filter: bool = False
+    use_lab_clahe: bool = False
+    use_multishot: bool = False
+
+    # --- Ensemble / voting (Phase 2 wiring; defaults make them inert) ---
+    ensemble_min_modalities_agree: int = 2
+    reid_solo_confirm_threshold: float = 0.70
+    voting_enabled: bool = False
+    voting_window_frames: int = 5
+    voting_min_agree: int = 3
+
+    # --- Plugin model paths (Phase 1) ---
+    # ``color_classifier_model``: Path to the OpenVINO IR (``model.xml``) for
+    # the WS-B color classifier. Default points at the artifact directory
+    # written by ``tools/train_color_classifier.py``. When the file is
+    # missing, the plugin raises a clear RuntimeError on first predict().
+    color_classifier_model: str = "models/color_classifier_openvino/model.xml"
+    type_classifier_model: str = ""
+    plate_ocr_model: str = ""
+
+    # --- Fast ReID backend (Phase 1 / WS-A) ---
+    # When ``use_openvino_reid`` is on AND an OpenVINO IR for OSNet exists at
+    # ``models/osnet_openvino_int8/model.xml`` the matcher uses the OpenVINO
+    # runtime path (target ≤40 ms/image on CPU). When the file is missing or
+    # the flag is off the matcher falls back to the legacy torchreid path
+    # (~1 s/image on CPU). ``reid_input_size`` is ``(height, width)`` and
+    # must agree with the size baked into the exported IR.
+    use_openvino_reid: bool = True
+    reid_input_size: tuple = (192, 96)
+    reid_openvino_model_dir: str = "models/osnet_openvino_int8"
+
+    # --- Phase 3 / T3.2 — FAISS-CPU gallery index ---
+    # ``match_global_session`` defaults to the legacy O(n) linear scan
+    # over ``self._sessions``. When ``use_faiss_index`` is True and the
+    # ``faiss-cpu`` package is importable, the registry instead routes the
+    # query through ``src.matching.GalleryIndex`` for an O(log n) IVF
+    # search. Default is False until the production rollout completes its
+    # shadow-mode benchmarking. ``faiss_index_dimension`` MUST match the
+    # ReID feature length (512 for OSNet-AIN).
+    use_faiss_index: bool = False
+    faiss_index_dimension: int = 512
+    faiss_index_nlist: int = 8
+
+
 @dataclass
 class AppConfig:
     """Root configuration container."""
@@ -128,6 +240,7 @@ class AppConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
+    matching: MatchingConfig = field(default_factory=MatchingConfig)
 
     # Legacy single-camera support
     video_source: str = ""
@@ -195,6 +308,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.processing.slot_ref_height = p.get(
             "slot_ref_height", config.processing.slot_ref_height
         )
+        config.processing.per_camera_tracker = bool(p.get(
+            "per_camera_tracker", config.processing.per_camera_tracker
+        ))
 
     # --- Legacy single-camera support ---
     if "video" in raw:
@@ -264,6 +380,98 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             gs = r_pp.get("grid_size", None)
             if gs is not None:
                 config.preprocessing.reid.grid_size = tuple(gs)
+
+    # --- Matching (ReID decision thresholds + plugin paths) ---
+    # Read env-var legacy flags so existing deployments behave the same when
+    # the new matching: block is absent from config.yaml. config.yaml wins
+    # over env vars when both are set — yaml is the documented source of truth.
+    config.matching.use_color_filter = (
+        os.environ.get("REID_USE_COLOR_FILTER", "false").lower() == "true"
+    )
+    config.matching.use_lab_clahe = (
+        os.environ.get("REID_USE_LAB_CLAHE", "false").lower() == "true"
+    )
+    config.matching.use_multishot = (
+        os.environ.get("REID_USE_MULTISHOT", "false").lower() == "true"
+    )
+
+    if "matching" in raw:
+        m = raw["matching"] or {}
+        cm = config.matching
+
+        # Thresholds
+        cm.b1_anpr = m.get("b1_anpr", cm.b1_anpr)
+        cm.b1_zone = m.get("b1_zone", cm.b1_zone)
+        cm.b1_cross_camera = m.get("b1_cross_camera", cm.b1_cross_camera)
+        cm.global_default = m.get("global_default", cm.global_default)
+        cm.global_with_plate = m.get("global_with_plate", cm.global_with_plate)
+        cm.global_cross_camera = m.get("global_cross_camera", cm.global_cross_camera)
+        cm.reattach_default = m.get("reattach_default", cm.reattach_default)
+        cm.reattach_cross_camera = m.get(
+            "reattach_cross_camera", cm.reattach_cross_camera
+        )
+        cm.legacy_color_fallback = m.get(
+            "legacy_color_fallback", cm.legacy_color_fallback
+        )
+        cm.color_dominant_filter = m.get(
+            "color_dominant_filter", cm.color_dominant_filter
+        )
+        cm.ocr_marginal_low = m.get("ocr_marginal_low", cm.ocr_marginal_low)
+        cm.ocr_marginal_high = m.get("ocr_marginal_high", cm.ocr_marginal_high)
+        cm.reid_solo_confirm = m.get("reid_solo_confirm", cm.reid_solo_confirm)
+
+        # HSV tolerances
+        cm.hsv_h_tol = m.get("hsv_h_tol", cm.hsv_h_tol)
+        cm.hsv_s_tol = m.get("hsv_s_tol", cm.hsv_s_tol)
+        cm.hsv_v_tol = m.get("hsv_v_tol", cm.hsv_v_tol)
+
+        # Feature flags — yaml overrides env-var defaults set above
+        cm.use_color_filter = m.get("use_color_filter", cm.use_color_filter)
+        cm.use_lab_clahe = m.get("use_lab_clahe", cm.use_lab_clahe)
+        cm.use_multishot = m.get("use_multishot", cm.use_multishot)
+
+        # Ensemble / voting (Phase 2)
+        cm.ensemble_min_modalities_agree = m.get(
+            "ensemble_min_modalities_agree", cm.ensemble_min_modalities_agree
+        )
+        cm.reid_solo_confirm_threshold = m.get(
+            "reid_solo_confirm_threshold", cm.reid_solo_confirm_threshold
+        )
+        cm.voting_enabled = m.get("voting_enabled", cm.voting_enabled)
+        cm.voting_window_frames = m.get(
+            "voting_window_frames", cm.voting_window_frames
+        )
+        cm.voting_min_agree = m.get("voting_min_agree", cm.voting_min_agree)
+
+        # Plugin model paths (Phase 1)
+        cm.color_classifier_model = m.get(
+            "color_classifier_model", cm.color_classifier_model
+        )
+        cm.type_classifier_model = m.get(
+            "type_classifier_model", cm.type_classifier_model
+        )
+        cm.plate_ocr_model = m.get("plate_ocr_model", cm.plate_ocr_model)
+
+        # Fast ReID backend (WS-A)
+        cm.use_openvino_reid = m.get("use_openvino_reid", cm.use_openvino_reid)
+        ris = m.get("reid_input_size", None)
+        if ris is not None:
+            # Accept "HxW" string or [H, W] list/tuple. Stored as (H, W).
+            if isinstance(ris, str) and "x" in ris.lower():
+                h_str, w_str = ris.lower().split("x", 1)
+                cm.reid_input_size = (int(h_str), int(w_str))
+            elif isinstance(ris, (list, tuple)) and len(ris) == 2:
+                cm.reid_input_size = (int(ris[0]), int(ris[1]))
+        cm.reid_openvino_model_dir = m.get(
+            "reid_openvino_model_dir", cm.reid_openvino_model_dir
+        )
+
+        # FAISS-CPU gallery index (Phase 3 / T3.2)
+        cm.use_faiss_index = m.get("use_faiss_index", cm.use_faiss_index)
+        cm.faiss_index_dimension = m.get(
+            "faiss_index_dimension", cm.faiss_index_dimension
+        )
+        cm.faiss_index_nlist = m.get("faiss_index_nlist", cm.faiss_index_nlist)
 
     # --- Output ---
     if "output" in raw:

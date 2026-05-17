@@ -1,57 +1,84 @@
 # =============================================================================
 # Damanat PMS Video Analytics — Multi-Camera Configuration (TEMPLATE)
 # =============================================================================
-# Copy this file to config.yaml and fill in your camera credentials:
-#   cp config.example.yaml config.yaml
+# Copy this file to config.yaml and fill in the camera credentials below:
+#
+#     cp config.example.yaml config.yaml
+#
+# Defaults below mirror the verified production configuration as of
+# 2026-05-17. Every model path resolves to an artifact tracked in this
+# repo — no additional downloads are required for the engine to boot.
 # =============================================================================
 
+database:
+  DATABASE_URL: "mssql+pyodbc://USER:PASSWORD@localhost:1433/damanat_pms?driver=ODBC+Driver+17+for+SQL+Server&TrustServerCertificate=yes"
+
 # --- Camera Definitions ---
-# Ground floor cameras (CAM_01, CAM_02) are excluded — outdoor, no ANPR.
+# Each camera has: id, name, floor, RTSP credentials, slots polygon file.
+# Ground-floor cameras (CAM-01, CAM-02) are still listed even though they
+# do not participate in slot detection — they are the outdoor ANPR-bound
+# cameras that feed the entrance flow.
 
 cameras:
+  - id: "CAM-01"
+    name: "Ground Floor — Camera 1"
+    floor: Ground Floor
+    ip: "10.1.13.60"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/GF_cam01.json"
+
+  - id: "CAM-02"
+    name: "Ground Floor — Camera 2"
+    floor: Ground Floor
+    ip: "10.1.13.61"
+    user: "YOUR_USER"
+    password: "YOUR_PASSWORD"
+    slots_file: "slots/GF_cam02.json"
+
   # ── B1 Floor ──────────────────────────────────────────────
-  - id: CAM_03
-    name: B1-PARKING
+  - id: "CAM-03"
+    name: "B1 Parking — Camera 03"
     floor: B1
     ip: "10.1.13.62"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b1_cam03.json"
 
-  - id: CAM_04
-    name: B1-PARKING
+  - id: "CAM-04"
+    name: "B1 Parking — Camera 04"
     floor: B1
     ip: "10.1.13.63"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b1_cam04.json"
 
-  - id: CAM_05
-    name: B1-PARKING
+  - id: "CAM-05"
+    name: "B1 Parking — Camera 05"
     floor: B1
     ip: "10.1.13.64"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b1_cam05.json"
 
-  - id: CAM_06
-    name: B1-PARKING
+  - id: "CAM-06"
+    name: "B1 Parking — Camera 06"
     floor: B1
     ip: "10.1.13.65"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b1_cam06.json"
 
-  - id: CAM_07
-    name: B1-PARKING
+  - id: "CAM-07"
+    name: "B1 Parking — Camera 07"
     floor: B1
     ip: "10.1.13.66"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b1_cam07.json"
 
-  - id: CAM_08
-    name: B1-PARKING
+  - id: "CAM-08"
+    name: "B1 Parking — Camera 08"
     floor: B1
     ip: "10.1.13.67"
     user: "YOUR_USER"
@@ -59,48 +86,48 @@ cameras:
     slots_file: "slots/b1_cam08.json"
 
   # ── B2 Floor ──────────────────────────────────────────────
-  - id: CAM_09
-    name: B2-PARKING
+  - id: "CAM-09"
+    name: "B2 Parking — Camera 09"
     floor: B2
     ip: "10.1.13.68"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b2_cam09.json"
 
-  - id: CAM_10
-    name: B2-PARKING
+  - id: "CAM-10"
+    name: "B2 Parking — Camera 10"
     floor: B2
     ip: "10.1.13.69"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
-    slots_file: "slots/b2_cam10.json"
+    slots_file: "slots/b2_cam10.json"   # NOTE: file currently missing — create with tools/draw_slots.py
 
-  - id: CAM_11
-    name: B2-PARKING
+  - id: "CAM-11"
+    name: "B2 Parking — Camera 11"
     floor: B2
     ip: "10.1.13.70"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b2_cam11.json"
 
-  - id: CAM_12
-    name: B2-PARKING
+  - id: "CAM-12"
+    name: "B2 Parking — Camera 12"
     floor: B2
     ip: "10.1.13.71"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b2_cam12.json"
 
-  - id: CAM_13
-    name: B2-PARKING
+  - id: "CAM-13"
+    name: "B2 Parking — Camera 13"
     floor: B2
     ip: "10.1.13.72"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b2_cam13.json"
 
-  - id: CAM_14
-    name: B2-PARKING
+  - id: "CAM-14"
+    name: "B2 Parking — Camera 14"
     floor: B2
     ip: "10.1.13.73"
     user: "YOUR_USER"
@@ -112,13 +139,17 @@ processing:
   mode: "round_robin"           # Process cameras one at a time in rotation
   target_fps_per_camera: 1      # Each camera gets ~1 frame/second
   stream_channel: 102           # RTSP channel: 101=main(4K), 102=sub(720p)
+  per_camera_tracker: true      # One TrackedDetector per camera (preserves ByteTrack state)
 
 # --- Detector Settings ---
+# Production detector is yolo11m (better recall on oblique floor angles).
+# yolo11s_openvino_model is also committed as a rollback if yolo11m exceeds
+# the CPU budget at 14 cameras x 1 FPS round-robin (~70 ms per camera).
 detector:
-  model_path: "models/yolo11n.pt"
-  confidence: 0.35
-  classes: [2, 5, 7]                  # 2 = car only
-  imgsz: 480                    # Lower resolution for CPU efficiency
+  model_path: "models/yolo11m_openvino_model"  # OpenVINO IR, ~70-120 ms/frame on CPU
+  confidence: 0.25                              # Low bar — parked cars in slots rarely false-positive
+  classes: [2, 5, 7]                            # 2=car, 5=bus, 7=truck (SUVs/vans often classified as truck)
+  imgsz: 640
 
 # --- Tracker Settings ---
 tracker:
@@ -131,10 +162,70 @@ state_machine:
 
 # --- Slot Assignment Settings ---
 assigner:
-  overlap_threshold: 0.3
+  overlap_threshold: 0.2
+
+# --- Matching / ReID Decision Configuration ---
+# Calibrated against the CARLA-pretrained + facility-finetuned IR
+# (models/osnet_facility_carla_int8_256x128). Tool:
+# tools/calibrate_thresholds_top20.py at Youden's J operating point on
+# the labelled eval pairs (1095 pairs, 95 positive + 1000 negative).
+# Score distribution on this IR:
+#   positives: mean 0.78, p10 0.45
+#   negatives: mean 0.37, p90 0.54
+#   margin   : 0.41 (vs 0.17 on the previous IR)
+matching:
+  # ReID cosine thresholds — Youden's J operating point on the current IR
+  b1_anpr: 0.45               # B1 confirmation when candidate is an ANPR crop
+  b1_zone: 0.53               # B1 confirmation for Park-Entry zone crops
+  b1_cross_camera: 0.41       # B1 confirmation when handing off between cams
+  global_default: 0.53        # Cross-session global search
+  global_with_plate: 0.44     # Same, when the session has a confirmed plate
+  global_cross_camera: 0.41   # Same, when query is on a different camera
+  reattach_default: 0.50      # Track→session reattach (orphan recovery)
+  reattach_cross_camera: 0.41
+  legacy_color_fallback: 0.35
+  color_dominant_filter: 0.45
+
+  # OCR marginal band — only relevant when plate_ocr_model is set
+  ocr_marginal_low: 0.40
+  ocr_marginal_high: 0.55
+
+  # ReID-solo confirm fast-path (single-modality high-confidence)
+  reid_solo_confirm: 0.68
+
+  # HSV tolerances for the legacy color compatibility predicate
+  hsv_h_tol: 12.0
+  hsv_s_tol: 80.0
+  hsv_v_tol: 80.0
+
+  # Ensemble rule + temporal voting
+  ensemble_min_modalities_agree: 2
+  voting_enabled: true
+  voting_window_frames: 3
+  voting_min_agree: 2
+
+  # Feature flags
+  use_color_filter: false      # Classifier head is primary; HSV is fallback only
+  use_lab_clahe: true          # Luminance normalisation under varied garage lighting
+  use_multishot: true          # Average features across 3 sharpest frames per confirmation
+
+  # ReID OpenVINO backend (production, 256x128 input, CARLA-pretrained INT8)
+  use_openvino_reid: true
+  reid_input_size: [256, 128]
+  reid_openvino_model_dir: "models/osnet_facility_carla_int8_256x128"
+
+  # Plugin model paths — empty string disables the plugin (NoopXxx fallback)
+  color_classifier_model: "models/color_classifier_openvino/model.xml"
+  type_classifier_model: "models/type_classifier_openvino/model.xml"
+  plate_ocr_model: ""          # DISABLED — see DEPLOYMENT.md to re-enable PaddleOCR
+
+  # FAISS-CPU gallery index (enable when session count exceeds ~5000)
+  use_faiss_index: false
+  faiss_index_dimension: 512
+  faiss_index_nlist: 8
 
 # --- Output Settings ---
 output:
   log_file: ""                  # Optional: path to event log file
   show_video: false             # Show annotated video (debug only)
-  show_camera: ""               # Which camera to show when show_video=true
+  show_camera: ""               # Which camera to show when show_video=true (e.g., "CAM-04")

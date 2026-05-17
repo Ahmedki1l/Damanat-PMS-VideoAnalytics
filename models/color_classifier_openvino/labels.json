@@ -1,0 +1,33 @@
+{
+  "labels": [
+    "black",
+    "white",
+    "grey",
+    "silver",
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "brown",
+    "beige",
+    "other"
+  ],
+  "input_size": [
+    224,
+    224
+  ],
+  "preprocessing": {
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "color_order": "RGB",
+    "letterbox": true
+  }
+}
