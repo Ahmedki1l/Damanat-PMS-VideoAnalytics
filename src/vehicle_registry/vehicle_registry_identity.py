@@ -1293,6 +1293,47 @@ class VehicleRegistryIdentityMixin:
                     return existing.plate
                 return existing.plate
 
+            # Plate-keyed defence: release any OTHER slot currently held by a
+            # DIFFERENT session for the same plate. Catches the rare case
+            # where two sessions for the same plate end up in _parked (the
+            # 120 s duplicate-session guard at confirm_anpr_session_directly
+            # missed because the prior session was created longer ago, or a
+            # service restart rebuilt _parked from observation). Same-session
+            # moves are handled by the block further down. The engine's slot
+            # state machine will write the slot-free DB event when it next
+            # observes the released slot as empty — same as the same-session
+            # release path below.
+            if session.plate:
+                stale_slots = [
+                    sid
+                    for sid, s in self._parked.items()
+                    if sid != slot_id
+                    and s.session_id != session.session_id
+                    and s.plate == session.plate
+                ]
+                for stale_sid in stale_slots:
+                    stale = self._parked.pop(stale_sid, None)
+                    if stale is None:
+                        continue
+                    logger.warning(
+                        "[REGISTRY] Plate %s was already linked to slot %s via "
+                        "stale session %s; releasing it in favour of session %s "
+                        "-> slot %s",
+                        session.plate,
+                        stale_sid,
+                        stale.session_id,
+                        session.session_id,
+                        slot_id,
+                    )
+                    stale.linked_slot = None
+                    stale.linked_slot_name = None
+                    stale.linked_camera = None
+                    stale.linked_floor = None
+                    stale.linked_zone_id = None
+                    stale.linked_zone_name = None
+                    stale.linked_at = None
+                    stale.status = "confirmed"
+
             # Phase 2 / T2.2 — temporal voting. When enabled, the commit
             # is gated by ``MatchVoter`` so a single noisy frame cannot
             # parked-flip a session on its own. The voter returns ``None``
