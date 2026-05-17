@@ -117,3 +117,5 @@ src/tools/roi_selector.py
 test_sse_logic.py
 
 migrate_slots.py
+
+.claude
