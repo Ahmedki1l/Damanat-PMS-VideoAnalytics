@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
 match_logger = logging.getLogger("reid_match_perf")
 
+# Cameras for which all identity matching is disabled. These cameras
+# only run detection — they do not participate in B1 confirmation,
+# cross-camera reattach, or slot linking.
+_IDENTITY_MATCHING_DISABLED_CAMERAS = frozenset({"CAM-01", "CAM-02"})
+
 
 class VehicleRegistryIdentityMixin:
     def is_plate_inside(self, plate: Optional[str]) -> bool:
@@ -347,6 +352,8 @@ class VehicleRegistryIdentityMixin:
         captured at Park_Entry.
         """
         now = timestamp or self._clock()
+        if camera_id in _IDENTITY_MATCHING_DISABLED_CAMERAS:
+            return None
         if ordered_images:
             session_reference_images = self._dedupe_valid_images(ordered_images)
         else:
@@ -1113,6 +1120,8 @@ class VehicleRegistryIdentityMixin:
         """
         if query_vector is None:
             return None
+        if camera_id in _IDENTITY_MATCHING_DISABLED_CAMERAS:
+            return None
 
         with self._lock:
             current_sid = self._track_session_map.get((camera_id, track_id))
@@ -1253,6 +1262,8 @@ class VehicleRegistryIdentityMixin:
         No blind fallback to recent ANPR events.
         """
         if track_id is None:
+            return None
+        if camera_id in _IDENTITY_MATCHING_DISABLED_CAMERAS:
             return None
 
         with self._lock:
