@@ -1,10 +1,15 @@
-# Core dependencies for Damanat PMS Video Analytics
+# Core dependencies for Damanat PMS Video Analytics — CLIENT INSTALL.
 #
 # torch + torchreid notes:
 #   torchreid (vehicle re-ID model) needs torch + torchvision. We pull them
 #   from PyTorch's CPU-only index — without --extra-index-url pip resolves
 #   to the GPU build (~2GB) which we don't need on the inference boxes.
 #   Order matters: numpy<2 first, then torch/torchvision, then torchreid.
+#
+# torchreid is technically only required by the TRAINING tools (under
+# tools/) and by the legacy fallback ReID path in src/reid_matcher. The
+# production engine loads ReID via OpenVINO so torchreid is never called
+# at runtime; kept here so the legacy fallback still works if needed.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 numpy<2.0.0               # torch/torchreid not yet compatible with NumPy 2.x
@@ -45,26 +50,25 @@ openvino-telemetry>=2023.2.1
 onnx>=1.16.0
 nncf>=2.10.0
 
-# Plate-OCR cross-check (Wave 1 / WS-D).
+# Plate-OCR cross-check (Wave 1 / WS-D) — DISABLED for client deployment.
 #
-# PaddleOCR-mobile reads license plates from floor crops at the marginal
-# ReID score band (see src.ocr.plate_ocr and Phase 2 gating). The detection
-# + recognition models live under ~/.paddlex/official_models and are
-# downloaded on first use:
+# config.example.yaml sets matching.plate_ocr_model: "" which routes to
+# NoopPlateOCR. The cascade ensemble rule (>=2 of {ReID, color, type})
+# still works without the OCR modality.
 #
-#     PP-OCRv5_mobile_det        ~ 5 MB
-#     en_PP-OCRv5_mobile_rec     ~ 8 MB
-#     PP-LCNet_x1_0_textline_ori ~ 7 MB   (only when use_angle_cls=True)
+# To re-enable:
+#   1. Uncomment the two lines below.
+#   2. In config.yaml, set matching.plate_ocr_model: "paddleocr-mobile".
+#   3. pip install paddleocr paddlepaddle (~500 MB combined install).
+# The mobile det+rec weights (~12-20 MB) auto-download to
+# ~/.paddlex/official_models/ on first PlateOCR.read() call.
 #
-# Total on-disk footprint: ~12-20 MB for the mobile pipeline (the older
-# PaddleOCR v3/v4 server variants are ~80 MB; we pin to mobile in code).
-# The Python wheel chain (paddleocr + paddlepaddle + paddlex) is ~500 MB
-# installed — gate it behind a feature flag in resource-constrained envs.
-#
-# On Windows + paddlepaddle 3.x oneDNN can trip a NotImpl at predict time;
-# the plugin sets FLAGS_use_mkldnn=0 by default to avoid it.
-paddleocr>=2.7.0
-paddlepaddle>=2.6.0
+# Notes for re-enablement:
+#   - Models: PP-OCRv5_mobile_det (~5 MB), en_PP-OCRv5_mobile_rec (~8 MB).
+#   - On Windows + paddlepaddle 3.x, oneDNN can trip a NotImpl at predict
+#     time; the plugin sets FLAGS_use_mkldnn=0 by default to avoid it.
+# paddleocr>=2.7.0
+# paddlepaddle>=2.6.0
 
 # Phase 3 / T3.2 — FAISS-CPU gallery index. Optional at runtime: when
 # absent the GalleryIndex falls back to a pure-numpy brute-force search
