@@ -731,11 +731,17 @@ class ParkingEngineRuntimeMixin:
                         self._persist_late_slot_plate(slot.id, plate, cam_id)
                 elif previous_plate:
                     # Registry says no plate (moved or unlinked), but machine has one.
-                    # Clear it to avoid ghost labels in the UI.
+                    # Clear it to avoid ghost labels in the UI. Also evict any
+                    # stale `_parked` entry so `/api/slots` (which reads from
+                    # registry.get_slot_plate) stops returning the old plate —
+                    # critical for CAM-01/CAM-02 where slot detection still
+                    # runs but plate matching is disabled, so try_link_to_slot
+                    # always returns None and never replaces the old binding.
                     state_machine.bind_identity(
                         None,
                         self._build_slot_snapshot_url(slot.id),
                     )
+                    self.vehicle_registry.unlink_slot(slot.id)
                     if self.db_manager:
                         self._persist_late_slot_plate(slot.id, None, cam_id)
 

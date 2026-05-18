@@ -151,9 +151,14 @@ class SlotStateMachine:
         }
 
     def bind_identity(self, plate_number: Optional[str], snapshot_url: str = "") -> None:
-        """Persist the confirmed identity for this slot until vacancy is confirmed."""
-        if plate_number:
-            self.plate_number = plate_number
+        """Persist the confirmed identity for this slot until vacancy is confirmed.
+
+        Passing ``plate_number=None`` (or ``""``) clears the field — callers in
+        engine_runtime.py rely on this to drop ghost plates when the registry
+        no longer has a binding for the slot (e.g. CAM-01/CAM-02 where plate
+        matching is disabled but slot detection still runs).
+        """
+        self.plate_number = plate_number or ""
         if snapshot_url:
             self.snapshot_url = snapshot_url
 
