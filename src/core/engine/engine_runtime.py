@@ -17,6 +17,7 @@ from src.services.parking_service import (
     load_camera_slots,
 )
 from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
+from src.vehicle_registry.vehicle_registry_identity import IDENTITY_MATCHING_DISABLED_CAMERAS
 
 
 logger = logging.getLogger(__name__)
@@ -451,7 +452,57 @@ class ParkingEngineRuntimeMixin:
             for slot in parking_slots:
                 all_active_slot_ids.add(slot.id)
 
+        self._free_plates_on_disabled_cameras()
         return total_slots
+
+    def _free_plates_on_disabled_cameras(self) -> None:
+        """One-shot startup cleanup: for cameras whose plate matching is
+        disabled (IDENTITY_MATCHING_DISABLED_CAMERAS — currently the ground
+        floor), clear any plate left bound to one of their slots in
+        ``slot_status`` and notify the PMS API to unbind. The slot's
+        ``is_available`` flag is left untouched — only the plate identity
+        is freed. Idempotent: a no-op if there are no stale bindings."""
+        if not self.db_manager:
+            return
+        cleared = []
+        session = self.db_manager.SessionLocal()
+        try:
+            from src.repositories import SlotStatusRepository
+
+            for cam_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
+                pipeline = self.pipelines.get(cam_id)
+                if pipeline is None:
+                    continue
+                for slot in pipeline.slots:
+                    latest = SlotStatusRepository.get_latest_by_slot(session, slot.id)
+                    if not latest or latest.status != "occupied":
+                        continue
+                    if not latest.plate_number:
+                        continue
+                    previous_plate = latest.plate_number
+                    update_current_slot_plate(
+                        session,
+                        slot_id=slot.id,
+                        plate=None,
+                        camera_id=cam_id,
+                    )
+                    cleared.append((cam_id, slot.id, previous_plate))
+        except Exception as exc:
+            session.rollback()
+            print(f"[ERROR] Failed to free plates on disabled cameras: {exc}")
+        finally:
+            session.close()
+
+        for cam_id, slot_id, plate in cleared:
+            print(
+                f"[INFO] Cleared stale plate {plate!r} from {cam_id}/{slot_id} "
+                f"(plate matching disabled on this camera)"
+            )
+        if cleared:
+            print(
+                f"[INFO] Freed {len(cleared)} slot plate binding(s) on startup "
+                f"for cameras with matching disabled"
+            )
 
     def _build_camera_pipeline(self, camera_config: CameraConfig, all_active_slot_ids: set):
         # Reference resolution (what the slot JSONs were drawn at)
@@ -631,6 +682,11 @@ class ParkingEngineRuntimeMixin:
 
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
         all_events = []
+        # Ground-floor cameras (CAM-01/CAM-02) host real slots but must not
+        # participate in plate identity matching — they only run occupancy
+        # state machines. Short-circuit here so we don't even ask the
+        # registry; the registry guards remain as defense-in-depth.
+        plate_matching_enabled = cam_id not in IDENTITY_MATCHING_DISABLED_CAMERAS
 
         for slot in pipeline.slots:
             state_machine = pipeline.state_machines[slot.id]
@@ -668,7 +724,11 @@ class ParkingEngineRuntimeMixin:
                     if snapshot_filename:
                         self._persist_slot_snapshot_path(slot.id, snapshot_filename)
 
-                if event.event_type == "vehicle_parked" and self.vehicle_registry:
+                if (
+                    event.event_type == "vehicle_parked"
+                    and self.vehicle_registry
+                    and plate_matching_enabled
+                ):
                     # Attempt to get plate first to save crop with correct filename
                     plate = self.vehicle_registry.get_plate_for_track(cam_id, track_id)
                     snapshot_path = None
@@ -708,6 +768,7 @@ class ParkingEngineRuntimeMixin:
             if (
                 self.vehicle_registry
                 and vehicle_in_slot
+                and plate_matching_enabled
                 and pipeline.state_machines[slot.id].state
                 in (SlotState.OCCUPIED, SlotState.LEAVING)
             ):
@@ -733,10 +794,7 @@ class ParkingEngineRuntimeMixin:
                     # Registry says no plate (moved or unlinked), but machine has one.
                     # Clear it to avoid ghost labels in the UI. Also evict any
                     # stale `_parked` entry so `/api/slots` (which reads from
-                    # registry.get_slot_plate) stops returning the old plate —
-                    # critical for CAM-01/CAM-02 where slot detection still
-                    # runs but plate matching is disabled, so try_link_to_slot
-                    # always returns None and never replaces the old binding.
+                    # registry.get_slot_plate) stops returning the old plate.
                     state_machine.bind_identity(
                         None,
                         self._build_slot_snapshot_url(slot.id),
@@ -744,6 +802,25 @@ class ParkingEngineRuntimeMixin:
                     self.vehicle_registry.unlink_slot(slot.id)
                     if self.db_manager:
                         self._persist_late_slot_plate(slot.id, None, cam_id)
+            elif (
+                self.vehicle_registry
+                and vehicle_in_slot
+                and not plate_matching_enabled
+                and pipeline.state_machines[slot.id].plate_number
+            ):
+                # Safety net for plate-disabled cameras (e.g. CAM-01/CAM-02):
+                # we no longer attempt try_link_to_slot here, so any stale
+                # plate left on the state machine from a previous deploy
+                # would never be cleared. Clear it directly and evict the
+                # registry's `_parked` entry so `/api/slots` stops returning
+                # the old plate.
+                state_machine.bind_identity(
+                    None,
+                    self._build_slot_snapshot_url(slot.id),
+                )
+                self.vehicle_registry.unlink_slot(slot.id)
+                if self.db_manager:
+                    self._persist_late_slot_plate(slot.id, None, cam_id)
 
             all_events.extend(events)
 

@@ -23,9 +23,13 @@ REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "
 match_logger = logging.getLogger("reid_match_perf")
 
 # Cameras for which all identity matching is disabled. These cameras
-# only run detection — they do not participate in B1 confirmation,
-# cross-camera reattach, or slot linking.
-_IDENTITY_MATCHING_DISABLED_CAMERAS = frozenset({"CAM-01", "CAM-02"})
+# only run detection and slot-occupancy state machines — they do not
+# participate in B1 confirmation, cross-camera reattach, plate→slot
+# linking, or any plate identity binding. The engine layer
+# (`_update_slot_state` in `core.engine.engine_runtime`) reads this set
+# directly to skip plate-related calls proactively; the three registry
+# entry points below also guard against it as defense-in-depth.
+IDENTITY_MATCHING_DISABLED_CAMERAS = frozenset({"CAM-01", "CAM-02"})
 
 
 class VehicleRegistryIdentityMixin:
@@ -352,7 +356,7 @@ class VehicleRegistryIdentityMixin:
         captured at Park_Entry.
         """
         now = timestamp or self._clock()
-        if camera_id in _IDENTITY_MATCHING_DISABLED_CAMERAS:
+        if camera_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
             return None
         if ordered_images:
             session_reference_images = self._dedupe_valid_images(ordered_images)
@@ -1120,7 +1124,7 @@ class VehicleRegistryIdentityMixin:
         """
         if query_vector is None:
             return None
-        if camera_id in _IDENTITY_MATCHING_DISABLED_CAMERAS:
+        if camera_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
             return None
 
         with self._lock:
@@ -1263,7 +1267,7 @@ class VehicleRegistryIdentityMixin:
         """
         if track_id is None:
             return None
-        if camera_id in _IDENTITY_MATCHING_DISABLED_CAMERAS:
+        if camera_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
             return None
 
         with self._lock:
