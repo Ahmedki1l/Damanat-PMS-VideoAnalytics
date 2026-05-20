@@ -229,6 +229,12 @@ class MatchingConfig:
 
 
 @dataclass
+class AlertsConfig:
+    """Alerting feature toggles."""
+    enable_restricted_zone_alerts: bool = False
+
+
+@dataclass
 class AppConfig:
     """Root configuration container."""
     cameras: List[CameraEntry] = field(default_factory=list)
@@ -241,6 +247,7 @@ class AppConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
     matching: MatchingConfig = field(default_factory=MatchingConfig)
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
 
     # Legacy single-camera support
     video_source: str = ""
@@ -394,6 +401,17 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     config.matching.use_multishot = (
         os.environ.get("REID_USE_MULTISHOT", "false").lower() == "true"
     )
+
+    # Alert toggles — env-var first, YAML overrides below if present.
+    config.alerts.enable_restricted_zone_alerts = (
+        os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS", "false").lower() == "true"
+    )
+    if "alerts" in raw:
+        a = raw["alerts"] or {}
+        config.alerts.enable_restricted_zone_alerts = a.get(
+            "enable_restricted_zone_alerts",
+            config.alerts.enable_restricted_zone_alerts,
+        )
 
     if "matching" in raw:
         m = raw["matching"] or {}

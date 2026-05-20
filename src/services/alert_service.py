@@ -1,7 +1,15 @@
+import os
+
 from sqlalchemy.orm import Session
 from src.model.alert import Alert
 from src.repositories import AlertRepository, ParkingSlotRepository
 from src.utils.datetime_helper import facility_now_naive
+
+_RESTRICTED_GATED_TYPES = ("special_needs_violation", "vehicle_intrusion")
+
+
+def _restricted_zone_alerts_enabled() -> bool:
+    return os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS", "false").lower() == "true"
 
 def check_slot_restricted(db: Session, slot_id: str) -> bool:
     """True when a slot should trigger alerts (violation zone, employee, or special-needs)."""
@@ -36,6 +44,11 @@ def report_alert(
     """
     if not check_slot_restricted(db, slot_id):
         return None
+
+    if not _restricted_zone_alerts_enabled():
+        gated_alert_type = get_alert_type_for_slot(db, slot_id)
+        if gated_alert_type in _RESTRICTED_GATED_TYPES:
+            return None
 
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
     # Dedicated per-alert snapshots are the preferred source. Fall back to the

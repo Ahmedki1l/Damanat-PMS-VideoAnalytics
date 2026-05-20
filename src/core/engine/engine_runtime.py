@@ -895,9 +895,15 @@ class ParkingEngineRuntimeMixin:
                 if alert_type is None:
                     final_events.append(event)
                     continue
+                if (
+                    not self.config.alerts.enable_restricted_zone_alerts
+                    and alert_type in ("special_needs_violation", "vehicle_intrusion")
+                ):
+                    final_events.append(event)
+                    continue
                 event.event_type = alert_type
                 event.is_alert = True
-                event.severity = "critical"
+                event.severity = "warning"
                 # Pass the full frame as fallback so the alert always carries an
                 # evidence image even when the per-vehicle crop is empty
                 # (Version 0 / Issue #v0-1 fix). Operators previously got
