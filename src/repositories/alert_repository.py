@@ -4,6 +4,19 @@ from src.model import Alert
 from src.utils.datetime_helper import facility_now_naive
 from typing import Optional
 
+# Legacy alert_type values written by older versions of alert_service. We
+# transparently include them when callers filter by the current value so the
+# REST endpoints surface both old and new rows.
+_ALERT_TYPE_ALIASES = {
+    "vehicle_violation": ("vehicle_violation", "violation"),
+    "vehicle_intrusion": ("vehicle_intrusion", "intrusion"),
+}
+
+
+def _alert_type_values(alert_type: str) -> tuple[str, ...]:
+    return _ALERT_TYPE_ALIASES.get(alert_type, (alert_type,))
+
+
 class AlertRepository:
     @staticmethod
     def create(db: Session, alert_model: Alert):
@@ -19,7 +32,7 @@ class AlertRepository:
             Alert.is_resolved == False
         )
         if alert_type:
-            query = query.filter(Alert.alert_type == alert_type)
+            query = query.filter(Alert.alert_type.in_(_alert_type_values(alert_type)))
         return query.first()
 
     @staticmethod
@@ -28,7 +41,7 @@ class AlertRepository:
         if is_resolved is not None:
             query = query.filter(Alert.is_resolved == is_resolved)
         if alert_type:
-            query = query.filter(Alert.alert_type == alert_type)
+            query = query.filter(Alert.alert_type.in_(_alert_type_values(alert_type)))
         return query.order_by(Alert.triggered_at.desc()).all()
 
     @staticmethod

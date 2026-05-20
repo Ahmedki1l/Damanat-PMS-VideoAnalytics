@@ -54,13 +54,19 @@ def log_vehicle_event(
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
     if slot:
         slot.is_available = not is_parked
-    
+
+    is_occupied_to_empty_transition = False
+    if not is_parked:
+        prev_status = SlotStatusRepository.get_latest_by_slot(db, slot_id)
+        if prev_status is not None and prev_status.status == "occupied":
+            is_occupied_to_empty_transition = True
+
     new_log = SlotStatus(
         slot_id=slot_id,
         plate_number=plate if is_parked else None,
         status="occupied" if is_parked else "available"
     )
-    
+
     alert_id = None
     if is_parked:
         alert = alert_service.report_alert(
@@ -79,6 +85,16 @@ def log_vehicle_event(
             alert_id = alert.id
 
     created = SlotStatusRepository.create(db, new_log)
+
+    if is_occupied_to_empty_transition:
+        try:
+            resolved_ids = alert_service.auto_resolve_slot_violation_alerts(db, slot_id)
+            if resolved_ids and alert_id is None:
+                alert_id = resolved_ids[0]
+        except Exception as exc:
+            print(
+                f"[WARN] auto-resolve slot violation alerts failed for slot {slot_id}: {exc}"
+            )
 
     if slot and plate:
         if is_parked:

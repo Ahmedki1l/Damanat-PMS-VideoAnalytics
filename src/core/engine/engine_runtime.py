@@ -903,7 +903,11 @@ class ParkingEngineRuntimeMixin:
                     continue
                 event.event_type = alert_type
                 event.is_alert = True
-                event.severity = "warning"
+                event.severity = (
+                    "critical"
+                    if alert_type == "vehicle_violation"
+                    else "warning"
+                )
                 # Pass the full frame as fallback so the alert always carries an
                 # evidence image even when the per-vehicle crop is empty
                 # (Version 0 / Issue #v0-1 fix). Operators previously got
