@@ -58,6 +58,10 @@ class VehicleRegistry(
 
         self._pending_event_order: List[str] = []
         self._pending_events: Dict[str, PendingANPREvent] = {}
+        # ANPR burst coalescing: maps an ANPR camera_id → the event_id of its
+        # currently-open burst, so rapid re-reads (last-wins within the window)
+        # overwrite the plate instead of creating competing events.
+        self._last_anpr_entry: Dict[str, str] = {}
         self._park_entry_candidates: Dict[str, ParkEntryCandidate] = {}
         self._sessions: Dict[str, VehicleSession] = {}
         self._track_session_map: Dict[Tuple[str, int], str] = {}

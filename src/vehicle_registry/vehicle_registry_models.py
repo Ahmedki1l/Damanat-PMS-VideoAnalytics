@@ -102,6 +102,12 @@ class VehicleSession:
     # Enables multi-camera simultaneous identity display.
     observing_tracks: Dict[str, int] = field(default_factory=dict)
 
+    # Per-camera latest ReID similarity score. Drives single-camera ownership:
+    # the live observer with the highest score owns the identity (display + data).
+    observing_scores: Dict[str, float] = field(default_factory=dict)
+    # The camera currently designated as the sole owner of this car's identity.
+    owner_camera: Optional[str] = None
+
     new_pipeline_score: float = 0.0
     old_pipeline_score: float = 0.0
 

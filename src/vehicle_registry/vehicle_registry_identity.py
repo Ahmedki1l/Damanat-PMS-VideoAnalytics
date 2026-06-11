@@ -31,6 +31,18 @@ match_logger = logging.getLogger("reid_match_perf")
 # entry points below also guard against it as defense-in-depth.
 IDENTITY_MATCHING_DISABLED_CAMERAS = frozenset({"CAM-01", "CAM-02"})
 
+# Single-camera ownership: a session observed by several cameras at once is
+# owned by exactly one — the live observer with the highest ReID score. A track
+# counts as "live" only if seen within OWNER_STALENESS_SECONDS; the current
+# owner is kept unless a challenger beats its score by OWNER_SWITCH_MARGIN
+# (hysteresis to stop label flicker when scores are close).
+OWNER_STALENESS_SECONDS = 3.0
+OWNER_SWITCH_MARGIN = 0.05
+# Score seeded for a camera that owns a session by definition (brand-new
+# appearance session, or a B1/ANPR plate confirmation) rather than by a ReID
+# similarity comparison.
+OWNER_DEFINITIVE_SCORE = 1.0
+
 
 class VehicleRegistryIdentityMixin:
     def is_plate_inside(self, plate: Optional[str]) -> bool:
@@ -660,6 +672,8 @@ class VehicleRegistryIdentityMixin:
                 )
                 self._track_session_map[(camera_id, track_id)] = session.session_id
                 session.observing_tracks[camera_id] = track_id
+                session.observing_scores[camera_id] = OWNER_DEFINITIVE_SCORE
+                session.owner_camera = camera_id
                 self._mark_track_seen(camera_id, track_id, now)
             else:
                 session = VehicleSession(
@@ -690,6 +704,8 @@ class VehicleRegistryIdentityMixin:
                 )
                 self._track_session_map[(camera_id, track_id)] = session.session_id
                 session.observing_tracks[camera_id] = track_id
+                session.observing_scores[camera_id] = OWNER_DEFINITIVE_SCORE
+                session.owner_camera = camera_id
                 self._mark_track_seen(camera_id, track_id, now)
                 # Phase 3 / T3.2 — track the new B1-confirmed session in
                 # the FAISS gallery (no-op when use_faiss_index is False).
@@ -789,18 +805,83 @@ class VehicleRegistryIdentityMixin:
             session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id, now)
 
+    def _resolve_owner_camera(
+        self,
+        session: VehicleSession,
+        now: datetime,
+    ) -> Optional[str]:
+        """Pick the single camera that owns this session's identity.
+
+        Assumes ``self._lock`` is held. A car seen by several cameras at once is
+        owned by exactly one:
+
+        * If the session is linked to a parking slot, the slot's camera owns it
+          (a parked car belongs to the camera whose slot it physically occupies).
+        * Otherwise the live observer (track seen within
+          ``OWNER_STALENESS_SECONDS``) with the highest ReID score owns it, with
+          ``OWNER_SWITCH_MARGIN`` hysteresis favouring the current owner so the
+          label does not flicker between cameras with near-equal scores.
+
+        Updates and returns ``session.owner_camera``. Returns ``None`` only when
+        no live observer can be determined.
+        """
+        if session.linked_slot and session.linked_camera:
+            session.owner_camera = session.linked_camera
+            return session.owner_camera
+
+        live = [
+            cam
+            for cam, tid in session.observing_tracks.items()
+            if (
+                (seen := self._track_last_seen.get((cam, tid))) is not None
+                and (now - seen).total_seconds() <= OWNER_STALENESS_SECONDS
+            )
+        ]
+        if not live:
+            # Nobody live right now — keep the last known owner if it is still
+            # an observer, otherwise clear it.
+            if session.owner_camera not in session.observing_tracks:
+                session.owner_camera = None
+            return session.owner_camera
+
+        if len(live) == 1:
+            session.owner_camera = live[0]
+            return session.owner_camera
+
+        def _score(cam: str) -> float:
+            return session.observing_scores.get(cam, 0.0)
+
+        best = max(live, key=_score)
+        current = session.owner_camera
+        if current in live and current != best:
+            # Incumbent keeps ownership unless the challenger clears the margin.
+            if _score(best) < _score(current) + OWNER_SWITCH_MARGIN:
+                best = current
+        session.owner_camera = best
+        return best
+
     def get_plate_for_track(
         self,
         camera_id: str,
         track_id: int,
     ) -> Optional[str]:
-        """Resolve plate through confirmed session mapping."""
+        """Resolve plate through confirmed session mapping.
+
+        Single-camera ownership: the plate is only returned to the owning
+        camera, so plate-driven data (slot linking, presence, alerts) is
+        attributed to one camera even when several see the car.
+        """
         with self._lock:
             session_id = self._track_session_map.get((camera_id, track_id))
             if session_id is None:
                 return None
             session = self._sessions.get(session_id)
-            return session.plate if session else None
+            if session is None:
+                return None
+            owner = self._resolve_owner_camera(session, self._clock())
+            if owner is not None and owner != camera_id:
+                return None
+            return session.plate
 
     def get_session_id_for_track(
         self,
@@ -820,12 +901,20 @@ class VehicleRegistryIdentityMixin:
     ) -> str:
         """
         Returns a stable, human-readable ID for a track.
+
+        Single-camera ownership: when several cameras observe the same car at
+        once, only the owning camera (highest ReID score among live observers)
+        gets the identity label; the others receive the ``"0"`` fallback so the
+        box is still drawn without the duplicated plate.
         """
         with self._lock:
             session_id = self._track_session_map.get((camera_id, track_id))
             if session_id:
                 session = self._sessions.get(session_id)
                 if session:
+                    owner = self._resolve_owner_camera(session, self._clock())
+                    if owner is not None and owner != camera_id:
+                        return "0"
                     return session.display_id
         return "0"
 
@@ -860,6 +949,9 @@ class VehicleRegistryIdentityMixin:
             )
             self._track_session_map[(camera_id, track_id)] = session.session_id
             session.observing_tracks[camera_id] = track_id
+            # The originating camera is the sole, definitive observer at birth.
+            session.observing_scores[camera_id] = OWNER_DEFINITIVE_SCORE
+            session.owner_camera = camera_id
             self._mark_track_seen(camera_id, track_id, now)
             # Phase 3 / T3.2 — appearance-only sessions are also "confirmed"
             # status so the gallery indexer upserts them too.
@@ -1010,6 +1102,10 @@ class VehicleRegistryIdentityMixin:
             with self._lock:
                 final_session = self._sessions.get(best_sid)
                 if final_session and final_session.status in ("confirmed", "parked"):
+                    # Record the matching score so single-camera ownership can
+                    # pick the highest-confidence observer for this session.
+                    if camera_id is not None:
+                        final_session.observing_scores[camera_id] = best_score
                     logger.info(
                         "[GLOBAL] cam=%s matched session %s (score=%.3f)",
                         camera_id,
@@ -1221,6 +1317,9 @@ class VehicleRegistryIdentityMixin:
             )
             self._track_session_map[(camera_id, track_id)] = best_sid
             target_session.observing_tracks[camera_id] = track_id
+            # Keep this camera's ownership score fresh as the car moves between
+            # views, so the highest-confidence observer stays the owner.
+            target_session.observing_scores[camera_id] = best_score
             self._mark_track_seen(camera_id, track_id)
 
             orphan_sid = current_sid
@@ -1462,7 +1561,9 @@ class VehicleRegistryIdentityMixin:
                     self._track_session_map.pop((obs_cam, obs_tid), None)
                     self._track_last_seen.pop((obs_cam, obs_tid), None)
                 session.observing_tracks.clear()
-                
+                session.observing_scores.clear()
+                session.owner_camera = None
+
                 # Legacy cleanup
                 if session.last_seen_camera and session.last_seen_track_id is not None:
                     self._track_session_map.pop(
