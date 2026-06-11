@@ -290,6 +290,11 @@ class VehicleRegistryCoreMixin:
                     session = self._sessions.get(session_id)
                     if session and key[0] in session.observing_tracks:
                         del session.observing_tracks[key[0]]
+                        # Keep ownership maps in sync: a camera that no longer
+                        # observes the car cannot keep its score or ownership.
+                        session.observing_scores.pop(key[0], None)
+                        if session.owner_camera == key[0]:
+                            session.owner_camera = None
 
             active_orders = []
             for event_id in self._pending_event_order:
