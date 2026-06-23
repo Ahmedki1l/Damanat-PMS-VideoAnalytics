@@ -209,10 +209,11 @@ matching:
   use_lab_clahe: true          # Luminance normalisation under varied garage lighting
   use_multishot: true          # Average features across 3 sharpest frames per confirmation
 
-  # ReID OpenVINO backend (production, 256x128 input, CARLA-pretrained INT8)
+  # ReID OpenVINO backend (production, 256x128 input, facility-finetuned INT8,
+  # squash-trained — consistent train/calibration/inference preprocessing)
   use_openvino_reid: true
   reid_input_size: [256, 128]
-  reid_openvino_model_dir: "models/osnet_facility_carla_int8_256x128"
+  reid_openvino_model_dir: "models/PS_carMatching"
 
   # Plugin model paths — empty string disables the plugin (NoopXxx fallback)
   color_classifier_model: "models/color_classifier_openvino/model.xml"
