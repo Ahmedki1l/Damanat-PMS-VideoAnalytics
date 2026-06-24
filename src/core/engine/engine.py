@@ -79,6 +79,10 @@ class ParkingEngine(
 
         self._frame_count = 0
         self._start_time = 0.0
+        # Window markers for the periodic effective-FPS readout: frame count
+        # and timestamp captured at the previous summary.
+        self._last_summary_frame = 0
+        self._last_summary_ts = 0.0
         self._reid_check_timer: Dict[tuple, float] = {}
         self._tracking_managers: Dict[str, object] = {}
         self._display_label_cache: Dict[tuple, Dict[str, object]] = {}
@@ -168,6 +172,8 @@ class ParkingEngine(
         self.is_running = True
         self.start_time = time.time()
         self._start_time = self.start_time
+        self._last_summary_frame = 0
+        self._last_summary_ts = self.start_time
 
         summary_interval = max(1, len(camera_configs) * 10)
 
