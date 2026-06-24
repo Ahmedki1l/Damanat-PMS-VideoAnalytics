@@ -53,6 +53,18 @@ class ParkingEngineVisualizationMixin:
                 all_statuses.append(status)
         self.event_bus.emit_status_summary(all_statuses)
 
+        # Effective throughput — actual processed frames/sec per camera versus
+        # the configured target_fps_per_camera cap. Lets you tell at a glance
+        # whether the cap is being met or the run is hardware-bound.
+        uptime = max(1e-6, time.time() - self.start_time)
+        n_cams = max(1, len(self.pipelines))
+        eff_per_cam = self._frame_count / uptime / n_cams
+        target = getattr(self.config.processing, "target_fps_per_camera", 0)
+        print(
+            f"[INFO] effective FPS/camera: {eff_per_cam:.1f} (target {target}) | "
+            f"uptime {int(uptime)}s | frames {self._frame_count}"
+        )
+
     def _draw_frame(self, frame, pipeline, assignment, cam_id, all_detections=None):
         """Draw slot polygons and detections on a frame."""
         if pipeline.roi_polygon is not None:
