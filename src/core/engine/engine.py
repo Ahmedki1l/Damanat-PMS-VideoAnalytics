@@ -170,6 +170,17 @@ class ParkingEngine(
         self._start_time = self.start_time
 
         summary_interval = max(1, len(camera_configs) * 10)
+
+        # Per-camera FPS pacing. ``target_fps_per_camera`` bounds how often any
+        # single camera is processed: each camera is handled at most once per
+        # ``min_interval`` seconds. A value <= 0 disables pacing (process as
+        # fast as the CPU allows, the historical behaviour).
+        target_fps = self.config.processing.target_fps_per_camera
+        min_interval = (1.0 / target_fps) if target_fps and target_fps > 0 else 0.0
+        last_processed: Dict[str, float] = {}
+        camera_ids = [c.id for c in camera_configs]
+        idle_cycles = 0
+
         grid_frames: Dict[str, np.ndarray] = {}
         grid_cell_width = 480
         grid_cell_height = 270
@@ -183,6 +194,20 @@ class ParkingEngine(
                     print("[WARN] All cameras unavailable. Retrying in 5s...")
                     time.sleep(5)
                     continue
+
+                # Throttle to the configured per-camera FPS. Cameras still due
+                # are processed immediately; if a full round passes with none
+                # due we nap briefly so the loop doesn't busy-spin at 100% CPU.
+                if min_interval > 0.0:
+                    now = time.time()
+                    if now - last_processed.get(cam_id, 0.0) < min_interval:
+                        idle_cycles += 1
+                        if idle_cycles >= len(camera_ids):
+                            time.sleep(min(min_interval, 0.01))
+                            idle_cycles = 0
+                        continue
+                    last_processed[cam_id] = now
+                    idle_cycles = 0
 
                 self._cleanup_stale_data()
                 # Periodic sweep (gated to once per ~30s) that purges
