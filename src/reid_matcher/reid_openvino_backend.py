@@ -60,6 +60,14 @@ def _load_metadata(model_dir: Path) -> dict:
             return parsed
     except ImportError:
         pass
+    except Exception as exc:
+        # A malformed metadata.yaml (e.g. an invalid escape in a quoted path)
+        # must never sink the OpenVINO backend — metadata is descriptive, not
+        # required for inference. Warn and fall through to the subset parser.
+        logger.warning(
+            "[REID/OV] Failed to parse %s (%r); using subset parser.",
+            meta_path, exc,
+        )
     # Fallback: tiny YAML-subset parser for the known schema.
     try:
         with meta_path.open("r", encoding="utf-8") as fh:

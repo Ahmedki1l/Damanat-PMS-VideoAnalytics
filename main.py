@@ -188,6 +188,20 @@ Examples:
         print(f"[HINT] Run 'python setup_model.py' first to download the model.")
         sys.exit(1)
 
+    # --- Prime the ReID matcher singleton with the runtime config ---
+    # The matcher is a process-wide singleton. If it is first constructed by a
+    # camera tracker / the registry (which call get_reid_matcher() with no
+    # args) it silently uses MatchingConfig() defaults and ignores config.yaml
+    # — falling back to the slow torchreid ImageNet path. Build it here, once,
+    # with the loaded matching config so the OpenVINO IR (e.g. PS_carMatching)
+    # is actually used.
+    from src.reid_matcher import get_reid_matcher
+    matcher = get_reid_matcher(config.preprocessing.reid, config.matching)
+    print(
+        f"[INFO] ReID matcher backend: {matcher.backend} "
+        f"(model_dir='{config.matching.reid_openvino_model_dir}')"
+    )
+
     # --- Initialize vehicle registry (shared between engine and API) ---
     registry = None
     if args.api:
