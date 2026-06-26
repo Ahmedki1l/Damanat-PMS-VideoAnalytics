@@ -300,16 +300,23 @@ class SlotDrawer:
 
         if self.mode in (self.MODE_DRAW, self.MODE_BOUNDARY):
             # In-progress polygon preview. Magenta for boundaries, red for slots.
+            # Markers are scaled to the frame size so they stay visible even when
+            # the window downscales a high-res (1080p/1440p) frame.
             pt_color = (255, 0, 255) if self.mode == self.MODE_BOUNDARY else (0, 0, 255)
+            scale = max(1.0, self.display.shape[1] / 1280.0)
+            radius = int(round(6 * scale))
+            line_w = max(2, int(round(2 * scale)))
             for i, pt in enumerate(self.current_points):
-                cv2.circle(self.display, tuple(pt), 5, pt_color, -1)
+                # White outline ring + filled dot so the point reads on any background.
+                cv2.circle(self.display, tuple(pt), radius + 2, (255, 255, 255), -1)
+                cv2.circle(self.display, tuple(pt), radius, pt_color, -1)
                 if i > 0:
                     cv2.line(
                         self.display,
                         tuple(self.current_points[i - 1]),
                         tuple(pt),
                         pt_color,
-                        2,
+                        line_w,
                     )
             if len(self.current_points) >= 2:
                 cv2.line(
@@ -317,7 +324,7 @@ class SlotDrawer:
                     tuple(self.current_points[-1]),
                     tuple(self.current_points[0]),
                     pt_color,
-                    1,
+                    max(1, line_w // 2),
                 )
 
         h = self.display.shape[0]
