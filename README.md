@@ -185,6 +185,166 @@ state_machine:
 
 ---
 
+## Zoning (Parking Areas)
+
+Zoning subdivides a floor into **areas** (aisles + ramps) so the ReID matcher
+only searches cars that can physically be where the query is — cheaper *and*
+more accurate. Zoning applies to **B1/B2 only**; Ground floor stays un-zoned.
+
+### The model — three nested levels
+
+```
+floor  (B1)                         ← physical level
+  └─ area  (B1-D, B1-E, B1-F, B1-RAMP)   ← a camera group within the floor
+       └─ cameras  (CAM-03 … CAM-08)      ← each camera belongs to ONE area
+            └─ slots / boundaries          ← drawn per camera
+```
+
+- **area** — a camera group within a floor (e.g. North/Center/South aisle, plus
+  the ramp as its own area). A car has exactly one `current_area` at a time.
+- **camera → area** — every B1/B2 camera is assigned **one** `area`. Its slots
+  inherit that area automatically (you never tag a slot with an area).
+- **boundary** — a polygon across a lane where two areas meet (e.g. a ramp
+  throat). It connects exactly two areas (`area_from → area_to`). Crossing it
+  moves a car between areas. Most cameras need **no** boundary — only the ones
+  that physically see a transition (ramps).
+
+Where data lives at runtime: areas → **`parking_areas`** table, boundaries →
+**`boundaries`** table, slots → **`parking_slots`** table. `config.yaml` is the
+**seed**: on the first run an empty `parking_areas` table is populated from it;
+after that the **database is the source of truth** (edit it with the tool below).
+
+### Setting up zones from zero — step by step
+
+**1. Sketch the areas.** Decide how each floor splits into aisles + ramp(s) and
+which cameras cover each. (One area can have several cameras; a camera belongs
+to one area.)
+
+**2. Define the areas** in `config.yaml` under a top-level `areas:` block:
+
+```yaml
+areas:
+  - area_id: "B1-E"            # unique id; referenced by cameras + adjacency
+    name: "B1 Center Aisle"
+    floor: B1
+    capacity: 30               # physical car limit (soft cap on the gallery)
+    adjacency: { "B1-F": 15, "B1-D": 15 }   # {neighbor: transit_seconds}
+  - area_id: "B1-RAMP"
+    name: "B1 Ramp (Down from B2)"
+    floor: B1
+    capacity: 6
+    adjacency: { "B2-RAMP": 30, "B1-F": 20 }   # the cross-floor link
+  # … one entry per aisle + ramp on B1 and B2
+```
+
+- **`adjacency`** is the topology graph: list each *directly reachable*
+  neighbour and the expected travel time in seconds. It gates the cross-area
+  handoff (a car entering an area is only matched against cars that just left an
+  adjacent area within its transit window). The only inter-floor edge is
+  `B2-RAMP ↔ B1-RAMP`.
+- **`capacity`** bounds how many cars an area's gallery holds.
+
+**3. Assign each camera its area** in `config.yaml` (one line per B1/B2 camera;
+Ground cameras get no `area`):
+
+```yaml
+cameras:
+  - id: "CAM-05"
+    name: "B1 Parking — Camera 05"
+    floor: B1
+    area: "B1-E"          # ← the only zoning field on a camera
+    ip: "10.1.13.64"
+    # …
+```
+
+**4. First run seeds the database.** Start the engine once; an empty
+`parking_areas` table is seeded from the `areas:` block, then becomes
+authoritative:
+
+```bash
+python main.py --config config.yaml
+```
+
+**5. Draw slots** per camera as usual (`python draw_slots.py --camera CAM-05`).
+Slots need no area tag — they inherit the camera's area.
+
+**6. Draw boundaries** only where two areas physically meet (the ramps). In
+`draw_slots.py` press **`b`** to enter BOUNDARY mode, click a thin band across
+the lane (perpendicular to traffic), right-click to finish, then answer the
+prompts:
+
+```
+Enter boundary name (default: boundary_1): ramp_C_to_RAMP
+Boundary FROM area (area_from): B2-C
+Boundary TO area   (area_to):   B2-RAMP
+```
+
+Boundaries render magenta and save to the `boundaries` table. A junction where
+3+ areas meet = draw one band per crossable pair.
+
+`area_from` / `area_to` are **validated** against your configured areas (read
+from the `parking_areas` table): a typo re-prompts with the list of valid area
+ids, a blank entry cancels the boundary, and `area_from == area_to` is rejected.
+
+A single boundary is **bidirectional** — the stored `area_from → area_to` is the
+nominal direction, but a car crossing the *other* way is detected automatically
+from its current area (e.g. a ramp used both down and up). So you draw **one**
+band per gate, not two.
+
+**7. Verify** the wiring:
+
+```bash
+python -c "from src.config import load_config; c=load_config('config.yaml'); \
+print('areas:', [a.area_id for a in c.areas]); \
+print('CAM-05 ->', c.area_for_camera('CAM-05')); \
+print('B1-E adj:', c.adjacency_for('B1-E'))"
+```
+
+### Editing the database after the first seed
+
+Because the DB (not YAML) is authoritative after the first run, edit areas with
+the management tool — see [`tools/manage_areas.py`](#manage_areaspy--areaboundary-db-editor)
+below (list / push from YAML / set a field / delete / re-seed).
+
+### Entry ReID — line-crossing image (CAM-03)
+
+A car enters via the ground ramp; the **ANPR server** sends the plate to
+`POST /api/anpr/event`, then an **external line-crossing detector** sends the
+B1-entrance frame from **CAM-03** to `POST /api/line-crossing`. The engine
+**detects and crops the entering car** from that frame (it also contains parked
+cars), seeds the Park_Entry ReID candidate, and binds it to the pending plate —
+which confirms the car at the B1 entrance, placing it `IN_AREA(B1-A)`.
+
+Send the **full CAM-03 frame** (not a pre-cropped car) as JSON, like the ANPR
+image:
+
+```json
+POST /api/line-crossing
+{
+  "image_base64": "<base64 JPEG of the full CAM-03 frame, no data: prefix>",
+  "camera_id": "CAM-03",     // optional, defaults to CAM-03
+  "plate": "4976RZD",        // optional, the ANPR plate it follows (correlation)
+  "timestamp": "2026-05-17T08:32:29"   // optional ISO, defaults to now
+}
+```
+
+Response: `{ "status": "ok", "plate": ..., "cropped": <bool>, "bound": <bool>, "timestamp": ... }`
+— `cropped` = a vehicle was detected & cropped; `bound` = tied to a pending ANPR
+entry. The vehicle crop is done server-side (largest vehicle in the frame), so
+the sender never needs to crop.
+
+### Notes
+
+- **Ground floor** (CAM-01/CAM-02) has no areas and is unaffected.
+- **Ramps are their own area** — a car is "in" the ramp while on it; the ramp
+  areas are the only link between floors.
+- **Un-zoned fallback:** remove the `areas:` block (and camera `area` fields) and
+  the system runs exactly as before (all-sessions matching).
+- **Camera → area lives in `config.yaml`** for now; reading it from the Gateway
+  cameras table is a planned follow-up.
+
+---
+
 ## Tools & Utilities
 
 ### `draw_slots.py` — Slot Polygon Drawing Tool
@@ -202,11 +362,34 @@ python draw_slots.py --image snapshot.jpg  # From saved image
 | Key | Mode | Description |
 |-----|------|-------------|
 | *(default)* | **DRAW** | Left-click adds polygon corners, right-click finishes and prompts for a custom slot name |
+| `b` | **BOUNDARY** | Draw an area-to-area crossing band (magenta); on finish, prompts for `area_from` / `area_to`. See [Zoning](#zoning-parking-areas). |
 | `e` | **EDIT** | Drag existing polygon vertices to reposition |
 | `r` | **REMOVE** | Click inside a slot polygon to delete it |
 | `n` | **RENAME** | Click inside a slot, then type a new name in the terminal |
 
 Other keys: `u` = undo last point, `d` = delete last slot, `s` = save & quit, `q` = quit without saving.
+
+Slots save to the `parking_slots` table; boundaries save to the `boundaries` table.
+
+### `manage_areas.py` — Area/Boundary DB Editor
+
+Edits the zoning tables (`parking_areas`, `boundaries`) in the live database.
+`config.yaml` only **seeds** `parking_areas` on the first run — after that the
+database is authoritative, so use this tool to change areas.
+
+```bash
+python tools/manage_areas.py list             # Show areas in the DB (+ camera counts)
+python tools/manage_areas.py boundaries        # Show boundaries in the DB
+python tools/manage_areas.py push              # Apply config.yaml's areas: block to the DB (upsert)
+python tools/manage_areas.py set --id B1-E --capacity 28              # Update one field
+python tools/manage_areas.py set --id B1-E --name "B1 Center" \
+    --floor B1 --capacity 30 --adjacency "B1-F:15,B1-D:15"            # Add/replace an area
+python tools/manage_areas.py delete --id B1-E                        # Remove an area
+python tools/manage_areas.py delete-boundary --id ramp_C_to_RAMP      # Remove a boundary
+python tools/manage_areas.py reseed --yes                            # Wipe + re-seed from config.yaml
+```
+
+Typical workflow after editing `config.yaml`: `python tools/manage_areas.py push`.
 
 ### `grid_view.py` — Multi-Camera Grid Display
 

@@ -8,8 +8,9 @@ stay easy to navigate while preserving the existing import path.
 import logging
 import os
 import threading
+from collections import defaultdict
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from src.config import MatchingConfig, ReIDPreprocessingConfig
 from src.matching import GalleryIndex, MatchDecision, MatchVoter
@@ -52,6 +53,7 @@ class VehicleRegistry(
         db_checker: Optional[Callable[[Optional[str]], bool]] = None,
         clock: Optional[Callable[[], datetime]] = None,
         match_decision: Optional[MatchDecision] = None,
+        area_registry=None,
     ):
         self._lock = threading.RLock()
         self._matcher_lock = threading.Lock()
@@ -68,6 +70,22 @@ class VehicleRegistry(
         self._track_last_seen: Dict[Tuple[str, int], datetime] = {}
         self._parked: Dict[str, VehicleSession] = {}
         self._history: List[VehicleSession] = []
+
+        # Zoning: area_id → {session_id} for the bounded (per-area) candidate
+        # pool. Maintained by set_session_area / _drop_session_from_area_index.
+        # ``area_registry`` (optional) resolves camera_id → area_id at runtime;
+        # None = un-zoned (legacy all-sessions behaviour everywhere).
+        self._area_registry = area_registry
+        self._area_sessions: Dict[str, Set[str]] = defaultdict(set)
+        # Cross-area handoff candidate builder — only when zoned. Lazy import
+        # keeps the zoning package out of the un-zoned import path.
+        self._handoff_matcher = None
+        if area_registry is not None:
+            from src.zoning.handoff_matcher import CrossAreaHandoffMatcher
+
+            self._handoff_matcher = CrossAreaHandoffMatcher(
+                area_registry, clock=clock or datetime.now
+            )
 
         self._matcher = None
         self._reid_matcher = None
@@ -156,6 +174,39 @@ class VehicleRegistry(
         consults the index when the feature flag is True.
         """
         return self._gallery_index
+
+    # --- Zoning: per-area session index -------------------------------- #
+    def set_session_area(self, session: VehicleSession, area_id: str) -> None:
+        """Assign a session to an area and keep the ``_area_sessions`` index in
+        sync. No-op when the area is unchanged. Empty ``area_id`` leaves the
+        session un-zoned (removed from any area bucket)."""
+        old = session.current_area
+        if old == (area_id or ""):
+            return
+        with self._lock:
+            if old:
+                self._area_sessions.get(old, set()).discard(session.session_id)
+            session.current_area = area_id or ""
+            if area_id:
+                self._area_sessions[area_id].add(session.session_id)
+                if session.area_entered_at is None:
+                    session.area_entered_at = self._clock()
+
+    def _drop_session_from_area_index(self, session: VehicleSession) -> None:
+        """Remove a session from its area bucket (called on exit/archival)."""
+        if session.current_area:
+            self._area_sessions.get(session.current_area, set()).discard(
+                session.session_id
+            )
+
+    def sessions_in_area(self, area_id: str) -> List[VehicleSession]:
+        """Live confirmed/parked sessions currently in an area (O(bucket))."""
+        with self._lock:
+            return [
+                self._sessions[sid]
+                for sid in self._area_sessions.get(area_id, set())
+                if sid in self._sessions
+            ]
 
     # ------------------------------------------------------------------ #
     # Gallery-index sync (Phase 3 / T3.2)

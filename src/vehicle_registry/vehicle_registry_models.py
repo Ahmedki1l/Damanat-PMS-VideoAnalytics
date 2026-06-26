@@ -108,6 +108,18 @@ class VehicleSession:
     # The camera currently designated as the sole owner of this car's identity.
     owner_camera: Optional[str] = None
 
+    # --- Zoning / area state machine (foundation; inert until set by the
+    # area state machine + bounded matcher). ``current_area`` is the area the
+    # car is currently in (derived from its owner camera's area). ``area_state``
+    # progresses IN_AREA → DEPARTING → IN_TRANSIT → ARRIVING → IN_AREA.
+    # ``area_entered_at`` stamps the last area entry (transit-time gating).
+    # ``departed_from_area`` records the area a DEPARTING/IN_TRANSIT car left,
+    # read by the cross-area handoff matcher. Empty/default = un-zoned. ---
+    current_area: str = ""
+    area_state: str = "IN_AREA"
+    area_entered_at: Optional[datetime] = None
+    departed_from_area: str = ""
+
     new_pipeline_score: float = 0.0
     old_pipeline_score: float = 0.0
 

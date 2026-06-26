@@ -521,11 +521,12 @@ class ParkingEngineRuntimeMixin:
         parking_slots = []
         special_zones = []
         roi_polygon = None
+        boundaries = []
         self._bootstrap_camera_slots_if_needed(camera_config)
         if self.db_manager:
             session = self.db_manager.SessionLocal()
             try:
-                parking_slots, special_zones, roi_polygon = load_camera_slots(
+                parking_slots, special_zones, roi_polygon, boundaries = load_camera_slots(
                     session,
                     camera_id=camera_config.id,
                     ref_resolution=ref_res,
@@ -541,6 +542,18 @@ class ParkingEngineRuntimeMixin:
             print(
                 f"[INFO] {camera_config.id} has {len(special_zones)} special zone(s): "
                 f"{[zone.id for zone in special_zones]}"
+            )
+
+        # Zoning: store per-camera boundary polygons (area-to-area crossings).
+        # Consumed by the BoundaryCrossingDetector when zoning is active; with
+        # no boundaries authored this is simply empty (no behaviour change).
+        if not hasattr(self, "boundaries"):
+            self.boundaries = {}
+        self.boundaries[camera_config.id] = {b.id: b for b in boundaries}
+        if boundaries:
+            print(
+                f"[INFO] {camera_config.id} has {len(boundaries)} boundary zone(s): "
+                f"{[(b.id, b.area_from, b.area_to) for b in boundaries]}"
             )
 
         violation_slots, initial_statuses = self._load_camera_db_state(

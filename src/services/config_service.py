@@ -1,7 +1,8 @@
 from sqlalchemy.orm import Session
 from src.model.config_run import Config, PreprocessingConfig
+from src.model.parking_area import ParkingArea
 from src.schemas import ScopeEnum
-from src.config import AppConfig
+from src.config import AppConfig, AreaEntry
 
 def ensure_config_initialized(db: Session, app_config: AppConfig):
     """
@@ -133,4 +134,61 @@ def sync_app_config_from_db(db: Session, app_config: AppConfig):
             app_config.preprocessing.reid.grid_size = (pp.grid_w, pp.grid_h)
 
     print("[DB] Runtime configuration successfully linked.")
+    return app_config
+
+
+def ensure_areas_initialized(db: Session, app_config: AppConfig):
+    """
+    Seed the ``parking_areas`` table from config.yaml when it is empty.
+
+    Mirrors :func:`ensure_config_initialized`. Areas are zoning metadata
+    (B1/B2 only); when config.yaml defines no areas this is a no-op and the
+    deployment runs un-zoned.
+    """
+    if db.query(ParkingArea).first():
+        return  # already populated — DB is authoritative
+    if not app_config.areas:
+        return  # un-zoned deployment, nothing to seed
+
+    print(f"[DB] Seeding {len(app_config.areas)} parking area(s) from YAML...")
+    for area in app_config.areas:
+        db.add(
+            ParkingArea(
+                area_id=area.area_id,
+                name=area.name,
+                floor=area.floor,
+                capacity=area.capacity,
+                adjacency_json=dict(area.adjacency),
+                is_active=True,
+            )
+        )
+    db.commit()
+    print("[DB] Parking areas seeded successfully.")
+
+
+def sync_areas_from_db(db: Session, app_config: AppConfig):
+    """
+    Load parking areas from the database into ``app_config.areas``.
+
+    The DB is the runtime source of truth (mirrors
+    :func:`sync_app_config_from_db`). When the table is empty the existing
+    YAML-loaded areas are kept untouched.
+    """
+    rows = db.query(ParkingArea).filter(ParkingArea.is_active == True).all()  # noqa: E712
+    if not rows:
+        return app_config
+
+    app_config.areas = [
+        AreaEntry(
+            area_id=row.area_id,
+            name=row.name or "",
+            floor=row.floor or "",
+            capacity=int(row.capacity or 0),
+            adjacency={
+                str(k): float(v) for k, v in (row.adjacency_json or {}).items()
+            },
+        )
+        for row in rows
+    ]
+    print(f"[DB] Linked {len(app_config.areas)} parking area(s) from database.")
     return app_config

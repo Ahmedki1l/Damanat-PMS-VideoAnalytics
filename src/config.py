@@ -7,9 +7,26 @@ Supports both single-camera (legacy) and multi-camera configurations.
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import yaml
+
+
+@dataclass
+class AreaEntry:
+    """
+    A parking *area* — a camera group within a floor (zoning).
+
+    Zoning applies to B1/B2 only. ``adjacency`` maps a neighbouring area_id to
+    the expected transit time (seconds) for a car to travel between the two
+    areas; it gates the cross-area handoff matcher. ``capacity`` is the physical
+    car/plate limit for the area (used as a soft cap on the bounded gallery).
+    """
+    area_id: str = ""
+    name: str = ""
+    floor: str = ""
+    capacity: int = 0
+    adjacency: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -18,6 +35,9 @@ class CameraEntry:
     id: str = ""
     name: str = ""
     floor: str = ""
+    # Parking area this camera covers (zoning). Empty = un-zoned (e.g. Ground
+    # floor gate cameras), which preserves the legacy all-sessions behaviour.
+    area: str = ""
     ip: str = ""
     user: str = ""
     password: str = ""
@@ -238,6 +258,9 @@ class AlertsConfig:
 class AppConfig:
     """Root configuration container."""
     cameras: List[CameraEntry] = field(default_factory=list)
+    # Parking areas (zoning). Empty on un-zoned deployments — every helper and
+    # the bounded matcher degrade to the legacy all-sessions behaviour then.
+    areas: List[AreaEntry] = field(default_factory=list)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
@@ -258,6 +281,32 @@ class AppConfig:
     def is_multi_camera(self) -> bool:
         """True if config has multiple cameras defined."""
         return len(self.cameras) > 0
+
+    # --- Zoning helpers -------------------------------------------------
+    def area_for_camera(self, camera_id: str) -> str:
+        """Return the area_id a camera belongs to, or "" if un-zoned."""
+        for cam in self.cameras:
+            if cam.id == camera_id:
+                return cam.area
+        return ""
+
+    def cameras_in_area(self, area_id: str) -> List[str]:
+        """Return the camera ids assigned to an area."""
+        if not area_id:
+            return []
+        return [cam.id for cam in self.cameras if cam.area == area_id]
+
+    def area_by_id(self, area_id: str) -> Optional[AreaEntry]:
+        """Return the AreaEntry for an area_id, or None if undefined."""
+        for area in self.areas:
+            if area.area_id == area_id:
+                return area
+        return None
+
+    def adjacency_for(self, area_id: str) -> Dict[str, float]:
+        """Return {neighbor_area_id: transit_seconds} for an area (empty if none)."""
+        area = self.area_by_id(area_id)
+        return dict(area.adjacency) if area else {}
 
 
 def load_config(config_path: str = "config.yaml") -> AppConfig:
@@ -292,12 +341,28 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
                 id=cam_raw.get("id", ""),
                 name=cam_raw.get("name", ""),
                 floor=cam_raw.get("floor", ""),
+                area=cam_raw.get("area", ""),
                 ip=cam_raw.get("ip", ""),
                 user=cam_raw.get("user", ""),
                 password=cam_raw.get("password", ""),
                 slots_file=cam_raw.get("slots_file", ""),
             )
             config.cameras.append(cam)
+
+    # --- Areas (zoning; optional — absent on un-zoned deployments) ---
+    if "areas" in raw:
+        for area_raw in raw["areas"] or []:
+            adj_raw = area_raw.get("adjacency", {}) or {}
+            # adjacency: {neighbor_area_id: transit_seconds}
+            adjacency = {str(k): float(v) for k, v in adj_raw.items()}
+            area = AreaEntry(
+                area_id=area_raw.get("area_id", area_raw.get("id", "")),
+                name=area_raw.get("name", ""),
+                floor=area_raw.get("floor", ""),
+                capacity=int(area_raw.get("capacity", 0) or 0),
+                adjacency=adjacency,
+            )
+            config.areas.append(area)
 
     # --- Processing ---
     if "processing" in raw:

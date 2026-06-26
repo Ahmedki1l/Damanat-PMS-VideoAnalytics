@@ -18,11 +18,15 @@ database:
 # Ground-floor cameras (CAM-01, CAM-02) are still listed even though they
 # do not participate in slot detection — they are the outdoor ANPR-bound
 # cameras that feed the entrance flow.
+#
+# `area:` (zoning, B1/B2 only) assigns a camera to one parking area defined in
+# the `areas:` block below. Ground-floor cameras omit `area` (un-zoned). A
+# camera's slots inherit its area automatically — you set it once per camera.
 
 cameras:
   - id: "CAM-01"
     name: "Ground Floor — Camera 1"
-    floor: Ground Floor
+    floor: Ground
     ip: "10.1.13.60"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -30,7 +34,7 @@ cameras:
 
   - id: "CAM-02"
     name: "Ground Floor — Camera 2"
-    floor: Ground Floor
+    floor: Ground
     ip: "10.1.13.61"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -40,6 +44,7 @@ cameras:
   - id: "CAM-03"
     name: "B1 Parking — Camera 03"
     floor: B1
+    area: "B1-A"
     ip: "10.1.13.62"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -48,6 +53,7 @@ cameras:
   - id: "CAM-04"
     name: "B1 Parking — Camera 04"
     floor: B1
+    area: "B1-A"
     ip: "10.1.13.63"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -56,6 +62,7 @@ cameras:
   - id: "CAM-05"
     name: "B1 Parking — Camera 05"
     floor: B1
+    area: "B1-B"
     ip: "10.1.13.64"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -64,6 +71,7 @@ cameras:
   - id: "CAM-06"
     name: "B1 Parking — Camera 06"
     floor: B1
+    area: "B1-B"
     ip: "10.1.13.65"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -72,6 +80,7 @@ cameras:
   - id: "CAM-07"
     name: "B1 Parking — Camera 07"
     floor: B1
+    area: "B1-C"
     ip: "10.1.13.66"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -80,6 +89,7 @@ cameras:
   - id: "CAM-08"
     name: "B1 Parking — Camera 08"
     floor: B1
+    area: "B1-C"
     ip: "10.1.13.67"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -89,6 +99,7 @@ cameras:
   - id: "CAM-09"
     name: "B2 Parking — Camera 09"
     floor: B2
+    area: "B2-A"
     ip: "10.1.13.68"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -97,6 +108,7 @@ cameras:
   - id: "CAM-10"
     name: "B2 Parking — Camera 10"
     floor: B2
+    area: "B2-A"
     ip: "10.1.13.69"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -105,6 +117,7 @@ cameras:
   - id: "CAM-11"
     name: "B2 Parking — Camera 11"
     floor: B2
+    area: "B2-B"
     ip: "10.1.13.70"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -113,6 +126,7 @@ cameras:
   - id: "CAM-12"
     name: "B2 Parking — Camera 12"
     floor: B2
+    area: "B2-B"
     ip: "10.1.13.71"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -121,6 +135,7 @@ cameras:
   - id: "CAM-13"
     name: "B2 Parking — Camera 13"
     floor: B2
+    area: "B2-C"
     ip: "10.1.13.72"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
@@ -129,10 +144,61 @@ cameras:
   - id: "CAM-14"
     name: "B2 Parking — Camera 14"
     floor: B2
+    area: "B2-C"
     ip: "10.1.13.73"
     user: "YOUR_USER"
     password: "YOUR_PASSWORD"
     slots_file: "slots/b2_cam14.json"
+
+# --- Parking Areas (zoning — B1/B2 only) ---------------------------------
+# An area = a camera group within a floor (aisles + ramps). Cameras reference
+# these via their `area:` field. `adjacency` = {neighbor_area_id: transit_secs}
+# (gates the cross-area handoff matcher). `capacity` = physical car limit (soft
+# cap on the bounded gallery). Ground floor has NO areas. Ramp areas may have
+# no cameras yet. Remove this whole block to run un-zoned (legacy behaviour).
+areas:
+  # ── B2 floor ──
+  - area_id: "B2-A"
+    name: "B2 North Aisle"
+    floor: B2
+    capacity: 30
+    adjacency: { "B2-B": 15 }
+  - area_id: "B2-B"
+    name: "B2 Center Aisle"
+    floor: B2
+    capacity: 30
+    adjacency: { "B2-A": 15, "B2-C": 15 }
+  - area_id: "B2-C"
+    name: "B2 South Aisle"
+    floor: B2
+    capacity: 30
+    adjacency: { "B2-B": 15, "B2-RAMP": 20 }
+  - area_id: "B2-RAMP"
+    name: "B2 Ramp (Up to B1)"
+    floor: B2
+    capacity: 6
+    adjacency: { "B2-C": 20, "B1-RAMP": 30 }   # cross-floor link
+  # ── B1 floor ──
+  - area_id: "B1-A"
+    name: "B1 North Aisle"
+    floor: B1
+    capacity: 30
+    adjacency: { "B1-B": 15 }
+  - area_id: "B1-B"
+    name: "B1 Center Aisle"
+    floor: B1
+    capacity: 30
+    adjacency: { "B1-A": 15, "B1-C": 15 }
+  - area_id: "B1-C"
+    name: "B1 South Aisle"
+    floor: B1
+    capacity: 30
+    adjacency: { "B1-B": 15, "B1-RAMP": 20 }
+  - area_id: "B1-RAMP"
+    name: "B1 Ramp (down to B2)"
+    floor: B1
+    capacity: 6
+    adjacency: { "B1-C": 20, "B2-RAMP": 30 }   # cross-floor link (B1 -> B2)
 
 # --- Processing Settings ---
 processing:

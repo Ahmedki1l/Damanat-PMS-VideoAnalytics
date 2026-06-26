@@ -15,6 +15,7 @@ from src.schemas import ParkingSlotUpdate
 SLOT_TYPE_PARKING = "parking"
 SLOT_TYPE_SPECIAL_ZONE = "special_zone"
 SLOT_TYPE_ROI = "roi"
+SLOT_TYPE_BOUNDARY = "boundary"  # zoning: area-to-area crossing polygon
 
 
 def get_slot_or_404(db: Session, slot_id: str):
@@ -32,6 +33,30 @@ def classify_slot_type(slot_id: str) -> str:
     if "Park_Entry" in normalized or "Entrence" in normalized:
         return SLOT_TYPE_SPECIAL_ZONE
     return SLOT_TYPE_PARKING
+
+
+def _entry_slot_type(entry) -> str:
+    """Resolve a slot entry's type, honouring an explicit ``type`` field
+    (set by the boundary drawing mode) before falling back to id-based
+    classification."""
+    explicit = None
+    if hasattr(entry, "get"):
+        explicit = entry.get("type")
+    if explicit == SLOT_TYPE_BOUNDARY:
+        return SLOT_TYPE_BOUNDARY
+    return classify_slot_type(_entry_slot_id(entry))
+
+
+def _entry_area_from(entry) -> Optional[str]:
+    if hasattr(entry, "get"):
+        return entry.get("area_from") or None
+    return getattr(entry, "area_from", None) or None
+
+
+def _entry_area_to(entry) -> Optional[str]:
+    if hasattr(entry, "get"):
+        return entry.get("area_to") or None
+    return getattr(entry, "area_to", None) or None
 
 
 def _normalize_polygon_points(points: Iterable[Iterable[float]]) -> list[list[float]]:
@@ -136,7 +161,97 @@ def load_camera_slots(
         else:
             parking_slots.append(runtime_slot)
 
-    return parking_slots, special_zones, roi_polygon
+    # Boundaries live in their own table (zoning), not in parking_slots.
+    boundaries = load_camera_boundaries(
+        db, camera_id, ref_resolution=ref_resolution, actual_resolution=actual_resolution
+    )
+
+    return parking_slots, special_zones, roi_polygon, boundaries
+
+
+def load_camera_boundaries(
+    db: Session,
+    camera_id: str,
+    ref_resolution=None,
+    actual_resolution=None,
+):
+    """Load a camera's area-to-area boundary polygons from the ``boundaries``
+    table as :class:`BoundaryZone` instances (empty list when none)."""
+    from src.model.boundary import Boundary
+    from src.zoning.boundary_detector import BoundaryZone
+
+    rows = db.query(Boundary).filter(Boundary.camera_id == camera_id).all()
+    result = []
+    for row in rows:
+        if not row.polygon or len(row.polygon) < 3:
+            continue
+        polygon = build_polygon(
+            row.polygon,
+            ref_resolution=ref_resolution,
+            actual_resolution=actual_resolution,
+        )
+        result.append(
+            BoundaryZone(
+                id=row.boundary_id,
+                polygon=polygon,
+                area_from=row.area_from or "",
+                area_to=row.area_to or "",
+            )
+        )
+    return result
+
+
+def sync_camera_boundaries(
+    db: Session,
+    camera_id: str,
+    floor: str,
+    boundary_entries: list,
+):
+    """Upsert a camera's boundary polygons into the ``boundaries`` table.
+
+    Mirrors :func:`sync_camera_slot_definitions` but for boundaries. Entries are
+    editor dicts carrying ``type="boundary"`` + ``area_from``/``area_to``;
+    non-boundary entries are ignored. Boundaries no longer present for the
+    camera are deleted."""
+    from src.model.boundary import Boundary
+
+    desired: dict[str, dict] = {}
+    for entry in boundary_entries:
+        if _entry_slot_type(entry) != SLOT_TYPE_BOUNDARY:
+            continue
+        polygon_json = _entry_polygon(entry)
+        if len(polygon_json) < 3:
+            continue
+        bid = _entry_slot_id(entry)
+        desired[bid] = {
+            "boundary_id": bid,
+            "camera_id": camera_id,
+            "floor": floor,
+            "polygon": polygon_json,
+            "area_from": _entry_area_from(entry),
+            "area_to": _entry_area_to(entry),
+        }
+
+    existing_rows = db.query(Boundary).filter(Boundary.camera_id == camera_id).all()
+    existing_by_id = {row.boundary_id: row for row in existing_rows}
+
+    for bid, payload in desired.items():
+        existing = existing_by_id.get(bid)
+        if existing:
+            existing.camera_id = payload["camera_id"]
+            existing.floor = payload["floor"]
+            existing.polygon = payload["polygon"]
+            existing.area_from = payload["area_from"]
+            existing.area_to = payload["area_to"]
+        else:
+            db.add(Boundary(**payload))
+
+    desired_ids = set(desired.keys())
+    for existing in existing_rows:
+        if existing.boundary_id not in desired_ids:
+            db.delete(existing)
+
+    db.commit()
 
 
 def sync_camera_slot_definitions(
@@ -152,7 +267,7 @@ def sync_camera_slot_definitions(
 
     for entry in slot_entries:
         slot_id = _entry_slot_id(entry)
-        slot_type = classify_slot_type(slot_id)
+        slot_type = _entry_slot_type(entry)
         if slot_type not in managed_slot_types:
             continue
 

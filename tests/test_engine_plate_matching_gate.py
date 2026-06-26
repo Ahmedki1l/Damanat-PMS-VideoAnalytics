@@ -41,7 +41,7 @@ sys.modules.setdefault(
     types.SimpleNamespace(
         sync_slots_from_config=lambda *args, **kwargs: None,
         bootstrap_camera_slots_from_json=lambda *args, **kwargs: None,
-        load_camera_slots=lambda *args, **kwargs: ([], None),
+        load_camera_slots=lambda *args, **kwargs: ([], [], None, []),
     ),
 )
 

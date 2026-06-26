@@ -48,7 +48,7 @@ def test_camera_slot_storage_loads_by_type_and_camera():
             polygon_points=[[0, 0], [100, 0], [100, 100], [0, 100]],
         )
 
-        parking_slots, special_zones, roi_polygon = load_camera_slots(
+        parking_slots, special_zones, roi_polygon, boundaries = load_camera_slots(
             session,
             camera_id="CAM_03",
             ref_resolution=(640, 360),
@@ -89,7 +89,7 @@ def test_bootstrap_from_legacy_json_imports_all_definition_types():
             default_zone_id="CAM_03",
             default_zone_name="CAM_03",
         )
-        parking_slots, special_zones, roi_polygon = load_camera_slots(session, "CAM_03")
+        parking_slots, special_zones, roi_polygon, boundaries = load_camera_slots(session, "CAM_03")
 
         assert migrated is True
         assert len(parking_slots) == 1

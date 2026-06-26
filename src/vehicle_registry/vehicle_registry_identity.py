@@ -972,6 +972,7 @@ class VehicleRegistryIdentityMixin:
         track_id: Optional[int] = None,
         max_time_gap_seconds: float = 600.0,
         similarity_threshold: float = 0.55,
+        area_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Search for an existing confirmed session that matches this query vector.
@@ -1007,6 +1008,23 @@ class VehicleRegistryIdentityMixin:
                 faiss_topk_ids = None
 
         with self._lock:
+            # Zoning: when an area is given (and the deployment is zoned), bound
+            # the candidate pool to cars currently IN that area plus the
+            # cross-area handoff pool (cars that recently departed an adjacent
+            # area within transit time). area_id None/"" or un-zoned → the
+            # legacy all-sessions pool (area_allowed_ids stays None).
+            area_allowed_ids = None
+            if (
+                area_id
+                and self._area_registry is not None
+                and self._area_registry.enabled
+            ):
+                area_allowed_ids = set(self._area_sessions.get(area_id, set()))
+                if self._handoff_matcher is not None:
+                    area_allowed_ids |= self._handoff_matcher.candidate_session_ids(
+                        area_id, list(self._sessions.values())
+                    )
+
             if faiss_topk_ids is not None:
                 # Pre-narrow to the FAISS top-K. Preserve all the existing
                 # invariants on the pool (confirmed/parked, feature present,
@@ -1016,6 +1034,7 @@ class VehicleRegistryIdentityMixin:
                     for sid, session in self._sessions.items()
                     if (
                         sid in faiss_topk_ids
+                        and (area_allowed_ids is None or sid in area_allowed_ids)
                         and session.status in ("confirmed", "parked")
                         and session.feature_vector is not None
                         and (now - session.last_seen_at).total_seconds()
@@ -1025,9 +1044,10 @@ class VehicleRegistryIdentityMixin:
             else:
                 potential_sessions = [
                     session
-                    for session in self._sessions.values()
+                    for sid, session in self._sessions.items()
                     if (
-                        session.status in ("confirmed", "parked")
+                        (area_allowed_ids is None or sid in area_allowed_ids)
+                        and session.status in ("confirmed", "parked")
                         and session.feature_vector is not None
                         and (now - session.last_seen_at).total_seconds()
                         <= max_time_gap_seconds
@@ -1572,6 +1592,10 @@ class VehicleRegistryIdentityMixin:
                     )
                 
                 self._sessions.pop(session.session_id, None)
+                # Zoning — drop the exited car from its area bucket so the
+                # bounded (per-area) candidate pool never matches a car that
+                # has already left the facility.
+                self._drop_session_from_area_index(session)
                 # Phase 3 / T3.2 — drop exited session from the FAISS
                 # gallery so a future query never matches against a car
                 # that has already left the facility.

@@ -303,7 +303,7 @@ class ParkingEngine(
             )
             session = self.db_manager.SessionLocal()
             try:
-                slots, special_zones, roi_polygon = load_camera_slots(
+                slots, special_zones, roi_polygon, boundaries = load_camera_slots(
                     session,
                     camera_id=camera_id,
                     ref_resolution=ref_res,
@@ -312,6 +312,9 @@ class ParkingEngine(
             finally:
                 session.close()
             self.special_zones[camera_id] = {zone.id: zone for zone in special_zones}
+            if not hasattr(self, "boundaries"):
+                self.boundaries = {}
+            self.boundaries[camera_id] = {b.id: b for b in boundaries}
         else:
             slots_path = slots_file or self.config.slots_file
             slots, roi_polygon = load_slots(slots_path) if os.path.exists(slots_path) else ([], None)

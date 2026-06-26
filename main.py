@@ -25,7 +25,12 @@ import threading
 from src.config import load_config
 from src.core.engine import ParkingEngine
 from src.database import init_db
-from src.services.config_service import ensure_config_initialized, sync_app_config_from_db
+from src.services.config_service import (
+    ensure_areas_initialized,
+    ensure_config_initialized,
+    sync_app_config_from_db,
+    sync_areas_from_db,
+)
 
 def start_api_server(engine, registry, host="0.0.0.0", port=8000):
     """Start the FastAPI server in a background thread."""
@@ -76,12 +81,43 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
             return True, crop
         return False, None
 
+    def detect_vehicle_crop(frame):
+        """Detect vehicles in a one-off image (e.g. a CAM-03 line-crossing
+        frame) and return the largest vehicle crop — the entering car, which
+        dominates the frame over background/parked cars. Returns None if no
+        vehicle is found. Uses a plain predict (no tracker state mutation)."""
+        try:
+            det = engine.detector
+            results = det.model.predict(
+                frame,
+                conf=det.detector_config.confidence,
+                classes=det.detector_config.classes,
+                imgsz=det.detector_config.imgsz,
+                device=det.device,
+                verbose=False,
+            )
+            if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+                return None
+            xyxy = results[0].boxes.xyxy.cpu().numpy()
+            areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+            x1, y1, x2, y2 = (int(v) for v in xyxy[int(areas.argmax())])
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                return None
+            return frame[y1:y2, x1:x2].copy()
+        except Exception as exc:
+            print(f"[API] detect_vehicle_crop failed: {exc!r}")
+            return None
+
     app = create_app(
         vehicle_registry=registry,
         get_slot_statuses=get_slot_statuses,
         get_camera_frame=get_camera_frame,
         get_slot_snapshot_source=get_slot_snapshot_source,
         get_park_entry_crop=get_park_entry_crop,
+        detect_vehicle_crop=detect_vehicle_crop,
         get_engine_status=engine.get_engine_status,
         event_bus=engine.event_bus,
         db_manager=engine.db_manager,
@@ -173,6 +209,10 @@ Examples:
         ensure_config_initialized(session, config)
         # Link DB config to runtime app_config
         sync_app_config_from_db(session, config)
+        # Zoning: seed parking_areas from YAML when empty, then make the DB the
+        # runtime source of truth for areas (mirrors the Config flow above).
+        ensure_areas_initialized(session, config)
+        sync_areas_from_db(session, config)
     finally:
         session.close()
 
