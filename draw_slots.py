@@ -298,15 +298,17 @@ class SlotDrawer:
                 2,
             )
 
-        if self.mode == self.MODE_DRAW:
+        if self.mode in (self.MODE_DRAW, self.MODE_BOUNDARY):
+            # In-progress polygon preview. Magenta for boundaries, red for slots.
+            pt_color = (255, 0, 255) if self.mode == self.MODE_BOUNDARY else (0, 0, 255)
             for i, pt in enumerate(self.current_points):
-                cv2.circle(self.display, tuple(pt), 5, (0, 0, 255), -1)
+                cv2.circle(self.display, tuple(pt), 5, pt_color, -1)
                 if i > 0:
                     cv2.line(
                         self.display,
                         tuple(self.current_points[i - 1]),
                         tuple(pt),
-                        (0, 0, 255),
+                        pt_color,
                         2,
                     )
             if len(self.current_points) >= 2:
@@ -314,13 +316,13 @@ class SlotDrawer:
                     self.display,
                     tuple(self.current_points[-1]),
                     tuple(self.current_points[0]),
-                    (0, 0, 255),
+                    pt_color,
                     1,
                 )
 
         h = self.display.shape[0]
         info = f"Slots: {len(self.slots)}"
-        if self.mode == self.MODE_DRAW:
+        if self.mode in (self.MODE_DRAW, self.MODE_BOUNDARY):
             info += f" | Points: {len(self.current_points)}"
         keys = "LClick=point RClick=finish | b=Boundary e=Edit r=Remove n=Rename | s=Save q=Quit"
         cv2.putText(
@@ -362,7 +364,7 @@ class SlotDrawer:
                 cv2.destroyAllWindows()
                 return self.slots
             if key == ord("u"):
-                if self.mode == self.MODE_DRAW and self.current_points:
+                if self.mode in (self.MODE_DRAW, self.MODE_BOUNDARY) and self.current_points:
                     self.current_points.pop()
                     self._redraw()
             elif key == ord("e"):
