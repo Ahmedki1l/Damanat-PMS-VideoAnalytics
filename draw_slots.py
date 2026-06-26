@@ -180,7 +180,10 @@ class SlotDrawer:
 
     def _handle_edit(self, event, x, y):
         if event == cv2.EVENT_LBUTTONDOWN:
-            self._drag_slot_idx, self._drag_point_idx = self._find_nearest_point(x, y, threshold=20)
+            # Grab radius scales with frame size so a vertex stays grabbable
+            # even when the window downscales a high-res frame.
+            grab = int(round(20 * max(1.0, self.image.shape[1] / 1280.0)))
+            self._drag_slot_idx, self._drag_point_idx = self._find_nearest_point(x, y, threshold=grab)
             if self._drag_slot_idx >= 0:
                 self._is_dragging = True
         elif event == cv2.EVENT_MOUSEMOVE and self._is_dragging:
@@ -280,8 +283,11 @@ class SlotDrawer:
             cv2.polylines(self.display, [pts], isClosed=True, color=color, thickness=2)
 
             if self.mode == self.MODE_EDIT:
+                vscale = max(1.0, self.display.shape[1] / 1280.0)
+                vradius = int(round(6 * vscale))
                 for pt in slot["polygon"]:
-                    cv2.circle(self.display, tuple(pt), 6, (0, 255, 255), -1)
+                    cv2.circle(self.display, tuple(pt), vradius + 2, (255, 255, 255), -1)
+                    cv2.circle(self.display, tuple(pt), vradius, (0, 255, 255), -1)
 
             cx = int(np.mean(pts[:, 0]))
             cy = int(np.mean(pts[:, 1]))

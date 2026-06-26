@@ -52,8 +52,8 @@ class ProcessingConfig:
     stream_channel: int = 102  # 101=main(4K), 102=sub(720p)
     # Resolution that slot polygons (slots/*.json) were drawn at.
     # The runtime will scale polygon coords from this to the actual stream resolution.
-    slot_ref_width: int = 640
-    slot_ref_height: int = 360
+    slot_ref_width: int = 1280
+    slot_ref_height: int = 720
     # When True, each camera gets its own TrackedDetector so ByteTrack state
     # is not corrupted by round-robin (Ultralytics' persist=True is per-model).
     # False reverts to the legacy single shared tracker (lower RAM, worse IDs).
