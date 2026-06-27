@@ -15,9 +15,11 @@ Usage:
     python draw_slots.py --rtsp "rtsp://..."          # Manual RTSP URL
 
 Controls:
-    Left Click   - Add a polygon point (or grab a point in EDIT mode)
+    Left Click   - Add a polygon point (or grab/drag a point already placed)
+    Left Drag    - Move an in-progress point before finishing the slot
     Right Click  - Finish current slot -> prompts for name in terminal
     'u'          - Undo last point
+    'x'          - Delete the in-progress point under the cursor
     'b'          - Toggle BOUNDARY mode (draw an area-to-area crossing band;
                    on finish, prompts for area_from / area_to)
     'e'          - Toggle EDIT mode (drag existing points)
@@ -72,8 +74,30 @@ class SlotDrawer:
         self._drag_slot_idx = -1
         self._drag_point_idx = -1
         self._is_dragging = False
+        # Index of the in-progress (not-yet-finished) point being dragged, or -1.
+        self._drag_current_idx = -1
+        # Last known cursor position (image coords); used by the 'x' delete key.
+        self._mouse_x = 0
+        self._mouse_y = 0
+
+    def _grab_radius(self) -> int:
+        """Point grab radius in image coords, scaled to the frame size so a
+        vertex stays grabbable when the window downscales a high-res frame."""
+        return int(round(15 * max(1.0, self.image.shape[1] / 1280.0)))
+
+    def _find_nearest_current_point(self, x, y) -> int:
+        """Index of the in-progress point within grab radius of (x, y), or -1."""
+        best_dist = self._grab_radius()
+        best = -1
+        for i, pt in enumerate(self.current_points):
+            dist = math.hypot(pt[0] - x, pt[1] - y)
+            if dist < best_dist:
+                best_dist = dist
+                best = i
+        return best
 
     def mouse_callback(self, event, x, y, flags, param):
+        self._mouse_x, self._mouse_y = x, y
         if self.mode == self.MODE_DRAW:
             self._handle_draw(event, x, y)
         elif self.mode == self.MODE_BOUNDARY:
@@ -85,11 +109,35 @@ class SlotDrawer:
         elif self.mode == self.MODE_RENAME:
             self._handle_rename(event, x, y)
 
-    def _handle_draw(self, event, x, y):
+    def _handle_inprogress_edit(self, event, x, y) -> bool:
+        """Shared left-button handling for an in-progress slot/boundary polygon.
+
+        Left-click near an existing point grabs it for dragging; left-click on
+        empty space adds a new point. Returns True if the event was consumed
+        (so the caller skips its own left-click handling) -- right-click
+        (finish) is left to the caller.
+        """
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.current_points.append([x, y])
+            idx = self._find_nearest_current_point(x, y)
+            if idx >= 0:
+                self._drag_current_idx = idx
+            else:
+                self.current_points.append([x, y])
+                self._redraw()
+            return True
+        if event == cv2.EVENT_MOUSEMOVE and self._drag_current_idx >= 0:
+            self.current_points[self._drag_current_idx] = [x, y]
             self._redraw()
-        elif event == cv2.EVENT_RBUTTONDOWN:
+            return True
+        if event == cv2.EVENT_LBUTTONUP:
+            self._drag_current_idx = -1
+            return True
+        return False
+
+    def _handle_draw(self, event, x, y):
+        if self._handle_inprogress_edit(event, x, y):
+            return
+        if event == cv2.EVENT_RBUTTONDOWN:
             if len(self.current_points) < 3:
                 print("  [WARN] Need at least 3 points.")
                 return
@@ -133,10 +181,9 @@ class SlotDrawer:
         Same click/finish UX as a slot, but on finish prompts for the two
         areas the boundary connects (validated against the known areas) and
         tags the entry as a boundary."""
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.current_points.append([x, y])
-            self._redraw()
-        elif event == cv2.EVENT_RBUTTONDOWN:
+        if self._handle_inprogress_edit(event, x, y):
+            return
+        if event == cv2.EVENT_RBUTTONDOWN:
             if len(self.current_points) < 3:
                 print("  [WARN] Need at least 3 points for a boundary band.")
                 return
@@ -337,7 +384,7 @@ class SlotDrawer:
         info = f"Slots: {len(self.slots)}"
         if self.mode in (self.MODE_DRAW, self.MODE_BOUNDARY):
             info += f" | Points: {len(self.current_points)}"
-        keys = "LClick=point RClick=finish | b=Boundary e=Edit r=Remove n=Rename | s=Save q=Quit"
+        keys = "LClick=point/drag RClick=finish u=undo x=del-point | b=Boundary e=Edit r=Remove n=Rename | s=Save q=Quit"
         cv2.putText(
             self.display,
             info,
@@ -379,6 +426,15 @@ class SlotDrawer:
             if key == ord("u"):
                 if self.mode in (self.MODE_DRAW, self.MODE_BOUNDARY) and self.current_points:
                     self.current_points.pop()
+                    self._redraw()
+            elif key == ord("x"):
+                # Delete the in-progress point under the cursor (else the last one).
+                if self.mode in (self.MODE_DRAW, self.MODE_BOUNDARY) and self.current_points:
+                    idx = self._find_nearest_current_point(self._mouse_x, self._mouse_y)
+                    if idx < 0:
+                        idx = len(self.current_points) - 1
+                    removed = self.current_points.pop(idx)
+                    print(f"  [DELETE] Removed in-progress point {removed}")
                     self._redraw()
             elif key == ord("e"):
                 self.mode = self.MODE_EDIT if self.mode != self.MODE_EDIT else self.MODE_DRAW
