@@ -72,6 +72,11 @@ class ParkingEngineVisualizationMixin:
         self._last_summary_ts = now
         self._last_summary_frame = self._frame_count
 
+        # On-site zoning test trace: periodic map of cars per area + in transit.
+        # No-op unless ZONING_TRACE is set (see src/zoning/trace.py).
+        if self.vehicle_registry is not None:
+            self.vehicle_registry.log_area_snapshot()
+
     def _draw_frame(self, frame, pipeline, assignment, cam_id, all_detections=None):
         """Draw slot polygons and detections on a frame."""
         if pipeline.roi_polygon is not None:

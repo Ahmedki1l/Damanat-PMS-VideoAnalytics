@@ -22,8 +22,17 @@ from src.vehicle_registry.vehicle_registry_models import (
     VehicleSession,
 )
 from src.vehicle_registry.vehicle_registry_queries import VehicleRegistryQueryMixin
+from src.zoning.trace import enabled as _area_trace_enabled, trace as _area_trace
 
 logger = logging.getLogger(__name__)
+
+
+def _session_label(session) -> str:
+    """Readable identity for traces: plate if known, else short session id."""
+    if getattr(session, "plate", None):
+        return session.plate
+    sid = session.session_id or ""
+    return f"#{sid[-6:]}" if sid else "#?"
 
 
 class VehicleRegistry(
@@ -217,6 +226,41 @@ class VehicleRegistry(
                 if sid in self._sessions
             ]
 
+    def area_snapshot(self) -> Dict[str, object]:
+        """Read-only map of where cars currently are (for the SNAPSHOT trace):
+        ``{"areas": {area_id: [labels]}, "transit": [labels]}``."""
+        with self._lock:
+            per_area: Dict[str, List[str]] = {}
+            for area_id, sids in self._area_sessions.items():
+                labels = [
+                    _session_label(self._sessions[sid])
+                    for sid in sids
+                    if sid in self._sessions
+                ]
+                if labels:
+                    per_area[area_id] = sorted(labels)
+            transit = sorted(
+                _session_label(s)
+                for s in self._sessions.values()
+                if s.area_state != "IN_AREA" and s.status in ("confirmed", "parked")
+            )
+        return {"areas": per_area, "transit": transit}
+
+    def log_area_snapshot(self) -> None:
+        """Emit a periodic SNAPSHOT trace line. No-op unless zoned AND
+        ZONING_TRACE is on (so the snapshot is not even built in production)."""
+        if self._area_state_machine is None or not _area_trace_enabled():
+            return
+        snap = self.area_snapshot()
+        areas = (
+            " | ".join(
+                f"{a}:[{','.join(v)}]" for a, v in sorted(snap["areas"].items())
+            )
+            or "(none)"
+        )
+        transit = ",".join(snap["transit"]) or "-"
+        _area_trace("SNAPSHOT", areas=areas, transit=transit)
+
     # --- Zoning: per-frame area-state drivers (no-ops when un-zoned) ---- #
     def settle_track_area(self, camera_id: str, track_id: int) -> None:
         """Settle this track's session into the observing camera's area, but
@@ -240,7 +284,18 @@ class VehicleRegistry(
                 return
             if self._resolve_owner_camera(session, self._clock()) != camera_id:
                 return
+            old_area, old_state = session.current_area, session.area_state
             self._area_state_machine.on_area_observed(session, area_id)
+            if session.current_area != old_area or session.area_state != old_state:
+                _area_trace(
+                    "SETTLE",
+                    car=_session_label(session),
+                    area=session.current_area,
+                    was=old_area or "-",
+                    prev=old_state,
+                    cam=camera_id,
+                    track=track_id,
+                )
 
     def apply_boundary_crossing(
         self, camera_id: str, track_id: int, area_from: str, area_to: str
@@ -257,7 +312,17 @@ class VehicleRegistry(
             session = self._sessions.get(session_id) if session_id else None
             if session is None:
                 return
+            old_area = session.current_area
             self._area_state_machine.on_boundary_cross(session, area_from, area_to)
+            _area_trace(
+                "CROSS",
+                car=_session_label(session),
+                cam=camera_id,
+                band=f"{area_from}->{area_to}",
+                departed=session.departed_from_area or "-",
+                state=session.area_state,
+                was=old_area or "-",
+            )
 
     # ------------------------------------------------------------------ #
     # Gallery-index sync (Phase 3 / T3.2)
