@@ -96,6 +96,17 @@ class BoundaryCrossingDetector:
             self._inside[key] = now_inside
         return crossings
 
+    def tracks_inside(self, camera_id: str) -> set:
+        """Track ids currently inside any boundary band on ``camera_id`` (as of
+        the latest :meth:`detect` call). Callers use this to suppress area
+        re-settling while a car sits in the ambiguous transition band — it is
+        IN_TRANSIT (eligible in both adjacent areas) until it leaves the band."""
+        return {
+            track_id
+            for (cam, track_id), inside in self._inside.items()
+            if cam == camera_id and inside
+        }
+
     def forget_track(self, camera_id: str, track_id: int) -> None:
         """Drop per-track state when a track ends (avoids unbounded growth)."""
         self._inside.pop((camera_id, track_id), None)

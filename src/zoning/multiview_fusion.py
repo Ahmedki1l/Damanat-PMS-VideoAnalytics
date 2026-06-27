@@ -8,10 +8,12 @@ pick the single best camera to "own" the identity. ``IntraAreaFusion`` simply
 **restricts that ownership contest to the cameras of one area**, so a car is
 owned by the best view *within its area* rather than across the whole building.
 
-Foundation status: this is a thin wrapper that delegates to the existing
-ownership logic; the area-restricted owner resolution is a deferred tuning task.
-For now ``resolve_owner`` returns the session's current owner unchanged (safe
-no-op), so wiring it into the engine does not alter today's behaviour.
+``resolve_owner`` runs the area-restricted ownership contest: among the cameras
+``observing`` the session, it keeps only those assigned to the car's settled
+``current_area`` and returns the highest-scoring one (deterministic tie-break).
+When zoning is off or the car is un-zoned / in-transit it returns the existing
+owner unchanged. It is implemented and unit-tested in isolation; the engine does
+not consult it yet, so it is inert until a later wiring step.
 """
 
 from __future__ import annotations
@@ -31,12 +33,32 @@ class IntraAreaFusion:
         return self._areas.area_for_camera(owner) if owner else ""
 
     def resolve_owner(self, session) -> Optional[str]:
-        """Return the camera that should own this car's identity, considering
-        only cameras in the car's area.
+        """Pick the camera that should own this car's identity, restricted to the
+        cameras of the area the car is currently settled in.
 
-        Scaffolding: delegates to the existing owner today (no behaviour
-        change). The area-restricted contest using ``observing_scores`` filtered
-        to ``AreaRegistry.cameras(area)`` is the deferred AI-Dev task.
+        Hysteresis: when zoning is off, or the car is un-zoned / in-transit
+        (``current_area == ""``), the existing owner is returned unchanged —
+        moving a car between areas is :class:`AreaStateMachine`'s job, never this
+        method's. Within the settled area, the highest ``observing_scores`` camera
+        wins, with a deterministic tie-break that prefers the incumbent owner (no
+        needless churn) and otherwise the lexicographically smallest ``camera_id``.
+
+        All ownership policy lives here: future signals (detection confidence,
+        bbox size, track age, view quality, composite score) slot into this method
+        without touching :class:`AreaRegistry`.
         """
-        # TODO(zoning): pick max observing_scores among cameras in this area.
-        return session.owner_camera
+        if not self._areas.enabled or not session.current_area:
+            return session.owner_camera
+
+        allowed = set(self._areas.cameras(session.current_area))
+        scores = {
+            cam: s for cam, s in session.observing_scores.items() if cam in allowed
+        }
+        if not scores:
+            return session.owner_camera
+
+        best = max(scores.values())
+        tied = sorted(cam for cam, s in scores.items() if s == best)
+        if session.owner_camera in tied:
+            return session.owner_camera
+        return tied[0]

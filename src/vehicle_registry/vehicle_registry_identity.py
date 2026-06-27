@@ -837,6 +837,39 @@ class VehicleRegistryIdentityMixin:
                 and (now - seen).total_seconds() <= OWNER_STALENESS_SECONDS
             )
         ]
+
+        # Zoning: restrict the ownership contest to cameras of the car's settled
+        # area (mirrors IntraAreaFusion.resolve_owner — the unit-tested spec of
+        # this policy). A neighbouring area's camera can't steal ownership and
+        # teleport the identity mid-transit. When no in-area camera is live, keep
+        # the current owner unchanged rather than handing it to an out-of-area
+        # camera. Fully gated: un-zoned / un-settled cars fall through unchanged.
+        if (
+            self._area_registry is not None
+            and self._area_registry.enabled
+            and session.current_area
+        ):
+            in_area = set(self._area_registry.cameras(session.current_area))
+            restricted = [cam for cam in live if cam in in_area]
+            if restricted:
+                live = restricted
+            else:
+                # No in-area camera is live. Hand off to any live *un-zoned*
+                # camera (NULL/empty area): it belongs to no competing area, so
+                # it can't teleport the identity, and owning it won't move
+                # current_area. Only keep the (stale) owner when there isn't even
+                # an un-zoned observer — this stops a car drifting into un-zoned
+                # space (e.g. a NULL-area ramp camera) from sticking on a dead
+                # owner. A *different zoned area's* camera is still excluded.
+                unzoned = [
+                    cam
+                    for cam in live
+                    if not self._area_registry.area_for_camera(cam)
+                ]
+                if not unzoned:
+                    return session.owner_camera
+                live = unzoned
+
         if not live:
             # Nobody live right now — keep the last known owner if it is still
             # an observer, otherwise clear it.

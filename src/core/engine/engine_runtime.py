@@ -693,6 +693,44 @@ class ParkingEngineRuntimeMixin:
             tracking_manager = self._tracking_managers[cam_id]
             tracking_manager.process_detections(frame, detections)
             self._process_global_tracking(cam_id, frame, detections, tracking_manager)
+            self._drive_area_state(cam_id, detections)
+
+    def _drive_area_state(self, cam_id: str, detections) -> None:
+        """Feed per-frame observations + boundary crossings to the registry's
+        area state machine so ``current_area`` tracks where each car is.
+
+        No-op unless zoning is enabled (``boundary_crossing_detector`` is built
+        only then).
+
+        Order matters. Boundary geometry is evaluated first so we know which
+        tracks are *currently inside* a band; those are NOT settled — a car in
+        the band is in the ambiguous transition zone and must stay IN_TRANSIT
+        (eligible in both adjacent areas) until it leaves into a confirmed area.
+        Otherwise ``settle_track_area`` would re-settle it into the source area
+        every frame after the one-shot outside→inside crossing, collapsing
+        IN_TRANSIT to a single frame and breaking cross-area handoff.
+        """
+        if self.boundary_crossing_detector is None or not self.vehicle_registry:
+            return
+
+        boundaries = list(self.boundaries.get(cam_id, {}).values())
+        inside_band: set = set()
+        if boundaries:
+            tracks = [(d.track_id, d.bbox) for d in detections if d.track_id != -1]
+            crossings = self.boundary_crossing_detector.detect(
+                cam_id, tracks, boundaries
+            )
+            inside_band = self.boundary_crossing_detector.tracks_inside(cam_id)
+            for crossing in crossings:
+                self.vehicle_registry.apply_boundary_crossing(
+                    cam_id, crossing.track_id, crossing.area_from, crossing.area_to
+                )
+
+        for detection in detections:
+            tid = detection.track_id
+            if tid == -1 or tid in inside_band:
+                continue
+            self.vehicle_registry.settle_track_area(cam_id, tid)
 
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
         all_events = []

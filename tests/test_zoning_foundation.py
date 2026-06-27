@@ -32,6 +32,7 @@ from src.zoning import (  # noqa: E402
     BoundaryCrossingDetector,
     BoundaryZone,
     CrossAreaHandoffMatcher,
+    IntraAreaFusion,
 )
 from src.vehicle_registry.vehicle_registry import VehicleRegistry  # noqa: E402
 from src.vehicle_registry.vehicle_registry_models import VehicleSession  # noqa: E402
@@ -331,6 +332,96 @@ class TestAreasDbRoundTrip(unittest.TestCase):
         self.assertEqual(len(boundaries), 1)
         self.assertEqual((boundaries[0].area_from, boundaries[0].area_to),
                          ("B2-C", "B2-RAMP"))
+
+
+class TestIntraAreaFusion(unittest.TestCase):
+    """Area-restricted ownership: ``resolve_owner`` picks the best observing
+    camera within the car's settled ``current_area``, else keeps the owner."""
+
+    def _two_cam_area_registry(self):
+        # B1-E has TWO cameras so the in-area contest and tie-break are testable
+        # (_make_config has one camera per area).
+        cfg = AppConfig()
+        cfg.cameras = [
+            CameraEntry(id="CAM-05", floor="B1", area="B1-E"),
+            CameraEntry(id="CAM-06", floor="B1", area="B1-E"),
+            CameraEntry(id="CAM-13", floor="B2", area="B2-C"),
+        ]
+        cfg.areas = [
+            AreaEntry("B1-E", "B1 Center", "B1", 30, {}),
+            AreaEntry("B2-C", "B2 South", "B2", 30, {}),
+        ]
+        return AreaRegistry(cfg)
+
+    def _session(self, **kw):
+        s = VehicleSession(session_id="s")
+        for k, v in kw.items():
+            setattr(s, k, v)
+        return s
+
+    def test_highest_score_in_area_wins(self):
+        fusion = IntraAreaFusion(self._two_cam_area_registry())
+        s = self._session(
+            current_area="B1-E",
+            owner_camera="CAM-06",
+            observing_scores={"CAM-05": 0.9, "CAM-06": 0.4},
+        )
+        self.assertEqual(fusion.resolve_owner(s), "CAM-05")
+
+    def test_higher_score_in_other_area_ignored(self):
+        # CAM-13 (B2-C) outscores CAM-05 but is outside the car's area -> ignored.
+        fusion = IntraAreaFusion(self._two_cam_area_registry())
+        s = self._session(
+            current_area="B1-E",
+            owner_camera="CAM-05",
+            observing_scores={"CAM-05": 0.6, "CAM-13": 0.9},
+        )
+        self.assertEqual(fusion.resolve_owner(s), "CAM-05")
+
+    def test_empty_current_area_keeps_owner(self):
+        # In-transit / un-zoned -> never re-contest ownership.
+        fusion = IntraAreaFusion(self._two_cam_area_registry())
+        s = self._session(
+            current_area="",
+            owner_camera="CAM-06",
+            observing_scores={"CAM-05": 0.9},
+        )
+        self.assertEqual(fusion.resolve_owner(s), "CAM-06")
+
+    def test_zoning_disabled_keeps_owner(self):
+        fusion = IntraAreaFusion(AreaRegistry(AppConfig()))  # enabled is False
+        s = self._session(
+            current_area="B1-E",
+            owner_camera="CAM-06",
+            observing_scores={"CAM-05": 0.9},
+        )
+        self.assertEqual(fusion.resolve_owner(s), "CAM-06")
+
+    def test_no_observer_in_area_keeps_owner(self):
+        fusion = IntraAreaFusion(self._two_cam_area_registry())
+        s = self._session(
+            current_area="B1-E",
+            owner_camera="CAM-13",
+            observing_scores={"CAM-13": 0.9},  # only an out-of-area observer
+        )
+        self.assertEqual(fusion.resolve_owner(s), "CAM-13")
+
+    def test_tie_break_prefers_incumbent_then_smallest_id(self):
+        fusion = IntraAreaFusion(self._two_cam_area_registry())
+        # Incumbent is among the tied cameras -> keep it (no needless churn).
+        s = self._session(
+            current_area="B1-E",
+            owner_camera="CAM-06",
+            observing_scores={"CAM-05": 0.8, "CAM-06": 0.8},
+        )
+        self.assertEqual(fusion.resolve_owner(s), "CAM-06")
+        # Owner not among the tied set -> lexicographically smallest id wins.
+        s2 = self._session(
+            current_area="B1-E",
+            owner_camera="CAM-99",
+            observing_scores={"CAM-05": 0.8, "CAM-06": 0.8},
+        )
+        self.assertEqual(fusion.resolve_owner(s2), "CAM-05")
 
 
 if __name__ == "__main__":

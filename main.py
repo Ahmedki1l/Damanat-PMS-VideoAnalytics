@@ -251,11 +251,18 @@ Examples:
     registry = None
     if args.api:
         from src.vehicle_registry import VehicleRegistry
+        from src.zoning import AreaRegistry
+
+        # Zoning: a read-only camera↔area index built from config. When no areas
+        # are defined it reports enabled=False and the registry stays in legacy
+        # un-zoned mode (area-bounded ReID + per-area ownership are no-ops).
+        area_registry = AreaRegistry(config)
         registry = VehicleRegistry(
             image_dir=config.output.snapshot_base_dir,
             public_base_url=config.output.public_base_url,
             snapshot_url_prefix=config.output.snapshot_url_prefix,
             gateway_path_prefix=config.output.gateway_path_prefix,
+            area_registry=area_registry,
         )
 
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)

@@ -80,11 +80,20 @@ class VehicleRegistry(
         # Cross-area handoff candidate builder — only when zoned. Lazy import
         # keeps the zoning package out of the un-zoned import path.
         self._handoff_matcher = None
+        # Per-car area lifecycle (IN_AREA/IN_TRANSIT/…). Lives here, next to the
+        # sessions it mutates; the engine feeds it observations + boundary
+        # crossings via settle_track_area / apply_boundary_crossing. None when
+        # un-zoned, so those driver methods are no-ops.
+        self._area_state_machine = None
         if area_registry is not None:
             from src.zoning.handoff_matcher import CrossAreaHandoffMatcher
+            from src.zoning.area_state_machine import AreaStateMachine
 
             self._handoff_matcher = CrossAreaHandoffMatcher(
                 area_registry, clock=clock or datetime.now
+            )
+            self._area_state_machine = AreaStateMachine(
+                self, area_registry, clock=clock or datetime.now
             )
 
         self._matcher = None
@@ -207,6 +216,48 @@ class VehicleRegistry(
                 for sid in self._area_sessions.get(area_id, set())
                 if sid in self._sessions
             ]
+
+    # --- Zoning: per-frame area-state drivers (no-ops when un-zoned) ---- #
+    def settle_track_area(self, camera_id: str, track_id: int) -> None:
+        """Settle this track's session into the observing camera's area, but
+        only when that camera currently *owns* the identity.
+
+        ``current_area`` is derived from the owner camera's area (the engine
+        calls this every frame for live tracks). Gating on ownership means a
+        single owner drives the area — neighbouring cameras that merely glimpse
+        the car never thrash ``current_area``. No-op when un-zoned or the
+        observing camera is un-zoned.
+        """
+        if self._area_state_machine is None:
+            return
+        area_id = self._area_registry.area_for_camera(camera_id)
+        if not area_id:
+            return
+        with self._lock:  # RLock — set_session_area below re-acquires safely
+            session_id = self._track_session_map.get((camera_id, track_id))
+            session = self._sessions.get(session_id) if session_id else None
+            if session is None:
+                return
+            if self._resolve_owner_camera(session, self._clock()) != camera_id:
+                return
+            self._area_state_machine.on_area_observed(session, area_id)
+
+    def apply_boundary_crossing(
+        self, camera_id: str, track_id: int, area_from: str, area_to: str
+    ) -> None:
+        """Apply a boundary crossing detected on a camera to the track's session
+        (IN_AREA → IN_TRANSIT, clearing ``current_area``). Direction is resolved
+        by the state machine from the car's current area, so one bidirectional
+        band serves both ways. No-op when un-zoned or the track has no session.
+        """
+        if self._area_state_machine is None:
+            return
+        with self._lock:
+            session_id = self._track_session_map.get((camera_id, track_id))
+            session = self._sessions.get(session_id) if session_id else None
+            if session is None:
+                return
+            self._area_state_machine.on_boundary_cross(session, area_from, area_to)
 
     # ------------------------------------------------------------------ #
     # Gallery-index sync (Phase 3 / T3.2)

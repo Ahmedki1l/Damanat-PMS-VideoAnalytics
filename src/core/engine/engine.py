@@ -24,6 +24,7 @@ from src.detection.tracker import TrackedDetector
 from src.events.event_bus import EventBus
 from src.models.slot import load_slots
 from src.services.parking_service import load_camera_slots
+from src.zoning import AreaRegistry, BoundaryCrossingDetector
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,10 @@ class ParkingEngine(
 
         self.pipelines: Dict[str, CameraPipeline] = {}
         self.special_zones: Dict[str, Dict] = {}
+        # camera_id -> {boundary_id: BoundaryZone}. Populated when pipelines load
+        # DB boundaries; initialized here so zoning hooks (_drive_area_state) are
+        # a safe no-op before/without any boundary polygons.
+        self.boundaries: Dict[str, Dict] = {}
         self._park_entry_track_to_candidate: Dict[int, str] = {}
         self._tracks_inside_zones: Dict[tuple, set] = {}
         self._confirmation_bursts: Dict[tuple, Dict] = {}
@@ -91,6 +96,23 @@ class ParkingEngine(
         # Legacy single-camera cooldown state.
         self._last_violation_alert_time = 0.0
         self._violation_cooldown_seconds = 5.0
+
+        # --- Zoning (no-ops on un-zoned deployments) ---------------------
+        # AreaRegistry is a cheap read-only camera↔area index. The per-car area
+        # lifecycle (AreaStateMachine) lives on the VehicleRegistry, alongside
+        # the sessions it mutates; the engine only owns the boundary-crossing
+        # *geometry* detector (it needs frame bboxes + polygons). Both are built
+        # only when areas are defined AND a registry exists (identity is an
+        # API-mode feature); otherwise the per-frame zoning hooks short-circuit
+        # and behaviour is byte-for-byte the legacy un-zoned path.
+        self.area_registry = AreaRegistry(config)
+        self.boundary_crossing_detector = None
+        if self.area_registry.enabled and self.vehicle_registry is not None:
+            self.boundary_crossing_detector = BoundaryCrossingDetector()
+            print(
+                f"[INFO] Zoning enabled: {len(self.area_registry.all_area_ids())} "
+                f"area(s) — per-area ownership active."
+            )
 
     def _build_tracked_detector(self) -> TrackedDetector:
         """Construct a fresh TrackedDetector using the current config."""
