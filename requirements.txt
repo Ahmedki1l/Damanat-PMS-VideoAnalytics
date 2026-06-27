@@ -37,6 +37,7 @@ python-multipart>=0.0.6   # File upload support
 sqlalchemy==2.0.47
 psycopg2-binary==2.9.11
 pyodbc>=5.0.0
+cryptography>=42.0.0      # Fernet decrypt for cameras.password_encrypted
 
 # Runtime dependencies required by Ultralytics/OpenVINO
 lap>=0.5.12

@@ -28,6 +28,7 @@ from src.database import init_db
 from src.services.config_service import (
     ensure_areas_initialized,
     ensure_config_initialized,
+    load_cameras_from_db,
     sync_app_config_from_db,
     sync_areas_from_db,
 )
@@ -213,6 +214,10 @@ Examples:
         # runtime source of truth for areas (mirrors the Config flow above).
         ensure_areas_initialized(session, config)
         sync_areas_from_db(session, config)
+        # DB-first camera roster (enabled rows from the cameras table); falls
+        # back to YAML cameras when the table is absent/empty. Runs after areas
+        # so a camera's `area` resolves against the synced parking_areas.
+        load_cameras_from_db(session, config)
     finally:
         session.close()
 

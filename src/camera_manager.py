@@ -33,6 +33,7 @@ class CameraConfig:
     user: str
     password: str
     slots_file: str
+    rtsp_port: int = 554  # From the DB cameras table; 554 keeps the legacy default
     rtsp_url: str = ""  # Built from ip/user/password
 
     def build_rtsp_url(self, channel: int = 102) -> str:
@@ -42,7 +43,7 @@ class CameraConfig:
         Channel 101 = main stream (4K), 102 = sub stream (720p).
         """
         self.rtsp_url = (
-            f"rtsp://{self.user}:{self.password}@{self.ip}:554"
+            f"rtsp://{self.user}:{self.password}@{self.ip}:{self.rtsp_port}"
             f"/Streaming/Channels/{channel}"
         )
         return self.rtsp_url

@@ -1,8 +1,10 @@
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from src.model.config_run import Config, PreprocessingConfig
 from src.model.parking_area import ParkingArea
 from src.schemas import ScopeEnum
-from src.config import AppConfig, AreaEntry
+from src.config import AppConfig, AreaEntry, CameraEntry
+from src.utils.crypto import make_decrypt
 
 def ensure_config_initialized(db: Session, app_config: AppConfig):
     """
@@ -191,4 +193,84 @@ def sync_areas_from_db(db: Session, app_config: AppConfig):
         for row in rows
     ]
     print(f"[DB] Linked {len(app_config.areas)} parking area(s) from database.")
+    return app_config
+
+
+def _norm_camera_id(value: str) -> str:
+    """Normalize a camera id for cross-source matching (DB ``Cam_03`` vs YAML
+    ``CAM-03``). Mirrors the normalization in tools/add_camera_area_column.py."""
+    return (value or "").upper().replace("-", "").replace("_", "")
+
+
+def load_cameras_from_db(db: Session, app_config: AppConfig):
+    """
+    DB-first camera roster. Replace ``app_config.cameras`` with the enabled rows
+    from the API-Gateway-owned ``cameras`` table.
+
+    Each camera's password is the decrypted ``password_encrypted`` when the
+    Fernet key (``cameras_encryption_key``) is set and the token is valid;
+    otherwise it falls back to the YAML password for that camera id. When the
+    table is missing or has no enabled rows, the YAML-loaded cameras are kept
+    untouched (mirrors :func:`sync_areas_from_db`).
+
+    The ``cameras`` table has no ORM model (owned by the API Gateway), so it is
+    queried with raw SQL guarded by ``inspect()`` — the style of
+    tools/add_camera_area_column.py.
+    """
+    engine = db.get_bind()
+    insp = inspect(engine)
+    if "cameras" not in insp.get_table_names():
+        print("[DB] `cameras` table not found — using YAML cameras.")
+        return app_config
+
+    # The `area` column is optional (added by add_camera_area_column.py).
+    has_area = "area" in {c["name"] for c in insp.get_columns("cameras")}
+    area_col = "area" if has_area else "NULL AS area"
+    rows = db.execute(
+        text(
+            f"SELECT camera_id, name, floor, {area_col}, ip_address, rtsp_port, "
+            f"username, password_encrypted, enabled FROM cameras WHERE enabled = 1"
+        )
+    ).fetchall()
+    if not rows:
+        print("[DB] No enabled cameras in DB — using YAML cameras.")
+        return app_config
+
+    decrypt = make_decrypt(app_config.cameras_encryption_key)
+    # YAML fallbacks keyed by normalized camera id: password (while the Fernet
+    # key is blank) and area (until cameras.area is populated, e.g. via
+    # tools/add_camera_area_column.py) so DB-first doesn't drop zoning.
+    yaml_pw = {_norm_camera_id(c.id): c.password for c in app_config.cameras}
+    yaml_area = {_norm_camera_id(c.id): c.area for c in app_config.cameras}
+
+    cameras = []
+    decrypted_n = 0
+    for r in rows:
+        pw = decrypt(r.password_encrypted)
+        if pw:
+            decrypted_n += 1
+        else:
+            pw = yaml_pw.get(_norm_camera_id(r.camera_id), "")
+        area = (r.area or "") or yaml_area.get(_norm_camera_id(r.camera_id), "")
+        cameras.append(
+            CameraEntry(
+                id=r.camera_id,
+                name=r.name or "",
+                floor=r.floor or "",
+                area=area,
+                ip=r.ip_address or "",
+                user=r.username or "",
+                password=pw,
+                rtsp_port=int(r.rtsp_port or 554),
+                # Runtime slots come from the parking_slots table, keyed by
+                # camera_id; slots_file is only used for one-off bootstrapping.
+                slots_file="",
+            )
+        )
+
+    app_config.cameras = cameras
+    print(
+        f"[DB] Loaded {len(cameras)} enabled camera(s) from database "
+        f"({decrypted_n} password(s) decrypted, rest from YAML)."
+    )
     return app_config

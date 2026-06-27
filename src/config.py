@@ -41,6 +41,8 @@ class CameraEntry:
     ip: str = ""
     user: str = ""
     password: str = ""
+    # RTSP port (from the DB cameras table; 554 keeps the legacy default).
+    rtsp_port: int = 554
     slots_file: str = ""
 
 
@@ -272,6 +274,10 @@ class AppConfig:
     matching: MatchingConfig = field(default_factory=MatchingConfig)
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
 
+    # Fernet key (urlsafe-base64, 32 bytes) shared with the API Gateway to
+    # decrypt cameras.password_encrypted. Blank = fall back to YAML passwords.
+    cameras_encryption_key: str = ""
+
     # Legacy single-camera support
     video_source: str = ""
     video_target_fps: int = 2
@@ -333,6 +339,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     
     if "database" in raw:
         config.database.url = raw["database"].get("DATABASE_URL", "")
+
+    # Fernet key for decrypting cameras.password_encrypted (env overrides YAML).
+    config.cameras_encryption_key = (
+        raw.get("CAMERAS_ENCRYPTION_KEY", "")
+        or os.environ.get("CAMERAS_ENCRYPTION_KEY", "")
+    )
 
     # --- Cameras (multi-camera mode) ---
     if "cameras" in raw:

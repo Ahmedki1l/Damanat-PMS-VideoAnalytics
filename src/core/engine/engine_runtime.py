@@ -433,6 +433,7 @@ class ParkingEngineRuntimeMixin:
                 user=camera.user,
                 password=camera.password,
                 slots_file=camera.slots_file,
+                rtsp_port=camera.rtsp_port,
             )
             camera_config.build_rtsp_url(channel=self.config.processing.stream_channel)
             camera_configs.append(camera_config)

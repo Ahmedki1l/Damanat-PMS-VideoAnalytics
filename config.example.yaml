@@ -13,7 +13,15 @@
 database:
   DATABASE_URL: "mssql+pyodbc://USER:PASSWORD@localhost:1433/damanat_pms?driver=ODBC+Driver+17+for+SQL+Server&TrustServerCertificate=yes"
 
+# Fernet key (urlsafe-base64, 32 bytes) shared with the API Gateway to decrypt
+# cameras.password_encrypted. Blank = fall back to the per-camera YAML passwords
+# below. (Can also be supplied via the CAMERAS_ENCRYPTION_KEY env var.)
+CAMERAS_ENCRYPTION_KEY: ""
+
 # --- Camera Definitions ---
+# The camera roster is loaded DB-first from the `cameras` table (enabled rows);
+# the entries below are the YAML fallback (used when that table is absent/empty)
+# and the password source while CAMERAS_ENCRYPTION_KEY is still blank.
 # Each camera has: id, name, floor, RTSP credentials, slots polygon file.
 # Ground-floor cameras (CAM-01, CAM-02) are still listed even though they
 # do not participate in slot detection — they are the outdoor ANPR-bound
