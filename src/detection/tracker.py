@@ -21,6 +21,7 @@ from ultralytics import YOLO
 from src.config import DetectorConfig, TrackerConfig, DetectorPreprocessingConfig
 from src.detection.detector import Detection
 from src.preprocessing import luminance_normalize, auto_gamma
+from src import perf_trace
 
 
 class TrackedDetector:
@@ -96,21 +97,23 @@ class TrackedDetector:
             List of Detection objects with stable track_id values.
         """
         # Preprocess for better detection in hard lighting
-        inference_frame = self._preprocess_frame(frame)
+        with perf_trace.stage("clahe"):
+            inference_frame = self._preprocess_frame(frame)
 
         # Build tracker config filename — Ultralytics expects e.g. "bytetrack.yaml"
         tracker_cfg = f"{self.tracker_config.type}.yaml"
 
-        results = self.model.track(
-            inference_frame,
-            conf=self.detector_config.confidence,
-            classes=self.detector_config.classes,
-            imgsz=self.detector_config.imgsz,
-            device=self.device,
-            persist=True,               # Maintain tracker state across frames
-            tracker=tracker_cfg,         # e.g., "bytetrack.yaml"
-            verbose=False,
-        )
+        with perf_trace.stage("infer"):
+            results = self.model.track(
+                inference_frame,
+                conf=self.detector_config.confidence,
+                classes=self.detector_config.classes,
+                imgsz=self.detector_config.imgsz,
+                device=self.device,
+                persist=True,               # Maintain tracker state across frames
+                tracker=tracker_cfg,         # e.g., "bytetrack.yaml"
+                verbose=False,
+            )
 
         return self._parse_results(results)
 

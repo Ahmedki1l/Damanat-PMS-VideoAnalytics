@@ -23,6 +23,7 @@ from src.core.engine.engine_visualization import ParkingEngineVisualizationMixin
 from src.detection.tracker import TrackedDetector
 from src.events.event_bus import EventBus
 from src.models.slot import load_slots
+from src import perf_trace
 from src.services.parking_service import load_camera_slots
 from src.zoning import AreaRegistry, BoundaryCrossingDetector
 
@@ -174,7 +175,10 @@ class ParkingEngine(
             return
 
         camera_configs = self._build_camera_configs()
-        self.cam_manager = CameraManager(camera_configs)
+        self.cam_manager = CameraManager(
+            camera_configs,
+            max_grab_fps=self.config.processing.max_grab_fps,
+        )
         opened = self.cam_manager.open_all()
         if opened == 0:
             print("[ERROR] No cameras could be opened. Exiting.")
@@ -217,7 +221,8 @@ class ParkingEngine(
 
         try:
             while True:
-                cam_id, frame = self.cam_manager.next_frame()
+                with perf_trace.stage("fetch"):
+                    cam_id, frame = self.cam_manager.next_frame()
                 if cam_id is None:
                     print("[WARN] All cameras unavailable. Retrying in 5s...")
                     time.sleep(5)
@@ -251,12 +256,17 @@ class ParkingEngine(
                         self._store_passthrough_frame(frame, cam_id, grid_frames)
                     continue
 
-                detection_frame = pipeline.apply_roi_mask(frame)
+                with perf_trace.stage("roi"):
+                    detection_frame = pipeline.apply_roi_mask(frame)
+                # clahe + infer stages are timed inside detect_and_track.
                 detections = self._detector_for(cam_id).detect_and_track(detection_frame)
-                self._process_special_zones(cam_id, frame, detections)
+                with perf_trace.stage("zones"):
+                    self._process_special_zones(cam_id, frame, detections)
 
-                assignment = pipeline.assigner.assign(detections)
-                all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
+                with perf_trace.stage("assign"):
+                    assignment = pipeline.assigner.assign(detections)
+                with perf_trace.stage("slot"):
+                    all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
                 if all_events:
                     final_events = self._filter_violation_events(
                         frame,
@@ -267,6 +277,7 @@ class ParkingEngine(
                     self._persist_final_events(final_events)
 
                 self._frame_count += 1
+                perf_trace.frame_done()
                 if self._frame_count % summary_interval == 0:
                     self._emit_full_summary()
 

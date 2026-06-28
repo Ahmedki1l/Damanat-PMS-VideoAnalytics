@@ -52,6 +52,11 @@ class ProcessingConfig:
     mode: str = "round_robin"
     target_fps_per_camera: int = 1
     stream_channel: int = 102  # 101=main(4K), 102=sub(720p)
+    # Cap how often each camera's background grabber decodes a frame (frames/sec).
+    # 0 = unthrottled (decode every frame — the legacy behaviour). Decoding all
+    # streams at full rate when only ~target_fps_per_camera is consumed wastes a
+    # lot of CPU; set this to ~target_fps + a little headroom (e.g. 8) to cut it.
+    max_grab_fps: int = 0
     # Resolution that slot polygons (slots/*.json) were drawn at.
     # The runtime will scale polygon coords from this to the actual stream resolution.
     slot_ref_width: int = 1280
@@ -394,6 +399,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         config.processing.per_camera_tracker = bool(p.get(
             "per_camera_tracker", config.processing.per_camera_tracker
+        ))
+        config.processing.max_grab_fps = int(p.get(
+            "max_grab_fps", config.processing.max_grab_fps
         ))
 
     # --- Legacy single-camera support ---

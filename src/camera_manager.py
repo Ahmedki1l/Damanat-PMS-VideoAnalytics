@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from src import perf_trace
+
 
 @dataclass
 class CameraConfig:
@@ -58,8 +60,10 @@ class CameraStream:
     ensures the stream stays alive.
     """
 
-    def __init__(self, config: CameraConfig):
+    def __init__(self, config: CameraConfig, max_grab_fps: float = 0.0):
         self.config = config
+        # Cap decode rate (frames/sec) in the grabber loop. 0 = unthrottled.
+        self._max_grab_fps = max_grab_fps
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_open = False
         self.frame_width: int = 0
@@ -117,6 +121,13 @@ class CameraStream:
         Only keeps the latest frame — old frames are discarded.
         This is the key to preventing RTSP buffer overflow.
         """
+        # Minimum seconds between decoded frames. 0 = decode as fast as the
+        # stream delivers (legacy). Throttling here is the single biggest CPU
+        # saver: we only need ~target_fps/cam, not the full ~20-25 fps the NVR
+        # sends, and decoding the rest just to discard it pegs the cores.
+        min_interval = (
+            1.0 / self._max_grab_fps if self._max_grab_fps and self._max_grab_fps > 0 else 0.0
+        )
         while not self._stop_event.is_set():
             if self.cap is None or not self.cap.isOpened():
                 # Stream died — try reconnecting
@@ -124,7 +135,10 @@ class CameraStream:
                 self._reconnect()
                 continue
 
+            t0 = time.perf_counter()
             ret, frame = self.cap.read()
+            if perf_trace.enabled():
+                perf_trace.record_decode((time.perf_counter() - t0) * 1000.0)
             if ret and frame is not None:
                 with self._frame_lock:
                     self._latest_frame = frame
@@ -132,6 +146,15 @@ class CameraStream:
                 # Read failed — reconnect
                 self.is_open = False
                 self._reconnect()
+                continue
+
+            # Throttle decode rate. CAP_PROP_BUFFERSIZE=1 keeps the next read
+            # recent, so sleeping here drops the surplus frames before they are
+            # decoded rather than after.
+            if min_interval > 0.0:
+                sleep_for = min_interval - (time.perf_counter() - t0)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
 
     def _reconnect(self):
         """Reconnect the stream (called from grabber thread)."""
@@ -195,13 +218,13 @@ class CameraManager:
     any camera instantly without blocking.
     """
 
-    def __init__(self, camera_configs: List[CameraConfig]):
+    def __init__(self, camera_configs: List[CameraConfig], max_grab_fps: float = 0.0):
         self.cameras: Dict[str, CameraStream] = {}
         self.camera_ids: List[str] = []
         self._current_index: int = 0
 
         for config in camera_configs:
-            stream = CameraStream(config)
+            stream = CameraStream(config, max_grab_fps=max_grab_fps)
             self.cameras[config.id] = stream
             self.camera_ids.append(config.id)
 

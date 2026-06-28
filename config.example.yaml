@@ -214,6 +214,9 @@ processing:
   target_fps_per_camera: 1      # Each camera gets ~1 frame/second
   stream_channel: 102           # RTSP channel: 101=main(4K), 102=sub(720p)
   per_camera_tracker: true      # One TrackedDetector per camera (preserves ByteTrack state)
+  max_grab_fps: 0               # Cap per-camera decode rate (fps). 0=unthrottled.
+                                # Set ~target_fps+headroom (e.g. 8) to stop wasting
+                                # CPU decoding frames that are never processed.
 
 # --- Detector Settings ---
 # Production detector is yolo11m (better recall on oblique floor angles).
