@@ -5,7 +5,11 @@ import numpy as np
 
 from src.config import load_config
 from src.database import init_db
-from src.services.parking_service import save_camera_roi
+from src.services.parking_service import load_camera_slots, save_camera_roi
+
+# Click within this many pixels of an existing point to grab it instead of
+# adding a new one.
+GRAB_RADIUS = 12
 
 
 def build_rtsp_url(camera_config, channel=102):
@@ -23,15 +27,40 @@ class ROISelector:
         self.db_manager = db_manager
         self.ref_resolution = ref_resolution
         self.points = []
+        self._drag_idx = -1
         self.window_name = (
             f"ROI Selector - {camera_id} "
-            "(Click to add points, 's' to save, 'c' to clear, 'q' to quit)"
+            "(drag=move pt, click=add, right-click=del, u=undo, c=clear, s=save, q=quit)"
         )
+
+    def _nearest_point_idx(self, x, y):
+        """Index of the existing point within GRAB_RADIUS of (x, y), or -1."""
+        best_idx, best_d2 = -1, GRAB_RADIUS * GRAB_RADIUS
+        for i, (px, py) in enumerate(self.points):
+            d2 = (px - x) ** 2 + (py - y) ** 2
+            if d2 <= best_d2:
+                best_idx, best_d2 = i, d2
+        return best_idx
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.points.append([x, y])
+            # Grab an existing point if the click landed on one; else add a point.
+            idx = self._nearest_point_idx(x, y)
+            if idx >= 0:
+                self._drag_idx = idx
+            else:
+                self.points.append([x, y])
             self.draw()
+        elif event == cv2.EVENT_MOUSEMOVE and self._drag_idx >= 0:
+            self.points[self._drag_idx] = [x, y]
+            self.draw()
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._drag_idx = -1
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            idx = self._nearest_point_idx(x, y)
+            if idx >= 0:
+                del self.points[idx]
+                self.draw()
 
     def draw(self):
         img_copy = self.img.copy()
@@ -63,6 +92,8 @@ class ROISelector:
             print(f"[ERROR] Could not grab frame from {self.camera_id}. Check RTSP URL/Connection.")
             return
 
+        self._load_existing_roi()
+
         cv2.namedWindow(self.window_name)
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
         self.draw()
@@ -74,6 +105,10 @@ class ROISelector:
             if key == ord("c"):
                 self.points = []
                 self.draw()
+            elif key == ord("u"):
+                if self.points:
+                    self.points.pop()
+                    self.draw()
             elif key == ord("s"):
                 if len(self.points) >= 3:
                     self.save_roi()
@@ -81,6 +116,30 @@ class ROISelector:
                 print("[WARN] Need at least 3 points to save ROI.")
 
         cv2.destroyAllWindows()
+
+    def _load_existing_roi(self):
+        """Pre-load this camera's saved ROI (if any) as editable points, scaled
+        from the stored reference resolution to the live frame's pixels."""
+        act_h, act_w = self.img.shape[:2]
+        session = self.db_manager.SessionLocal()
+        try:
+            _, _, roi_polygon, _ = load_camera_slots(
+                session,
+                camera_id=self.camera_id,
+                ref_resolution=self.ref_resolution,
+                actual_resolution=(act_w, act_h),
+            )
+        finally:
+            session.close()
+
+        if roi_polygon is None:
+            print(f"[INFO] No existing ROI for {self.camera_id} — starting fresh.")
+            return
+
+        # Drop the closing point that shapely repeats to close the ring.
+        coords = list(roi_polygon.exterior.coords)[:-1]
+        self.points = [[int(round(x)), int(round(y))] for x, y in coords]
+        print(f"[INFO] Loaded existing ROI for {self.camera_id} ({len(self.points)} points) — edit and 's' to save.")
 
     def save_roi(self):
         points = [p[:] for p in self.points]
