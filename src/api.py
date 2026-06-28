@@ -345,6 +345,34 @@ def create_app(
         image_bytes: Optional[bytes] = None,
         frame=None,
     ) -> bool:
+        # B-entry = the CAM-03 B1 confirmation snapshot pushed via the ANPR API
+        # (plate + image). Attach it to the plate's session as the primary ReID
+        # identity reference at B1, rather than opening a new gate candidate.
+        if direction == "B-entry":
+            import cv2
+            import numpy as np
+
+            if frame is None and image_bytes:
+                frame = cv2.imdecode(
+                    np.frombuffer(image_bytes, dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+            if frame is None or frame.size == 0:
+                print(f"[API] B-entry for plate {plate}: no usable image — skipped")
+                return False
+            session_id = registry.confirm_b1_entrance_by_plate(plate, frame)
+            if session_id:
+                print(
+                    f"[API] CAM-03 B-entry snapshot attached for plate {plate} "
+                    f"-> session {session_id} (primary ReID reference at B1)"
+                )
+                return True
+            print(
+                f"[API] B-entry for plate {plate}: no matching session yet "
+                f"(gate entry not seen?) — snapshot not attached"
+            )
+            return False
+
         if direction != "entry":
             return False
 

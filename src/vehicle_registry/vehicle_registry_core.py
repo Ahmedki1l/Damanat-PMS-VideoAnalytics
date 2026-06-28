@@ -306,8 +306,17 @@ class VehicleRegistryCoreMixin:
         elif direction == "exit":
             self._handle_exit(plate, now)
             logger.info("[ANPR] Exit: plate=%s", plate)
+        elif direction == "B-entry":
+            # The B1 (CAM-03) confirmation snapshot, pushed via the ANPR API as
+            # plate + image. It does NOT open a new pending entry — it confirms
+            # an existing gate read. The image is attached to the plate's session
+            # (and used for ReID) by confirm_b1_entrance_by_plate in the API
+            # layer, which has the decoded frame. Nothing to record here.
+            logger.info("[ANPR] B1 confirmation (CAM-03) snapshot: plate=%s", plate)
         else:
-            raise ValueError(f"Unsupported ANPR direction: {direction}")
+            # Be defensive: an unrecognised direction from the ANPR client must
+            # not 500 the webhook (which would drop the event). Log and no-op.
+            logger.warning("[ANPR] Ignoring unsupported direction %r (plate=%s)", direction, plate)
 
         return event
 

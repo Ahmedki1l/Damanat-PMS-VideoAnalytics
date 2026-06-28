@@ -730,6 +730,56 @@ class VehicleRegistryIdentityMixin:
             )
             return session.plate
 
+    def confirm_b1_entrance_by_plate(
+        self,
+        plate: str,
+        image: np.ndarray,
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """Attach an externally-pushed B1 entrance snapshot to the plate's
+        session and make it the primary identity reference at B1.
+
+        This is the API-push counterpart of the in-engine CAM_03 B1_Entrence
+        confirmation (:meth:`confirm_at_b1_entrance`): the external ANPR/vision
+        integration delivers the CAM_03 image via the ANPR endpoint with
+        direction ``B-entry`` (plate + image), instead of relying on the live
+        YOLO track passing through the confirmation zone — which is unreliable
+        when per-camera FPS is low. Keyed by plate, since there is no live track.
+
+        Returns the session_id it enriched, or None when no session exists yet
+        for the plate (e.g. the gate ``entry`` event was missed) or the image is
+        unusable.
+        """
+        if image is None or getattr(image, "size", 0) == 0:
+            return None
+        now = timestamp or self._clock()
+        with self._lock:
+            session = None
+            for s in self._sessions.values():
+                if s.plate != plate:
+                    continue
+                if s.status not in ("confirmed", "parked", "provisional"):
+                    continue
+                if session is None or s.last_seen_at > session.last_seen_at:
+                    session = s
+            if session is None:
+                return None
+
+            session.last_seen_at = now
+            session.last_seen_camera = "CAM-03"
+            if not self._persist_session_gallery(
+                session, [image], now, primary_snapshot_index=0
+            ):
+                return None
+            self._gallery_index_upsert(session)
+            logger.info(
+                "[B1] CAM-03 B-entry snapshot attached for plate=%s -> session %s "
+                "(primary identity reference at B1)",
+                plate,
+                session.session_id,
+            )
+            return session.session_id
+
     def update_confirmed_session_gallery(
         self,
         camera_id: str,
