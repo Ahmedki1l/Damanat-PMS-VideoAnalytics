@@ -22,6 +22,17 @@ import os
 import sys
 import threading
 
+# Force UTF-8 console output. Windows consoles default to a legacy code page
+# (e.g. cp1252), which renders UTF-8 names like "B1 Parking — Camera 08" as
+# mojibake ("B1 Parking â€” Camera 08"). The names are stored correctly; only
+# the printout was garbled. reconfigure() is a no-op where stdout isn't a
+# regular stream (e.g. already-wrapped pipes), so guard it defensively.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 from src.config import load_config
 from src.core.engine import ParkingEngine
 from src.database import init_db
