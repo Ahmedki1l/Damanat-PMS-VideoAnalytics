@@ -202,6 +202,18 @@ def _norm_camera_id(value: str) -> str:
     return (value or "").upper().replace("-", "").replace("_", "")
 
 
+def _is_anpr_camera(camera_id: str) -> bool:
+    """True for the gate ANPR cameras (``ANPR-Entry`` / ``ANPR-Exit``).
+
+    These cameras live in the shared ``cameras`` table alongside the parking
+    cameras, but their plates are read by the external ANPR server and pushed
+    to VA via ``/api/anpr/event`` — VA must NOT open their streams or run the
+    YOLO/ReID video pipeline on them. They are excluded from the roster so no
+    CameraPipeline is ever built for them. Match is by normalized id prefix so
+    future ``ANPR-*`` cameras are covered automatically."""
+    return _norm_camera_id(camera_id).startswith("ANPR")
+
+
 def load_cameras_from_db(db: Session, app_config: AppConfig):
     """
     DB-first camera roster. Replace ``app_config.cameras`` with the enabled rows
@@ -245,7 +257,14 @@ def load_cameras_from_db(db: Session, app_config: AppConfig):
 
     cameras = []
     decrypted_n = 0
+    skipped_anpr = []
     for r in rows:
+        # ANPR gate cameras (ANPR-Entry/ANPR-Exit) are read by the external
+        # ANPR server and delivered via /api/anpr/event. Keep them out of the
+        # roster entirely so VA never opens their stream or runs YOLO/ReID.
+        if _is_anpr_camera(r.camera_id):
+            skipped_anpr.append(r.camera_id)
+            continue
         pw = decrypt(r.password_encrypted)
         if pw:
             decrypted_n += 1
@@ -267,6 +286,16 @@ def load_cameras_from_db(db: Session, app_config: AppConfig):
                 slots_file="",
             )
         )
+
+    if skipped_anpr:
+        print(
+            f"[DB] Excluded {len(skipped_anpr)} ANPR gate camera(s) from the "
+            f"video pipeline (no YOLO/ReID): {skipped_anpr}"
+        )
+
+    if not cameras:
+        print("[DB] No enabled non-ANPR cameras in DB — using YAML cameras.")
+        return app_config
 
     app_config.cameras = cameras
     print(
