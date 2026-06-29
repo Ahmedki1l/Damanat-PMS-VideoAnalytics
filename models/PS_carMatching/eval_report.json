@@ -1,0 +1,19 @@
+{
+  "model": "PS_carMatching",
+  "backbone": "osnet_ain_x1_0",
+  "quantisation": "int8",
+  "input_size": [256, 128],
+  "finetuned": true,
+  "source_weights": "osnet_ain_x1_0_facility.pth",
+  "export_timestamp": "2026-06-23T21:18:11.250880+00:00",
+  "evaluated_on": "2026-06-27",
+  "bench_type": "model_level_reid (crop-pair rank-N / mAP)",
+  "note": "Re-ID model accuracy bench only. This is NOT the per-area + cross-area handoff (end-to-end) bench, which still requires real multi-camera footage.",
+  "baseline_label": "Baseline (previously deployed model)",
+  "summary": {
+    "rank1":  { "baseline": 0.526, "fine_tuned": 0.737, "delta_pp": 21.1 },
+    "rank5":  { "baseline": 0.789, "fine_tuned": 0.895, "delta_pp": 10.6 },
+    "rank10": { "baseline": 0.789, "fine_tuned": 0.895, "delta_pp": 10.6 },
+    "mAP":    { "baseline": 0.298, "fine_tuned": 0.505, "delta_pp": 20.7, "ratio": 1.7 }
+  }
+}
