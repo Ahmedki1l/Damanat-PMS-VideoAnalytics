@@ -12,6 +12,7 @@ Why not a standalone tracker?
   - Using model.track() is simpler and avoids common integration bugs.
 """
 
+import inspect
 from typing import Dict, List
 
 import torch
@@ -112,7 +113,13 @@ class TrackedDetector:
             raise AssertionError(
                 f"Only {set(_TRACKER_MAP)} are supported, but got '{cfg.tracker_type}'"
             )
-        return tracker_class(cfg, frame_rate=30)
+        # ``frame_rate`` is accepted by most but not all Ultralytics versions —
+        # only pass it when the constructor actually takes it, so the same code
+        # works across versions. When absent, the tracker uses its own default.
+        kwargs = {}
+        if "frame_rate" in inspect.signature(tracker_class.__init__).parameters:
+            kwargs["frame_rate"] = 30
+        return tracker_class(cfg, **kwargs)
 
     def _tracker_for(self, camera_id: str):
         """Return (lazily creating) this camera's dedicated tracker."""
