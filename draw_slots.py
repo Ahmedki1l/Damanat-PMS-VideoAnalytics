@@ -40,7 +40,11 @@ import numpy as np
 
 from src.config import AppConfig, load_config
 from src.database import init_db
-from src.services.config_service import sync_app_config_from_db, sync_areas_from_db
+from src.services.config_service import (
+    load_cameras_from_db,
+    sync_app_config_from_db,
+    sync_areas_from_db,
+)
 from src.services.parking_service import (
     SLOT_TYPE_PARKING,
     SLOT_TYPE_SPECIAL_ZONE,
@@ -612,6 +616,7 @@ def main():
             session = db.SessionLocal()
             sync_app_config_from_db(session, config)
             sync_areas_from_db(session, config)  # so boundary validation sees DB areas
+            load_cameras_from_db(session, config)  # DB-first roster: see cameras added directly to the DB
             session.close()
         except Exception as exc:
             print(f"[WARN] Could not sync with database: {exc}. Using YAML/defaults.")
@@ -624,7 +629,7 @@ def main():
         if args.camera.lower() == "all":
             for cam in config.cameras:
                 rtsp_url = (
-                    f"rtsp://{cam.user}:{cam.password}@{cam.ip}:554/Streaming/Channels/{channel}"
+                    f"rtsp://{cam.user}:{cam.password}@{cam.ip}:{cam.rtsp_port}/Streaming/Channels/{channel}"
                 )
                 label = f"{cam.id} - {cam.name} ({cam.floor})"
                 process_camera(cam.id, rtsp_url, label, config, db)
@@ -640,7 +645,7 @@ def main():
                 sys.exit(1)
 
             rtsp_url = (
-                f"rtsp://{cam_entry.user}:{cam_entry.password}@{cam_entry.ip}:554/Streaming/Channels/{channel}"
+                f"rtsp://{cam_entry.user}:{cam_entry.password}@{cam_entry.ip}:{cam_entry.rtsp_port}/Streaming/Channels/{channel}"
             )
             label = f"{cam_entry.id} - {cam_entry.name} ({cam_entry.floor})"
             process_camera(cam_entry.id, rtsp_url, label, config, db)
