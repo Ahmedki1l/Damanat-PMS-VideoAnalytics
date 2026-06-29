@@ -149,6 +149,15 @@ def cmd_seed(session, url, args):
         if args.floor:
             rows = [r for r in rows if r.get(floor_col) == args.floor]
 
+        # First-run guard (for container start-up): skip any table that already
+        # has rows, so a restart/redeploy never overwrites live data.
+        if getattr(args, "if_empty", False):
+            existing = session.query(model).count()
+            if existing:
+                print(f"  {name:<16} skipped ({existing} existing row(s))")
+                totals[name] = 0
+                continue
+
         if args.mode == "replace":
             dq = session.query(model)
             if args.floor and floor_col:
@@ -195,6 +204,9 @@ def main():
                    help="upsert (default) merges by PK; replace wipes the floor first")
     s.add_argument("--dry-run", action="store_true",
                    help="Preview counts, then roll back without writing")
+    s.add_argument("--if-empty", action="store_true",
+                   help="Seed only tables that are currently empty (first-run "
+                        "guard for container startup; never clobbers live data)")
 
     args = p.parse_args()
     config, session, url = _open_session(args.config, args.db_url)

@@ -74,5 +74,10 @@ COPY . .
 
 EXPOSE 8000
 
-# Run migrations then API
-ENTRYPOINT ["sh", "-c","python main.py --api"]
+# On start: seed the drawn zoning geometry (areas/slots/boundaries) into any
+# EMPTY tables, then launch the API. `--if-empty` makes this a first-run seed —
+# a restart/redeploy against a populated DB skips it and never clobbers live
+# occupancy. Disable with SEED_GEOMETRY_ON_START=false; point at another dump
+# with GEOMETRY_FILE=/path/to/dump.json. main.py still creates tables + seeds
+# parking_areas from config.yaml, so the seed is additive (slots + boundaries).
+ENTRYPOINT ["sh", "-c", "if [ \"${SEED_GEOMETRY_ON_START:-true}\" = true ] && [ -f \"${GEOMETRY_FILE:-geometry.json}\" ]; then echo '[entrypoint] seeding geometry into empty tables...'; python tools/sync_geometry.py seed --in \"${GEOMETRY_FILE:-geometry.json}\" --if-empty || echo '[entrypoint] geometry seed skipped (continuing)'; fi; exec python main.py --api"]

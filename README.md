@@ -345,6 +345,109 @@ the sender never needs to crop.
 
 ---
 
+## Production Database Setup
+
+Everything the analytics engine needs in the database. The engine **owns and
+auto-creates** its tables — you never write DDL by hand. The only manual work is
+(1) pointing it at the right DB and (2) moving the geometry you drew on the
+testing PC over to production.
+
+> The camera roster (`cameras` table) is owned by the **API Gateway**, not this
+> service — it is not part of these steps. This service only manages
+> `parking_areas`, `parking_slots`, `boundaries`, and its runtime tables.
+
+### Tables this service creates
+
+| Table | Holds | Seeded from | Authoritative source after first run |
+|-------|-------|-------------|--------------------------------------|
+| `parking_areas` | area defs (capacity, adjacency) | `config.yaml` `areas:` block | the database |
+| `parking_slots` | slot polygons you drew | `draw_slots.py` (writes the DB directly) | the database |
+| `boundaries` | area-crossing polygons you drew | `draw_slots.py` `b` mode | the database |
+| `slot_status`, `alerts`, `camera_feeds`, `config`, `preprocessing_config` | runtime state / events | created empty, filled at runtime | the database |
+
+All of them are created automatically by `Base.metadata.create_all` on the first
+run — including the `parking_slots` column back-fills in `_ensure_schema_updates`.
+There is **no migration step to run**.
+
+### Step-by-step (production bring-up)
+
+**1. Point the engine at the production database.** Edit `database.DATABASE_URL`
+in the production `config.yaml`:
+
+```yaml
+database:
+  DATABASE_URL: "mssql+pyodbc://USER:PASS@DB_HOST:1433/damanat_pms?driver=ODBC+Driver+17+for+SQL+Server&TrustServerCertificate=yes"
+```
+
+The engine auto-creates the database itself if it does not yet exist (see
+`init_db` — it connects to `master` and issues `CREATE DATABASE` when missing),
+so the SQL Server login just needs `dbcreator` (or the DB pre-created with an
+`db_owner` login).
+
+**2. Make sure `config.yaml` has the real `areas:` block and per-camera `area:`
+fields** (see [Zoning](#zoning-parking-areas)). This block seeds `parking_areas`
+on first run.
+
+**3. First run — creates every table and seeds the areas:**
+
+```bash
+python main.py --config config.yaml          # let it start once, then Ctrl-C
+# or, to seed areas without starting the full engine:
+python tools/manage_areas.py push
+```
+
+Verify the areas landed:
+
+```bash
+python tools/manage_areas.py list
+python tools/manage_areas.py boundaries        # empty until step 4
+```
+
+**4. Move the geometry you drew on the testing PC → production.** Slots and
+boundaries live in the DB, so they don't travel with `config.yaml` — use
+[`tools/sync_geometry.py`](#sync_geometrypy--migrate-slotsboundariesareas-between-dbs):
+
+```bash
+# On the TESTING PC (its config.yaml points at the test DB) — dump all floors:
+python tools/sync_geometry.py export --out geometry.json
+
+# Copy geometry.json to the production server, then on PRODUCTION:
+python tools/sync_geometry.py seed --in geometry.json --dry-run   # preview counts
+python tools/sync_geometry.py seed --in geometry.json             # apply (upsert)
+```
+
+This carries **areas + slots + boundaries for both B1 and B2** in one file. The
+seed is an idempotent upsert by primary key, and it resets each slot's runtime
+fields (`is_available`, `last_snapshot_path`) so prod keeps its own live state.
+
+**5. Verify the geometry landed:**
+
+```bash
+python tools/manage_areas.py list          # areas + camera counts
+python tools/manage_areas.py boundaries    # boundaries now populated
+python -c "from src.database import init_db; from src.config import load_config; \
+c=load_config('config.yaml'); s=init_db(c.database.url).SessionLocal(); \
+from src.model.parkingslot import ParkingSlot; \
+print('slots:', s.query(ParkingSlot).count())"
+```
+
+**6. Start the engine for real:**
+
+```bash
+python main.py --config config.yaml
+```
+
+### Updating geometry later
+
+After the first run the **database is authoritative**, not `config.yaml`. To change things in production:
+
+- **Areas** (capacity / adjacency / add / remove): `python tools/manage_areas.py …` (see below).
+- **Slots / boundaries**: re-draw on the testing PC, then re-run the
+  `sync_geometry.py` export → seed from step 4. Use `--floor B1` (or `B2`) to push
+  just one floor, or `--mode replace` to wipe-and-reload a floor cleanly.
+
+---
+
 ## Tools & Utilities
 
 ### `draw_slots.py` — Slot Polygon Drawing Tool
@@ -390,6 +493,31 @@ python tools/manage_areas.py reseed --yes                            # Wipe + re
 ```
 
 Typical workflow after editing `config.yaml`: `python tools/manage_areas.py push`.
+
+### `sync_geometry.py` — Migrate slots/boundaries/areas between DBs
+
+Dumps the authored zoning geometry (`parking_areas`, `parking_slots`,
+`boundaries`) to a portable JSON file on one machine and re-applies it on
+another — the canonical way to push what you drew on the testing PC into
+production. The camera roster is untouched (that's the Gateway's).
+
+```bash
+# Export from the DB this config points at (all floors):
+python tools/sync_geometry.py export --out geometry.json
+python tools/sync_geometry.py export --out b1.json --floor B1     # one floor only
+
+# Seed into the DB this config points at:
+python tools/sync_geometry.py seed --in geometry.json --dry-run   # preview, no writes
+python tools/sync_geometry.py seed --in geometry.json             # upsert by primary key
+python tools/sync_geometry.py seed --in geometry.json --mode replace --floor B1  # wipe+reload a floor
+```
+
+- `--config` picks the DB (default `config.yaml`); `--db-url` overrides it to hit
+  either DB directly if both are reachable from one box.
+- Seeding is an idempotent **upsert by primary key**; runtime-only slot fields
+  (`is_available`, `last_snapshot_path`) are reset so prod keeps its own live state.
+
+See [Production Database Setup](#production-database-setup) for the full bring-up sequence.
 
 ### `grid_view.py` — Multi-Camera Grid Display
 
