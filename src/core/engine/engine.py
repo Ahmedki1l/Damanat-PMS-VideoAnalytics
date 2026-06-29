@@ -49,17 +49,14 @@ class ParkingEngine(
         self.vehicle_registry = vehicle_registry
         self.db_manager = db_manager
 
-        # Per-camera tracker: one TrackedDetector per camera so Ultralytics'
-        # persist=True ByteTrack state isn't shared across round-robin cameras
-        # (which makes it think every cycle the scene "teleports" and drops IDs).
-        # The shared-detector fallback stays available for low-RAM deployments.
-        self._shared_detector: Optional[TrackedDetector] = None
-        self._per_camera_detectors: Dict[str, TrackedDetector] = {}
-        if not config.processing.per_camera_tracker:
-            self._shared_detector = self._build_tracked_detector()
-            print("[INFO] Using single shared tracker across all cameras.")
-        else:
-            print("[INFO] Using per-camera tracker (one TrackedDetector instance per camera).")
+        # Detection / tracking are decoupled: ONE shared detection model (one
+        # set of weights / one OpenVINO compiled model → RAM stays flat at 27
+        # cameras), while ByteTrack *state* is kept per camera inside the
+        # TrackedDetector (keyed by camera_id). This gives both low RAM and
+        # stable per-camera track IDs — round-robin frames from different
+        # cameras no longer corrupt each other's tracker state.
+        self._shared_detector: Optional[TrackedDetector] = self._build_tracked_detector()
+        print("[INFO] Shared detection model + per-camera tracker state (decoupled).")
         self.event_bus = EventBus(log_file=config.output.log_file)
 
         self.pipelines: Dict[str, CameraPipeline] = {}
@@ -124,22 +121,13 @@ class ParkingEngine(
         )
 
     def _detector_for(self, camera_id: str) -> TrackedDetector:
-        """Return the detector responsible for tracking this camera's frames.
-
-        In per-camera mode, lazy-instantiates one TrackedDetector per camera
-        on first use. In shared mode, returns the singleton. Memory cost in
-        per-camera mode is ~one OpenVINO compiled model per camera (~100 MB
-        each for yolo11s at 640px); for 14 cameras that's ~1.4 GB, which is
-        within the 8-16 GB envelope listed in the README.
+        """Return the shared detector. Per-camera ByteTrack state is isolated
+        inside TrackedDetector (keyed by camera_id passed to detect_and_track),
+        so a single shared model serves every camera without mixing track IDs.
         """
-        if self._shared_detector is not None:
-            return self._shared_detector
-        detector = self._per_camera_detectors.get(camera_id)
-        if detector is None:
-            print(f"[INFO] Building tracker for {camera_id} (per-camera mode)...")
-            detector = self._build_tracked_detector()
-            self._per_camera_detectors[camera_id] = detector
-        return detector
+        if self._shared_detector is None:
+            self._shared_detector = self._build_tracked_detector()
+        return self._shared_detector
 
     @property
     def detector(self) -> TrackedDetector:
@@ -259,7 +247,7 @@ class ParkingEngine(
                 with perf_trace.stage("roi"):
                     detection_frame = pipeline.apply_roi_mask(frame)
                 # clahe + infer stages are timed inside detect_and_track.
-                detections = self._detector_for(cam_id).detect_and_track(detection_frame)
+                detections = self._detector_for(cam_id).detect_and_track(detection_frame, cam_id)
                 with perf_trace.stage("zones"):
                     self._process_special_zones(cam_id, frame, detections)
 
@@ -388,7 +376,7 @@ class ParkingEngine(
 
                 self.last_processed_at = datetime.now()
                 detection_frame = pipeline.apply_roi_mask(frame)
-                detections = self._detector_for(camera_id).detect_and_track(detection_frame)
+                detections = self._detector_for(camera_id).detect_and_track(detection_frame, camera_id)
                 self._process_special_zones(camera_id, frame, detections)
                 assignment = pipeline.assigner.assign(detections)
 

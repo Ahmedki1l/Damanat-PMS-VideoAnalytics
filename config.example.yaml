@@ -213,7 +213,9 @@ processing:
   mode: "round_robin"           # Process cameras one at a time in rotation
   target_fps_per_camera: 1      # Each camera gets ~1 frame/second
   stream_channel: 102           # RTSP channel: 101=main(4K), 102=sub(720p)
-  per_camera_tracker: true      # One TrackedDetector per camera (preserves ByteTrack state)
+  per_camera_tracker: false     # DEPRECATED/ignored: detection is now always a single shared
+                                # model with per-camera ByteTrack state kept inside TrackedDetector
+                                # (low RAM + stable per-camera IDs, no need for N model copies).
   max_grab_fps: 0               # Cap per-camera decode rate (fps). 0=unthrottled.
                                 # Set ~target_fps+headroom (e.g. 8) to stop wasting
                                 # CPU decoding frames that are never processed.
