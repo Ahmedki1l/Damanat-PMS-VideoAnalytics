@@ -97,7 +97,7 @@ def sync_app_config_from_db(db: Session, app_config: AppConfig):
 
     # 2. Detector settings
     app_config.detector.device = db_config.device.value if hasattr(db_config.device, 'value') else str(db_config.device)
-    app_config.detector.model_path = db_config.model_path
+    app_config.detector.model_path = (db_config.model_path or "").strip()
     app_config.detector.confidence = db_config.confidence
     app_config.detector.imgsz = db_config.imgsz
     if db_config.classes:
