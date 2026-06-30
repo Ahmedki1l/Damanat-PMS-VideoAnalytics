@@ -184,6 +184,11 @@ Examples:
         help="Run only a specific camera by ID (e.g., CAM_04).",
     )
     parser.add_argument(
+        "--floor", type=str, default=None,
+        help="Run only the cameras on a given floor (e.g., B1) — for testing "
+             "one floor in isolation. Applies to multi-camera mode.",
+    )
+    parser.add_argument(
         "--show", action="store_true",
         help="Show annotated video window for debugging.",
     )
@@ -231,6 +236,23 @@ Examples:
         load_cameras_from_db(session, config)
     finally:
         session.close()
+
+    # Restrict the roster to a single floor when --floor is given. Useful for
+    # bringing up / load-testing one floor (e.g. B1) in isolation without the
+    # full 25-camera deployment. Match is case-insensitive on the floor label.
+    if args.floor:
+        want = args.floor.strip().lower()
+        filtered = [c for c in config.cameras if (c.floor or "").strip().lower() == want]
+        if not filtered:
+            floors = sorted({(c.floor or "").strip() for c in config.cameras})
+            print(f"\n[ERROR] No cameras on floor '{args.floor}'.")
+            print(f"[HINT] Available floors: {floors}")
+            sys.exit(1)
+        config.cameras = filtered
+        print(
+            f"[INFO] --floor {args.floor}: running {len(filtered)} camera(s): "
+            f"{[c.id for c in filtered]}"
+        )
 
     # Apply CLI overrides
     if args.show:
