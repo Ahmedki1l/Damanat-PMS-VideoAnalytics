@@ -714,6 +714,73 @@ python main.py --video parking_video.mp4 --show   # Local video file
 | 6 cameras (one floor) | 6 cores | 8 GB |
 | 12 cameras (full system) | 8+ cores | 8-16 GB |
 
+### CPU Throughput Optimization (INT8 + AMX, 25-camera scale)
+
+For the 25-camera deployment targeting **4–5 fps/camera** on the production
+server (Intel Xeon Silver 4410Y, **16 vCPU**, with `avx512_vnni` + `amx_int8`),
+three levers cut per-frame cost. They are independent — apply them together.
+
+**1. INT8 @ imgsz 320 detection model (AMX path).** The quantized YOLO IR runs
+several × faster than FP32@640 on AMX hardware.
+
+- Build the INT8 IR (already committed as `models/yolo11m_320_int8_openvino_model`,
+  rebuild only to recalibrate):
+  ```bash
+  python tools/export_yolo_int8_openvino.py --calib-dir <full parking-cam frames> --min-side 640
+  ```
+  > Calibration quality affects **accuracy, not speed**. Use full frames from the
+  > actual B1/B2/ground parking cameras for a production-accuracy IR; entry-cam or
+  > mixed frames are fine only for measuring latency.
+- Point the runtime at it via the **DB `Config` table** (the DB is authoritative
+  at runtime, not `config.yaml` — see [Production Database Setup](#production-database-setup)):
+  | DB `Config` field | Value |
+  |---|---|
+  | `model_path` | `models/yolo11m_320_int8_openvino_model` |
+  | `imgsz` | `320` |
+  | `target_fps` | `5` |
+
+**2. Decode throttle.** Unthrottled HEVC decode pulls every camera at full stream
+rate (~21 fps), burning ~10 of 16 cores on decode alone and starving inference.
+Cap it in the **server's `config.yaml`** (this knob is YAML-only — *not* synced
+from the DB):
+```yaml
+processing:
+  max_grab_fps: 6        # ≈ target_fps + headroom; 0 = unthrottled (do NOT use in prod)
+```
+Cleanest production equivalent: lower the NVR **sub-stream FPS to ~6** (avoids the
+benign `Could not find ref with POC` HEVC log spam the sleep-throttle causes).
+> `per_camera_tracker` in `config.yaml` is **dead** (parsed but never read —
+> detection is always a shared model with per-camera ByteTrack state). Safe to delete.
+
+**3. Ground-floor ReID off (automatic, by floor).** Ground-floor cameras run YOLO
+occupancy only — no ReID embedding compute and no plate/identity matching. This is
+gated by floor (`is_reid_disabled_floor`), so any camera on the `Ground` floor is
+covered automatically; identity for ground is established via the external ANPR
+gate plates. No configuration needed.
+
+**Measure the parallel ceiling on the box** (THROUGHPUT mode — what fps/camera is
+achievable once inference is parallelised; on Linux pin cores with `taskset`):
+```bash
+python tools/bench_yolo.py \
+  --model models/yolo11m_320_int8_openvino_model --imgsz 320 \
+  --threads 8 --threads 16 --cameras 23
+```
+
+**Measured impact** (10 B1 cameras, server, steady state):
+
+| Metric | FP32 @ 640, unthrottled | INT8 @ 320, throttled |
+|---|---|---|
+| decode | ~10 cores | ~0.2 cores |
+| `infer` | ~1400–2000 ms | ~200 ms |
+| total / frame | ~1500–2500 ms | ~290 ms |
+
+> **Known limitation:** the pipeline still runs **one inference at a time**
+> (OpenVINO LATENCY mode, serial round-robin), so per-camera fps improves ~5× but
+> does not yet reach 5 fps. Hitting the target needs a **parallel inference pool**
+> (or N per-floor processes via `--floor`); `bench_yolo.py` reports that ceiling.
+> Once detection is cheap, the per-frame CLAHE preprocessing (~55 ms,
+> `preprocessing.detector.enabled`) becomes a meaningful slice worth A/B-testing.
+
 ---
 
 ## Developer Guide
