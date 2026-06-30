@@ -797,6 +797,56 @@ class VehicleRegistryIdentityMixin:
             )
             return session.session_id
 
+    def add_gallery_snapshot_by_plate(
+        self,
+        plate: str,
+        image: np.ndarray,
+        source_cam: str = "CAM-23",
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """Append an externally-pushed snapshot to the plate's session gallery as
+        a SECONDARY appearance reference — without overriding the primary B1
+        (CAM-03 ``B-entry``) identity reference.
+
+        This is the plate-keyed counterpart of :meth:`add_session_snapshot` for
+        the entry-ramp camera (CAM-23, ``ramp-entry``): the gate ANPR establishes
+        the plate, CAM-03 sets the primary B1 reference, and CAM-23 contributes an
+        extra viewpoint that enriches cross-camera ReID recall without replacing
+        anything. Keyed by plate (no live track), mirroring
+        :meth:`confirm_b1_entrance_by_plate`.
+
+        Returns the session_id it enriched, or None when no session exists yet for
+        the plate or the image is unusable.
+        """
+        if image is None or getattr(image, "size", 0) == 0:
+            return None
+        now = timestamp or self._clock()
+        with self._lock:
+            session = None
+            for s in self._sessions.values():
+                if s.plate != plate:
+                    continue
+                if s.status not in ("confirmed", "parked", "provisional"):
+                    continue
+                if session is None or s.last_seen_at > session.last_seen_at:
+                    session = s
+            if session is None:
+                return None
+
+            # add_session_snapshot appends to the gallery (does NOT touch the
+            # primary feature_vector/snapshot_path); self._lock is a reentrant
+            # RLock so the nested acquire is safe.
+            path = self.add_session_snapshot(session.session_id, image, timestamp=now)
+            if path is None:
+                return None
+            self._gallery_index_upsert(session)
+            logger.info(
+                "[B1] %s snapshot added to plate=%s -> session %s "
+                "(secondary ReID reference)",
+                source_cam, plate, session.session_id,
+            )
+            return session.session_id
+
     def update_confirmed_session_gallery(
         self,
         camera_id: str,

@@ -373,6 +373,37 @@ def create_app(
             )
             return False
 
+        # ramp-entry = the CAM-23 ramp-top snapshot pushed via the ANPR API. Add
+        # it to the plate's session gallery as a SECONDARY appearance reference
+        # (an extra viewpoint for cross-camera ReID) — it does NOT override the
+        # primary B-entry (CAM-03) reference.
+        if direction == "ramp-entry":
+            import cv2
+            import numpy as np
+
+            if frame is None and image_bytes:
+                frame = cv2.imdecode(
+                    np.frombuffer(image_bytes, dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+            if frame is None or frame.size == 0:
+                print(f"[API] ramp-entry for plate {plate}: no usable image — skipped")
+                return False
+            session_id = registry.add_gallery_snapshot_by_plate(
+                plate, frame, source_cam=camera_id or "CAM-23",
+            )
+            if session_id:
+                print(
+                    f"[API] CAM-23 ramp-entry snapshot added for plate {plate} "
+                    f"-> session {session_id} (secondary ReID reference)"
+                )
+                return True
+            print(
+                f"[API] ramp-entry for plate {plate}: no matching session yet "
+                f"(gate entry not seen?) — snapshot not added"
+            )
+            return False
+
         if direction != "entry":
             return False
 
