@@ -63,9 +63,16 @@ class VehicleRegistry(
         clock: Optional[Callable[[], datetime]] = None,
         match_decision: Optional[MatchDecision] = None,
         area_registry=None,
+        camera_floors: Optional[Dict[str, str]] = None,
     ):
         self._lock = threading.RLock()
         self._matcher_lock = threading.Lock()
+
+        # camera_id → floor label, used by the identity gate to skip ReID /
+        # plate matching on ground-floor cameras (see is_reid_disabled_floor /
+        # _is_reid_disabled_camera). Empty map ⇒ every camera is treated as
+        # identity-enabled (legacy behaviour).
+        self._camera_floors: Dict[str, str] = dict(camera_floors or {})
 
         self._pending_event_order: List[str] = []
         self._pending_events: Dict[str, PendingANPREvent] = {}

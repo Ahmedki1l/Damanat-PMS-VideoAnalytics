@@ -22,14 +22,22 @@ logger = logging.getLogger(__name__)
 REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
 match_logger = logging.getLogger("reid_match_perf")
 
-# Cameras for which all identity matching is disabled. These cameras
-# only run detection and slot-occupancy state machines — they do not
-# participate in B1 confirmation, cross-camera reattach, plate→slot
-# linking, or any plate identity binding. The engine layer
-# (`_update_slot_state` in `core.engine.engine_runtime`) reads this set
-# directly to skip plate-related calls proactively; the three registry
-# entry points below also guard against it as defense-in-depth.
-IDENTITY_MATCHING_DISABLED_CAMERAS = frozenset({"CAM-01", "CAM-02"})
+# Floors that run YOLO occupancy only — no ReID embedding compute and no
+# plate/identity matching. Currently the ground floor. These cameras host real
+# slots and occupancy state machines, but do NOT participate in ReID feature
+# extraction, B1 confirmation, cross-camera reattach, or plate→slot linking;
+# identity for them is established via the external ANPR gate plates, not
+# appearance. The engine layer (`_process_special_zones` / `_update_slot_state`
+# in `core.engine.engine_runtime`) reads this predicate directly to skip ReID
+# and plate calls proactively; the three registry entry points below also guard
+# against it as defense-in-depth (via the injected camera→floor map).
+#
+# Matched on the normalized floor label so the DB spelling ("Ground") and the
+# test spelling ("Ground Floor") both resolve. Replaces the former hardcoded
+# ``IDENTITY_MATCHING_DISABLED_CAMERAS = {"CAM-01", "CAM-02"}`` camera-id set so
+# any ground-floor camera is covered automatically, regardless of id.
+def is_reid_disabled_floor(floor: str) -> bool:
+    return (floor or "").strip().lower() in {"ground", "ground floor"}
 
 # Single-camera ownership: a session observed by several cameras at once is
 # owned by exactly one — the live observer with the highest ReID score. A track
@@ -352,6 +360,15 @@ class VehicleRegistryIdentityMixin:
             )
             return event.plate
 
+    def _is_reid_disabled_camera(self, camera_id: str) -> bool:
+        """Floor-based identity gate for a ``camera_id``, resolved through the
+        ``camera_id → floor`` map injected at registry construction
+        (``self._camera_floors``). Defaults to *enabled* (returns False) when
+        the map lacks the camera, so a missing entry never silently drops
+        identity matching."""
+        floors = getattr(self, "_camera_floors", None) or {}
+        return is_reid_disabled_floor(floors.get(camera_id, ""))
+
     def confirm_at_b1_entrance(
         self,
         camera_id: str,
@@ -368,7 +385,7 @@ class VehicleRegistryIdentityMixin:
         captured at Park_Entry.
         """
         now = timestamp or self._clock()
-        if camera_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
+        if self._is_reid_disabled_camera(camera_id):
             return None
         if ordered_images:
             session_reference_images = self._dedupe_valid_images(ordered_images)
@@ -1323,7 +1340,7 @@ class VehicleRegistryIdentityMixin:
         """
         if query_vector is None:
             return None
-        if camera_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
+        if self._is_reid_disabled_camera(camera_id):
             return None
 
         with self._lock:
@@ -1469,7 +1486,7 @@ class VehicleRegistryIdentityMixin:
         """
         if track_id is None:
             return None
-        if camera_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
+        if is_reid_disabled_floor(floor):
             return None
 
         with self._lock:

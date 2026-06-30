@@ -296,6 +296,10 @@ Examples:
             snapshot_url_prefix=config.output.snapshot_url_prefix,
             gateway_path_prefix=config.output.gateway_path_prefix,
             area_registry=area_registry,
+            # camera_id → floor, so the identity gate can skip ReID/plate
+            # matching on ground-floor cameras by floor rather than a hardcoded
+            # camera-id set.
+            camera_floors={c.id: c.floor for c in config.cameras},
         )
 
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)

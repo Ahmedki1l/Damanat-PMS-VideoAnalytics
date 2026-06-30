@@ -17,7 +17,7 @@ from src.services.parking_service import (
     load_camera_slots,
 )
 from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
-from src.vehicle_registry.vehicle_registry_identity import IDENTITY_MATCHING_DISABLED_CAMERAS
+from src.vehicle_registry.vehicle_registry_identity import is_reid_disabled_floor
 
 
 logger = logging.getLogger(__name__)
@@ -458,11 +458,11 @@ class ParkingEngineRuntimeMixin:
 
     def _free_plates_on_disabled_cameras(self) -> None:
         """One-shot startup cleanup: for cameras whose plate matching is
-        disabled (IDENTITY_MATCHING_DISABLED_CAMERAS — currently the ground
-        floor), clear any plate left bound to one of their slots in
-        ``slot_status`` and notify the PMS API to unbind. The slot's
-        ``is_available`` flag is left untouched — only the plate identity
-        is freed. Idempotent: a no-op if there are no stale bindings."""
+        disabled (ground-floor cameras, via ``is_reid_disabled_floor``), clear
+        any plate left bound to one of their slots in ``slot_status`` and notify
+        the PMS API to unbind. The slot's ``is_available`` flag is left
+        untouched — only the plate identity is freed. Idempotent: a no-op if
+        there are no stale bindings."""
         if not self.db_manager:
             return
         cleared = []
@@ -470,9 +470,8 @@ class ParkingEngineRuntimeMixin:
         try:
             from src.repositories import SlotStatusRepository
 
-            for cam_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
-                pipeline = self.pipelines.get(cam_id)
-                if pipeline is None:
+            for cam_id, pipeline in self.pipelines.items():
+                if not is_reid_disabled_floor(pipeline.floor):
                     continue
                 for slot in pipeline.slots:
                     latest = SlotStatusRepository.get_latest_by_slot(session, slot.id)
@@ -687,7 +686,13 @@ class ParkingEngineRuntimeMixin:
                     confirmation_zone,
                 )
 
-        if cam_id not in ["CAM-01", "CAM-02"] and detections:
+        # Ground-floor cameras run YOLO occupancy only — skip all ReID embedding
+        # compute (TrackingManager feature extraction + global tracking). This
+        # is the core-saving gate; identity for ground is via ANPR plates, not
+        # appearance. Gated by floor so any ground camera is covered, not just a
+        # hardcoded id pair.
+        floor = self.pipelines[cam_id].floor if cam_id in self.pipelines else ""
+        if not is_reid_disabled_floor(floor) and detections:
             if cam_id not in self._tracking_managers:
                 self._tracking_managers[cam_id] = TrackingManager(cam_id)
             tracking_manager = self._tracking_managers[cam_id]
@@ -734,11 +739,11 @@ class ParkingEngineRuntimeMixin:
 
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
         all_events = []
-        # Ground-floor cameras (CAM-01/CAM-02) host real slots but must not
-        # participate in plate identity matching — they only run occupancy
-        # state machines. Short-circuit here so we don't even ask the
-        # registry; the registry guards remain as defense-in-depth.
-        plate_matching_enabled = cam_id not in IDENTITY_MATCHING_DISABLED_CAMERAS
+        # Ground-floor cameras host real slots but must not participate in plate
+        # identity matching — they only run occupancy state machines. Short-
+        # circuit here (by floor) so we don't even ask the registry; the
+        # registry guards remain as defense-in-depth.
+        plate_matching_enabled = not is_reid_disabled_floor(pipeline.floor)
 
         for slot in pipeline.slots:
             state_machine = pipeline.state_machines[slot.id]
