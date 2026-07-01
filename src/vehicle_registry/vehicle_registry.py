@@ -85,6 +85,10 @@ class VehicleRegistry(
         self._track_session_map: Dict[Tuple[str, int], str] = {}
         self._track_last_seen: Dict[Tuple[str, int], datetime] = {}
         self._parked: Dict[str, VehicleSession] = {}
+        # Plate-lock: slots whose plate binding has been frozen. A locked slot is
+        # refused by the relocate / stale-release / theft paths in
+        # try_link_to_slot until it is explicitly unlocked (slot goes VACANT).
+        self._locked_slots: set[str] = set()
         self._history: List[VehicleSession] = []
 
         # Zoning: area_id → {session_id} for the bounded (per-area) candidate

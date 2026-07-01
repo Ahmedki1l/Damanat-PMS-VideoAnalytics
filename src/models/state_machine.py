@@ -119,6 +119,13 @@ class SlotStateMachine:
         self.snapshot_url: str = ""
         self.last_update_time: str = datetime.now().isoformat()
 
+        # Plate-lock: once a parked car's plate is confirmed above the bar it is
+        # frozen (plate_locked=True) and cannot change until the slot goes VACANT.
+        # plate_confidence is the score of the currently-bound plate; while
+        # unlocked the binding only ever upgrades to a strictly higher score.
+        self.plate_locked: bool = False
+        self.plate_confidence: float = 0.0
+
         # Store violation zone status from DB
         self._is_violation_zone: bool = is_violation_zone
 
@@ -148,25 +155,50 @@ class SlotStateMachine:
             "is_violation_zone": self.is_violation_zone,
             "plate_number": self.plate_number,
             "snapshot_url": self.snapshot_url,
+            "plate_locked": self.plate_locked,
+            "plate_confidence": self.plate_confidence,
         }
 
-    def bind_identity(self, plate_number: Optional[str], snapshot_url: str = "") -> None:
+    def is_plate_locked(self) -> bool:
+        """True once the bound plate has been frozen for this slot."""
+        return self.plate_locked
+
+    def bind_identity(
+        self,
+        plate_number: Optional[str],
+        snapshot_url: str = "",
+        confidence: Optional[float] = None,
+        lock: bool = False,
+    ) -> None:
         """Persist the confirmed identity for this slot until vacancy is confirmed.
 
         Passing ``plate_number=None`` (or ``""``) clears the field — callers in
         engine_runtime.py rely on this to drop ghost plates when the registry
         no longer has a binding for the slot (e.g. CAM-01/CAM-02 where plate
         matching is disabled but slot detection still runs).
+
+        Args:
+            confidence: Score of this plate reading. When provided it becomes the
+                slot's ``plate_confidence`` (the value the unlocked upgrade path
+                compares against). ``None`` leaves the stored confidence untouched.
+            lock: When True, hard-freeze the binding — subsequent lower/other
+                readings are ignored until ``clear_identity`` (slot goes VACANT).
         """
         self.plate_number = plate_number or ""
         if snapshot_url:
             self.snapshot_url = snapshot_url
+        if confidence is not None:
+            self.plate_confidence = confidence
+        if lock:
+            self.plate_locked = True
 
     def clear_identity(self) -> None:
         """Clear the persisted identity after the slot is confirmed vacant."""
         self.plate_number = ""
         self.snapshot_url = ""
         self.latest_detection_bbox = None
+        self.plate_locked = False
+        self.plate_confidence = 0.0
 
     def update(
         self,

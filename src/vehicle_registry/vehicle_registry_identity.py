@@ -1068,6 +1068,29 @@ class VehicleRegistryIdentityMixin:
                     return session.display_id
         return "0"
 
+    def get_reid_score_for_track(
+        self,
+        camera_id: str,
+        track_id: int,
+    ) -> Optional[float]:
+        """Latest ReID similarity for a track on this camera (None if unknown).
+
+        Reads the per-camera ``observing_scores`` recorded when the track was
+        matched/confirmed; falls back to the session's ``new_pipeline_score``.
+        Used only for the ``--show`` overlay — display, not decisions.
+        """
+        with self._lock:
+            session_id = self._track_session_map.get((camera_id, track_id))
+            if not session_id:
+                return None
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            score = session.observing_scores.get(camera_id)
+            if score is None:
+                score = session.new_pipeline_score
+            return float(score) if score else None
+
     def create_appearance_session(
         self,
         camera_id: str,
@@ -1583,6 +1606,7 @@ class VehicleRegistryIdentityMixin:
                     if sid != slot_id
                     and s.session_id != session.session_id
                     and s.plate == session.plate
+                    and sid not in self._locked_slots  # never release a frozen slot
                 ]
                 for stale_sid in stale_slots:
                     stale = self._parked.pop(stale_sid, None)
@@ -1641,6 +1665,17 @@ class VehicleRegistryIdentityMixin:
             # linked to a different slot, remove that old linkage first.
             if session.linked_slot and session.linked_slot != slot_id:
                 old_slot_id = session.linked_slot
+                # Plate-lock: a session frozen into a locked slot must not be
+                # relocated. A mis-association at another (unlocked) slot would
+                # otherwise pop the locked slot and move the plate — exactly the
+                # drift this feature prevents. Refuse; keep the frozen binding.
+                if old_slot_id in self._locked_slots:
+                    logger.debug(
+                        "[REGISTRY] Refusing to move session %s (plate %s) off "
+                        "LOCKED slot %s to %s — binding frozen.",
+                        session.session_id, session.plate, old_slot_id, slot_id,
+                    )
+                    return session.plate
                 logger.info(
                     "[REGISTRY] Vehicle session %s (plate %s) moving from slot %s to %s",
                     session.session_id,
@@ -1688,6 +1723,9 @@ class VehicleRegistryIdentityMixin:
         Detach the currently parked session from a slot after vacancy is confirmed.
         """
         with self._lock:
+            # Vacancy always releases any plate-lock on the slot — this is the
+            # only place a lock is dropped (the "slot state changed" release).
+            self._locked_slots.discard(slot_id)
             session = self._parked.pop(slot_id, None)
             if session is None:
                 return None
@@ -1700,9 +1738,121 @@ class VehicleRegistryIdentityMixin:
             session.linked_zone_id = None
             session.linked_zone_name = None
             session.linked_at = None
+            session.ocr_confirmed = False
             if session.status == "parked":
                 session.status = "confirmed"
             return plate
+
+    # ------------------------------------------------------------------ #
+    # Plate-lock: freeze a confirmed plate onto a parked slot
+    # ------------------------------------------------------------------ #
+    def lock_slot(self, slot_id: str) -> None:
+        """Freeze the current plate binding on ``slot_id``. Idempotent.
+
+        Once locked, the relocate / stale-release / move paths in
+        ``try_link_to_slot`` refuse to touch the slot until ``unlink_slot``
+        (slot confirmed VACANT) drops the lock.
+        """
+        with self._lock:
+            if slot_id in self._parked:
+                self._locked_slots.add(slot_id)
+
+    def is_slot_locked(self, slot_id: str) -> bool:
+        """True if ``slot_id``'s plate binding is currently frozen."""
+        with self._lock:
+            return slot_id in self._locked_slots
+
+    def get_slot_binding_confidence(self, slot_id: str) -> float:
+        """ReID score of the session currently parked in ``slot_id`` (0.0 if none)."""
+        with self._lock:
+            session = self._parked.get(slot_id)
+            return float(session.new_pipeline_score) if session is not None else 0.0
+
+    def get_slot_ocr_confirmed(self, slot_id: str) -> bool:
+        """True if the session parked in ``slot_id`` has had its plate OCR-confirmed."""
+        with self._lock:
+            session = self._parked.get(slot_id)
+            return bool(session.ocr_confirmed) if session is not None else False
+
+    def try_ocr_confirm_slot(self, slot_id: str, crop_bgr) -> bool:
+        """Forced-OCR dead-zone pass (§3b): read the plate off the parked car
+        crop and, if it agrees with the session's plate, mark the session
+        ``ocr_confirmed`` so the lock gate's OCR arm fires.
+
+        Reuses the already-loaded OCR plugin held by MatchDecision — no second
+        PaddleOCR is constructed. Returns True once confirmed (also short-circuits
+        True if already confirmed). The per-slot attempt cap lives on the engine
+        side so this stays a single cheap read.
+        """
+        with self._lock:
+            session = self._parked.get(slot_id)
+            if session is None or not session.plate:
+                return False
+            if session.ocr_confirmed:
+                return True
+        # OCR is heavy — run it OUTSIDE the registry lock so the per-frame loop
+        # for other cameras/slots isn't blocked on a PaddleOCR read.
+        ocr = getattr(self._match_decision, "plate_ocr", None)
+        if ocr is None or not hasattr(ocr, "read"):
+            return False
+        try:
+            ocr_text, _conf = ocr.read(crop_bgr)
+        except Exception:
+            return False
+        if not ocr_text:
+            return False
+        from src.ocr.plate_ocr import plates_match
+        with self._lock:
+            session = self._parked.get(slot_id)
+            if session is None or not session.plate:
+                return False
+            if plates_match(ocr_text, session.plate):
+                session.ocr_confirmed = True
+                return True
+        return False
+
+    def restore_parked_binding(
+        self,
+        slot_id: str,
+        slot_name: str,
+        plate: str,
+        confidence: float,
+        camera_id: str,
+        floor: str,
+        locked: bool,
+        timestamp: datetime,
+    ) -> None:
+        """Rebuild a parked+locked binding from persisted DB state on restart.
+
+        The registry starts empty after a restart, but the DB remembers which
+        slots held which plate (and whether frozen). This reinserts a minimal
+        ``VehicleSession`` into ``_parked`` (and ``_locked_slots`` when locked)
+        so the API reports the plate immediately and the first post-restart
+        frame cannot overwrite a correct record with a fresh provisional one.
+        See engine_runtime._load_camera_db_state.
+        """
+        with self._lock:
+            if slot_id in self._parked:
+                return
+            session = VehicleSession(
+                session_id=f"restored_{uuid.uuid4().hex[:12]}",
+                plate=plate,
+                first_seen_at=timestamp,
+                last_seen_at=timestamp,
+                last_seen_camera=camera_id,
+                status="parked",
+                new_pipeline_score=confidence,
+                old_pipeline_score=confidence,
+            )
+            session.linked_slot = slot_id
+            session.linked_slot_name = slot_name
+            session.linked_camera = camera_id
+            session.linked_floor = floor
+            session.linked_at = timestamp
+            self._sessions[session.session_id] = session
+            self._parked[slot_id] = session
+            if locked:
+                self._locked_slots.add(slot_id)
 
     def _handle_exit(self, plate: str, timestamp: datetime) -> None:
         """
@@ -1721,6 +1871,9 @@ class VehicleRegistryIdentityMixin:
             ]
             for slot_id in parked_slots_to_clear:
                 sess = self._parked.pop(slot_id)
+                # The car left the facility — drop any plate-lock too so we don't
+                # leak a frozen entry pointing at a slot no longer in _parked.
+                self._locked_slots.discard(slot_id)
                 if sess not in sessions_to_remove:
                     sessions_to_remove.append(sess)
 

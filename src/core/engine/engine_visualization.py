@@ -42,6 +42,14 @@ class ParkingEngineVisualizationMixin:
             del self._display_label_cache[cache_key]
         return display_id, False
 
+    def _reid_score_suffix(self, cam_id: str, track_id: int) -> str:
+        """Return ``" 0.82"`` (leading space) for the bbox overlay, or ``""``
+        when no ReID score is known for this track. Display only."""
+        if not self.vehicle_registry:
+            return ""
+        score = self.vehicle_registry.get_reid_score_for_track(cam_id, track_id)
+        return f" {score:.2f}" if score is not None else ""
+
     def _emit_full_summary(self):
         """Emit status summary across all cameras."""
         all_statuses = []
@@ -139,6 +147,27 @@ class ParkingEngineVisualizationMixin:
                 2,
             )
 
+            # Plate-lock badge: show the bound plate beneath the slot label.
+            # [LOCK]+score once frozen (green), dim '?'+score while provisional.
+            # ASCII only — cv2.putText is Hershey-font, no Unicode glyphs.
+            plate = state_machine.plate_number
+            if plate:
+                if state_machine.plate_locked:
+                    badge = f"{plate} [LOCK] {state_machine.plate_confidence:.2f}"
+                    badge_color = (0, 255, 0)
+                else:
+                    badge = f"{plate} ? {state_machine.plate_confidence:.2f}"
+                    badge_color = (0, 200, 200)
+                cv2.putText(
+                    frame,
+                    badge,
+                    (cx - 40, cy + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    badge_color,
+                    1,
+                )
+
         for track_id, detection in assignment.slot_vehicle_map.values():
             x1, y1, x2, y2 = [int(v) for v in detection.bbox]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
@@ -148,9 +177,10 @@ class ParkingEngineVisualizationMixin:
             if self.vehicle_registry:
                 display_id, is_sticky_confirmed = self._resolve_display_label(cam_id, track_id)
 
+            label = f"{display_id}{self._reid_score_suffix(cam_id, track_id)}"
             cv2.putText(
                 frame,
-                f"{display_id}",
+                label,
                 (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -174,9 +204,10 @@ class ParkingEngineVisualizationMixin:
                         track_id,
                     )
 
+                label = f"{display_id}{self._reid_score_suffix(cam_id, track_id)} (?)"
                 cv2.putText(
                     frame,
-                    f"{display_id} (?)",
+                    label,
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,

@@ -117,3 +117,43 @@ class DatabaseManager:
                             "ADD reserved_for VARCHAR(255) NULL"
                         )
                     )
+
+                # ---- Plate-lock binding columns (dialect-aware) ----------------
+                # Production runs on MSSQL (BIT + named-constraint defaults); the
+                # test suite runs on SQLite (BOOLEAN/no named constraint). Branch
+                # so both create_all and this back-fill succeed on either engine.
+                dialect = self.engine.dialect.name
+                if dialect == "mssql":
+                    bool_type, bool_def = "BIT", "0"
+                    add_kw = "ADD"
+
+                    def _default(name, val):
+                        return f"CONSTRAINT DF_parking_slots_{name} DEFAULT {val}"
+                else:  # sqlite (tests) and other engines
+                    bool_type, bool_def = "BOOLEAN", "0"
+                    add_kw = "ADD COLUMN"
+
+                    def _default(name, val):
+                        return f"DEFAULT {val}"
+
+                # Nullable columns omit an explicit NULL keyword — nullable is the
+                # default in both dialects, and SQLite's ADD COLUMN rejects a bare
+                # NULL constraint (only MSSQL accepts it).
+                if "current_plate" not in columns:
+                    conn.execute(text(
+                        f"ALTER TABLE parking_slots {add_kw} current_plate VARCHAR(50)"
+                    ))
+                if "plate_confidence" not in columns:
+                    conn.execute(text(
+                        f"ALTER TABLE parking_slots {add_kw} plate_confidence FLOAT "
+                        f"NOT NULL {_default('plate_confidence', '0')}"
+                    ))
+                if "plate_locked" not in columns:
+                    conn.execute(text(
+                        f"ALTER TABLE parking_slots {add_kw} plate_locked {bool_type} "
+                        f"NOT NULL {_default('plate_locked', bool_def)}"
+                    ))
+                if "plate_locked_at" not in columns:
+                    conn.execute(text(
+                        f"ALTER TABLE parking_slots {add_kw} plate_locked_at DATETIME"
+                    ))

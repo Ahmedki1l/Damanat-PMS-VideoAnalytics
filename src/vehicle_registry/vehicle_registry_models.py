@@ -129,6 +129,13 @@ class VehicleSession:
     type_class: Optional[str] = None
     ocr_plate_variants: List[str] = field(default_factory=list)
 
+    # Plate-lock: set True once OCR has actually read this car's plate and it
+    # agreed with ``self.plate`` (B1 confirm path, or the forced-OCR dead-zone
+    # pass). The lock gate reads this directly — it is the OCR arm of the
+    # "ReID >= lock_confidence OR ocr_confirmed" freeze condition, and does not
+    # rely on the synthetic Decision built for the voter (which carries no OCR).
+    ocr_confirmed: bool = False
+
     @property
     def display_id(self) -> str:
         """Returns plate if available, otherwise session ID."""

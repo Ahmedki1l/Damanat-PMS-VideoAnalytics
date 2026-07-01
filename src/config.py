@@ -199,6 +199,11 @@ class MatchingConfig:
     # optional (a "solo confirm"). Used by Phase 2 ensemble wiring.
     reid_solo_confirm: float = 0.70
 
+    # Plate-lock bar: a voting-committed plate freezes onto a parked slot when
+    # its ReID score clears this (OR OCR agreement, see engine_runtime). Defaults
+    # to reid_solo_confirm; kept separate so the freeze bar can be tuned alone.
+    lock_confidence: float = 0.70
+
     # --- HSV tolerances for color_compatible() ---
     # Tightened from 25 -> 12 in Phase 2 / T2.1: the learned 11-class color
     # classifier is now the primary path. The legacy HSV gate is kept as a
@@ -522,6 +527,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.ocr_marginal_low = m.get("ocr_marginal_low", cm.ocr_marginal_low)
         cm.ocr_marginal_high = m.get("ocr_marginal_high", cm.ocr_marginal_high)
         cm.reid_solo_confirm = m.get("reid_solo_confirm", cm.reid_solo_confirm)
+        cm.lock_confidence = m.get("lock_confidence", cm.lock_confidence)
 
         # HSV tolerances
         cm.hsv_h_tol = m.get("hsv_h_tol", cm.hsv_h_tol)
