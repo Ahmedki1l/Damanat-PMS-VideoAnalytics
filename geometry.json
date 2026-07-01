@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "exported_at": "2026-06-29T20:51:56.655955+00:00",
+  "exported_at": "2026-07-01T08:51:19.253745+00:00",
   "source_db": "localhost/damanat_pms",
   "floor_filter": null,
   "tables": {
@@ -97,7 +97,7 @@
     "parking_slots": [
       {
         "slot_id": "B1_CRO",
-        "slot_name": "B1_CRO",
+        "slot_name": "B1 CRO",
         "camera_id": "CAM-21",
         "floor": "B1",
         "zone_id": "CAM-21",
@@ -165,7 +165,7 @@
       },
       {
         "slot_id": "B10_CTO",
-        "slot_name": "B10_CTO",
+        "slot_name": "B10 CTO",
         "camera_id": "CAM-20",
         "floor": "B1",
         "zone_id": "CAM-20",
@@ -194,6 +194,102 @@
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "CTO"
+      },
+      {
+        "slot_id": "B11 CFO",
+        "slot_name": "B11 CFO",
+        "camera_id": "CAM-24",
+        "floor": "B1",
+        "zone_id": "CAM-24",
+        "zone_name": "CAM-24",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            779.0,
+            345.0
+          ],
+          [
+            988.0,
+            348.0
+          ],
+          [
+            884.0,
+            238.0
+          ],
+          [
+            725.0,
+            242.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "EMPLOYEE",
+        "reserved_for": "CFO"
+      },
+      {
+        "slot_id": "B12 CCO",
+        "slot_name": "B12 CCO",
+        "camera_id": "CAM-24",
+        "floor": "B1",
+        "zone_id": "CAM-24",
+        "zone_name": "CAM-24",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            479.0,
+            348.0
+          ],
+          [
+            738.0,
+            345.0
+          ],
+          [
+            699.0,
+            230.0
+          ],
+          [
+            520.0,
+            226.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "EMPLOYEE",
+        "reserved_for": "CCO"
+      },
+      {
+        "slot_id": "B13 COO",
+        "slot_name": "B13 COO",
+        "camera_id": "CAM-24",
+        "floor": "B1",
+        "zone_id": "CAM-24",
+        "zone_name": "CAM-24",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            248.0,
+            350.0
+          ],
+          [
+            436.0,
+            349.0
+          ],
+          [
+            494.0,
+            243.0
+          ],
+          [
+            364.0,
+            249.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "EMPLOYEE",
+        "reserved_for": "COO"
       },
       {
         "slot_id": "B14",
@@ -257,7 +353,7 @@
             382.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B15_latest.jpg",
+        "last_snapshot_path": null,
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
@@ -289,8 +385,8 @@
             368.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B16_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -322,7 +418,7 @@
           ]
         ],
         "last_snapshot_path": null,
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -429,8 +525,72 @@
             375.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B2_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null
+      },
+      {
+        "slot_id": "B20",
+        "slot_name": "B20",
+        "camera_id": "CAM-25",
+        "floor": "B2",
+        "zone_id": "CAM-25",
+        "zone_name": "CAM-25",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            1077.0,
+            359.0
+          ],
+          [
+            679.0,
+            352.0
+          ],
+          [
+            666.0,
+            155.0
+          ],
+          [
+            919.0,
+            162.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null
+      },
+      {
+        "slot_id": "B21",
+        "slot_name": "B21",
+        "camera_id": "CAM-25",
+        "floor": "B2",
+        "zone_id": "CAM-25",
+        "zone_name": "CAM-25",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            634.0,
+            348.0
+          ],
+          [
+            229.0,
+            349.0
+          ],
+          [
+            380.0,
+            167.0
+          ],
+          [
+            631.0,
+            159.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -473,8 +633,8 @@
             181.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B22_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -505,8 +665,8 @@
             328.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B23_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -537,7 +697,7 @@
             209.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B24_latest.jpg",
+        "last_snapshot_path": null,
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
@@ -677,7 +837,7 @@
       },
       {
         "slot_id": "B3",
-        "slot_name": "B3",
+        "slot_name": "B3 COS",
         "camera_id": "CAM-04",
         "floor": "B1",
         "zone_id": "CAM-04",
@@ -701,11 +861,11 @@
             337.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B3_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
-        "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reservation_type": "EMPLOYEE",
+        "reserved_for": "COS"
       },
       {
         "slot_id": "B5",
@@ -733,15 +893,15 @@
             297.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B5_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
       },
       {
         "slot_id": "B6_Reserved",
-        "slot_name": "Slot B6 Reserved",
+        "slot_name": "B6 Reserved",
         "camera_id": "CAM-06",
         "floor": "B1",
         "zone_id": "B1 Parking — Camera 06",
@@ -765,15 +925,15 @@
             272.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B6_Reserved_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "Reserved"
       },
       {
         "slot_id": "B7_CHRO",
-        "slot_name": "B7_CHRO",
+        "slot_name": "B7 CHRO",
         "camera_id": "CAM-22",
         "floor": "B1",
         "zone_id": "CAM-22",
@@ -805,7 +965,7 @@
       },
       {
         "slot_id": "B8_CSBDO",
-        "slot_name": "B8_CSBDO",
+        "slot_name": "B8 CSBDO",
         "camera_id": "CAM-22",
         "floor": "B1",
         "zone_id": "CAM-22",
@@ -861,8 +1021,8 @@
             289.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B9_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -993,8 +1153,8 @@
             218.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G1_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "SPECIAL",
         "reserved_for": null
@@ -1025,8 +1185,8 @@
             131.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G2_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -1057,8 +1217,8 @@
             289.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G7_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -1089,8 +1249,8 @@
             320.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G8_latest.jpg",
-        "is_available": false,
+        "last_snapshot_path": null,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -1154,7 +1314,7 @@
           ]
         ],
         "last_snapshot_path": null,
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": true,
         "reservation_type": "GENERAL",
         "reserved_for": null
@@ -1568,6 +1728,106 @@
         ],
         "area_from": "B1-B",
         "area_to": "B1-A"
+      },
+      {
+        "boundary_id": "Cam-24 Bound1",
+        "camera_id": "CAM-24",
+        "floor": "B1",
+        "polygon": [
+          [
+            1058.0,
+            351.0
+          ],
+          [
+            944.0,
+            357.0
+          ],
+          [
+            1107.0,
+            598.0
+          ],
+          [
+            1220.0,
+            567.0
+          ]
+        ],
+        "area_from": "B1-A",
+        "area_to": "B1-B"
+      },
+      {
+        "boundary_id": "Cam-24 Bound2",
+        "camera_id": "CAM-24",
+        "floor": "B1",
+        "polygon": [
+          [
+            299.0,
+            369.0
+          ],
+          [
+            187.0,
+            358.0
+          ],
+          [
+            79.0,
+            512.0
+          ],
+          [
+            222.0,
+            525.0
+          ]
+        ],
+        "area_from": "B2-B",
+        "area_to": "B2-C"
+      },
+      {
+        "boundary_id": "Cam-25 Bound1",
+        "camera_id": "CAM-25",
+        "floor": "B2",
+        "polygon": [
+          [
+            132.0,
+            369.0
+          ],
+          [
+            309.0,
+            373.0
+          ],
+          [
+            244.0,
+            714.0
+          ],
+          [
+            9.0,
+            708.0
+          ]
+        ],
+        "area_from": "B2-B",
+        "area_to": "B2-A"
+      },
+      {
+        "boundary_id": "Cam-25 Bound2",
+        "camera_id": "CAM-25",
+        "floor": "B2",
+        "polygon": [
+          [
+            1169.0,
+            369.0
+          ],
+          [
+            994.0,
+            379.0
+          ],
+          [
+            1059.0,
+            713.0
+          ],
+          [
+            1265.0,
+            714.0
+          ]
+        ],
+        "area_from": "B2-C",
+        "area_to": "B2-B"
       },
       {
         "boundary_id": "Cam-5 Bound",
