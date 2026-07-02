@@ -189,6 +189,15 @@ Examples:
              "one floor in isolation. Applies to multi-camera mode.",
     )
     parser.add_argument(
+        "--cameras", type=str, default=None,
+        help="Run only a comma-separated subset of cameras by ID (e.g. "
+             "'CAM-03,CAM-04,CAM-05'). Splits a floor across parallel processes "
+             "to raise aggregate FPS (each process is one serial inference "
+             "worker; keep <=6 cameras per process to approach 5 fps/cam). "
+             "Case-insensitive; '_' and '-' are interchangeable. Composes with "
+             "--floor. Applies to multi-camera mode.",
+    )
+    parser.add_argument(
         "--show", action="store_true",
         help="Show annotated video window for debugging.",
     )
@@ -251,6 +260,35 @@ Examples:
         config.cameras = filtered
         print(
             f"[INFO] --floor {args.floor}: running {len(filtered)} camera(s): "
+            f"{[c.id for c in filtered]}"
+        )
+
+    # Restrict the roster to an explicit camera subset when --cameras is given.
+    # This is the parallel-scaling lever: each process runs one serial inference
+    # worker (~fixed inferences/sec), so fps/camera scales as that budget split
+    # over fewer cameras. Launch several processes (each with its own --cameras
+    # group and --port) to use more cores concurrently. Composes with --floor.
+    if args.cameras:
+        def _norm(cid: str) -> str:
+            return cid.strip().upper().replace("_", "-")
+
+        wanted = [_norm(c) for c in args.cameras.split(",") if c.strip()]
+        by_id = {_norm(c.id): c for c in config.cameras}
+        unknown = [c for c in wanted if c not in by_id]
+        if unknown:
+            print(f"\n[ERROR] Unknown camera id(s) for --cameras: {unknown}")
+            print(f"[HINT] Available: {sorted(by_id)}")
+            sys.exit(1)
+        # Preserve request order, drop duplicates.
+        seen = set()
+        filtered = []
+        for c in wanted:
+            if c not in seen:
+                seen.add(c)
+                filtered.append(by_id[c])
+        config.cameras = filtered
+        print(
+            f"[INFO] --cameras: running {len(filtered)} camera(s): "
             f"{[c.id for c in filtered]}"
         )
 
