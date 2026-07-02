@@ -318,6 +318,16 @@ class VehicleRegistryCoreMixin:
             # not 500 the webhook (which would drop the event). Log and no-op.
             logger.warning("[ANPR] Ignoring unsupported direction %r (plate=%s)", direction, plate)
 
+        # Warm-start: a returning car with a retained gallery is re-loaded now so
+        # ReID can re-identify it immediately on this visit (no-op when disabled,
+        # no folder, or already live). Off the lock — build_session_from_gallery
+        # takes it itself.
+        if direction == "entry" and plate and self.gallery_store is not None:
+            try:
+                self.build_session_from_gallery(plate)
+            except Exception as exc:  # pragma: no cover - warm-start best-effort
+                logger.debug("[gallery] warm-start failed for %s: %r", plate, exc)
+
         return event
 
     def _rebind_anpr_plate(self, event_id: str, new_plate: str) -> None:

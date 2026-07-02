@@ -173,6 +173,13 @@ class VehicleRegistry(
             metric="cosine",
         )
 
+        # Per-car persistent gallery (folder per plate). Lazily built on first
+        # use (needs the ReID backend name for the model tag); None when
+        # ``gallery_persist_enabled`` is False. ``_gallery_last_add`` throttles
+        # accumulation to one write per (plate, camera) per configured interval.
+        self._gallery_store = None
+        self._gallery_last_add: Dict[Tuple[str, str], float] = {}
+
         # DI seams (T0.5). ``db_checker`` lets tests replace the SQL probe in
         # is_plate_inside; ``clock`` lets tests advance time deterministically.
         # Both default to None — callsites still use the real
@@ -197,6 +204,26 @@ class VehicleRegistry(
     def matching_config(self) -> MatchingConfig:
         """Active matching configuration (thresholds + feature flags)."""
         return self._matching_config
+
+    @property
+    def gallery_store(self):
+        """Lazy per-car gallery store. None when persistence is disabled.
+
+        The model tag (``backend:model-dir``) is captured at first use so a
+        later ReID model swap invalidates the cached vectors (reload re-embeds
+        from the retained crops)."""
+        if not getattr(self._matching_config, "gallery_persist_enabled", False):
+            return None
+        if self._gallery_store is None:
+            from src.vehicle_registry.gallery_store import VehicleGalleryStore
+
+            model_dir = (self._matching_config.reid_openvino_model_dir or "").rstrip("/\\")
+            tag = f"{getattr(self.reid_matcher, 'backend', '?')}:{os.path.basename(model_dir) or 'default'}"
+            self._gallery_store = VehicleGalleryStore(
+                self._image_dir, tag, self._matching_config.gallery_max_refs_per_car
+            )
+            logger.info("[gallery] persistent per-car gallery enabled (tag=%s)", tag)
+        return self._gallery_store
 
     @property
     def match_decision(self) -> MatchDecision:

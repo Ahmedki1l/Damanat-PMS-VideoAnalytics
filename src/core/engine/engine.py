@@ -187,6 +187,11 @@ class ParkingEngine(
                 f"[INFO] Slot-hosting cameras (ReID ownership priority): "
                 f"{sorted(slotted)}"
             )
+            # Reload each still-inside car's persisted per-plate gallery so ReID
+            # can re-identify it after a restart (enriches the vectorless
+            # sessions _restore_plate_locks just created). No-op when the gallery
+            # feature is disabled.
+            self._restore_vehicle_galleries()
         print(f"[INFO] Processing mode: {self.config.processing.mode}")
         print(
             f"[INFO] Target FPS per camera: "

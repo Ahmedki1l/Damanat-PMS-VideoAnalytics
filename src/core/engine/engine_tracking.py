@@ -858,6 +858,17 @@ class ParkingEngineTrackingMixin:
                         self.update_vehicle_presence(
                             plate, floor=pipeline.floor, camera_id=cam_id,
                         )
+                    # Grow this car's persistent gallery with a fresh full-view
+                    # crop (throttled/gated/deduped inside the registry) so its
+                    # ReID profile keeps improving and survives restart.
+                    ref_crop = self._crop_detection(frame, detection)
+                    if ref_crop is not None:
+                        self.vehicle_registry.record_reference_for_track(
+                            cam_id,
+                            detection.track_id,
+                            ref_crop,
+                            self._bbox_view_quality(frame, detection),
+                        )
                     continue
 
                 if tracking_manager:

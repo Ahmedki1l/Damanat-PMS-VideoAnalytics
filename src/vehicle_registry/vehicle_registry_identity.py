@@ -1229,6 +1229,159 @@ class VehicleRegistryIdentityMixin:
             )
             return session_id
 
+    def record_reference_for_track(
+        self,
+        camera_id: str,
+        track_id: int,
+        crop_bgr: np.ndarray,
+        view_quality: float,
+    ) -> bool:
+        """Engine-facing wrapper: resolve the (camera, track)'s session and add a
+        gallery reference for it. No-op when the track has no session or the
+        session has no plate yet. See :meth:`accumulate_reference`."""
+        with self._lock:
+            sid = self._track_session_map.get((camera_id, track_id))
+            session = self._sessions.get(sid) if sid else None
+        if session is None:
+            return False
+        return self.accumulate_reference(session, crop_bgr, camera_id, view_quality)
+
+    def accumulate_reference(
+        self,
+        session,
+        crop_bgr: np.ndarray,
+        camera_id: str,
+        view_quality: float,
+    ) -> bool:
+        """Add one quality-gated reference view to a plate's growing gallery.
+
+        Grows ``session.reference_feature_vectors`` (which
+        ``match_global_session`` already scores against) AND persists the crop +
+        embedding to the plate's on-disk folder so it survives restart. Gated:
+        persistence enabled, plate known, full view, sharp enough; throttled to
+        one add per (plate, camera) per interval; deduped against existing refs;
+        capped in-memory (disk cap handled by the store). No-op / False when any
+        gate fails. Poor crops are rejected so the gallery is not poisoned.
+        """
+        store = self.gallery_store
+        if store is None or session is None or not getattr(session, "plate", None):
+            return False
+        if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
+            return False
+        cfg = self._matching_config
+        if float(view_quality) < cfg.gallery_min_view_quality:
+            return False
+
+        now_dt = self._clock()
+        now_ts = now_dt.timestamp()
+        key = (session.plate, camera_id or "")
+        if now_ts - self._gallery_last_add.get(key, 0.0) < cfg.gallery_accumulate_interval_s:
+            return False
+        # Consume the interval now (before the heavy embed) so a blurry or
+        # duplicate frame doesn't retrigger extract_feature every tick.
+        self._gallery_last_add[key] = now_ts
+
+        try:
+            from src.reid_matcher.reid_burst import sharpness_score
+
+            if sharpness_score(crop_bgr) < cfg.gallery_min_sharpness:
+                return False
+        except Exception:
+            return False
+
+        vec = self.reid_matcher.extract_feature(crop_bgr)
+        if vec is None:
+            return False
+
+        with self._lock:
+            live = self._sessions.get(session.session_id)
+            if live is None or not live.plate:
+                return False
+            for ref in [live.feature_vector] + list(live.reference_feature_vectors):
+                if ref is not None and self.reid_matcher.compute_similarity(vec, ref) > cfg.gallery_dedup_cosine:
+                    return False  # near-duplicate — nothing new to learn
+            live.reference_feature_vectors.append(vec)
+            cap = max(1, int(cfg.gallery_max_refs_per_car))
+            if len(live.reference_feature_vectors) > cap:
+                # FIFO cap in memory; the disk store keeps the quality-best set.
+                live.reference_feature_vectors = live.reference_feature_vectors[-cap:]
+            self._gallery_index_upsert(live)
+            plate = live.plate
+
+        # Disk write off the lock.
+        store.save_ref(plate, crop_bgr, vec, quality=float(view_quality), camera_id=camera_id or "")
+        return True
+
+    def build_session_from_gallery(
+        self, plate: str, floor: Optional[str] = None
+    ) -> Optional[str]:
+        """Reload a plate's persisted gallery into a live confirmed session.
+
+        Used at startup (cars still inside) and on ANPR re-entry (warm-start).
+        Uses the cached vectors when the stored model tag matches; otherwise
+        re-embeds from the retained crops. If a live session already exists for
+        the plate (e.g. the vectorless one created by _restore_plate_locks), its
+        appearance vectors are ENRICHED from the gallery instead of duplicating.
+        Returns the session_id, or None when there is nothing to load."""
+        store = self.gallery_store
+        if store is None or not plate or not store.has(plate):
+            return None
+
+        vectors, tag = store.load_vectors(plate)
+        if (not vectors) or tag != store._model_tag:
+            crops = store.load_crops(plate)
+            if crops:
+                feats = self.reid_matcher.extract_features_batch(crops)
+                vectors = [f for f in feats if f is not None]
+        if not vectors:
+            return None
+
+        now = self._clock()
+        with self._lock:
+            existing = next(
+                (
+                    s
+                    for s in self._sessions.values()
+                    if s.plate == plate and s.status in ("confirmed", "parked")
+                ),
+                None,
+            )
+            if existing is not None:
+                # Attach the persisted appearance to the live (often vectorless)
+                # session so ReID can re-identify it — no duplicate session.
+                if existing.feature_vector is None:
+                    existing.feature_vector = vectors[0]
+                    extra = vectors[1:]
+                else:
+                    extra = vectors
+                existing.reference_feature_vectors.extend(extra)
+                self._gallery_index_upsert(existing)
+                logger.info(
+                    "[gallery] enriched existing session %s (plate=%s) with %d refs",
+                    existing.session_id, plate, len(vectors),
+                )
+                return existing.session_id
+
+            session_id = f"reload_{uuid.uuid4().hex[:12]}"
+            session = VehicleSession(
+                session_id=session_id,
+                plate=plate,
+                feature_vector=vectors[0],
+                reference_feature_vectors=list(vectors[1:]),
+                first_seen_at=now,
+                last_seen_at=now,
+                last_seen_camera="",
+                status="confirmed",
+                linked_floor=floor or "",
+            )
+            self._sessions[session_id] = session
+            self._gallery_index_upsert(session)
+        logger.info(
+            "[gallery] reloaded plate=%s -> session %s (%d refs)",
+            plate, session_id, len(vectors),
+        )
+        return session_id
+
     def match_global_session(
         self,
         query_vector: Optional[np.ndarray],
@@ -2097,6 +2250,17 @@ class VehicleRegistryIdentityMixin:
         Close a parked session and purge all record of a plate when it exits.
         Ensures the system 'forgets' the vehicle completely upon exit.
         """
+        # Retention: keep the plate's on-disk gallery for a future return
+        # (warm-start), just stamp the exit time so the TTL GC ages it from now.
+        # The in-memory purge below still runs — a car outside the facility must
+        # never match a car inside.
+        store = self.gallery_store
+        if store is not None and plate:
+            try:
+                store.stamp_exit(plate, timestamp)
+            except Exception as exc:  # pragma: no cover - disk best-effort
+                logger.debug("[gallery] stamp_exit failed for %s: %r", plate, exc)
+
         with self._lock:
             # 1. Find and close any active sessions for this plate (parked or driving)
             sessions_to_remove = [

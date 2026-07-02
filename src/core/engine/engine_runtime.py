@@ -236,6 +236,47 @@ class ParkingEngineRuntimeMixin:
     # without VA seeing the corresponding ANPR exit event.
     _EXIT_JANITOR_INTERVAL_S = 30.0
 
+    def _restore_vehicle_galleries(self) -> None:
+        """Reload the persisted per-plate gallery for every car still inside the
+        facility (open ``parking_sessions``) so ReID can re-identify it after a
+        restart. Enriches the vectorless sessions created by
+        ``_restore_plate_locks``. No-op when the gallery feature is off or there
+        is no DB."""
+        if not self.db_manager or not self.vehicle_registry:
+            return
+        if getattr(self.vehicle_registry, "gallery_store", None) is None:
+            return
+        try:
+            from sqlalchemy import text as _text
+
+            session = self.db_manager.SessionLocal()
+            try:
+                rows = session.execute(
+                    _text(
+                        "SELECT plate_number, floor FROM dbo.parking_sessions "
+                        "WHERE status = 'open'"
+                    )
+                ).fetchall()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning("[gallery] restore query failed: %r", exc)
+            return
+
+        restored = 0
+        for row in rows:
+            plate = row[0]
+            floor = row[1] if len(row) > 1 else None
+            if not plate:
+                continue
+            try:
+                if self.vehicle_registry.build_session_from_gallery(plate, floor=floor):
+                    restored += 1
+            except Exception as exc:
+                logger.warning("[gallery] restore failed for plate=%s: %r", plate, exc)
+        if restored:
+            print(f"[INFO] Restored {restored} vehicle gallery(ies) from disk (cars still inside).")
+
     def _exit_janitor_tick(self) -> None:
         """Once per `_EXIT_JANITOR_INTERVAL_S`, find plates VA still has in
         memory whose latest parking_sessions row is closed (per PMS-AI), and
@@ -253,6 +294,18 @@ class ParkingEngineRuntimeMixin:
         if now_ts - last < self._EXIT_JANITOR_INTERVAL_S:
             return
         self._exit_janitor_last_run_at = now_ts
+
+        # Age out per-plate gallery folders idle past the retention TTL (checked
+        # hourly, piggy-backing the janitor cadence). No-op when disabled.
+        store = getattr(self.vehicle_registry, "gallery_store", None)
+        if store is not None:
+            gc_last = getattr(self, "_gallery_gc_last_run_at", 0.0)
+            if now_ts - gc_last > 3600.0:
+                self._gallery_gc_last_run_at = now_ts
+                try:
+                    store.gc(self.config.matching.gallery_retention_days)
+                except Exception as exc:
+                    logger.warning("[gallery] GC failed: %r", exc)
 
         # Snapshot the plates the registry currently holds. Done under the
         # registry's lock-protected accessor (or via a stable copy) so we

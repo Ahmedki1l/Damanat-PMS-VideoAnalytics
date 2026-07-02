@@ -190,6 +190,19 @@ class MatchingConfig:
     # 0 disables the gate.
     global_match_margin: float = 0.05
 
+    # --- Per-car persistent multi-shot gallery (folder per plate) --------- #
+    # A growing set of quality-gated reference crops+vectors per plate, kept on
+    # disk so a car's appearance profile survives restart and warm-starts a
+    # returning car. All gated by ``gallery_persist_enabled`` — off ⇒ today's
+    # in-memory-only behaviour.
+    gallery_persist_enabled: bool = False
+    gallery_max_refs_per_car: int = 10        # cap crops/vectors per plate folder
+    gallery_retention_days: float = 5.0       # GC folders idle longer than this
+    gallery_min_view_quality: float = 0.9     # full-view gate (see _bbox_view_quality)
+    gallery_min_sharpness: float = 40.0       # reject blurry crops (sharpness_score)
+    gallery_dedup_cosine: float = 0.97        # skip near-duplicate refs
+    gallery_accumulate_interval_s: float = 3.0  # throttle per (plate, camera)
+
     # Legacy multi-feature fallback path (image_matcher.VehicleImageMatcher).
     legacy_color_fallback: float = 0.35
 
@@ -537,6 +550,29 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.lock_confidence = m.get("lock_confidence", cm.lock_confidence)
         cm.global_match_margin = m.get(
             "global_match_margin", cm.global_match_margin
+        )
+
+        # Per-car persistent gallery
+        cm.gallery_persist_enabled = m.get(
+            "gallery_persist_enabled", cm.gallery_persist_enabled
+        )
+        cm.gallery_max_refs_per_car = m.get(
+            "gallery_max_refs_per_car", cm.gallery_max_refs_per_car
+        )
+        cm.gallery_retention_days = m.get(
+            "gallery_retention_days", cm.gallery_retention_days
+        )
+        cm.gallery_min_view_quality = m.get(
+            "gallery_min_view_quality", cm.gallery_min_view_quality
+        )
+        cm.gallery_min_sharpness = m.get(
+            "gallery_min_sharpness", cm.gallery_min_sharpness
+        )
+        cm.gallery_dedup_cosine = m.get(
+            "gallery_dedup_cosine", cm.gallery_dedup_cosine
+        )
+        cm.gallery_accumulate_interval_s = m.get(
+            "gallery_accumulate_interval_s", cm.gallery_accumulate_interval_s
         )
 
         # HSV tolerances
