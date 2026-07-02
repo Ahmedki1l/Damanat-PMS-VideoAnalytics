@@ -588,6 +588,12 @@ class ParkingEngineRuntimeMixin:
             return
         if is_reid_disabled_floor(floor):
             return
+        # Slots whose plate was restored from persistence but not yet re-derived
+        # by the (freshly empty) ReID gallery. Protected from the per-frame
+        # "clear on no-match" path so a restart doesn't drop the plate before a
+        # live track re-confirms it; cleared once re-derived or the slot vacates.
+        if not hasattr(self, "_restored_plate_slots"):
+            self._restored_plate_slots = set()
         now = datetime.now()
         for slot_id, b in plate_bindings.items():
             sm = pipeline.state_machines.get(slot_id)
@@ -599,6 +605,7 @@ class ParkingEngineRuntimeMixin:
                 confidence=b["confidence"],
                 lock=b["locked"],
             )
+            self._restored_plate_slots.add(slot_id)
             self.vehicle_registry.restore_parked_binding(
                 slot_id=slot_id,
                 slot_name=b["slot_name"],
@@ -896,6 +903,10 @@ class ParkingEngineRuntimeMixin:
                     # unlink_slot also drops any plate-lock on the slot.
                     plate = self.vehicle_registry.unlink_slot(slot.id)
                     self._forced_ocr_attempts.pop(slot.id, None)
+                    # Car left — the restored plate is no longer valid for this
+                    # slot; drop restart-stickiness so a new car is resolved fresh.
+                    if getattr(self, "_restored_plate_slots", None):
+                        self._restored_plate_slots.discard(slot.id)
                     if plate:
                         event.plate_number = plate
                     if self.db_manager:
@@ -971,6 +982,14 @@ class ParkingEngineRuntimeMixin:
         )
 
         if not plate:
+            # Restart stickiness: a plate restored from persistence has no
+            # gallery/track backing yet, so try_link_to_slot returns None on the
+            # first frames. Keep the restored plate on the still-occupied slot
+            # rather than dropping it — the whole point of persistence. It stays
+            # correctable (OCR/ReID can still upgrade it below once the car is
+            # re-identified) and is cleared only when the slot goes VACANT.
+            if previous_plate and slot.id in getattr(self, "_restored_plate_slots", ()):
+                return
             # Registry says no plate (moved/unlinked, or the voter is still
             # deferring). Only clear a PROVISIONAL binding — a locked one already
             # returned above — to avoid ghost labels in the UI / API.
@@ -985,6 +1004,12 @@ class ParkingEngineRuntimeMixin:
                         slot.id, None, 0.0, False, cam_id
                     )
             return
+
+        # A live track re-derived a plate for this slot — it is now backed by
+        # the running registry, so drop the restart-stickiness protection and
+        # let normal clear/upgrade behaviour resume.
+        if getattr(self, "_restored_plate_slots", None):
+            self._restored_plate_slots.discard(slot.id)
 
         new_conf = registry.get_slot_binding_confidence(slot.id)
 
