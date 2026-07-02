@@ -196,22 +196,22 @@ class ParkingEngineVisualizationMixin:
                 x1, y1, x2, y2 = [int(v) for v in detection.bbox]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
-                display_id = track_id
-                is_sticky_confirmed = False
-                if self.vehicle_registry:
-                    display_id, is_sticky_confirmed = self._resolve_display_label(
-                        cam_id,
-                        track_id,
-                    )
-
-                label = f"{display_id}{self._reid_score_suffix(cam_id, track_id)} (?)"
+                # A plate identity is shown ONLY on cars that occupy a slot (the
+                # slot_vehicle_map loop above). A car not assigned to any slot —
+                # an aisle / passing / transit car, and every car on a camera
+                # with no slots — is drawn WITHOUT a plate so an identity is never
+                # "locked" onto a car this camera has no slot to hold. This caps
+                # plated cars at len(slots) per camera (zero on a slotless one).
+                # Cross-camera ReID identity is still tracked internally for
+                # handoff; only the on-frame label is suppressed here.
+                label = f"{track_id} (?)"
                 cv2.putText(
                     frame,
                     label,
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
-                    (0, 255, 255) if is_sticky_confirmed else (0, 0, 255),
+                    (0, 0, 255),
                     2,
                 )
                 bc_x, bc_y = detection.bottom_center
