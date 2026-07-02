@@ -1359,6 +1359,15 @@ class VehicleRegistryIdentityMixin:
                 else:
                     extra = vectors
                 existing.reference_feature_vectors.extend(extra)
+                # Cap after enrich: a repeated warm-start (duplicate ANPR entry,
+                # or a reload racing a live session) must not grow the ref list
+                # without bound — more refs cost matching time AND widen the
+                # false-match surface. Keep the most recent up to the cap.
+                cap = max(1, int(self._matching_config.gallery_max_refs_per_car))
+                if len(existing.reference_feature_vectors) > cap:
+                    existing.reference_feature_vectors = (
+                        existing.reference_feature_vectors[-cap:]
+                    )
                 self._gallery_index_upsert(existing)
                 logger.info(
                     "[gallery] enriched existing session %s (plate=%s) with %d refs",
@@ -1536,7 +1545,19 @@ class VehicleRegistryIdentityMixin:
         # plate that matches a candidate already in the ReID top-5, so a stray
         # misread can't fabricate an identity. This is the reliable path: ReID
         # need only place the car in the top-5, OCR nails the exact plate.
-        if query_crop is not None and top_candidates:
+        #
+        # Cost gate: OCR (~50-100 ms) runs only when the ReID top-1 is NOT a
+        # clear, confident winner — i.e. its score is below the solo-confirm bar
+        # OR the runner-up is within the ambiguity margin. A decisive top-1
+        # skips OCR entirely (the fallback confirms it), so easy matches stay
+        # cheap and OCR is spent where it actually disambiguates.
+        cfg = self._matching_config
+        _best = top_candidates[0][1] if top_candidates else -1.0
+        _runner = top_candidates[1][1] if len(top_candidates) > 1 else -1.0
+        _ocr_worth_it = _best < getattr(cfg, "reid_solo_confirm", 0.68) or (
+            (_best - _runner) < getattr(cfg, "global_match_margin", 0.05) or 0.0
+        )
+        if query_crop is not None and top_candidates and _ocr_worth_it:
             ocr = getattr(self._match_decision, "plate_ocr", None)
             if ocr is not None and hasattr(ocr, "read"):
                 try:
@@ -2264,6 +2285,10 @@ class VehicleRegistryIdentityMixin:
                 store.stamp_exit(plate, timestamp)
             except Exception as exc:  # pragma: no cover - disk best-effort
                 logger.debug("[gallery] stamp_exit failed for %s: %r", plate, exc)
+        # Drop this plate's accumulation-throttle entries so the map doesn't
+        # grow unbounded over a long-running process.
+        for key in [k for k in self._gallery_last_add if k[0] == plate]:
+            self._gallery_last_add.pop(key, None)
 
         with self._lock:
             # 1. Find and close any active sessions for this plate (parked or driving)

@@ -162,6 +162,28 @@ class VehicleGalleryStore:
     def delete(self, plate: str) -> None:
         shutil.rmtree(self._plate_dir(plate), ignore_errors=True)
 
+    @staticmethod
+    def clear_all(base_dir: str) -> int:
+        """Delete every per-plate gallery folder under ``<base_dir>/gallery``.
+
+        Used by the ``--reset-plates`` command so a reset also forgets the
+        persisted appearance galleries — otherwise a returning car would
+        warm-start its wiped plate identity straight back from disk. Returns the
+        number of plate folders removed. Static so callers (e.g. main.py before
+        the registry is built) don't need a live store."""
+        root = os.path.join(base_dir or "vehicle_images", "gallery")
+        if not os.path.isdir(root):
+            return 0
+        removed = 0
+        try:
+            for entry in os.scandir(root):
+                if entry.is_dir():
+                    shutil.rmtree(entry.path, ignore_errors=True)
+                    removed += 1
+        except OSError as exc:  # pragma: no cover - defensive
+            logger.warning("[gallery] clear_all failed under %s: %r", root, exc)
+        return removed
+
     # ------------------------------------------------------------------ #
     # Load
     # ------------------------------------------------------------------ #

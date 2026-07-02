@@ -248,6 +248,7 @@ Examples:
     # finds nothing to restore. --reset-plates-only clears and exits.
     if args.reset_plates or args.reset_plates_only:
         from src.services.slot_status_service import reset_all_slot_plates
+        from src.vehicle_registry.gallery_store import VehicleGalleryStore
 
         session = db.SessionLocal()
         try:
@@ -255,6 +256,10 @@ Examples:
             print(f"[RESET] Cleared plate identity on {cleared} slot(s).")
         finally:
             session.close()
+        # Also wipe the persisted per-car galleries — otherwise a returning car
+        # would warm-start its just-cleared plate identity back from disk.
+        wiped = VehicleGalleryStore.clear_all(config.output.snapshot_base_dir)
+        print(f"[RESET] Removed {wiped} per-car gallery folder(s).")
         if args.reset_plates_only:
             sys.exit(0)
 
