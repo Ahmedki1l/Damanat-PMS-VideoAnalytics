@@ -858,6 +858,7 @@ class ParkingEngineTrackingMixin:
             self._reid_check_timer[track_key] = now_ts
 
             query_vector = None
+            crop = None
             if tracking_manager:
                 query_vector = tracking_manager.get_track_feature(detection.track_id)
 
@@ -868,6 +869,12 @@ class ParkingEngineTrackingMixin:
 
             if query_vector is None:
                 continue
+
+            # Crop for rank-5 OCR disambiguation inside match_global_session
+            # (the smoothed-feature path above skips cropping). Gated to one
+            # ReID check/sec per track, so this extra crop is cheap.
+            if crop is None:
+                crop = self._crop_detection(frame, detection)
 
             # Bound the candidate pool to this camera's area (+ the cross-area
             # handoff pool of cars that recently departed an adjacent area) so a
@@ -885,6 +892,7 @@ class ParkingEngineTrackingMixin:
                 camera_id=cam_id,
                 track_id=detection.track_id,
                 area_id=area_id or None,
+                query_crop=crop,
             )
             if matched_session:
                 self.vehicle_registry.attach_session_to_track(

@@ -51,6 +51,14 @@ OWNER_SWITCH_MARGIN = 0.05
 # similarity comparison.
 OWNER_DEFINITIVE_SCORE = 1.0
 
+# Rank-5 OCR disambiguation: minimum plate-OCR confidence before a read is
+# allowed to pick a session among the ReID top-5. Combined with the hard
+# requirement that the read match a candidate ALREADY in the ReID top-5 (and
+# in the camera's area), so a stray misread cannot invent a match.
+RANK5_OCR_MIN_CONF = 0.60
+# How many nearest ReID neighbours to keep as the candidate pool ("rank-5").
+GLOBAL_MATCH_RANK = 5
+
 
 class VehicleRegistryIdentityMixin:
     def is_plate_inside(self, plate: Optional[str]) -> bool:
@@ -1197,6 +1205,7 @@ class VehicleRegistryIdentityMixin:
         max_time_gap_seconds: float = 600.0,
         similarity_threshold: float = 0.55,
         area_id: Optional[str] = None,
+        query_crop: Optional[np.ndarray] = None,
     ) -> Optional[str]:
         """
         Search for an existing confirmed session that matches this query vector.
@@ -1210,6 +1219,17 @@ class VehicleRegistryIdentityMixin:
         :class:`GalleryIndex` for an O(log n) lookup; the active-track
         guard, ``check_modalities`` cascade and ``MatchDecision.decide_global``
         verdict still apply on the surviving candidates.
+
+        Rank-5 selection: rather than committing to the single nearest neighbour
+        (rank-1, noisy on oblique 720p views), the candidate pool is narrowed to
+        the top-5 by ReID similarity. When ``query_crop`` is supplied and plate
+        OCR is available, a confident read that matches one of those 5
+        candidates' plate is chosen outright (ReID need only place the car in
+        the top-5; OCR makes the precise pick). If OCR can't disambiguate, the
+        method falls back to the rank-1 verdict gated by the
+        abstain-on-ambiguity margin, returning None when the top-2 are too
+        close — a missing label self-heals on a later frame; a wrong one does
+        not.
         """
         if query_vector is None:
             return None
@@ -1299,14 +1319,12 @@ class VehicleRegistryIdentityMixin:
         if not guarded_sessions:
             return None
 
-        best_sid = None
-        best_score = -1.0
-        # Highest score among the NON-winning candidates — feeds the
-        # abstain-on-ambiguity margin gate below. Tracked across ALL guarded
-        # candidates (confirmed verdict or not): a near-tie with any other
-        # in-pool car means the winner is a guess between similar cars.
-        runner_up_score = -1.0
-        decision = self.match_decision
+        # Rank-5: score every guarded candidate once, then keep only the top-5
+        # nearest by ReID similarity. The correct identity is far more reliably
+        # within the 5 nearest than exactly rank-1 on these oblique views, so we
+        # let the secondary signal decide among the 5 instead of trusting the
+        # single argmax.
+        scored = []
         for session in guarded_sessions:
             session_vectors = [session.feature_vector] + list(
                 session.reference_feature_vectors
@@ -1319,18 +1337,59 @@ class VehicleRegistryIdentityMixin:
                 ),
                 default=0.0,
             )
+            scored.append((session, score))
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        top_candidates = scored[:GLOBAL_MATCH_RANK]
+
+        # --- Rank-5 OCR disambiguation ---------------------------------- #
+        # With the live crop in hand, read the plate ONCE and pick the top-5
+        # candidate whose plate it matches. Requires a confident read AND a
+        # plate that matches a candidate already in the ReID top-5, so a stray
+        # misread can't fabricate an identity. This is the reliable path: ReID
+        # need only place the car in the top-5, OCR nails the exact plate.
+        if query_crop is not None and top_candidates:
+            ocr = getattr(self._match_decision, "plate_ocr", None)
+            if ocr is not None and hasattr(ocr, "read"):
+                try:
+                    ocr_text, ocr_conf = ocr.read(query_crop)
+                except Exception:
+                    ocr_text, ocr_conf = "", 0.0
+                if ocr_text and float(ocr_conf or 0.0) >= RANK5_OCR_MIN_CONF:
+                    from src.ocr.plate_ocr import plates_match
+
+                    for cand, cand_score in top_candidates:
+                        if not cand.plate or not plates_match(ocr_text, cand.plate):
+                            continue
+                        with self._lock:
+                            final = self._sessions.get(cand.session_id)
+                            if final and final.status in ("confirmed", "parked"):
+                                if camera_id is not None:
+                                    final.observing_scores[camera_id] = cand_score
+                                final.ocr_confirmed = True
+                                logger.info(
+                                    "[GLOBAL] cam=%s rank-5 OCR pick: session %s "
+                                    "plate=%s (reid=%.3f ocr_conf=%.2f)",
+                                    camera_id, cand.session_id, cand.plate,
+                                    cand_score, ocr_conf,
+                                )
+                                return cand.session_id
+
+        # --- Fallback: rank-1 verdict + abstain-on-ambiguity margin ------ #
+        # OCR couldn't pick among the top-5 (unreadable, or no candidate plate
+        # matched). Fall back to the highest-scoring candidate that the
+        # ensemble confirms, but abstain when the top-2 are within the margin —
+        # a near-tie is a coin flip and a wrong plate propagates into the DB.
+        best_sid = None
+        best_score = -1.0
+        runner_up_score = -1.0
+        decision = self.match_decision
+        for session, score in top_candidates:
             cross_camera = bool(
                 session.plate
                 and session.last_seen_camera
                 and camera_id
                 and session.last_seen_camera != camera_id
             )
-            # Phase 2 T2.1 — global-match has no live query crop available
-            # at this callsite (we receive a feature vector, not an image),
-            # so we pass only the cached metadata on the session and let
-            # MatchDecision treat the rest as "no signal". When the caller
-            # extends this signature to pass a crop in a future revision the
-            # plumbing here is unchanged.
             modalities = decision.check_modalities(
                 query_crop=None,
                 candidate_crop=None,
@@ -1354,11 +1413,6 @@ class VehicleRegistryIdentityMixin:
             else:
                 runner_up_score = max(runner_up_score, score)
 
-        # Abstain-on-ambiguity: with several visually similar cars in the pool
-        # the argmax is close to a coin flip. Require the winner to beat every
-        # other candidate by a clear margin; otherwise return no match — a
-        # missing label self-heals on a later frame (or via OCR), a wrong
-        # plate propagates into slot bindings and the DB.
         if best_sid is not None and runner_up_score >= 0.0:
             margin = float(
                 getattr(self._matching_config, "global_match_margin", 0.05) or 0.0
