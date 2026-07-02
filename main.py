@@ -169,6 +169,8 @@ Examples:
   python main.py --camera CAM_04 --show           # Single camera with visualization
   python main.py --video sample.mp4 --show        # Legacy single-file mode
   python main.py --show --show-camera CAM_04      # Multi-cam, show one camera
+  python main.py --reset-plates-only              # Wipe all slot plates, then exit
+  python main.py --reset-plates --api             # Clear plates, then run clean
         """,
     )
     parser.add_argument(
@@ -196,6 +198,17 @@ Examples:
              "worker; keep <=6 cameras per process to approach 5 fps/cam). "
              "Case-insensitive; '_' and '-' are interchangeable. Composes with "
              "--floor. Applies to multi-camera mode.",
+    )
+    parser.add_argument(
+        "--reset-plates", action="store_true",
+        help="Wipe every slot's plate identity (current_plate / lock + latest "
+             "slot_status plate) at startup, then run with a clean slate. "
+             "Occupancy is left untouched; nothing is restored on next boot. "
+             "VA-local only (does not notify PMS-AI).",
+    )
+    parser.add_argument(
+        "--reset-plates-only", action="store_true",
+        help="Same clear as --reset-plates, then exit without running the engine.",
     )
     parser.add_argument(
         "--show", action="store_true",
@@ -228,7 +241,23 @@ Examples:
     config = load_config(args.config)
     db = init_db(config.database.url)
     db.create_tables()
-    
+
+    # Plate reset: wipe every slot's persisted plate identity so the parking
+    # starts with no plate numbers. Runs before pipelines build, so the fresh
+    # engine also starts with empty in-memory state and _load_camera_db_state
+    # finds nothing to restore. --reset-plates-only clears and exits.
+    if args.reset_plates or args.reset_plates_only:
+        from src.services.slot_status_service import reset_all_slot_plates
+
+        session = db.SessionLocal()
+        try:
+            cleared = reset_all_slot_plates(session)
+            print(f"[RESET] Cleared plate identity on {cleared} slot(s).")
+        finally:
+            session.close()
+        if args.reset_plates_only:
+            sys.exit(0)
+
     # Initialize Config table if empty
     session = db.SessionLocal()
     try:
