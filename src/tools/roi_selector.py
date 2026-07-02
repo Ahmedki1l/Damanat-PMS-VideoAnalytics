@@ -165,9 +165,10 @@ class ROISelector:
 
 
 if __name__ == "__main__":
+    import sys
+
     config = load_config()
     db = init_db(config.database.url)
-    target_cams = ["CAM-01", "CAM-02"]
 
     raw_config = {"cameras": [], "processing": {"stream_channel": config.processing.stream_channel}}
     for cam in config.cameras:
@@ -182,12 +183,23 @@ if __name__ == "__main__":
             }
         )
 
-    print("Available Cameras for ROI definition:")
-    for cam in raw_config["cameras"]:
-        if cam["id"] in target_cams:
+    # ROIs are per-camera and apply to B1/B2 exactly as to the ground floor.
+    # A camera id may be passed on the command line
+    # (e.g. `python -m src.tools.roi_selector CAM-07`); otherwise every enabled
+    # camera is listed and prompted for.
+    arg_id = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+    default_id = raw_config["cameras"][0]["id"] if raw_config["cameras"] else "CAM-01"
+
+    if not arg_id:
+        print("Available Cameras for ROI definition:")
+        for cam in raw_config["cameras"]:
             print(f" - {cam['id']}: {cam['name']} ({cam['floor']})")
 
-    cam_id = input("\nEnter Camera ID to configure (or press Enter for CAM-01): ").strip() or "CAM-01"
+    cam_id = (
+        arg_id
+        or input(f"\nEnter Camera ID to configure (or press Enter for {default_id}): ").strip()
+        or default_id
+    )
 
     selected_cam = next((c for c in raw_config["cameras"] if c["id"] == cam_id), None)
     if not selected_cam:
