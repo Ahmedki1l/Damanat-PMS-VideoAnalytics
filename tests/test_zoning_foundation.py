@@ -157,9 +157,13 @@ class TestBoundedMatching(unittest.TestCase):
     def test_in_area_only_and_legacy(self):
         r = _zoned_registry(_make_config())
         v = self._vec()
-        for sid, area in [("in", "B1-E"), ("out", "B2-C")]:
+        # "out" gets a distinguishable vector (clearly lower similarity to v)
+        # so the legacy all-sessions pool has an unambiguous winner — the
+        # abstain-on-ambiguity margin gate only fires on near-ties.
+        v_out = self._vec()
+        for sid, area, vec in [("in", "B1-E", v.copy()), ("out", "B2-C", v_out)]:
             s = VehicleSession(session_id=sid, status="confirmed",
-                               feature_vector=v.copy())
+                               feature_vector=vec)
             r._sessions[sid] = s
             r.set_session_area(s, area)
         # Bounded to B1-E -> only the in-area car is eligible.
@@ -173,11 +177,26 @@ class TestBoundedMatching(unittest.TestCase):
             r.match_global_session(v, camera_id="CAM-07", area_id="B1-F",
                                    similarity_threshold=0.4)
         )
-        # Legacy (area_id=None) -> all-sessions, matches one of them.
-        self.assertIn(
+        # Legacy (area_id=None) -> all-sessions; "in" is the clear winner.
+        self.assertEqual(
             r.match_global_session(v, camera_id="CAM-05", area_id=None,
                                    similarity_threshold=0.4),
-            {"in", "out"},
+            "in",
+        )
+
+    def test_ambiguous_near_tie_abstains(self):
+        """Two candidates with (near-)identical vectors -> the margin gate
+        refuses to guess between them (returns None) instead of coin-flipping
+        the plate onto the wrong car."""
+        r = _zoned_registry(_make_config())
+        v = self._vec()
+        for sid in ("twin_a", "twin_b"):
+            s = VehicleSession(session_id=sid, status="confirmed",
+                               feature_vector=v.copy())
+            r._sessions[sid] = s
+        self.assertIsNone(
+            r.match_global_session(v, camera_id="CAM-05", area_id=None,
+                                   similarity_threshold=0.4)
         )
 
     def test_adjacent_handoff_included(self):

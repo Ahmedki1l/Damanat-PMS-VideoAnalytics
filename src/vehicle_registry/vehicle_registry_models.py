@@ -98,6 +98,16 @@ class VehicleSession:
     
     gate_snapshot_paths: List[str] = field(default_factory=list)
 
+    # True while the session's ONLY ReID reference is the wide ANPR gate image
+    # (created by confirm_anpr_session_directly at the moment of the gate `entry`
+    # event). The gate shot is a poor cross-camera reference — different
+    # viewpoint/scale/lighting than the overhead parking cameras — so a session
+    # in this state is EXCLUDED from match_global_session: it must not be able to
+    # latch onto a car already parked inside before the real car reaches a floor.
+    # Cleared once CAM-03 (B1_Entrence) attaches a genuine primary reference via
+    # confirm_b1_entrance_by_plate, after which the session becomes matchable.
+    gate_reference_only: bool = False
+
     # Maps camera_id → track_id for all cameras currently observing this car.
     # Enables multi-camera simultaneous identity display.
     observing_tracks: Dict[str, int] = field(default_factory=dict)

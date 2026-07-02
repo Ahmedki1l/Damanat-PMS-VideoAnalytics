@@ -183,6 +183,13 @@ class MatchingConfig:
     reattach_default: float = 0.52
     reattach_cross_camera: float = 0.43
 
+    # Abstain-on-ambiguity margin for match_global_session: when the best and
+    # second-best candidates score within this distance of each other, the
+    # match is ambiguous (visually similar cars) and NO session is returned —
+    # a missing label is recoverable on a later frame, a wrong plate is not.
+    # 0 disables the gate.
+    global_match_margin: float = 0.05
+
     # Legacy multi-feature fallback path (image_matcher.VehicleImageMatcher).
     legacy_color_fallback: float = 0.35
 
@@ -528,6 +535,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.ocr_marginal_high = m.get("ocr_marginal_high", cm.ocr_marginal_high)
         cm.reid_solo_confirm = m.get("reid_solo_confirm", cm.reid_solo_confirm)
         cm.lock_confidence = m.get("lock_confidence", cm.lock_confidence)
+        cm.global_match_margin = m.get(
+            "global_match_margin", cm.global_match_margin
+        )
 
         # HSV tolerances
         cm.hsv_h_tol = m.get("hsv_h_tol", cm.hsv_h_tol)

@@ -1029,6 +1029,15 @@ class ParkingEngineRuntimeMixin:
                 crop = self._bbox_crop(frame, detection)
                 if crop is not None:
                     ocr_ok = registry.try_ocr_confirm_slot(slot.id, crop)
+                    if ocr_ok:
+                        # The OCR pass may have CORRECTED the binding (rebind
+                        # on confident mismatch) — re-read the slot's plate so
+                        # the lock below freezes the corrected identity, not
+                        # the stale local `plate`.
+                        corrected = registry.get_slot_plate(slot.id)
+                        if corrected and corrected != plate:
+                            plate = corrected
+                            new_conf = registry.get_slot_binding_confidence(slot.id)
 
         # Lock gate. `plate` being non-None already means the voter committed
         # (try_link_to_slot is voting-gated), so this is "voting AND (ReID bar

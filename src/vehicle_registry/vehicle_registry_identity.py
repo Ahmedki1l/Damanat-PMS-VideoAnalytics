@@ -278,6 +278,11 @@ class VehicleRegistryIdentityMixin:
             candidate_id=candidate_id,
             status="confirmed",
             gate_snapshot_paths=gate_snapshot_paths,
+            # Gate image only — keep this session out of global ReID matching
+            # until CAM-03 attaches a real B1 reference (confirm_b1_entrance_by_plate).
+            # Prevents the wide gate shot from false-matching a car already parked
+            # inside the garage the instant the entry event arrives.
+            gate_reference_only=True,
         )
 
         # Persist the ANPR image as the primary gallery reference so it appears
@@ -657,11 +662,48 @@ class VehicleRegistryIdentityMixin:
                 return None
 
             existing_sid = self._track_session_map.get((camera_id, track_id))
-            session = self._sessions.get(existing_sid) if existing_sid else None
+            track_session = self._sessions.get(existing_sid) if existing_sid else None
+
+            # Reuse a session already created for THIS ANPR event — e.g. the
+            # direct gate-entry session from confirm_anpr_session_directly (also
+            # enriched by the CAM-03 B-entry API push). That path and this live
+            # in-zone confirmation both confirm the same physical entry, so
+            # creating a fresh session here would leave two sessions carrying the
+            # same plate (the frozen-at-entrance duplicate seen in production).
+            event_session = None
+            for candidate_session in self._sessions.values():
+                if (
+                    candidate_session.event_id == event.event_id
+                    and candidate_session.status in ("confirmed", "parked")
+                ):
+                    event_session = candidate_session
+                    break
+
+            # The event-bound session wins over a bare appearance session the
+            # live track may have spun up first (ordering: appearance-before-gate).
+            session = event_session or track_session
+
+            # Collapse that appearance orphan onto the event session so the car
+            # doesn't end up with two sessions. Only ever drop a plate-less
+            # appearance session — never delete another confirmed identity.
+            if (
+                event_session is not None
+                and track_session is not None
+                and track_session.session_id != event_session.session_id
+                and not track_session.plate
+            ):
+                self._track_session_map.pop((camera_id, track_id), None)
+                self._sessions.pop(track_session.session_id, None)
+                self._gallery_index_remove(track_session.session_id)
+                logger.info(
+                    "[B1] Collapsed appearance session %s into event session %s "
+                    "(same car, plate=%s)",
+                    track_session.session_id, event_session.session_id, event.plate,
+                )
 
             if session:
                 logger.info(
-                    "[B1] Upgrading appearance session %s with plate %s",
+                    "[B1] Upgrading existing session %s with plate %s",
                     session.session_id,
                     event.plate,
                 )
@@ -679,10 +721,13 @@ class VehicleRegistryIdentityMixin:
                     now,
                     primary_snapshot_index=primary_snapshot_index,
                 )
+                # The primary reference is now the live CAM-03 crop, not the wide
+                # gate image — this session is a trustworthy global-match target.
+                session.gate_reference_only = False
                 session.new_pipeline_score = best_score
                 session.old_pipeline_score = getattr(best_candidate, "old_pipeline_score", best_score)
                 session.gate_snapshot_paths = self._candidate_snapshot_paths(live_candidate)
-                
+
                 self._drop_other_track_mappings_for_session(
                     session.session_id,
                     keep=(camera_id, track_id),
@@ -692,6 +737,9 @@ class VehicleRegistryIdentityMixin:
                 session.observing_scores[camera_id] = OWNER_DEFINITIVE_SCORE
                 session.owner_camera = camera_id
                 self._mark_track_seen(camera_id, track_id, now)
+                # Re-sync the gallery index: the feature vector / references just
+                # changed (and a reused direct session was already indexed).
+                self._gallery_index_upsert(session)
             else:
                 session = VehicleSession(
                     session_id=f"sess_{uuid.uuid4().hex[:12]}",
@@ -788,6 +836,9 @@ class VehicleRegistryIdentityMixin:
                 session, [image], now, primary_snapshot_index=0
             ):
                 return None
+            # The primary reference is now the real CAM-03 shot, not the wide gate
+            # image — the session is a trustworthy match target again.
+            session.gate_reference_only = False
             self._gallery_index_upsert(session)
             logger.info(
                 "[B1] CAM-03 B-entry snapshot attached for plate=%s -> session %s "
@@ -1210,6 +1261,7 @@ class VehicleRegistryIdentityMixin:
                         and (area_allowed_ids is None or sid in area_allowed_ids)
                         and session.status in ("confirmed", "parked")
                         and session.feature_vector is not None
+                        and not session.gate_reference_only
                         and (now - session.last_seen_at).total_seconds()
                         <= max_time_gap_seconds
                     )
@@ -1222,6 +1274,7 @@ class VehicleRegistryIdentityMixin:
                         (area_allowed_ids is None or sid in area_allowed_ids)
                         and session.status in ("confirmed", "parked")
                         and session.feature_vector is not None
+                        and not session.gate_reference_only
                         and (now - session.last_seen_at).total_seconds()
                         <= max_time_gap_seconds
                     )
@@ -1248,6 +1301,11 @@ class VehicleRegistryIdentityMixin:
 
         best_sid = None
         best_score = -1.0
+        # Highest score among the NON-winning candidates — feeds the
+        # abstain-on-ambiguity margin gate below. Tracked across ALL guarded
+        # candidates (confirmed verdict or not): a near-tie with any other
+        # in-pool car means the winner is a guess between similar cars.
+        runner_up_score = -1.0
         decision = self.match_decision
         for session in guarded_sessions:
             session_vectors = [session.feature_vector] + list(
@@ -1288,8 +1346,33 @@ class VehicleRegistryIdentityMixin:
                 modalities=modalities,
             )
             if verdict.verdict == "confirm" and score > best_score:
+                if best_sid is not None:
+                    # The demoted previous winner becomes a runner-up.
+                    runner_up_score = max(runner_up_score, best_score)
                 best_score = score
                 best_sid = session.session_id
+            else:
+                runner_up_score = max(runner_up_score, score)
+
+        # Abstain-on-ambiguity: with several visually similar cars in the pool
+        # the argmax is close to a coin flip. Require the winner to beat every
+        # other candidate by a clear margin; otherwise return no match — a
+        # missing label self-heals on a later frame (or via OCR), a wrong
+        # plate propagates into slot bindings and the DB.
+        if best_sid is not None and runner_up_score >= 0.0:
+            margin = float(
+                getattr(self._matching_config, "global_match_margin", 0.05) or 0.0
+            )
+            if margin > 0.0 and (best_score - runner_up_score) < margin:
+                logger.info(
+                    "[GLOBAL] cam=%s abstain: ambiguous match "
+                    "(best=%.3f runner_up=%.3f margin=%.2f)",
+                    camera_id,
+                    best_score,
+                    runner_up_score,
+                    margin,
+                )
+                return None
 
         if best_sid:
             with self._lock:
@@ -1796,7 +1879,7 @@ class VehicleRegistryIdentityMixin:
         if ocr is None or not hasattr(ocr, "read"):
             return False
         try:
-            ocr_text, _conf = ocr.read(crop_bgr)
+            ocr_text, ocr_conf = ocr.read(crop_bgr)
         except Exception:
             return False
         if not ocr_text:
@@ -1809,7 +1892,76 @@ class VehicleRegistryIdentityMixin:
             if plates_match(ocr_text, session.plate):
                 session.ocr_confirmed = True
                 return True
-        return False
+
+            # Corrective rebind: OCR read a DIFFERENT plate off the physically
+            # parked car. ReID guessed wrong — OCR is ground truth when it
+            # reads at high confidence. If the read matches another in-garage
+            # session's plate, move that identity onto this slot (and mark it
+            # OCR-confirmed so the engine's lock gate freezes the CORRECT
+            # plate). Without this, a wrong provisional binding can never be
+            # fixed: OCR only "agrees or nothing", and the upgrade-only rule
+            # keeps the wrong plate indefinitely.
+            if float(ocr_conf or 0.0) < 0.80:
+                return False  # not confident enough to overturn ReID
+            other = None
+            for s in self._sessions.values():
+                if s.session_id == session.session_id or not s.plate:
+                    continue
+                if s.status not in ("confirmed", "parked"):
+                    continue
+                if plates_match(ocr_text, s.plate):
+                    other = s
+                    break
+            if other is None:
+                logger.info(
+                    "[OCR-REBIND] slot=%s OCR read %r (conf=%.2f) contradicts "
+                    "bound plate %s but matches no in-garage session — leaving "
+                    "binding provisional",
+                    slot_id, ocr_text, ocr_conf, session.plate,
+                )
+                return False
+            # Never steal an identity frozen onto another slot; a competing
+            # LOCK means the conflict needs a human/exit event, not a swap.
+            if other.linked_slot and other.linked_slot != slot_id:
+                if other.linked_slot in self._locked_slots:
+                    logger.warning(
+                        "[OCR-REBIND] slot=%s OCR says plate %s, but that plate "
+                        "is LOCKED to slot %s — refusing to rebind",
+                        slot_id, other.plate, other.linked_slot,
+                    )
+                    return False
+                # The car is physically HERE per OCR — release its stale
+                # (provisional) binding elsewhere.
+                self._parked.pop(other.linked_slot, None)
+
+            now = self._clock()
+            old_plate = session.plate
+            # Carry the slot metadata from the evicted session onto the
+            # corrected one, then detach the wrong session from this slot.
+            other.linked_slot = slot_id
+            other.linked_slot_name = session.linked_slot_name
+            other.linked_camera = session.linked_camera
+            other.linked_floor = session.linked_floor
+            other.linked_zone_id = session.linked_zone_id
+            other.linked_zone_name = session.linked_zone_name
+            other.linked_at = now
+            other.status = "parked"
+            other.ocr_confirmed = True
+            session.linked_slot = None
+            session.linked_slot_name = None
+            session.linked_camera = None
+            session.linked_floor = None
+            session.linked_at = None
+            session.ocr_confirmed = False
+            if session.status == "parked":
+                session.status = "confirmed"
+            self._parked[slot_id] = other
+            logger.warning(
+                "[OCR-REBIND] slot=%s corrected plate %s -> %s "
+                "(OCR read %r, conf=%.2f)",
+                slot_id, old_plate, other.plate, ocr_text, ocr_conf,
+            )
+            return True
 
     def restore_parked_binding(
         self,

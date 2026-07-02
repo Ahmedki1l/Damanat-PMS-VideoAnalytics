@@ -869,10 +869,22 @@ class ParkingEngineTrackingMixin:
             if query_vector is None:
                 continue
 
+            # Bound the candidate pool to this camera's area (+ the cross-area
+            # handoff pool of cars that recently departed an adjacent area) so a
+            # parked car can't be ReID-matched to a session sitting in an
+            # unrelated area/floor — the cross-area false-lock that mislabels a
+            # B2 car with a B1 entrant's plate. Resolves to "" when zoning is off
+            # or the camera is un-zoned, in which case match_global_session falls
+            # back to the legacy all-sessions pool (no behaviour change there).
+            area_id = ""
+            if self.area_registry is not None and self.area_registry.enabled:
+                area_id = self.area_registry.area_for_camera(cam_id)
+
             matched_session = self.vehicle_registry.match_global_session(
                 query_vector,
                 camera_id=cam_id,
                 track_id=detection.track_id,
+                area_id=area_id or None,
             )
             if matched_session:
                 self.vehicle_registry.attach_session_to_track(
