@@ -1554,9 +1554,9 @@ class VehicleRegistryIdentityMixin:
         cfg = self._matching_config
         _best = top_candidates[0][1] if top_candidates else -1.0
         _runner = top_candidates[1][1] if len(top_candidates) > 1 else -1.0
-        _ocr_worth_it = _best < getattr(cfg, "reid_solo_confirm", 0.68) or (
-            (_best - _runner) < getattr(cfg, "global_match_margin", 0.05) or 0.0
-        )
+        _solo = getattr(cfg, "reid_solo_confirm", 0.68) or 0.68
+        _margin = getattr(cfg, "global_match_margin", 0.05) or 0.0
+        _ocr_worth_it = (_best < _solo) or ((_best - _runner) < _margin)
         if query_crop is not None and top_candidates and _ocr_worth_it:
             ocr = getattr(self._match_decision, "plate_ocr", None)
             if ocr is not None and hasattr(ocr, "read"):
