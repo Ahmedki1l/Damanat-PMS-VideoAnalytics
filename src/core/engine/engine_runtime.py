@@ -251,9 +251,13 @@ class ParkingEngineRuntimeMixin:
 
             session = self.db_manager.SessionLocal()
             try:
+                # Startup restore probe — fail fast rather than hang the boot if
+                # another connection holds a lock on parking_sessions (NOLOCK +
+                # short LOCK_TIMEOUT; see _exit_janitor_tick for rationale).
+                session.execute(_text("SET LOCK_TIMEOUT 3000"))
                 rows = session.execute(
                     _text(
-                        "SELECT plate_number, floor FROM dbo.parking_sessions "
+                        "SELECT plate_number, floor FROM dbo.parking_sessions WITH (NOLOCK) "
                         "WHERE status = 'open'"
                     )
                 ).fetchall()
@@ -330,6 +334,13 @@ class ParkingEngineRuntimeMixin:
 
             session = self.db_manager.SessionLocal()
             try:
+                # This runs on the main loop thread, so it must never block the
+                # pipeline. LOCK_TIMEOUT makes a lock-blocked read raise (err
+                # 1222) after 3s instead of hanging forever (and un-killably,
+                # since the wait is a native ODBC socket call); the NOLOCK hint
+                # avoids taking shared locks at all. A stale/dirty read is fine —
+                # a plate that just closed is re-checked on the next tick.
+                session.execute(_text("SET LOCK_TIMEOUT 3000"))
                 # One round-trip: get the latest status per plate. Plates
                 # with no rows aren't in the result — those are fine, they
                 # haven't entered yet. `expanding=True` lets SQLAlchemy
@@ -338,7 +349,7 @@ class ParkingEngineRuntimeMixin:
                     "SELECT plate_number, status FROM ("
                     "  SELECT plate_number, status, "
                     "         ROW_NUMBER() OVER (PARTITION BY plate_number ORDER BY entry_time DESC) AS rn "
-                    "  FROM dbo.parking_sessions "
+                    "  FROM dbo.parking_sessions WITH (NOLOCK) "
                     "  WHERE plate_number IN :plates"
                     ") t WHERE rn = 1"
                 ).bindparams(bindparam("plates", expanding=True))

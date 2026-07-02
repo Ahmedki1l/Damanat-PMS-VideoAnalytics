@@ -101,9 +101,13 @@ class VehicleRegistryIdentityMixin:
 
             session = db_manager.SessionLocal()
             try:
+                # Called from the per-frame identity gate — must not block on a
+                # lock (NOLOCK + short LOCK_TIMEOUT; a stale read fails open
+                # below, which is the safe default here).
+                session.execute(_text("SET LOCK_TIMEOUT 3000"))
                 row = session.execute(
                     _text(
-                        "SELECT TOP 1 status FROM dbo.parking_sessions "
+                        "SELECT TOP 1 status FROM dbo.parking_sessions WITH (NOLOCK) "
                         "WHERE plate_number = :p ORDER BY entry_time DESC"
                     ),
                     {"p": plate},
