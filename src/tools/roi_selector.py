@@ -28,9 +28,16 @@ class ROISelector:
         self.ref_resolution = ref_resolution
         self.points = []
         self._drag_idx = -1
+        # Reference geometry drawn underneath the ROI so it can be aligned to the
+        # existing boundaries / slots. Each entry is (int-pts array, label).
+        self._ov_slots = []
+        self._ov_zones = []
+        self._ov_bounds = []
+        self._show_overlay = True
         self.window_name = (
             f"ROI Selector - {camera_id} "
-            "(drag=move pt, click=add, right-click=del, u=undo, c=clear, s=save, q=quit)"
+            "(click=add, drag=move, right-click=del, u=undo, c=clear, "
+            "b=toggle boundaries, s=save, q=quit)"
         )
 
     def _nearest_point_idx(self, x, y):
@@ -62,8 +69,29 @@ class ROISelector:
                 del self.points[idx]
                 self.draw()
 
+    def _draw_overlay(self, img):
+        """Draw the reference geometry (slots grey, special zones cyan,
+        boundaries magenta with an area_from->area_to label) under the ROI."""
+        def _poly(pts, color, thickness, label=None):
+            if pts is None or len(pts) < 2:
+                return
+            cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thickness)
+            if label:
+                cx, cy = int(pts[:, 0].mean()), int(pts[:, 1].mean())
+                cv2.putText(img, label, (cx - 20, cy), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, color, 1, cv2.LINE_AA)
+
+        for pts, label in self._ov_slots:
+            _poly(pts, (160, 160, 160), 1, label)
+        for pts, label in self._ov_zones:
+            _poly(pts, (255, 255, 0), 1, label)
+        for pts, label in self._ov_bounds:
+            _poly(pts, (255, 0, 255), 2, label)
+
     def draw(self):
         img_copy = self.img.copy()
+        if self._show_overlay:
+            self._draw_overlay(img_copy)
         if self.points:
             for pt in self.points:
                 cv2.circle(img_copy, tuple(pt), 5, (0, 255, 0), -1)
@@ -92,7 +120,7 @@ class ROISelector:
             print(f"[ERROR] Could not grab frame from {self.camera_id}. Check RTSP URL/Connection.")
             return
 
-        self._load_existing_roi()
+        self._load_existing_geometry()
 
         cv2.namedWindow(self.window_name)
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
@@ -104,6 +132,9 @@ class ROISelector:
                 break
             if key == ord("c"):
                 self.points = []
+                self.draw()
+            elif key == ord("b"):
+                self._show_overlay = not self._show_overlay
                 self.draw()
             elif key == ord("u"):
                 if self.points:
@@ -117,13 +148,20 @@ class ROISelector:
 
         cv2.destroyAllWindows()
 
-    def _load_existing_roi(self):
-        """Pre-load this camera's saved ROI (if any) as editable points, scaled
-        from the stored reference resolution to the live frame's pixels."""
+    @staticmethod
+    def _poly_to_pts(polygon):
+        """Shapely polygon -> int Nx2 pixel array (closing point dropped)."""
+        coords = list(polygon.exterior.coords)[:-1]
+        return np.array([[int(round(x)), int(round(y))] for x, y in coords], dtype=np.int32)
+
+    def _load_existing_geometry(self):
+        """Pre-load this camera's saved ROI as editable points, plus the existing
+        slots / special zones / boundaries as a read-only reference overlay — all
+        scaled from the stored reference resolution to the live frame's pixels."""
         act_h, act_w = self.img.shape[:2]
         session = self.db_manager.SessionLocal()
         try:
-            _, _, roi_polygon, _ = load_camera_slots(
+            slots, zones, roi_polygon, boundaries = load_camera_slots(
                 session,
                 camera_id=self.camera_id,
                 ref_resolution=self.ref_resolution,
@@ -132,13 +170,23 @@ class ROISelector:
         finally:
             session.close()
 
+        self._ov_slots = [(self._poly_to_pts(s.polygon), s.label) for s in slots]
+        self._ov_zones = [(self._poly_to_pts(z.polygon), z.label) for z in zones]
+        self._ov_bounds = [
+            (self._poly_to_pts(b.polygon), f"{b.area_from}->{b.area_to}")
+            for b in boundaries
+        ]
+        print(
+            f"[INFO] Reference overlay: {len(self._ov_slots)} slot(s), "
+            f"{len(self._ov_zones)} zone(s), {len(self._ov_bounds)} boundary(ies) "
+            f"— 'b' toggles."
+        )
+
         if roi_polygon is None:
             print(f"[INFO] No existing ROI for {self.camera_id} — starting fresh.")
             return
 
-        # Drop the closing point that shapely repeats to close the ring.
-        coords = list(roi_polygon.exterior.coords)[:-1]
-        self.points = [[int(round(x)), int(round(y))] for x, y in coords]
+        self.points = [list(pt) for pt in self._poly_to_pts(roi_polygon)]
         print(f"[INFO] Loaded existing ROI for {self.camera_id} ({len(self.points)} points) — edit and 's' to save.")
 
     def save_roi(self):
