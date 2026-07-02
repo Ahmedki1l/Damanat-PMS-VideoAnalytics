@@ -59,6 +59,11 @@ RANK5_OCR_MIN_CONF = 0.60
 # How many nearest ReID neighbours to keep as the candidate pool ("rank-5").
 GLOBAL_MATCH_RANK = 5
 
+# Minimum view-quality for a camera to count as having a "full view" of a car
+# in the ownership contest (see _resolve_owner_camera). view_quality is 1.0
+# when the bbox is fully inside the frame, lower when clipped by an edge.
+_FULL_VIEW_MIN = 0.9
+
 
 class VehicleRegistryIdentityMixin:
     def is_plate_inside(self, plate: Optional[str]) -> bool:
@@ -1045,6 +1050,33 @@ class VehicleRegistryIdentityMixin:
                 if not unzoned:
                     return session.owner_camera
                 live = unzoned
+
+        # Priority 1 — slot-hosting cameras. A car straddling a slot camera and
+        # a slotless aisle/transit camera should be owned by the slot camera, so
+        # its identity (and plate) is attributed where it can actually be bound
+        # to a slot and locked. Only narrows when a slot camera is live; empty
+        # ``_cameras_with_slots`` (not configured) leaves ``live`` untouched.
+        if self._cameras_with_slots:
+            slotted = [cam for cam in live if cam in self._cameras_with_slots]
+            if slotted:
+                live = slotted
+
+        # Priority 2 — cameras with a full view of the car. Among the surviving
+        # candidates, one that sees the whole vehicle (bbox not clipped by a
+        # frame edge) outranks one that only catches part of it, since the full
+        # view yields the more trustworthy crop/identity. Only narrows when at
+        # least one live camera has a full-view reading; no readings ⇒ unchanged.
+        if len(live) > 1:
+            full_view = [
+                cam
+                for cam in live
+                if self._track_view_quality.get(
+                    (cam, session.observing_tracks.get(cam)), 0.0
+                )
+                >= _FULL_VIEW_MIN
+            ]
+            if full_view:
+                live = full_view
 
         if not live:
             # Nobody live right now — keep the last known owner if it is still

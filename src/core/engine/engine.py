@@ -174,6 +174,19 @@ class ParkingEngine(
 
         total_slots = self._initialize_camera_pipelines(camera_configs)
         print(f"[INFO] Total parking slots across all cameras: {total_slots}")
+
+        # Tell the registry which cameras host parking slots so ReID ownership
+        # prefers them over slotless transit/aisle cameras (a car's identity is
+        # attributed to the camera that can actually bind its plate to a slot).
+        if self.vehicle_registry is not None:
+            slotted = {
+                cam_id for cam_id, pipeline in self.pipelines.items() if pipeline.slots
+            }
+            self.vehicle_registry.set_cameras_with_slots(slotted)
+            print(
+                f"[INFO] Slot-hosting cameras (ReID ownership priority): "
+                f"{sorted(slotted)}"
+            )
         print(f"[INFO] Processing mode: {self.config.processing.mode}")
         print(
             f"[INFO] Target FPS per camera: "

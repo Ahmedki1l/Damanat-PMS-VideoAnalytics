@@ -369,6 +369,7 @@ class VehicleRegistryCoreMixin:
             ]
             for key in stale_track_keys:
                 self._track_last_seen.pop(key, None)
+                self._track_view_quality.pop(key, None)
                 session_id = self._track_session_map.pop(key, None)
                 # Also clean up the session's observing_tracks entry
                 if session_id:

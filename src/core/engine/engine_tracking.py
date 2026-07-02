@@ -343,6 +343,30 @@ class ParkingEngineTrackingMixin:
             selected.append(secondary)
         return selected
 
+    def _bbox_view_quality(self, frame: np.ndarray, detection) -> float:
+        """How fully this camera sees the car: 1.0 when the bbox sits entirely
+        inside the frame (with a 1% edge margin), decreasing toward 0.0 as the
+        box is clipped by a frame edge (part of the car out of view).
+
+        Estimated as the fraction of the detection's *reported* bbox area that
+        falls inside the frame — a box hard against an edge has been clamped by
+        the detector, so its reported extent beyond the border is the missing
+        part of the car. Used only as an ownership tie-breaker (display/
+        attribution), never a detection decision.
+        """
+        try:
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = (float(v) for v in detection.bbox)
+            bw, bh = x2 - x1, y2 - y1
+            if bw <= 0 or bh <= 0:
+                return 0.0
+            mx, my = 0.01 * w, 0.01 * h
+            ix = max(0.0, min(x2, w - mx) - max(x1, mx))
+            iy = max(0.0, min(y2, h - my) - max(y1, my))
+            return max(0.0, min(1.0, (ix * iy) / (bw * bh)))
+        except Exception:
+            return 0.0
+
     def _crop_detection(
         self,
         frame: np.ndarray,
@@ -802,6 +826,14 @@ class ParkingEngineTrackingMixin:
         for detection in detections:
             if detection.track_id == -1:
                 continue
+
+            # Record how fully this camera sees the car — feeds the ReID
+            # ownership tie-breaker (a full view outranks a clipped one).
+            self.vehicle_registry.record_track_view(
+                cam_id,
+                detection.track_id,
+                self._bbox_view_quality(frame, detection),
+            )
 
             track_key = (cam_id, detection.track_id)
             session_id = self.vehicle_registry.get_session_id_for_track(

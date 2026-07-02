@@ -74,6 +74,21 @@ class VehicleRegistry(
         # identity-enabled (legacy behaviour).
         self._camera_floors: Dict[str, str] = dict(camera_floors or {})
 
+        # Cameras that host parking slots. Ownership prefers these over slotless
+        # transit/aisle cameras (see _resolve_owner_camera) so a car's identity
+        # is attributed to the camera that can actually bind its plate to a slot.
+        # Populated by the engine after pipelines are built (set_cameras_with_slots);
+        # empty ⇒ no slot preference (legacy behaviour).
+        self._cameras_with_slots: Set[str] = set()
+
+        # (camera_id, track_id) → latest view quality in [0, 1]: how fully the
+        # camera sees this car (1.0 = bbox fully inside the frame, lower when
+        # clipped by an edge). Fed per frame by the engine (record_track_view)
+        # and used as the second ownership tie-breaker after slot preference —
+        # a camera with the whole car outranks one that only sees part of it.
+        # Empty ⇒ no view preference (legacy behaviour).
+        self._track_view_quality: Dict[Tuple[str, int], float] = {}
+
         self._pending_event_order: List[str] = []
         self._pending_events: Dict[str, PendingANPREvent] = {}
         # ANPR burst coalescing: maps an ANPR camera_id → the event_id of its
@@ -271,6 +286,24 @@ class VehicleRegistry(
         )
         transit = ",".join(snap["transit"]) or "-"
         _area_trace("SNAPSHOT", areas=areas, transit=transit)
+
+    # --- Ownership priority inputs (fed by the engine) ------------------ #
+    def set_cameras_with_slots(self, camera_ids) -> None:
+        """Declare which cameras host parking slots. Ownership prefers these
+        over slotless transit cameras. Called once after pipelines are built."""
+        with self._lock:
+            self._cameras_with_slots = set(camera_ids or ())
+
+    def record_track_view(
+        self, camera_id: str, track_id: int, view_quality: float
+    ) -> None:
+        """Record how fully ``camera_id`` currently sees track ``track_id``
+        (1.0 = whole car in frame, lower when clipped). Used as the second
+        ownership tie-breaker after slot preference. Cheap per-frame call."""
+        if track_id is None or track_id < 0:
+            return
+        with self._lock:
+            self._track_view_quality[(camera_id, track_id)] = float(view_quality)
 
     # --- Zoning: per-frame area-state drivers (no-ops when un-zoned) ---- #
     def settle_track_area(self, camera_id: str, track_id: int) -> None:
