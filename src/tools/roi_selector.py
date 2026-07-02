@@ -167,8 +167,20 @@ class ROISelector:
 if __name__ == "__main__":
     import sys
 
+    from src.services.config_service import load_cameras_from_db
+
     config = load_config()
     db = init_db(config.database.url)
+
+    # DB-first roster: replace the YAML cameras with the enabled rows from the
+    # `cameras` table (decrypted passwords, ANPR cameras excluded) — the same
+    # source of truth the engine uses. Falls back to YAML when the table is
+    # absent/empty.
+    _session = db.SessionLocal()
+    try:
+        load_cameras_from_db(_session, config)
+    finally:
+        _session.close()
 
     raw_config = {"cameras": [], "processing": {"stream_channel": config.processing.stream_channel}}
     for cam in config.cameras:
