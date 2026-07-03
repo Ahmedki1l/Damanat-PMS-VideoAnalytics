@@ -224,6 +224,7 @@ class VehicleRegistryIdentityMixin:
         images: List[np.ndarray],
         now: datetime,
         primary_snapshot_index: int = 0,
+        seed_gallery: bool = False,
     ) -> bool:
         ordered_images = self._dedupe_valid_images(images)
         if not ordered_images:
@@ -249,7 +250,55 @@ class VehicleRegistryIdentityMixin:
             primary_feature = feature_vectors[primary_snapshot_index]
             if primary_feature is not None:
                 session.feature_vector = primary_feature
+
+        # Seed the durable per-plate gallery folder (vehicle_images/gallery/
+        # <plate>/) so a folder exists on disk the moment a car is confirmed —
+        # instead of only when live-tracking accumulation happens to fire (which
+        # may never happen for a short-lived / low-FPS car). Reuses the
+        # already-extracted feature. ONLY when the caller passes seed_gallery:
+        # the authoritative CAM-03 B-entry reference (confirm_b1_entrance_by_plate)
+        # is safe to persist, but the wide gate-only ANPR shot from the direct
+        # session is NOT — it is kept out of matching by gate_reference_only, and
+        # persisting it would reintroduce the false-match-against-a-parked-car
+        # risk on warm-start (build_session_from_gallery loads it primary-first).
+        if seed_gallery:
+            self._seed_plate_gallery_reference(
+                session, ordered_images, feature_vectors, primary_snapshot_index
+            )
         return True
+
+    def _seed_plate_gallery_reference(
+        self,
+        session,
+        ordered_images: List[np.ndarray],
+        feature_vectors: List[Optional[np.ndarray]],
+        primary_snapshot_index: int,
+    ) -> None:
+        """Persist the primary confirmation crop + embedding to the plate's
+        on-disk gallery. No-op when persistence is off, the plate is unknown, or
+        the primary image/feature is missing. Best-effort — disk errors are
+        swallowed so confirmation never fails on a storage hiccup."""
+        store = self.gallery_store
+        plate = getattr(session, "plate", None)
+        if store is None or not plate:
+            return
+        idx = primary_snapshot_index
+        if idx >= len(ordered_images) or idx >= len(feature_vectors):
+            return
+        image = ordered_images[idx]
+        feature = feature_vectors[idx]
+        if image is None or getattr(image, "size", 0) == 0 or feature is None:
+            return
+        try:
+            store.save_ref(
+                plate,
+                image,
+                feature,
+                quality=999.0,  # authoritative reference — keep over live views
+                camera_id=getattr(session, "last_seen_camera", "") or "ANPR",
+            )
+        except Exception as exc:  # pragma: no cover - disk best-effort
+            logger.debug("[gallery] seed for %s failed: %r", plate, exc)
 
     def confirm_anpr_session_directly(
         self,
@@ -376,6 +425,67 @@ class VehicleRegistryIdentityMixin:
 
             logger.info(
                 "[PARK_ENTRY] Bound ANPR event %s (plate=%s) to candidate %s",
+                event.event_id,
+                event.plate,
+                candidate_id,
+            )
+            return event.plate
+
+    def bind_anpr_event_to_candidate(
+        self,
+        candidate_id: str,
+        event_id: str,
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """Bind a SPECIFIC pending ANPR entry (by ``event_id``) to a candidate.
+
+        Used by the ANPR-image entry path, where the candidate's snapshot IS the
+        ANPR camera's shot of the very plate we just decoded — so the pairing is
+        known by identity and must NOT go through the FIFO
+        :meth:`bind_next_pending_anpr_to_candidate` (which pairs by arrival
+        order and can cross-bind an image to an *older* pending entry for a
+        different plate, swapping the two cars). The live-track path, where a
+        CAM-03 crop has no plate yet, still uses the FIFO method.
+
+        Returns the bound plate, or None when the event is not (any longer) a
+        bindable pending entry — the caller then falls back to FIFO.
+        """
+        now = timestamp or self._clock()
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if candidate is None or candidate.status != "open":
+                return None
+            event = self._pending_events.get(event_id)
+            if event is None or event.direction != "entry":
+                return None
+            if event.status not in ("pending", "provisional"):
+                return None
+            age = (now - event.timestamp).total_seconds()
+            if age > self.PENDING_ANPR_EXPIRY_SECONDS:
+                event.status = "expired"
+                return None
+
+            # If this event was already provisionally bound to a different
+            # candidate (e.g. a burst re-read produced a fresh ANPR-image
+            # candidate for the same plate), retire the stale candidate so the
+            # "one event ↔ one candidate" invariant holds — otherwise both would
+            # match the next B1 image. Newer image wins (burst last-wins).
+            prev_cid = event.candidate_id
+            if prev_cid and prev_cid != candidate_id:
+                stale = self._park_entry_candidates.get(prev_cid)
+                if stale is not None and stale.status != "confirmed":
+                    stale.status = "dropped"
+                    stale.bound_event_id = None
+
+            event.status = "provisional"
+            event.candidate_id = candidate.candidate_id
+
+            candidate.status = "provisional"
+            candidate.bound_event_id = event.event_id
+            candidate.last_seen_at = now
+
+            logger.info(
+                "[PARK_ENTRY] Bound ANPR event %s (plate=%s) to candidate %s (by event)",
                 event.event_id,
                 event.plate,
                 candidate_id,
@@ -849,8 +959,11 @@ class VehicleRegistryIdentityMixin:
 
             session.last_seen_at = now
             session.last_seen_camera = "CAM-03"
+            # seed_gallery=True: the CAM-03 B-entry crop is the authoritative
+            # primary identity reference — safe to persist to the durable gallery
+            # (unlike the wide gate-only shot in confirm_anpr_session_directly).
             if not self._persist_session_gallery(
-                session, [image], now, primary_snapshot_index=0
+                session, [image], now, primary_snapshot_index=0, seed_gallery=True
             ):
                 return None
             # The primary reference is now the real CAM-03 shot, not the wide gate

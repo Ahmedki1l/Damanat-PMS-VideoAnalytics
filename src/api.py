@@ -344,6 +344,7 @@ def create_app(
         camera_id: Optional[str] = None,
         image_bytes: Optional[bytes] = None,
         frame=None,
+        event_id: Optional[str] = None,
     ) -> bool:
         # B-entry = the CAM-03 B1 confirmation snapshot pushed via the ANPR API
         # (plate + image). Attach it to the plate's session as the primary ReID
@@ -441,9 +442,22 @@ def create_app(
                     if live_candidate is not None:
                         live_candidate.source = "anpr_image"
 
-                bound_plate = registry.bind_next_pending_anpr_to_candidate(
-                    candidate.candidate_id
+                # Bind this candidate to the SPECIFIC ANPR event we just
+                # registered — the candidate's image is that plate's own car, so
+                # pairing by identity avoids the FIFO cross-bind that swaps two
+                # cars entering close together. Fall back to FIFO if the event is
+                # no longer bindable (e.g. already confirmed via a race).
+                bound_plate = (
+                    registry.bind_anpr_event_to_candidate(
+                        candidate.candidate_id, event_id
+                    )
+                    if event_id
+                    else None
                 )
+                if not bound_plate:
+                    bound_plate = registry.bind_next_pending_anpr_to_candidate(
+                        candidate.candidate_id
+                    )
                 if bound_plate:
                     # Retrieve gate snapshot paths and bound event_id from the candidate
                     # so the direct session is wired to the same ANPR event record.
@@ -692,6 +706,7 @@ def create_app(
             record.direction,
             camera_id=event.camera_id,
             image_bytes=image_bytes,
+            event_id=record.event_id,
         )
 
         return ANPREventResponse(
@@ -736,6 +751,7 @@ def create_app(
             record.plate,
             record.direction,
             image_bytes=image_bytes,
+            event_id=record.event_id,
         )
 
         return ANPREventResponse(
