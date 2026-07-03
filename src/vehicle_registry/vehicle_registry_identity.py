@@ -356,9 +356,11 @@ class VehicleRegistryIdentityMixin:
         # CAM_03 confirmation images that get added later.
         self._persist_session_gallery(session, [image], now, primary_snapshot_index=0)
 
+        evicted_slots: List[str] = []
         with self._lock:
-            # Guard: if a session for this plate was already confirmed (e.g. the
-            # car DID pass through B1_Entrence in a race), skip creating a duplicate.
+            # Fast path: a same-arrival burst (an existing same-plate session
+            # < 120s old) means the car DID pass through B1_Entrence in a race —
+            # reuse it instead of creating a duplicate.
             for existing in self._sessions.values():
                 if (
                     existing.plate == plate
@@ -373,10 +375,21 @@ class VehicleRegistryIdentityMixin:
                     )
                     return existing.session_id
 
+            # No recent burst match ⇒ a genuine (re-)entry. This ANPR gate read
+            # is authoritative: evict any STALE (>=120s) same-plate session still
+            # open from a missed exit so one plate never holds two active slots.
+            evicted_slots = self._claim_plate_globally(
+                plate, keep_session_id=session_id, timestamp=now
+            )
+
             self._sessions[session_id] = session
             # Phase 3 / T3.2 — track the new confirmed session in the FAISS
             # gallery (no-op when use_faiss_index is False).
             self._gallery_index_upsert(session)
+
+        # DB clear off-lock — never hold self._lock across DB I/O.
+        for slot_id in evicted_slots:
+            self._clear_slot_db_binding(slot_id)
 
         logger.info(
             "[ANPR] Direct session %s created for plate=%s — "
@@ -759,6 +772,8 @@ class VehicleRegistryIdentityMixin:
             feature for feature in session_reference_features if feature is not None
         ]
 
+        evicted_slots: List[str] = []
+        result_plate: Optional[str] = None
         with self._lock:
             live_candidate = self._park_entry_candidates.get(best_candidate.candidate_id)
             if live_candidate is None or live_candidate.status != "provisional":
@@ -827,6 +842,15 @@ class VehicleRegistryIdentityMixin:
                     "(same car, plate=%s)",
                     track_session.session_id, event_session.session_id, event.plate,
                 )
+
+            # Authoritative gate read: evict any OTHER stale same-plate session
+            # still open from a missed exit, keeping the one we're about to
+            # upgrade/create. DB clear happens off-lock after this block.
+            evicted_slots = self._claim_plate_globally(
+                event.plate,
+                keep_session_id=session.session_id if session else None,
+                timestamp=now,
+            )
 
             if session:
                 logger.info(
@@ -920,7 +944,12 @@ class VehicleRegistryIdentityMixin:
                 session.session_id,
                 best_score,
             )
-            return session.plate
+            result_plate = session.plate
+
+        # DB clear off-lock — never hold self._lock across DB I/O.
+        for slot_id in evicted_slots:
+            self._clear_slot_db_binding(slot_id)
+        return result_plate
 
     def confirm_b1_entrance_by_plate(
         self,
@@ -945,6 +974,8 @@ class VehicleRegistryIdentityMixin:
         if image is None or getattr(image, "size", 0) == 0:
             return None
         now = timestamp or self._clock()
+        evicted_slots: List[str] = []
+        result_sid: Optional[str] = None
         with self._lock:
             session = None
             for s in self._sessions.values():
@@ -970,13 +1001,24 @@ class VehicleRegistryIdentityMixin:
             # image — the session is a trustworthy match target again.
             session.gate_reference_only = False
             self._gallery_index_upsert(session)
+            # Convergence: this authoritative CAM-03 B-entry read is a good moment
+            # to collapse any OTHER stale same-plate session left open by a missed
+            # exit onto this one. Cannot itself create a duplicate.
+            evicted_slots = self._claim_plate_globally(
+                plate, keep_session_id=session.session_id, timestamp=now
+            )
             logger.info(
                 "[B1] CAM-03 B-entry snapshot attached for plate=%s -> session %s "
                 "(primary identity reference at B1)",
                 plate,
                 session.session_id,
             )
-            return session.session_id
+            result_sid = session.session_id
+
+        # DB clear off-lock — never hold self._lock across DB I/O.
+        for slot_id in evicted_slots:
+            self._clear_slot_db_binding(slot_id)
+        return result_sid
 
     def add_gallery_snapshot_by_plate(
         self,
@@ -2359,29 +2401,219 @@ class VehicleRegistryIdentityMixin:
         so the API reports the plate immediately and the first post-restart
         frame cannot overwrite a correct record with a fresh provisional one.
         See engine_runtime._load_camera_db_state.
+
+        Boot-restore dedup: the persisted DB may hold the same plate on two slots
+        (a missed exit left a stale binding). One plate may occupy at most one
+        slot, so we keep the most-recent binding and evict the older — even a
+        locked one. This registry is a single shared instance across all cameras,
+        so enforcing it here is sufficient.
         """
+        released_slots: List[str] = []
+        skip_restore = False
         with self._lock:
             if slot_id in self._parked:
                 return
-            session = VehicleSession(
-                session_id=f"restored_{uuid.uuid4().hex[:12]}",
-                plate=plate,
-                first_seen_at=timestamp,
-                last_seen_at=timestamp,
-                last_seen_camera=camera_id,
-                status="parked",
-                new_pipeline_score=confidence,
-                old_pipeline_score=confidence,
+
+            if plate:
+                rivals = [
+                    (oslot, other)
+                    for oslot, other in self._parked.items()
+                    if oslot != slot_id and other.plate == plate
+                ]
+                if rivals:
+                    # Incoming wins only when STRICTLY newer than every rival; on
+                    # a tie the already-restored rival (first restore) wins, so
+                    # restore order is deterministic.
+                    incoming_newest = all(
+                        (other.linked_at or other.first_seen_at or timestamp) < timestamp
+                        for _, other in rivals
+                    )
+                    if incoming_newest:
+                        for _, other in rivals:
+                            released = self._close_session(other, reason="restore_dedup_stale")
+                            if released is not None:
+                                released_slots.append(released)
+                    else:
+                        # A rival is newer: keep the single newest rival, evict
+                        # the rest, and skip restoring the stale incoming row.
+                        skip_restore = True
+                        winner = max(
+                            rivals,
+                            key=lambda pair: (
+                                pair[1].linked_at or pair[1].first_seen_at or timestamp
+                            ),
+                        )[1]
+                        for _, other in rivals:
+                            if other is winner:
+                                continue
+                            released = self._close_session(other, reason="restore_dedup_stale")
+                            if released is not None:
+                                released_slots.append(released)
+
+            if skip_restore:
+                # The incoming row lost the tie-break — clear its own DB binding
+                # so a later restart does not resurrect it.
+                released_slots.append(slot_id)
+            else:
+                session = VehicleSession(
+                    session_id=f"restored_{uuid.uuid4().hex[:12]}",
+                    plate=plate,
+                    first_seen_at=timestamp,
+                    last_seen_at=timestamp,
+                    last_seen_camera=camera_id,
+                    status="parked",
+                    new_pipeline_score=confidence,
+                    old_pipeline_score=confidence,
+                )
+                session.linked_slot = slot_id
+                session.linked_slot_name = slot_name
+                session.linked_camera = camera_id
+                session.linked_floor = floor
+                session.linked_at = timestamp
+                self._sessions[session.session_id] = session
+                self._parked[slot_id] = session
+                if locked:
+                    self._locked_slots.add(slot_id)
+
+        # DB clear off-lock — never hold self._lock across DB I/O.
+        for sid in released_slots:
+            self._clear_slot_db_binding(sid)
+
+    def _close_session(self, session: VehicleSession, reason: str) -> Optional[str]:
+        """Tear one session down completely and move it to history.
+
+        Sets ``status``/``exit_reason``, drops all cross-camera track bindings,
+        removes the session from ``_sessions``, the per-area index and the FAISS
+        gallery, and — when the session owns a parking slot — pops that slot from
+        ``_parked`` and releases any plate-lock on it. Returns the released
+        ``slot_id`` (or ``None``) so the caller can clear that slot's DB row
+        *outside* the registry lock: this method performs **no** DB I/O.
+
+        Must be called under ``self._lock`` (RLock — safe to nest). Shared by the
+        normal exit path (``_handle_exit``) and the ANPR eviction chokepoint
+        (``_claim_plate_globally``); the distinct log line is left to callers.
+        """
+        session.status = "exited"
+        session.exit_reason = reason
+
+        # Clean up track bindings across all cameras
+        for obs_cam, obs_tid in list(session.observing_tracks.items()):
+            self._track_session_map.pop((obs_cam, obs_tid), None)
+            self._track_last_seen.pop((obs_cam, obs_tid), None)
+        session.observing_tracks.clear()
+        session.observing_scores.clear()
+        session.owner_camera = None
+
+        # Legacy cleanup
+        if session.last_seen_camera and session.last_seen_track_id is not None:
+            self._track_session_map.pop(
+                (session.last_seen_camera, session.last_seen_track_id),
+                None,
             )
-            session.linked_slot = slot_id
-            session.linked_slot_name = slot_name
-            session.linked_camera = camera_id
-            session.linked_floor = floor
-            session.linked_at = timestamp
-            self._sessions[session.session_id] = session
-            self._parked[slot_id] = session
-            if locked:
-                self._locked_slots.add(slot_id)
+
+        # Slot teardown — a parked session releases its slot and any plate-lock.
+        # Only release the slot this session actually owns (guards against a
+        # stale linked_slot pointing at a slot now held by another session).
+        released_slot: Optional[str] = None
+        slot_id = session.linked_slot
+        if slot_id is not None and self._parked.get(slot_id) is session:
+            self._parked.pop(slot_id, None)
+            self._locked_slots.discard(slot_id)
+            released_slot = slot_id
+        # A closed session must never dangle a slot pointer (it would otherwise
+        # ghost-bind on a later frame or misreport a location). Mirrors the
+        # link-clearing in try_link_to_slot's stale-release path.
+        session.linked_slot = None
+        session.linked_slot_name = None
+        session.linked_camera = None
+        session.linked_floor = None
+        session.linked_zone_id = None
+        session.linked_zone_name = None
+        session.linked_at = None
+
+        self._sessions.pop(session.session_id, None)
+        # Zoning — drop the closed car from its area bucket so the bounded
+        # (per-area) candidate pool never matches a car that has left.
+        self._drop_session_from_area_index(session)
+        # Phase 3 / T3.2 — drop from the FAISS gallery so a future query never
+        # matches against a car that has already left the facility.
+        self._gallery_index_remove(session.session_id)
+        self._history.append(session)
+        return released_slot
+
+    def _clear_slot_db_binding(self, slot_id: str) -> None:
+        """Best-effort: null the persisted plate binding on one ``parking_slots``
+        row after an ANPR eviction, so a restart does not resurrect the stale
+        plate on that slot (see ``restore_parked_binding`` / _load_camera_db_state).
+
+        No-op when no ``db_manager`` is wired (VA-local/test env), mirroring
+        ``is_plate_inside``'s fail-open DI. MUST be called **outside**
+        ``self._lock`` — it opens a DB session, and DB I/O must never run under
+        the registry lock.
+        """
+        db_manager = getattr(self, "db_manager", None)
+        if db_manager is None or not slot_id:
+            return
+        try:
+            from src.services.slot_status_service import clear_slot_plate_binding
+
+            session = db_manager.SessionLocal()
+            try:
+                clear_slot_plate_binding(session, slot_id)
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(
+                "[REGISTRY] Failed to clear DB plate binding for slot %s: %r",
+                slot_id, exc,
+            )
+
+    def _claim_plate_globally(
+        self,
+        plate: str,
+        keep_session_id: Optional[str],
+        reason: str = "plate_reclaimed_elsewhere",
+        timestamp: Optional[datetime] = None,  # reserved; eviction is not time-stamped
+    ) -> List[str]:
+        """Enforce 'one plate = one active session': force-close every OTHER
+        active (confirmed/parked) session for ``plate`` and return the parking
+        ``slot_id``s they released.
+
+        This is the single chokepoint that makes a genuine ANPR gate read the
+        authority for a plate — a real re-entry evicts a stale session left open
+        by a missed exit-camera detection, even a plate-locked one. Only ANPR
+        callers invoke it; the ReID / OCR in-frame paths keep their locked-slot
+        refusal untouched.
+
+        Purely in-memory. It does NOT touch the DB — callers clear the returned
+        slots via ``_clear_slot_db_binding`` AFTER releasing ``self._lock``, so no
+        DB I/O ever runs under the lock. It does NOT ``stamp_exit`` (the car has
+        not left the facility, so the gallery-TTL clock must not start) and does
+        NOT purge pending events plate-wide (that would destroy the current
+        re-entry's own pending event; the 30 s ``_cleanup_stale_data`` GC ages
+        out the stale one). Must be called under ``self._lock`` (RLock).
+        """
+        if not plate:
+            return []
+        # Snapshot the victims first — _close_session mutates self._sessions.
+        victims = [
+            s
+            for s in self._sessions.values()
+            if s.plate == plate
+            and s.status in ("confirmed", "parked")
+            and s.session_id != keep_session_id
+        ]
+        released: List[str] = []
+        for session in victims:
+            slot_id = self._close_session(session, reason=reason)
+            logger.warning(
+                "[REGISTRY] Force-evicted stale session %s for plate %s "
+                "(slot=%s, reason=%s) — likely a missed exit-camera detection",
+                session.session_id, plate, slot_id, reason,
+            )
+            if slot_id is not None:
+                released.append(slot_id)
+        return released
 
     def _handle_exit(self, plate: str, timestamp: datetime) -> None:
         """
@@ -2404,50 +2636,21 @@ class VehicleRegistryIdentityMixin:
             self._gallery_last_add.pop(key, None)
 
         with self._lock:
-            # 1. Find and close any active sessions for this plate (parked or driving)
+            # 1. Find and close any active sessions for this plate (parked or driving).
             sessions_to_remove = [
                 s for s in self._sessions.values() if s.plate == plate
             ]
-            
-            # Also check _parked dict specifically
-            parked_slots_to_clear = [
-                slot_id for slot_id, sess in self._parked.items() if sess.plate == plate
-            ]
-            for slot_id in parked_slots_to_clear:
-                sess = self._parked.pop(slot_id)
-                # The car left the facility — drop any plate-lock too so we don't
-                # leak a frozen entry pointing at a slot no longer in _parked.
-                self._locked_slots.discard(slot_id)
-                if sess not in sessions_to_remove:
+            # Also include any parked session keyed under this plate whose object
+            # has already left _sessions, so its slot still gets torn down.
+            seen_ids = {s.session_id for s in sessions_to_remove}
+            for sess in self._parked.values():
+                if sess.plate == plate and sess.session_id not in seen_ids:
                     sessions_to_remove.append(sess)
+                    seen_ids.add(sess.session_id)
 
+            # _close_session owns the per-session + slot/plate-lock teardown.
             for session in sessions_to_remove:
-                session.status = "exited"
-                # Clean up track bindings across all cameras
-                for obs_cam, obs_tid in list(session.observing_tracks.items()):
-                    self._track_session_map.pop((obs_cam, obs_tid), None)
-                    self._track_last_seen.pop((obs_cam, obs_tid), None)
-                session.observing_tracks.clear()
-                session.observing_scores.clear()
-                session.owner_camera = None
-
-                # Legacy cleanup
-                if session.last_seen_camera and session.last_seen_track_id is not None:
-                    self._track_session_map.pop(
-                        (session.last_seen_camera, session.last_seen_track_id),
-                        None,
-                    )
-                
-                self._sessions.pop(session.session_id, None)
-                # Zoning — drop the exited car from its area bucket so the
-                # bounded (per-area) candidate pool never matches a car that
-                # has already left the facility.
-                self._drop_session_from_area_index(session)
-                # Phase 3 / T3.2 — drop exited session from the FAISS
-                # gallery so a future query never matches against a car
-                # that has already left the facility.
-                self._gallery_index_remove(session.session_id)
-                self._history.append(session)
+                self._close_session(session, reason="exit_event")
                 logger.info("[REGISTRY] Closed session %s for plate %s (Exit)", session.session_id, plate)
 
             # 2. Purge any PENDING/PROVISIONAL ANPR events for this plate

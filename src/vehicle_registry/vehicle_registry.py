@@ -10,7 +10,7 @@ import os
 import threading
 from collections import defaultdict
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from src.config import MatchingConfig, ReIDPreprocessingConfig
 from src.matching import GalleryIndex, MatchDecision, MatchVoter
@@ -64,7 +64,13 @@ class VehicleRegistry(
         match_decision: Optional[MatchDecision] = None,
         area_registry=None,
         camera_floors: Optional[Dict[str, str]] = None,
+        db_manager: Optional[Any] = None,
     ):
+        # Optional DB handle (exposes SessionLocal) used for best-effort writes
+        # such as clearing a stale slot's plate binding after an ANPR eviction
+        # (_clear_slot_db_binding). None ⇒ VA-local in-memory only (fail-open,
+        # mirrors is_plate_inside's optional db_checker DI).
+        self.db_manager = db_manager
         self._lock = threading.RLock()
         self._matcher_lock = threading.Lock()
 

@@ -171,8 +171,12 @@ class TestRegistryLock(unittest.TestCase):
         self.assertNotIn("Slot_B", self.registry._parked)
         self.assertTrue(self.registry.is_slot_locked("Slot_A"))
 
-    def test_locked_stale_slot_not_released_by_other_session(self):
-        # A DIFFERENT session for the same plate must not release a locked slot.
+    def test_locked_stale_slot_not_released_by_reid_slot_link(self):
+        # ReID-side protection intact: a DIFFERENT session for the same plate
+        # must NOT release a locked slot via try_link_to_slot (the in-frame path
+        # keeps its "never steal a frozen identity" refusal). Only a genuine ANPR
+        # gate read may evict a locked stale session — see
+        # test_locked_stale_slot_evicted_by_anpr_reentry.
         stale = self._session(parked_slot="Slot_A", score=0.9, age_minutes=10)
         self.registry.lock_slot("Slot_A")
         fresh = self._session(age_minutes=0)
@@ -214,6 +218,143 @@ class TestRegistryLock(unittest.TestCase):
         )
         self.assertIn("Slot_A", self.registry._parked)
         self.assertFalse(self.registry.is_slot_locked("Slot_A"))
+
+    # ----------------------------------------------------------------------- #
+    # ANPR chokepoint — _claim_plate_globally (one plate = one active session)
+    # ----------------------------------------------------------------------- #
+    def test_locked_stale_slot_evicted_by_anpr_reentry(self):
+        # A genuine ANPR gate read IS authoritative: it evicts even a locked
+        # stale session for the same plate (a likely missed exit).
+        stale = self._session(parked_slot="Slot_A", score=0.9, age_minutes=10)
+        self.registry.lock_slot("Slot_A")
+        self.assertTrue(self.registry.is_slot_locked("Slot_A"))
+
+        released = self.registry._claim_plate_globally(
+            self.PLATE, keep_session_id=None, timestamp=datetime.now()
+        )
+
+        self.assertEqual(released, ["Slot_A"])
+        self.assertEqual(stale.status, "exited")
+        self.assertEqual(stale.exit_reason, "plate_reclaimed_elsewhere")
+        self.assertNotIn(stale.session_id, self.registry._sessions)
+        self.assertNotIn("Slot_A", self.registry._parked)
+        self.assertFalse(self.registry.is_slot_locked("Slot_A"))
+
+    def test_claim_plate_no_match_is_noop(self):
+        s = self._session(parked_slot="Slot_A", score=0.9)
+        released = self.registry._claim_plate_globally(
+            "SOME-OTHER-PLATE", keep_session_id=None
+        )
+        self.assertEqual(released, [])
+        self.assertIs(self.registry._parked.get("Slot_A"), s)
+        self.assertEqual(s.status, "parked")
+
+    def test_claim_plate_closes_slotless_session_no_slot_released(self):
+        s = self._session(score=0.5)  # confirmed, not parked
+        released = self.registry._claim_plate_globally(self.PLATE, keep_session_id=None)
+        self.assertEqual(released, [])
+        self.assertEqual(s.status, "exited")
+        self.assertNotIn(s.session_id, self.registry._sessions)
+
+    def test_claim_plate_excludes_keep_session(self):
+        keep = self._session(parked_slot="Slot_A", score=0.9)
+        other = self._session(parked_slot="Slot_B", score=0.8, age_minutes=5)
+        released = self.registry._claim_plate_globally(
+            self.PLATE, keep_session_id=keep.session_id
+        )
+        self.assertEqual(released, ["Slot_B"])
+        self.assertIs(self.registry._parked.get("Slot_A"), keep)
+        self.assertEqual(keep.status, "parked")
+        self.assertEqual(other.status, "exited")
+        self.assertNotIn("Slot_B", self.registry._parked)
+
+    def test_claim_plate_ignores_already_exited(self):
+        s = self._session(score=0.5)
+        s.status = "exited"  # not an active victim
+        released = self.registry._claim_plate_globally(self.PLATE, keep_session_id=None)
+        self.assertEqual(released, [])
+        self.assertIn(s.session_id, self.registry._sessions)  # left untouched
+
+    def test_clear_slot_db_binding_invokes_primitive_off_lock(self):
+        # _clear_slot_db_binding forwards to the DB primitive with the slot_id
+        # and must run with the registry lock released (no DB I/O under lock).
+        import threading
+        import src.services.slot_status_service as svc
+
+        calls = []
+        lock_free = {"value": None}
+
+        class _StubSession:
+            def close(self):
+                pass
+
+        class _StubDB:
+            def SessionLocal(self):
+                return _StubSession()
+
+        def _fake_clear(db, slot_id):
+            calls.append(slot_id)
+            acquired = {"ok": False}
+
+            def _try():
+                got = self.registry._lock.acquire(timeout=0.5)
+                acquired["ok"] = got
+                if got:
+                    self.registry._lock.release()
+
+            t = threading.Thread(target=_try)
+            t.start()
+            t.join()
+            lock_free["value"] = acquired["ok"]
+            return True
+
+        orig = svc.clear_slot_plate_binding
+        svc.clear_slot_plate_binding = _fake_clear
+        try:
+            self.registry.db_manager = _StubDB()
+            self.registry._clear_slot_db_binding("Slot_A")
+        finally:
+            svc.clear_slot_plate_binding = orig
+
+        self.assertEqual(calls, ["Slot_A"])
+        self.assertTrue(lock_free["value"], "DB clear must run outside the registry lock")
+
+    # ----------------------------------------------------------------------- #
+    # Boot-restore dedup — one plate never restores onto two slots
+    # ----------------------------------------------------------------------- #
+    def _restore(self, slot, ts, locked=False):
+        self.registry.restore_parked_binding(
+            slot_id=slot, slot_name=slot, plate=self.PLATE,
+            confidence=0.9, camera_id=self.CAM, floor="B1", locked=locked,
+            timestamp=ts,
+        )
+
+    def test_restore_dedup_later_survives_earlier_evicted(self):
+        t0 = datetime.now()
+        self._restore("Slot_A", t0)                       # older
+        self._restore("Slot_B", t0 + timedelta(minutes=5))  # newer
+        self.assertNotIn("Slot_A", self.registry._parked)
+        self.assertIn("Slot_B", self.registry._parked)
+        self.assertEqual(self.registry.get_slot_plate("Slot_B"), self.PLATE)
+
+    def test_restore_dedup_order_independent(self):
+        # Restore the NEWER binding first, then the older: the older must be
+        # skipped (not restored), not the other way round.
+        t0 = datetime.now()
+        self._restore("Slot_B", t0 + timedelta(minutes=5))  # newer, first
+        self._restore("Slot_A", t0)                          # older, second
+        self.assertIn("Slot_B", self.registry._parked)
+        self.assertNotIn("Slot_A", self.registry._parked)
+
+    def test_restore_dedup_locked_older_still_evicted(self):
+        t0 = datetime.now()
+        self._restore("Slot_A", t0, locked=True)
+        self.assertTrue(self.registry.is_slot_locked("Slot_A"))
+        self._restore("Slot_B", t0 + timedelta(minutes=5), locked=True)
+        self.assertNotIn("Slot_A", self.registry._parked)
+        self.assertFalse(self.registry.is_slot_locked("Slot_A"))
+        self.assertIn("Slot_B", self.registry._parked)
+        self.assertTrue(self.registry.is_slot_locked("Slot_B"))
 
 
 if __name__ == "__main__":

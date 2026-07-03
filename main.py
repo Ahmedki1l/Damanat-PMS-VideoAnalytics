@@ -372,6 +372,10 @@ Examples:
             # matching on ground-floor cameras by floor rather than a hardcoded
             # camera-id set.
             camera_floors={c.id: c.floor for c in config.cameras},
+            # Best-effort DB handle for clearing a stale slot's plate binding
+            # after an ANPR eviction (_clear_slot_db_binding). Same handle the
+            # engine uses below.
+            db_manager=db,
         )
 
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)

@@ -250,6 +250,11 @@ class VehicleRegistryCoreMixin:
         )
 
         if direction == "entry":
+            # Set inside the lock: the pending event to return early (a coalesced
+            # burst or an ignored duplicate), and any slots freed by a burst
+            # rebind eviction. DB clear + early return happen off the lock below.
+            coalesced_event = None
+            evicted_slots: List[str] = []
             with self._lock:
                 # Burst coalescing: a rapid re-read on the same ANPR camera
                 # within ANPR_COALESCE_SECONDS is the same passing car — keep the
@@ -271,38 +276,50 @@ class VehicleRegistryCoreMixin:
                         burst.timestamp = now  # slide the window
                         if old_plate != plate:
                             burst.plate = plate
-                            self._rebind_anpr_plate(burst.event_id, plate)
+                            evicted_slots = self._rebind_anpr_plate(
+                                burst.event_id, plate, timestamp=now
+                            )
                             logger.info(
                                 "[ANPR] Burst re-read on %s: plate %s -> %s (last wins)",
                                 camera_id,
                                 old_plate,
                                 plate,
                             )
-                        return burst
+                        coalesced_event = burst
 
-                for event_id in reversed(self._pending_event_order):
-                    existing = self._pending_events.get(event_id)
-                    if not existing:
-                        continue
-                    if existing.direction != "entry" or existing.plate != plate:
-                        continue
-                    if existing.status not in ("pending", "provisional"):
-                        continue
-                    age = (now - existing.timestamp).total_seconds()
-                    if age <= 600.0:
-                        logger.info(
-                            "[ANPR] Duplicate entry ignored for plate=%s (age=%.1fs, status=%s)",
-                            plate,
-                            age,
-                            existing.status,
-                        )
-                        return existing
+                if coalesced_event is None:
+                    for event_id in reversed(self._pending_event_order):
+                        existing = self._pending_events.get(event_id)
+                        if not existing:
+                            continue
+                        if existing.direction != "entry" or existing.plate != plate:
+                            continue
+                        if existing.status not in ("pending", "provisional"):
+                            continue
+                        age = (now - existing.timestamp).total_seconds()
+                        if age <= 600.0:
+                            logger.info(
+                                "[ANPR] Duplicate entry ignored for plate=%s (age=%.1fs, status=%s)",
+                                plate,
+                                age,
+                                existing.status,
+                            )
+                            coalesced_event = existing
+                            break
 
-                self._pending_events[event.event_id] = event
-                self._pending_event_order.append(event.event_id)
-                if camera_id is not None:
-                    self._last_anpr_entry[camera_id] = event.event_id
-                logger.info("[ANPR] Entry: plate=%s", plate)
+                if coalesced_event is None:
+                    self._pending_events[event.event_id] = event
+                    self._pending_event_order.append(event.event_id)
+                    if camera_id is not None:
+                        self._last_anpr_entry[camera_id] = event.event_id
+                    logger.info("[ANPR] Entry: plate=%s", plate)
+
+            # DB clear off-lock — never hold self._lock across DB I/O. Then return
+            # the coalesced/duplicate event early (skipping warm-start, as before).
+            for slot_id in evicted_slots:
+                self._clear_slot_db_binding(slot_id)
+            if coalesced_event is not None:
+                return coalesced_event
         elif direction == "exit":
             self._handle_exit(plate, now)
             logger.info("[ANPR] Exit: plate=%s", plate)
@@ -330,7 +347,9 @@ class VehicleRegistryCoreMixin:
 
         return event
 
-    def _rebind_anpr_plate(self, event_id: str, new_plate: str) -> None:
+    def _rebind_anpr_plate(
+        self, event_id: str, new_plate: str, timestamp: Optional[datetime] = None
+    ) -> List[str]:
         """Propagate a burst plate overwrite to state already derived from an
         ANPR event.
 
@@ -344,7 +363,13 @@ class VehicleRegistryCoreMixin:
         through ``get_display_id_for_track`` / ``get_plate_for_track`` on the next
         frame, so no direct state-machine poke is needed. In the common case the
         3s burst completes while the car is still at the gate, before parking.
+
+        Returns the parking ``slot_id``s freed by evicting any stale same-plate
+        session as the corrected plate becomes authoritative; the caller clears
+        those DB rows off-lock (this method does no DB I/O).
         """
+        now = timestamp or self._clock()
+        released: List[str] = []
         with self._lock:
             event = self._pending_events.get(event_id)
             if event is not None:
@@ -360,6 +385,17 @@ class VehicleRegistryCoreMixin:
             )
             for session in sessions:
                 old = session.plate
+                if old != new_plate:
+                    # The corrected plate is authoritative: evict any OTHER stale
+                    # same-plate session before this one adopts the plate, so one
+                    # plate never holds two active slots.
+                    released.extend(
+                        self._claim_plate_globally(
+                            new_plate,
+                            keep_session_id=session.session_id,
+                            timestamp=now,
+                        )
+                    )
                 session.plate = new_plate
                 self._gallery_index_upsert(session)
                 logger.info(
@@ -368,6 +404,7 @@ class VehicleRegistryCoreMixin:
                     old,
                     new_plate,
                 )
+        return released
 
     def _cleanup_stale_data(self, now: datetime):
         """Garbage collection for expired candidates and pending events."""

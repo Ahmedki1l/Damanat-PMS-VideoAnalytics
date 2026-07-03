@@ -84,6 +84,12 @@ class VehicleSession:
     candidate_id: Optional[str] = None
 
     status: str = "confirmed"
+    # Why the session was closed, recorded when it moves to _history. In-memory
+    # only (no DB column). Values: "exit_event" (normal exit-camera detection),
+    # "plate_reclaimed_elsewhere" (evicted by a fresh ANPR gate read of the same
+    # plate — a likely missed exit), "restore_dedup_stale" (boot-restore dropped
+    # an older duplicate binding for the same plate).
+    exit_reason: Optional[str] = None
 
     linked_slot: Optional[str] = None
     linked_slot_name: Optional[str] = None
