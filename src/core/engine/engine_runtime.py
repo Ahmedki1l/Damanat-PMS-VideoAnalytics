@@ -795,7 +795,7 @@ class ParkingEngineRuntimeMixin:
 
         camera_special_zones = self.special_zones.get(cam_id, {})
 
-        if cam_id == "CAM-01" and "Park_Entry" in camera_special_zones:
+        if cam_id == "CAM-23" and "Park_Entry" in camera_special_zones:
             self._process_park_entry_zone(
                 cam_id,
                 frame,
