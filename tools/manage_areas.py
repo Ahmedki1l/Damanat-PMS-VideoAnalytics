@@ -25,6 +25,10 @@ Usage:
     python tools/manage_areas.py delete --id B1-E
     python tools/manage_areas.py delete-boundary --id ramp_C_to_RAMP
 
+    # Relabel an existing boundary's area_from/area_to (e.g. after renaming or
+    # splitting an area) without touching its camera_id or polygon
+    python tools/manage_areas.py set-boundary --id "Cam-7 Bound2" --area-to RAMP-UP
+
     # Wipe parking_areas and re-seed it from config.yaml's areas: block
     python tools/manage_areas.py reseed --yes
 
@@ -157,6 +161,21 @@ def cmd_delete_boundary(session, config, args):
     print(f"[OK] deleted boundary '{args.id}'.")
 
 
+def cmd_set_boundary(session, config, args):
+    """Relabel an existing boundary's area_from/area_to (e.g. after renaming
+    an area) without touching its camera_id or polygon."""
+    row = session.query(Boundary).filter(Boundary.boundary_id == args.id).first()
+    if not row:
+        print(f"[WARN] boundary '{args.id}' not found.")
+        return
+    if args.area_from is not None:
+        row.area_from = args.area_from
+    if args.area_to is not None:
+        row.area_to = args.area_to
+    session.commit()
+    print(f"[OK] boundary '{args.id}' now {row.area_from} -> {row.area_to}.")
+
+
 def cmd_reseed(session, config, args):
     if not args.yes:
         print("[ABORT] reseed wipes parking_areas. Re-run with --yes to confirm.")
@@ -190,6 +209,11 @@ def main():
     db = sub.add_parser("delete-boundary", help="Delete one boundary")
     db.add_argument("--id", required=True)
 
+    sb = sub.add_parser("set-boundary", help="Relabel an existing boundary's area_from/area_to")
+    sb.add_argument("--id", required=True, help="boundary_id")
+    sb.add_argument("--area-from")
+    sb.add_argument("--area-to")
+
     r = sub.add_parser("reseed", help="Wipe parking_areas and re-seed from config.yaml")
     r.add_argument("--yes", action="store_true", help="Confirm the wipe")
 
@@ -208,6 +232,8 @@ def main():
             cmd_delete(session, config, args)
         elif args.command == "delete-boundary":
             cmd_delete_boundary(session, config, args)
+        elif args.command == "set-boundary":
+            cmd_set_boundary(session, config, args)
         elif args.command == "reseed":
             cmd_reseed(session, config, args)
     finally:

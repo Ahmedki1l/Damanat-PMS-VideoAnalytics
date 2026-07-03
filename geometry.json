@@ -1,25 +1,26 @@
 {
   "schema_version": 1,
-  "exported_at": "2026-07-01T08:51:19.253745+00:00",
+  "exported_at": "2026-07-03T08:44:26.305017+00:00",
   "source_db": "localhost/damanat_pms",
   "floor_filter": null,
   "tables": {
     "parking_areas": [
       {
         "area_id": "B1-A",
-        "name": "B1 North Aisle",
+        "name": "B1 A Aisle (Entrance)",
         "floor": "B1",
-        "capacity": 6,
+        "capacity": 30,
         "adjacency_json": {
-          "B1-B": 15.0
+          "B1-B": 15.0,
+          "RAMP-DN": 20.0
         },
         "is_active": true
       },
       {
         "area_id": "B1-B",
-        "name": "B1 Center Aisle",
+        "name": "B1 B Aisle",
         "floor": "B1",
-        "capacity": 8,
+        "capacity": 30,
         "adjacency_json": {
           "B1-A": 15.0,
           "B1-C": 15.0
@@ -28,43 +29,31 @@
       },
       {
         "area_id": "B1-C",
-        "name": "B1 South Aisle",
+        "name": "B1 C Aisle (Exit)",
         "floor": "B1",
-        "capacity": 6,
+        "capacity": 30,
         "adjacency_json": {
           "B1-B": 15.0,
-          "B1-RAMP": 20.0,
-          "B2-RAMP": 30.0
-        },
-        "is_active": true
-      },
-      {
-        "area_id": "B1-RAMP",
-        "name": "B1 Ramp (down to B2)",
-        "floor": "B1",
-        "capacity": 2,
-        "adjacency_json": {
-          "B1-C": 20.0,
-          "B2-A": 30.0
+          "RAMP-UP": 20.0
         },
         "is_active": true
       },
       {
         "area_id": "B2-A",
-        "name": "B2 North Aisle",
+        "name": "B2 A Aisle",
         "floor": "B2",
-        "capacity": 10,
+        "capacity": 30,
         "adjacency_json": {
           "B2-B": 15.0,
-          "B1-RAMP": 30.0
+          "RAMP-DN": 20.0
         },
         "is_active": true
       },
       {
         "area_id": "B2-B",
-        "name": "B2 Center Aisle",
+        "name": "B2 B Aisle",
         "floor": "B2",
-        "capacity": 10,
+        "capacity": 30,
         "adjacency_json": {
           "B2-A": 15.0,
           "B2-C": 15.0
@@ -73,23 +62,34 @@
       },
       {
         "area_id": "B2-C",
-        "name": "B2 South Aisle",
+        "name": "B2 C Aisle",
         "floor": "B2",
-        "capacity": 10,
+        "capacity": 30,
         "adjacency_json": {
           "B2-B": 15.0,
-          "B2-RAMP": 20.0
+          "RAMP-UP": 20.0
         },
         "is_active": true
       },
       {
-        "area_id": "B2-RAMP",
-        "name": "B2 Ramp (Up to B1)",
-        "floor": "B2",
-        "capacity": 2,
+        "area_id": "RAMP-DN",
+        "name": "Down Ramp B1->B2 (A end)",
+        "floor": "",
+        "capacity": 6,
+        "adjacency_json": {
+          "B1-A": 20.0,
+          "B2-A": 20.0
+        },
+        "is_active": true
+      },
+      {
+        "area_id": "RAMP-UP",
+        "name": "Up Ramp B2->B1 (C end)",
+        "floor": "",
+        "capacity": 6,
         "adjacency_json": {
           "B2-C": 20.0,
-          "B1-C": 30.0
+          "B1-C": 20.0
         },
         "is_active": true
       }
@@ -121,11 +121,15 @@
             190.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B1_CRO_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "CRO"
+        "reserved_for": "CRO",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B1_Entrence",
@@ -161,7 +165,11 @@
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B10_CTO",
@@ -181,19 +189,23 @@
             398.0
           ],
           [
-            716.0,
-            292.0
+            713.0,
+            299.0
           ],
           [
-            520.0,
-            304.0
+            521.0,
+            311.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B10_CTO_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "CTO"
+        "reserved_for": "CTO",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B11 CFO",
@@ -205,27 +217,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            779.0,
-            345.0
+            844.0,
+            441.0
           ],
           [
-            988.0,
-            348.0
+            1214.0,
+            456.0
           ],
           [
-            884.0,
-            238.0
+            1019.0,
+            275.0
           ],
           [
-            725.0,
-            242.0
+            774.0,
+            263.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B11 CFO_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "CFO"
+        "reserved_for": "CFO",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B12 CCO",
@@ -237,27 +253,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            479.0,
-            348.0
+            343.0,
+            434.0
           ],
           [
-            738.0,
-            345.0
+            808.0,
+            449.0
           ],
           [
-            699.0,
-            230.0
+            748.0,
+            272.0
           ],
           [
-            520.0,
-            226.0
+            456.0,
+            258.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B12 CCO_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "CCO"
+        "reserved_for": "CCO",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B13 COO",
@@ -269,27 +289,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            248.0,
-            350.0
+            11.0,
+            413.0
           ],
           [
-            436.0,
-            349.0
+            306.0,
+            437.0
           ],
           [
-            494.0,
-            243.0
+            421.0,
+            263.0
           ],
           [
-            364.0,
-            249.0
+            210.0,
+            264.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B13 COO_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "COO"
+        "reserved_for": "COO",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B14",
@@ -317,11 +341,15 @@
             224.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B14_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B15",
@@ -333,31 +361,35 @@
         "slot_type": "parking",
         "polygon": [
           [
-            857.0,
-            375.0
+            901.0,
+            604.0
           ],
           [
-            687.0,
-            87.0
+            745.0,
+            320.0
           ],
           [
-            890.0,
-            103.0
+            934.0,
+            326.0
           ],
           [
-            1020.0,
-            217.0
+            1065.0,
+            435.0
           ],
           [
-            972.0,
-            382.0
+            1008.0,
+            600.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B15_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B16",
@@ -385,11 +417,15 @@
             368.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B16_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B17",
@@ -401,27 +437,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            158.0,
-            340.0
+            -27.0,
+            378.0
           ],
           [
-            628.0,
-            368.0
+            474.0,
+            416.0
           ],
           [
-            632.0,
-            136.0
+            477.0,
+            299.0
           ],
           [
-            272.0,
-            132.0
+            71.0,
+            277.0
           ]
         ],
-        "last_snapshot_path": null,
-        "is_available": false,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B17_latest.jpg",
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B18",
@@ -433,35 +473,39 @@
         "slot_type": "parking",
         "polygon": [
           [
-            688.0,
-            360.0
+            520.0,
+            414.0
           ],
           [
-            932.0,
-            364.0
+            942.0,
+            422.0
           ],
           [
-            852.0,
-            224.0
+            738.0,
+            218.0
           ],
           [
-            854.0,
-            92.0
+            749.0,
+            64.0
           ],
           [
-            676.0,
-            100.0
+            539.0,
+            71.0
           ],
           [
-            684.0,
-            264.0
+            528.0,
+            303.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B18_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B19",
@@ -473,31 +517,35 @@
         "slot_type": "parking",
         "polygon": [
           [
-            1038.0,
-            384.0
+            980.0,
+            415.0
           ],
           [
-            1220.0,
-            372.0
+            1210.0,
+            409.0
           ],
           [
             1244.0,
             172.0
           ],
           [
-            908.0,
-            110.0
+            797.0,
+            77.0
           ],
           [
-            910.0,
-            240.0
+            786.0,
+            225.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B19_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B2",
@@ -509,27 +557,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            185.0,
-            188.0
+            166.0,
+            239.0
           ],
           [
-            374.0,
-            172.0
+            362.0,
+            232.0
           ],
           [
-            407.0,
-            351.0
+            413.0,
+            592.0
           ],
           [
-            100.0,
-            375.0
+            97.0,
+            601.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B2_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B20",
@@ -541,27 +593,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            1077.0,
-            359.0
+            1104.0,
+            412.0
           ],
           [
-            679.0,
-            352.0
+            646.0,
+            415.0
           ],
           [
-            666.0,
-            155.0
+            641.0,
+            193.0
           ],
           [
-            919.0,
-            162.0
+            899.0,
+            206.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B20_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B21",
@@ -573,27 +629,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            634.0,
-            348.0
+            613.0,
+            407.0
           ],
           [
-            229.0,
-            349.0
+            147.0,
+            389.0
           ],
           [
-            380.0,
-            167.0
+            359.0,
+            189.0
           ],
           [
-            631.0,
-            159.0
+            614.0,
+            195.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B21_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B22",
@@ -633,11 +693,15 @@
             181.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B22_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B23",
@@ -665,11 +729,15 @@
             328.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B23_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B24",
@@ -697,11 +765,15 @@
             209.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B24_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B25",
@@ -713,27 +785,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            876.0,
-            336.0
+            965.0,
+            440.0
           ],
           [
-            752.0,
-            194.0
+            814.0,
+            262.0
           ],
           [
-            924.0,
-            192.0
+            1023.0,
+            255.0
           ],
           [
-            1106.0,
-            324.0
+            1269.0,
+            417.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B25_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B26",
@@ -745,27 +821,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            442.0,
-            338.0
+            400.0,
+            459.0
           ],
           [
-            760.0,
-            332.0
+            915.0,
+            440.0
           ],
           [
-            722.0,
-            170.0
+            770.0,
+            256.0
           ],
           [
-            506.0,
-            172.0
+            505.0,
+            265.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B26_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B27",
@@ -777,27 +857,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            140.0,
-            332.0
+            14.0,
+            459.0
           ],
           [
-            358.0,
-            328.0
+            355.0,
+            467.0
           ],
           [
-            464.0,
-            184.0
+            469.0,
+            269.0
           ],
           [
-            282.0,
-            200.0
+            263.0,
+            271.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B27_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B28",
@@ -809,31 +893,35 @@
         "slot_type": "parking",
         "polygon": [
           [
-            500.0,
-            232.0
+            413.0,
+            284.0
           ],
           [
-            616.0,
-            258.0
+            689.0,
+            279.0
           ],
           [
-            672.0,
-            236.0
+            670.0,
+            164.0
           ],
           [
             668.0,
             60.0
           ],
           [
-            552.0,
-            60.0
+            471.0,
+            66.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B28_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B3",
@@ -845,27 +933,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            436.0,
-            172.0
+            387.0,
+            241.0
           ],
           [
-            671.0,
-            152.0
+            565.0,
+            228.0
           ],
           [
-            757.0,
-            316.0
+            748.0,
+            561.0
           ],
           [
-            486.0,
-            337.0
+            449.0,
+            585.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B3_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "COS"
+        "reserved_for": "COS",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B5",
@@ -881,23 +973,27 @@
             423.0
           ],
           [
-            1004.0,
-            423.0
+            1014.0,
+            428.0
           ],
           [
-            889.0,
-            300.0
+            906.0,
+            294.0
           ],
           [
             725.0,
             297.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B5_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B6_Reserved",
@@ -909,27 +1005,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            247.0,
-            153.0
+            170.0,
+            381.0
           ],
           [
-            513.0,
-            119.0
+            413.0,
+            366.0
           ],
           [
-            607.0,
-            219.0
+            506.0,
+            494.0
           ],
           [
-            292.0,
-            272.0
+            207.0,
+            509.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B6_Reserved_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "Reserved"
+        "reserved_for": "Reserved",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B7_CHRO",
@@ -957,11 +1057,15 @@
             210.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B7_CHRO_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "CHRO"
+        "reserved_for": "CHRO",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B8_CSBDO",
@@ -989,11 +1093,15 @@
             192.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B8_CSBDO_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
-        "reserved_for": "CSBDO"
+        "reserved_for": "CSBDO",
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "B9",
@@ -1005,27 +1113,31 @@
         "slot_type": "parking",
         "polygon": [
           [
-            929.0,
-            154.0
+            807.0,
+            336.0
           ],
           [
-            686.0,
-            117.0
+            577.0,
+            312.0
           ],
           [
-            539.0,
-            233.0
+            413.0,
+            456.0
           ],
           [
-            819.0,
-            289.0
+            709.0,
+            489.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B9_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "CAM-01__roi",
@@ -1073,7 +1185,11 @@
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "CAM-02__roi",
@@ -1121,7 +1237,1307 @@
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-03__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-03",
+        "floor": "B1",
+        "zone_id": "CAM-03",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            951.0,
+            2.0
+          ],
+          [
+            1277.0,
+            0.0
+          ],
+          [
+            1278.0,
+            719.0
+          ],
+          [
+            4.0,
+            717.0
+          ],
+          [
+            18.0,
+            154.0
+          ],
+          [
+            25.0,
+            59.0
+          ],
+          [
+            29.0,
+            24.0
+          ],
+          [
+            172.0,
+            6.0
+          ],
+          [
+            233.0,
+            24.0
+          ],
+          [
+            363.0,
+            122.0
+          ],
+          [
+            872.0,
+            47.0
+          ],
+          [
+            877.0,
+            152.0
+          ],
+          [
+            588.0,
+            213.0
+          ],
+          [
+            793.0,
+            340.0
+          ],
+          [
+            878.0,
+            312.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-05__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-05",
+        "floor": "B1",
+        "zone_id": "CAM-05",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            756.0,
+            4.0
+          ],
+          [
+            1278.0,
+            3.0
+          ],
+          [
+            1277.0,
+            716.0
+          ],
+          [
+            7.0,
+            715.0
+          ],
+          [
+            -2.0,
+            226.0
+          ],
+          [
+            20.0,
+            214.0
+          ],
+          [
+            141.0,
+            160.0
+          ],
+          [
+            215.0,
+            132.0
+          ],
+          [
+            620.0,
+            31.0
+          ],
+          [
+            693.0,
+            7.0
+          ],
+          [
+            705.0,
+            33.0
+          ],
+          [
+            461.0,
+            142.0
+          ],
+          [
+            770.0,
+            214.0
+          ],
+          [
+            760.0,
+            17.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-06__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-06",
+        "floor": "B1",
+        "zone_id": "CAM-06",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            1278.0,
+            2.0
+          ],
+          [
+            487.0,
+            1.0
+          ],
+          [
+            479.0,
+            175.0
+          ],
+          [
+            163.0,
+            362.0
+          ],
+          [
+            150.0,
+            271.0
+          ],
+          [
+            27.0,
+            283.0
+          ],
+          [
+            3.0,
+            717.0
+          ],
+          [
+            1277.0,
+            714.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-07__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-07",
+        "floor": "B1",
+        "zone_id": "CAM-07",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            5.0,
+            2.0
+          ],
+          [
+            576.0,
+            3.0
+          ],
+          [
+            577.0,
+            213.0
+          ],
+          [
+            816.0,
+            327.0
+          ],
+          [
+            854.0,
+            249.0
+          ],
+          [
+            856.0,
+            241.0
+          ],
+          [
+            845.0,
+            250.0
+          ],
+          [
+            1079.0,
+            248.0
+          ],
+          [
+            1088.0,
+            255.0
+          ],
+          [
+            1116.0,
+            312.0
+          ],
+          [
+            1275.0,
+            716.0
+          ],
+          [
+            8.0,
+            714.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-08__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-08",
+        "floor": "B1",
+        "zone_id": "CAM-08",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            738.0,
+            270.0
+          ],
+          [
+            864.0,
+            257.0
+          ],
+          [
+            819.0,
+            199.0
+          ],
+          [
+            1027.0,
+            216.0
+          ],
+          [
+            1273.0,
+            403.0
+          ],
+          [
+            1279.0,
+            717.0
+          ],
+          [
+            6.0,
+            712.0
+          ],
+          [
+            1.0,
+            4.0
+          ],
+          [
+            740.0,
+            2.0
+          ],
+          [
+            728.0,
+            273.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-09__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-09",
+        "floor": "B2",
+        "zone_id": "CAM-09",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            884.0,
+            1.0
+          ],
+          [
+            1276.0,
+            0.0
+          ],
+          [
+            1277.0,
+            716.0
+          ],
+          [
+            7.0,
+            716.0
+          ],
+          [
+            3.0,
+            358.0
+          ],
+          [
+            433.0,
+            141.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-10__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-10",
+        "floor": "B2",
+        "zone_id": "CAM-10",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            695.0,
+            135.0
+          ],
+          [
+            1278.0,
+            398.0
+          ],
+          [
+            1267.0,
+            717.0
+          ],
+          [
+            5.0,
+            714.0
+          ],
+          [
+            2.0,
+            6.0
+          ],
+          [
+            322.0,
+            4.0
+          ],
+          [
+            678.0,
+            17.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-11__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-11",
+        "floor": "B2",
+        "zone_id": "CAM-11",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            2.0,
+            359.0
+          ],
+          [
+            176.0,
+            243.0
+          ],
+          [
+            368.0,
+            135.0
+          ],
+          [
+            471.0,
+            143.0
+          ],
+          [
+            584.0,
+            68.0
+          ],
+          [
+            609.0,
+            5.0
+          ],
+          [
+            802.0,
+            0.0
+          ],
+          [
+            820.0,
+            99.0
+          ],
+          [
+            1107.0,
+            718.0
+          ],
+          [
+            5.0,
+            719.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-12__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-12",
+        "floor": "B2",
+        "zone_id": "CAM-12",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            7.0,
+            717.0
+          ],
+          [
+            0.0,
+            658.0
+          ],
+          [
+            386.0,
+            81.0
+          ],
+          [
+            240.0,
+            80.0
+          ],
+          [
+            238.0,
+            3.0
+          ],
+          [
+            612.0,
+            1.0
+          ],
+          [
+            621.0,
+            65.0
+          ],
+          [
+            674.0,
+            134.0
+          ],
+          [
+            819.0,
+            138.0
+          ],
+          [
+            1087.0,
+            338.0
+          ],
+          [
+            1276.0,
+            343.0
+          ],
+          [
+            1276.0,
+            717.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-14__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-14",
+        "floor": "B2",
+        "zone_id": "CAM-14",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            818.0,
+            189.0
+          ],
+          [
+            952.0,
+            209.0
+          ],
+          [
+            987.0,
+            200.0
+          ],
+          [
+            1022.0,
+            188.0
+          ],
+          [
+            1134.0,
+            239.0
+          ],
+          [
+            1278.0,
+            712.0
+          ],
+          [
+            10.0,
+            714.0
+          ],
+          [
+            118.0,
+            268.0
+          ],
+          [
+            342.0,
+            286.0
+          ],
+          [
+            654.0,
+            317.0
+          ],
+          [
+            714.0,
+            307.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-15__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-15",
+        "floor": "B2",
+        "zone_id": "CAM-15",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            27.0,
+            358.0
+          ],
+          [
+            154.0,
+            254.0
+          ],
+          [
+            152.0,
+            1.0
+          ],
+          [
+            1277.0,
+            0.0
+          ],
+          [
+            1273.0,
+            715.0
+          ],
+          [
+            3.0,
+            715.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-16__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-16",
+        "floor": "B2",
+        "zone_id": "CAM-16",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            603.0,
+            248.0
+          ],
+          [
+            614.0,
+            3.0
+          ],
+          [
+            1220.0,
+            9.0
+          ],
+          [
+            1242.0,
+            450.0
+          ],
+          [
+            1277.0,
+            481.0
+          ],
+          [
+            1277.0,
+            717.0
+          ],
+          [
+            7.0,
+            714.0
+          ],
+          [
+            1.0,
+            388.0
+          ],
+          [
+            138.0,
+            305.0
+          ],
+          [
+            531.0,
+            369.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-17__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-17",
+        "floor": "B2",
+        "zone_id": "CAM-17",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            497.0,
+            266.0
+          ],
+          [
+            520.0,
+            187.0
+          ],
+          [
+            765.0,
+            182.0
+          ],
+          [
+            775.0,
+            254.0
+          ],
+          [
+            810.0,
+            253.0
+          ],
+          [
+            821.0,
+            174.0
+          ],
+          [
+            1012.0,
+            173.0
+          ],
+          [
+            1031.0,
+            239.0
+          ],
+          [
+            1281.0,
+            395.0
+          ],
+          [
+            1279.0,
+            714.0
+          ],
+          [
+            9.0,
+            714.0
+          ],
+          [
+            0.0,
+            457.0
+          ],
+          [
+            149.0,
+            337.0
+          ],
+          [
+            219.0,
+            276.0
+          ],
+          [
+            254.0,
+            260.0
+          ],
+          [
+            239.0,
+            165.0
+          ],
+          [
+            452.0,
+            185.0
+          ],
+          [
+            462.0,
+            265.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-18__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-18",
+        "floor": "B2",
+        "zone_id": "CAM-18",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            1243.0,
+            317.0
+          ],
+          [
+            863.0,
+            323.0
+          ],
+          [
+            790.0,
+            263.0
+          ],
+          [
+            777.0,
+            30.0
+          ],
+          [
+            4.0,
+            36.0
+          ],
+          [
+            2.0,
+            713.0
+          ],
+          [
+            1278.0,
+            714.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-19__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-19",
+        "floor": "B2",
+        "zone_id": "CAM-19",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            974.0,
+            281.0
+          ],
+          [
+            1041.0,
+            359.0
+          ],
+          [
+            1301.0,
+            356.0
+          ],
+          [
+            1278.0,
+            711.0
+          ],
+          [
+            308.0,
+            724.0
+          ],
+          [
+            178.0,
+            720.0
+          ],
+          [
+            0.0,
+            720.0
+          ],
+          [
+            5.0,
+            5.0
+          ],
+          [
+            984.0,
+            2.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-20__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-20",
+        "floor": "B1",
+        "zone_id": "CAM-20",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            696.0,
+            264.0
+          ],
+          [
+            694.0,
+            64.0
+          ],
+          [
+            779.0,
+            23.0
+          ],
+          [
+            820.0,
+            8.0
+          ],
+          [
+            1076.0,
+            38.0
+          ],
+          [
+            1278.0,
+            2.0
+          ],
+          [
+            1278.0,
+            715.0
+          ],
+          [
+            6.0,
+            717.0
+          ],
+          [
+            8.0,
+            462.0
+          ],
+          [
+            124.0,
+            471.0
+          ],
+          [
+            357.0,
+            259.0
+          ],
+          [
+            360.0,
+            117.0
+          ],
+          [
+            535.0,
+            85.0
+          ],
+          [
+            532.0,
+            273.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-21__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-21",
+        "floor": "B1",
+        "zone_id": "CAM-21",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            5.0,
+            0.0
+          ],
+          [
+            871.0,
+            3.0
+          ],
+          [
+            844.0,
+            243.0
+          ],
+          [
+            1273.0,
+            666.0
+          ],
+          [
+            1278.0,
+            714.0
+          ],
+          [
+            5.0,
+            711.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-22__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-22",
+        "floor": "B1",
+        "zone_id": "CAM-22",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            277.0,
+            166.0
+          ],
+          [
+            1002.0,
+            157.0
+          ],
+          [
+            1276.0,
+            463.0
+          ],
+          [
+            1279.0,
+            713.0
+          ],
+          [
+            7.0,
+            712.0
+          ],
+          [
+            2.0,
+            412.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-23__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-23",
+        "floor": "B1",
+        "zone_id": "CAM-23",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            363.0,
+            2.0
+          ],
+          [
+            377.0,
+            99.0
+          ],
+          [
+            546.0,
+            84.0
+          ],
+          [
+            552.0,
+            0.0
+          ],
+          [
+            1277.0,
+            1.0
+          ],
+          [
+            1278.0,
+            712.0
+          ],
+          [
+            4.0,
+            714.0
+          ],
+          [
+            5.0,
+            4.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-24__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-24",
+        "floor": "B1",
+        "zone_id": "CAM-24",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            477.0,
+            242.0
+          ],
+          [
+            530.0,
+            127.0
+          ],
+          [
+            697.0,
+            125.0
+          ],
+          [
+            747.0,
+            259.0
+          ],
+          [
+            799.0,
+            254.0
+          ],
+          [
+            854.0,
+            29.0
+          ],
+          [
+            990.0,
+            37.0
+          ],
+          [
+            1101.0,
+            259.0
+          ],
+          [
+            1269.0,
+            412.0
+          ],
+          [
+            1279.0,
+            479.0
+          ],
+          [
+            1276.0,
+            712.0
+          ],
+          [
+            7.0,
+            716.0
+          ],
+          [
+            15.0,
+            308.0
+          ],
+          [
+            168.0,
+            205.0
+          ],
+          [
+            193.0,
+            158.0
+          ],
+          [
+            408.0,
+            142.0
+          ],
+          [
+            401.0,
+            239.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "CAM-25__roi",
+        "slot_name": "Global ROI Mask",
+        "camera_id": "CAM-25",
+        "floor": "B2",
+        "zone_id": "CAM-25",
+        "zone_name": "Global ROI Mask",
+        "slot_type": "roi",
+        "polygon": [
+          [
+            4.0,
+            407.0
+          ],
+          [
+            247.0,
+            161.0
+          ],
+          [
+            359.0,
+            179.0
+          ],
+          [
+            410.0,
+            81.0
+          ],
+          [
+            587.0,
+            69.0
+          ],
+          [
+            602.0,
+            186.0
+          ],
+          [
+            647.0,
+            187.0
+          ],
+          [
+            662.0,
+            79.0
+          ],
+          [
+            827.0,
+            81.0
+          ],
+          [
+            877.0,
+            191.0
+          ],
+          [
+            1273.0,
+            381.0
+          ],
+          [
+            1271.0,
+            713.0
+          ],
+          [
+            3.0,
+            717.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "G1",
@@ -1153,11 +2569,15 @@
             218.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G1_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "SPECIAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "G2",
@@ -1185,11 +2605,15 @@
             131.0
           ]
         ],
-        "last_snapshot_path": null,
-        "is_available": true,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G2_latest.jpg",
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "G7",
@@ -1217,11 +2641,15 @@
             289.0
           ]
         ],
-        "last_snapshot_path": null,
-        "is_available": true,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G7_latest.jpg",
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "G8",
@@ -1249,11 +2677,15 @@
             320.0
           ]
         ],
-        "last_snapshot_path": null,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G8_latest.jpg",
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "V1_Violation_1",
@@ -1285,7 +2717,11 @@
         "is_available": true,
         "is_violation_zone": true,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       },
       {
         "slot_id": "V2_Violation_2",
@@ -1314,113 +2750,17 @@
           ]
         ],
         "last_snapshot_path": null,
-        "is_available": false,
+        "is_available": true,
         "is_violation_zone": true,
         "reservation_type": "GENERAL",
-        "reserved_for": null
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
       }
     ],
     "boundaries": [
-      {
-        "boundary_id": "Cam-03 Bound",
-        "camera_id": "CAM-03",
-        "floor": "B1",
-        "polygon": [
-          [
-            -1.0,
-            167.0
-          ],
-          [
-            848.0,
-            46.0
-          ],
-          [
-            872.0,
-            73.0
-          ],
-          [
-            3.0,
-            218.0
-          ]
-        ],
-        "area_from": "B1-A",
-        "area_to": "B1-B"
-      },
-      {
-        "boundary_id": "Cam-05 Bound2",
-        "camera_id": "CAM-05",
-        "floor": "B1",
-        "polygon": [
-          [
-            284.0,
-            103.0
-          ],
-          [
-            2.0,
-            196.0
-          ],
-          [
-            1.0,
-            245.0
-          ],
-          [
-            422.0,
-            76.0
-          ]
-        ],
-        "area_from": "B1-C",
-        "area_to": "B1-B"
-      },
-      {
-        "boundary_id": "Cam-07 Bound1",
-        "camera_id": "CAM-07",
-        "floor": "B1",
-        "polygon": [
-          [
-            1279.0,
-            718.0
-          ],
-          [
-            1277.0,
-            306.0
-          ],
-          [
-            1235.0,
-            182.0
-          ],
-          [
-            1096.0,
-            717.0
-          ]
-        ],
-        "area_from": "B1-B",
-        "area_to": "B1-A"
-      },
-      {
-        "boundary_id": "Cam-08 Bound",
-        "camera_id": "CAM-08",
-        "floor": "B1",
-        "polygon": [
-          [
-            1157.0,
-            329.0
-          ],
-          [
-            1279.0,
-            411.0
-          ],
-          [
-            1275.0,
-            712.0
-          ],
-          [
-            1116.0,
-            705.0
-          ]
-        ],
-        "area_from": "B1-B",
-        "area_to": "B1-C"
-      },
       {
         "boundary_id": "Cam-10 Bound",
         "camera_id": "CAM-10",
@@ -1444,32 +2784,7 @@
           ]
         ],
         "area_from": "B2-C",
-        "area_to": "B2-RAMP"
-      },
-      {
-        "boundary_id": "Cam-10 Bound2",
-        "camera_id": "CAM-10",
-        "floor": "B2",
-        "polygon": [
-          [
-            1275.0,
-            663.0
-          ],
-          [
-            1278.0,
-            401.0
-          ],
-          [
-            1003.0,
-            279.0
-          ],
-          [
-            1116.0,
-            657.0
-          ]
-        ],
-        "area_from": "B2-B",
-        "area_to": "B2-C"
+        "area_to": "RAMP-UP"
       },
       {
         "boundary_id": "Cam-11 Bound",
@@ -1526,85 +2841,6 @@
         "area_to": "B2-A"
       },
       {
-        "boundary_id": "Cam-14 Bound",
-        "camera_id": "CAM-14",
-        "floor": "B2",
-        "polygon": [
-          [
-            349.0,
-            34.0
-          ],
-          [
-            640.0,
-            53.0
-          ],
-          [
-            683.0,
-            134.0
-          ],
-          [
-            220.0,
-            118.0
-          ],
-          [
-            293.0,
-            78.0
-          ]
-        ],
-        "area_from": "B2-B",
-        "area_to": "B2-C"
-      },
-      {
-        "boundary_id": "Cam-17 Bound1",
-        "camera_id": "CAM-17",
-        "floor": "B2",
-        "polygon": [
-          [
-            1272.0,
-            448.0
-          ],
-          [
-            1148.0,
-            344.0
-          ],
-          [
-            1028.0,
-            348.0
-          ],
-          [
-            1276.0,
-            708.0
-          ]
-        ],
-        "area_from": "B2-A",
-        "area_to": "B2-B"
-      },
-      {
-        "boundary_id": "Cam-17 Bound2",
-        "camera_id": "CAM-17",
-        "floor": "B2",
-        "polygon": [
-          [
-            2.0,
-            352.0
-          ],
-          [
-            132.0,
-            366.0
-          ],
-          [
-            72.0,
-            716.0
-          ],
-          [
-            2.0,
-            712.0
-          ]
-        ],
-        "area_from": "B2-B",
-        "area_to": "B2-C"
-      },
-      {
         "boundary_id": "Cam-18 Bound",
         "camera_id": "CAM-18",
         "floor": "B2",
@@ -1635,8 +2871,8 @@
         "floor": "B1",
         "polygon": [
           [
-            332.0,
-            268.0
+            282.0,
+            331.0
           ],
           [
             -6.0,
@@ -1647,8 +2883,8 @@
             714.0
           ],
           [
-            384.0,
-            280.0
+            316.0,
+            342.0
           ]
         ],
         "area_from": "B1-B",
@@ -1710,124 +2946,24 @@
         "floor": "B1",
         "polygon": [
           [
-            208.0,
-            324.0
+            233.0,
+            403.0
           ],
           [
-            84.0,
-            348.0
+            193.0,
+            327.0
           ],
           [
             -4.0,
             712.0
           ],
           [
-            176.0,
-            720.0
+            138.0,
+            704.0
           ]
         ],
         "area_from": "B1-B",
         "area_to": "B1-A"
-      },
-      {
-        "boundary_id": "Cam-24 Bound1",
-        "camera_id": "CAM-24",
-        "floor": "B1",
-        "polygon": [
-          [
-            1058.0,
-            351.0
-          ],
-          [
-            944.0,
-            357.0
-          ],
-          [
-            1107.0,
-            598.0
-          ],
-          [
-            1220.0,
-            567.0
-          ]
-        ],
-        "area_from": "B1-A",
-        "area_to": "B1-B"
-      },
-      {
-        "boundary_id": "Cam-24 Bound2",
-        "camera_id": "CAM-24",
-        "floor": "B1",
-        "polygon": [
-          [
-            299.0,
-            369.0
-          ],
-          [
-            187.0,
-            358.0
-          ],
-          [
-            79.0,
-            512.0
-          ],
-          [
-            222.0,
-            525.0
-          ]
-        ],
-        "area_from": "B2-B",
-        "area_to": "B2-C"
-      },
-      {
-        "boundary_id": "Cam-25 Bound1",
-        "camera_id": "CAM-25",
-        "floor": "B2",
-        "polygon": [
-          [
-            132.0,
-            369.0
-          ],
-          [
-            309.0,
-            373.0
-          ],
-          [
-            244.0,
-            714.0
-          ],
-          [
-            9.0,
-            708.0
-          ]
-        ],
-        "area_from": "B2-B",
-        "area_to": "B2-A"
-      },
-      {
-        "boundary_id": "Cam-25 Bound2",
-        "camera_id": "CAM-25",
-        "floor": "B2",
-        "polygon": [
-          [
-            1169.0,
-            369.0
-          ],
-          [
-            994.0,
-            379.0
-          ],
-          [
-            1059.0,
-            713.0
-          ],
-          [
-            1265.0,
-            714.0
-          ]
-        ],
-        "area_from": "B2-C",
-        "area_to": "B2-B"
       },
       {
         "boundary_id": "Cam-5 Bound",
@@ -1851,7 +2987,7 @@
             455.0
           ]
         ],
-        "area_from": "B2-RAMP",
+        "area_from": "RAMP-UP",
         "area_to": "B1-C"
       },
       {
@@ -1860,12 +2996,12 @@
         "floor": "B1",
         "polygon": [
           [
-            420.0,
-            271.0
+            282.0,
+            496.0
           ],
           [
-            523.0,
-            259.0
+            447.0,
+            499.0
           ],
           [
             83.0,
@@ -1881,7 +3017,7 @@
           ]
         ],
         "area_from": "B1-C",
-        "area_to": "B1-RAMP"
+        "area_to": "RAMP-DN"
       },
       {
         "boundary_id": "Cam-9 Bound",
@@ -1893,41 +3029,20 @@
             352.0
           ],
           [
-            585.0,
-            348.0
+            671.0,
+            353.0
           ],
           [
-            425.0,
-            718.0
+            497.0,
+            717.0
           ],
           [
             874.0,
             714.0
           ]
         ],
-        "area_from": "B1-RAMP",
+        "area_from": "RAMP-DN",
         "area_to": "B2-A"
-      },
-      {
-        "boundary_id": "Cam-9 Bound2",
-        "camera_id": "CAM-09",
-        "floor": "B2",
-        "polygon": [
-          [
-            4.0,
-            716.0
-          ],
-          [
-            1.0,
-            328.0
-          ],
-          [
-            180.0,
-            243.0
-          ]
-        ],
-        "area_from": "B2-A",
-        "area_to": "B2-B"
       },
       {
         "boundary_id": "Cam19-Bound",
@@ -1935,20 +3050,20 @@
         "floor": "B2",
         "polygon": [
           [
-            848.0,
-            300.0
+            1078.0,
+            378.0
           ],
           [
-            662.0,
-            248.0
+            922.0,
+            383.0
           ],
           [
-            96.0,
-            436.0
+            1060.0,
+            714.0
           ],
           [
-            148.0,
-            586.0
+            1278.0,
+            711.0
           ]
         ],
         "area_from": "B2-A",
