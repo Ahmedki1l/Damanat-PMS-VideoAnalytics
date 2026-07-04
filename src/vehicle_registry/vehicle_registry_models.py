@@ -114,6 +114,14 @@ class VehicleSession:
     # confirm_b1_entrance_by_plate, after which the session becomes matchable.
     gate_reference_only: bool = False
 
+    # A car-cropped ANPR gate-image embedding held for delayed promotion. Stashed
+    # at the gate `entry` event (confirm_anpr_session_directly) but kept OUT of
+    # matching — like gate_reference_only — until CAM-03 confirms the plate. At
+    # that point confirm_b1_entrance_by_plate appends it to
+    # reference_feature_vectors: the car is anchored by then, so the extra frontal
+    # ANPR view enriches the appearance profile without the entry-time swap risk.
+    pending_anpr_vector: Optional[np.ndarray] = None
+
     # Maps camera_id → track_id for all cameras currently observing this car.
     # Enables multi-camera simultaneous identity display.
     observing_tracks: Dict[str, int] = field(default_factory=dict)

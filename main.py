@@ -364,6 +364,12 @@ Examples:
         area_registry = AreaRegistry(config)
         registry = VehicleRegistry(
             image_dir=config.output.snapshot_base_dir,
+            # Without this the registry silently falls back to MatchingConfig()
+            # DEFAULTS — ignoring every YAML-tuned threshold AND leaving
+            # gallery_persist_enabled at its False default, so no per-plate
+            # gallery folder is ever seeded. Pass the loaded matching config so
+            # the tuned Youden thresholds + gallery persistence actually apply.
+            matching_config=config.matching,
             public_base_url=config.output.public_base_url,
             snapshot_url_prefix=config.output.snapshot_url_prefix,
             gateway_path_prefix=config.output.gateway_path_prefix,

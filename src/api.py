@@ -361,6 +361,18 @@ def create_app(
             if frame is None or frame.size == 0:
                 print(f"[API] B-entry for plate {plate}: no usable image — skipped")
                 return False
+            # Crop to the entering car: the CAM-03 frame is a wide fisheye view
+            # with the car in a corner (+ parked cars in the background), so
+            # embedding the full frame is the dominant cause of low ReID scores.
+            # Store a tight crop instead; fall back to the full frame if the
+            # detector isn't wired or finds nothing.
+            if detect_vehicle_crop is not None:
+                try:
+                    _c = detect_vehicle_crop(frame)
+                    if _c is not None and getattr(_c, "size", 0) > 0:
+                        frame = _c
+                except Exception as _exc:
+                    print(f"[API] B-entry vehicle crop failed: {_exc!r}")
             session_id = registry.confirm_b1_entrance_by_plate(plate, frame)
             if session_id:
                 print(
@@ -390,6 +402,15 @@ def create_app(
             if frame is None or frame.size == 0:
                 print(f"[API] ramp-entry for plate {plate}: no usable image — skipped")
                 return False
+            # Crop to the car before storing as a gallery reference (same reason
+            # as B-entry — a wide frame embeds poorly). Fall back to full frame.
+            if detect_vehicle_crop is not None:
+                try:
+                    _c = detect_vehicle_crop(frame)
+                    if _c is not None and getattr(_c, "size", 0) > 0:
+                        frame = _c
+                except Exception as _exc:
+                    print(f"[API] ramp-entry vehicle crop failed: {_exc!r}")
             session_id = registry.add_gallery_snapshot_by_plate(
                 plate, frame, source_cam=camera_id or "CAM-23",
             )
@@ -483,9 +504,24 @@ def create_app(
                             )
                             _event_id = live_cand.bound_event_id or ""
 
+                    # Crop the ANPR frame to the car so the held-back reference is
+                    # a tight vehicle crop — the frame is a wide gate shot (road,
+                    # buildings, sun) that embeds poorly. Falls back to the full
+                    # frame if the detector isn't wired or finds nothing. This crop
+                    # is stashed as the session's pending_anpr_vector and only
+                    # promoted to a matchable reference after CAM-03 confirmation.
+                    _anpr_ref = frame
+                    if detect_vehicle_crop is not None:
+                        try:
+                            _car = detect_vehicle_crop(frame)
+                            if _car is not None and getattr(_car, "size", 0) > 0:
+                                _anpr_ref = _car
+                        except Exception as _exc:
+                            print(f"[API] ANPR vehicle crop failed: {_exc!r}")
+
                     registry.confirm_anpr_session_directly(
                         plate=bound_plate,
-                        image=frame,
+                        image=_anpr_ref,
                         event_id=_event_id,
                         candidate_id=candidate.candidate_id,
                         gate_snapshot_paths=_gate_paths,

@@ -498,6 +498,10 @@ class VehicleRegistryIdentityMixin:
             # Prevents the wide gate shot from false-matching a car already parked
             # inside the garage the instant the entry event arrives.
             gate_reference_only=True,
+            # Hold this ANPR (car-cropped) embedding for promotion to a matchable
+            # reference once CAM-03 confirms the plate — see the promotion block in
+            # confirm_b1_entrance_by_plate. Excluded from matching until then.
+            pending_anpr_vector=feature_vector,
         )
 
         # Persist the ANPR image as the primary gallery reference (UI gallery /
@@ -1205,6 +1209,29 @@ class VehicleRegistryIdentityMixin:
             # The primary reference is now the real CAM-03 shot, not the wide gate
             # image — the session is a trustworthy match target again.
             session.gate_reference_only = False
+            # Promote the ANPR frontal crop (stashed at gate entry, held out of
+            # matching until now) to a matchable reference. The car is anchored to
+            # this session by the CAM-03 confirmation, so the extra frontal view
+            # enriches the appearance profile without the entry-time swap risk.
+            # Deduped + FIFO-capped, mirroring accumulate_reference so one view
+            # can't dominate or duplicate the gallery.
+            pend = session.pending_anpr_vector
+            if pend is not None:
+                cfg = self._matching_config
+                known = [session.feature_vector] + list(session.reference_feature_vectors)
+                if not any(
+                    ref is not None
+                    and self.reid_matcher.compute_similarity(pend, ref)
+                    > cfg.gallery_dedup_cosine
+                    for ref in known
+                ):
+                    session.reference_feature_vectors.append(pend)
+                    cap = max(1, int(cfg.gallery_max_refs_per_car))
+                    if len(session.reference_feature_vectors) > cap:
+                        session.reference_feature_vectors = (
+                            session.reference_feature_vectors[-cap:]
+                        )
+                session.pending_anpr_vector = None
             self._gallery_index_upsert(session)
             # Convergence: this authoritative CAM-03 B-entry read is a good moment
             # to collapse any OTHER stale same-plate session left open by a missed
