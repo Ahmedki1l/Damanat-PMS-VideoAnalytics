@@ -367,6 +367,17 @@ class ParkingEngineRuntimeMixin:
         purged_at = datetime.now()
         for plate in closed:
             try:
+                # Skip a plate VA itself just saw re-enter: the DB row is still
+                # the old 'closed' one because PMS-AI has not inserted the new
+                # open row yet. Pure in-memory check — no extra DB round-trip.
+                if getattr(self.vehicle_registry, "has_recent_reentry", None) and \
+                        self.vehicle_registry.has_recent_reentry(plate):
+                    logger.debug(
+                        "[exit_janitor] skip purge plate=%s: fresh re-entry "
+                        "within grace (DB open row still lagging)",
+                        plate,
+                    )
+                    continue
                 self.vehicle_registry._handle_exit(plate, purged_at)
                 logger.info(
                     "[exit_janitor] purged in-memory state for plate=%s "

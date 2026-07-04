@@ -71,6 +71,14 @@ class VehicleRegistryIdentityMixin:
         shared DB. Single source of truth — avoids in-memory drift between VA
         and PMS-AI when the gate's exit-ANPR event was missed.
 
+        Re-entry override: when the DB probe says NOT inside (latest row
+        closed), this still returns True if VA itself just observed a genuine
+        re-entry — an ANPR exit followed by a NEWER ANPR entry within
+        ``REENTRY_DB_GRACE_SECONDS`` (see :meth:`has_recent_reentry`). This
+        covers the window between a real re-entry and PMS-AI inserting the new
+        open row, without resurrecting a plain missed-exit ghost (which never
+        has a post-exit entry).
+
         Returns True if VA has no DB binding (legacy/test env) or no plate is
         passed; the guard fails open so unrelated logic still runs.
 
@@ -84,7 +92,9 @@ class VehicleRegistryIdentityMixin:
         db_checker = getattr(self, "_db_checker", None)
         if db_checker is not None:
             try:
-                return bool(db_checker(plate))
+                # DB says not-inside — honour it UNLESS VA just saw a genuine,
+                # recent re-entry the DB has not re-opened yet.
+                return bool(db_checker(plate)) or self.has_recent_reentry(plate)
             except Exception as exc:
                 logger.warning(
                     "[is_plate_inside] injected db_checker raised for %s: %r",
@@ -123,7 +133,39 @@ class VehicleRegistryIdentityMixin:
             # has fired, so allow the link to proceed (registry-side gates
             # cover the "never entered" case).
             return True
-        return row[0] == "open"
+        # status == 'open' means inside; on 'closed' fall through to the
+        # re-entry-grace override before declaring the car exited.
+        return row[0] == "open" or self.has_recent_reentry(plate)
+
+    def _has_fresh_reentry(self, plate: Optional[str], now: datetime) -> bool:
+        """True iff VA observed an ANPR exit for ``plate`` and then a NEWER ANPR
+        entry within ``REENTRY_DB_GRACE_SECONDS`` — a genuine re-entry the shared
+        DB has not caught up on (PMS-AI has not yet inserted the new open row).
+
+        Stays False for a plain missed-exit (an exit with no later entry, or an
+        entry with no prior exit), preserving the anti-ghost guard: only a real,
+        authoritative re-entry ANPR read can flip it True.
+
+        Lock-free by design — each read is a single atomic ``dict.get`` and the
+        maps are only ever written with whole-datetime assignments, so a torn
+        read is impossible and a stale read is benign (grace boundary off by one
+        event).
+        """
+        if not plate:
+            return False
+        entry_at = self._last_anpr_entry_at.get(plate)
+        exit_at = self._last_anpr_exit_at.get(plate)
+        if entry_at is None or exit_at is None:
+            return False
+        if entry_at <= exit_at:
+            return False
+        return (now - entry_at).total_seconds() <= self.REENTRY_DB_GRACE_SECONDS
+
+    def has_recent_reentry(self, plate: Optional[str]) -> bool:
+        """Public, DB-free re-entry-grace check. Consulted by is_plate_inside (to
+        override a stale 'closed' DB read) and by the engine exit-janitor (to
+        skip purging a plate that just genuinely re-entered)."""
+        return self._has_fresh_reentry(plate, self._clock())
 
     @staticmethod
     def _dedupe_valid_images(images: List[np.ndarray]) -> List[np.ndarray]:
@@ -2999,6 +3041,12 @@ class VehicleRegistryIdentityMixin:
                 store.stamp_exit(plate, timestamp)
             except Exception as exc:  # pragma: no cover - disk best-effort
                 logger.debug("[gallery] stamp_exit failed for %s: %r", plate, exc)
+        # Re-entry grace: stamp the exit time for BOTH callers of _handle_exit
+        # (the ANPR exit branch AND the exit-janitor). A plain missed-exit keeps
+        # entry_at <= exit_at (predicate False -> still evicted); only a NEW ANPR
+        # entry after this stamp makes _has_fresh_reentry True.
+        if plate:
+            self._last_anpr_exit_at[plate] = timestamp
         # Drop this plate's accumulation-throttle entries so the map doesn't
         # grow unbounded over a long-running process.
         for key in [k for k in self._gallery_last_add if k[0] == plate]:

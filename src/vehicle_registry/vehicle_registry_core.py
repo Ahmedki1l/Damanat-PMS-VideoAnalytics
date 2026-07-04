@@ -274,6 +274,12 @@ class VehicleRegistryCoreMixin:
         )
 
         if direction == "entry":
+            # Re-entry grace: record the latest ANPR entry time for this plate
+            # BEFORE the coalesce/duplicate logic, so every entry sub-path (fresh
+            # event, burst-coalesced re-read, duplicate-ignored) refreshes it.
+            # Pairs with _last_anpr_exit_at (stamped in _handle_exit) so a genuine
+            # exit->re-entry is honored while PMS-AI's open row is still lagging.
+            self._last_anpr_entry_at[plate] = now
             # Set inside the lock: the pending event to return early (a coalesced
             # burst or an ignored duplicate), and any slots freed by a burst
             # rebind eviction. DB clear + early return happen off the lock below.
@@ -488,6 +494,21 @@ class VehicleRegistryCoreMixin:
                 ev = self._pending_events.get(eid)
                 if ev is None or ev.status not in ("pending", "provisional", "confirmed"):
                     self._last_anpr_entry.pop(cam_id, None)
+
+            # Prune re-entry-grace stamps far past any useful window (memory
+            # hygiene; a plate this old can never satisfy _has_fresh_reentry).
+            _reentry_ttl = (
+                max(self.REENTRY_DB_GRACE_SECONDS, self.PENDING_ANPR_EXPIRY_SECONDS)
+                + 300
+            )
+            for _plate, _entry_at in list(self._last_anpr_entry_at.items()):
+                _exit_at = self._last_anpr_exit_at.get(_plate, _entry_at)
+                if (
+                    (now - _entry_at).total_seconds() > _reentry_ttl
+                    and (now - _exit_at).total_seconds() > _reentry_ttl
+                ):
+                    self._last_anpr_entry_at.pop(_plate, None)
+                    self._last_anpr_exit_at.pop(_plate, None)
 
             candidates_to_delete = []
             for candidate_id, candidate in self._park_entry_candidates.items():

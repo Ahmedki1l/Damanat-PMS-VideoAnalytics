@@ -45,6 +45,13 @@ class VehicleRegistry(
     """
 
     PENDING_ANPR_EXPIRY_SECONDS = 30
+    # Re-entry DB-grace: a car can exit (parking_sessions -> closed) and RE-ENTER
+    # before PMS-AI inserts the new open row. During that window the freshest DB
+    # row is still the exit's closed row, so is_plate_inside would wrongly report
+    # "already exited". If VA itself saw an ANPR exit followed by a NEWER ANPR
+    # entry within this many seconds, treat the plate as inside despite the
+    # lagging DB. Bounds the worst-case double-fault ghost to this many seconds.
+    REENTRY_DB_GRACE_SECONDS = 60
     CANDIDATE_EXPIRY_SECONDS = 30
     # Effectively infinite; track mappings are now primarily cleared via the ANPR Exit event.
     TRACK_MAPPING_EXPIRY_SECONDS = 86400 * 30
@@ -101,6 +108,13 @@ class VehicleRegistry(
         # currently-open burst, so rapid re-reads (last-wins within the window)
         # overwrite the plate instead of creating competing events.
         self._last_anpr_entry: Dict[str, str] = {}
+        # Re-entry grace (skew-free, VA-internal). NOT the burst map above:
+        # these are plate -> datetime of the latest ANPR entry / exit VA itself
+        # observed, consulted by _has_fresh_reentry to override a stale 'closed'
+        # DB row PMS-AI has not yet re-opened after a genuine re-entry. Bounded
+        # by distinct plate count; pruned in _cleanup_stale_data.
+        self._last_anpr_entry_at: Dict[str, datetime] = {}
+        self._last_anpr_exit_at: Dict[str, datetime] = {}
         self._park_entry_candidates: Dict[str, ParkEntryCandidate] = {}
         self._sessions: Dict[str, VehicleSession] = {}
         self._track_session_map: Dict[Tuple[str, int], str] = {}
