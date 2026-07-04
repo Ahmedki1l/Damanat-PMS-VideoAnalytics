@@ -144,8 +144,12 @@ class TestReattachRampTransit(unittest.TestCase):
         clock = FakeClock()
         registry = make_test_registry(clock=clock)
         areas = _down_ramp_registry()
+        # Mirror the production __init__: the three zoning components are wired
+        # together. make_test_registry builds an un-zoned registry, so wire them
+        # here (same objects the engine would hold).
         registry._area_registry = areas
         registry._handoff_matcher = CrossAreaHandoffMatcher(areas, clock=clock)
+        registry._area_state_machine = AreaStateMachine(registry, areas, clock=clock)
         return registry, clock
 
     def test_descending_car_reattaches_across_floor(self):
@@ -175,6 +179,44 @@ class TestReattachRampTransit(unittest.TestCase):
 
         self.assertEqual(result, b1.session_id)
         self.assertEqual(registry._track_session_map.get(("CAM-09", 12)), b1.session_id)
+
+    def test_full_path_boundary_crossing_then_reattach(self):
+        """End-to-end through the REAL engine entry points, no hand-set transit
+        fields: a plated B1 car crosses the CAM-07 down-ramp band
+        (``apply_boundary_crossing`` — the exact call the engine makes) which
+        drives it IN_TRANSIT off RAMP-DN, then surfaces on CAM-09 (B2-A) and
+        reattaches with its plate intact. Proves the boundary->transit->reattach
+        wiring carries the plate across the floor with nothing blocking it."""
+        registry, clock = self._zoned_registry()
+        vec = np.array([0.7, 0.3], dtype=np.float32)
+
+        b1 = make_vehicle_session(
+            "CAR-DOWN", feature_vector=vec, last_seen_camera="CAM-07",
+            last_seen_track_id=5, status="confirmed",
+        )
+        registry._sessions[b1.session_id] = b1
+        registry.set_session_area(b1, "B1-A")            # settled in B1-A
+        registry._track_session_map[("CAM-07", 5)] = b1.session_id
+        b1.observing_tracks["CAM-07"] = 5
+
+        # Engine call #1 — the car crosses the down-ramp entrance band on CAM-07.
+        registry.apply_boundary_crossing("CAM-07", 5, "B1-A", "RAMP-DN")
+        self.assertEqual(b1.area_state, "IN_TRANSIT")
+        self.assertEqual(b1.departed_from_area, "RAMP-DN")
+        self.assertEqual(b1.current_area, "")
+
+        # Engine call #2 — the car surfaces on CAM-09 (B2-A) as a new anon track.
+        registry.create_appearance_session(
+            "CAM-09", track_id=49, feature_vector=vec.copy(), timestamp=clock()
+        )
+        result = registry.reattach_track_to_confirmed_session(
+            camera_id="CAM-09", track_id=49, query_vector=vec.copy(),
+            similarity_threshold=0.52,
+        )
+
+        self.assertEqual(result, b1.session_id)
+        self.assertEqual(registry._track_session_map.get(("CAM-09", 49)), b1.session_id)
+        self.assertEqual(b1.plate, "CAR-DOWN")
 
     def test_parked_b1_car_not_reattached_from_b2(self):
         """Leak guard intact: a B1 car sitting parked (not transiting) must not

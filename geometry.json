@@ -12,7 +12,7 @@
         "capacity": 30,
         "adjacency_json": {
           "B1-B": 15.0,
-          "RAMP-DN": 20.0
+          "RAMP-DN": 60.0
         },
         "is_active": true
       },
@@ -34,7 +34,7 @@
         "capacity": 30,
         "adjacency_json": {
           "B1-B": 15.0,
-          "RAMP-UP": 20.0
+          "RAMP-UP": 60.0
         },
         "is_active": true
       },
@@ -45,7 +45,7 @@
         "capacity": 30,
         "adjacency_json": {
           "B2-B": 15.0,
-          "RAMP-DN": 20.0
+          "RAMP-DN": 60.0
         },
         "is_active": true
       },
@@ -67,7 +67,7 @@
         "capacity": 30,
         "adjacency_json": {
           "B2-B": 15.0,
-          "RAMP-UP": 20.0
+          "RAMP-UP": 60.0
         },
         "is_active": true
       },
@@ -77,8 +77,8 @@
         "floor": "",
         "capacity": 6,
         "adjacency_json": {
-          "B1-A": 20.0,
-          "B2-A": 20.0
+          "B1-A": 60.0,
+          "B2-A": 60.0
         },
         "is_active": true
       },
@@ -88,8 +88,8 @@
         "floor": "",
         "capacity": 6,
         "adjacency_json": {
-          "B2-C": 20.0,
-          "B1-C": 20.0
+          "B2-C": 60.0,
+          "B1-C": 60.0
         },
         "is_active": true
       }
