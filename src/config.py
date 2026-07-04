@@ -108,7 +108,13 @@ class DetectorPreprocessingConfig:
 
 @dataclass
 class ReIDPreprocessingConfig:
-    """Luminance normalization settings for the ReID path."""
+    """Luminance normalization settings for the ReID path.
+
+    NOTE: applies to the legacy torchreid fallback ONLY. The production
+    OpenVINO backend never applies CLAHE — its IRs (e.g. PS_carMatching) are
+    trained and calibrated on raw squish-resized crops, and normalising
+    luminance at inference would shift embeddings off the trained
+    distribution (see VehicleReIDMatcher backend selection logging)."""
     enabled: bool = True
     clip_limit: float = 2.0
     grid_size: tuple = (8, 8)

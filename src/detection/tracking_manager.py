@@ -28,6 +28,11 @@ class TrackState:
         self.smoothed_feature: Optional[np.ndarray] = None
         self.last_updated = time.time()
         self.update_count = 0
+        # Frames this track was detected in (whether or not we extracted).
+        # The periodic re-extract cadence keys off this, NOT update_count:
+        # update_count only grows when an extraction happens, so a cadence
+        # based on it stalls permanently once the dense phase ends.
+        self.frames_seen = 0
         
         # Meta-data for fusion
         self.plate: Optional[str] = None
@@ -64,10 +69,17 @@ class TrackingManager:
         self.camera_id = camera_id
         self.matcher = reid_matcher or get_reid_matcher()
         self.tracks: Dict[int, TrackState] = {}
-        
+
+        # Highest track id ever observed on this camera. ByteTrack issues new
+        # ids monotonically within one tracker instance, so a BRAND-NEW id at
+        # or below this watermark means the tracker was recreated (camera
+        # reconnect / stream restart) and its numbering restarted — see the
+        # reset guard in process_detections.
+        self._max_seen_track_id = -1
+
         # Configurable smoothing
         self.ema_alpha = 0.9
-        
+
     def process_detections(self, frame: np.ndarray, detections: List[Detection]):
         """
         Update track features for all active detections in a frame.
@@ -79,28 +91,57 @@ class TrackingManager:
         to_extract_indices = []
         to_extract_crops = []
 
+        # Tracker-reset guard: a brand-new id at or below the highest id we
+        # have ever seen means the tracker restarted its numbering. Every
+        # retained TrackState belongs to the pre-reset world — drop them all
+        # so a recycled id cannot inherit another car's EMA feature (identity
+        # contamination feeding match_global_session / reattach). The cost is
+        # one dense re-extraction phase per surviving track; the alternative
+        # is silently blending two different cars into one feature.
+        for det in detections:
+            if det.track_id == -1:
+                continue
+            if (
+                det.track_id not in self.tracks
+                and det.track_id <= self._max_seen_track_id
+            ):
+                logger.warning(
+                    "[TRACKING] %s: new track id %d at/below watermark %d — "
+                    "tracker reset detected; dropping %d cached track states",
+                    self.camera_id,
+                    det.track_id,
+                    self._max_seen_track_id,
+                    len(self.tracks),
+                )
+                self.tracks.clear()
+                # Re-arm the watermark from the new numbering so this frame's
+                # freshly created states are not wiped again next frame.
+                self._max_seen_track_id = -1
+                break
+
         for i, det in enumerate(detections):
             if det.track_id == -1:
                 continue
-            
+
             active_tids.add(det.track_id)
+            self._max_seen_track_id = max(self._max_seen_track_id, det.track_id)
             
             if det.track_id not in self.tracks:
                 self.tracks[det.track_id] = TrackState(det.track_id, self.camera_id, alpha=self.ema_alpha)
             
             track = self.tracks[det.track_id]
-            
+            track.frames_seen += 1
+
             # Decision Logic: When to extract ReID?
             # 1. New track
-            # 2. Periodically (e.g. every 10 frames or 2 seconds) to handle perspective change
+            # 2. Periodically (every 10 frames) to handle perspective change
             # 3. If quality is much better than before (handled by engine burst logic optionally)
-            
+
             # Extract densely while the track is still young so cross-camera
             # handoff gets several viewpoints, then back off to a lighter cadence.
             should_extract = (
-                track.update_count == 0
-                or track.update_count < 10
-                or track.update_count % 10 == 0
+                track.update_count < 10
+                or track.frames_seen % 10 == 0
             )
             if should_extract:
                 crop = self._crop_vehicle(frame, det)

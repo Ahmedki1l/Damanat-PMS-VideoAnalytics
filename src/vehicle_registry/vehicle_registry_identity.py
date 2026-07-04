@@ -218,6 +218,66 @@ class VehicleRegistryIdentityMixin:
         )
         return candidate
 
+    def _prepare_session_gallery(
+        self,
+        images: List[np.ndarray],
+        timestamp: Optional[datetime] = None,
+        precomputed_features: Optional[List[Optional[np.ndarray]]] = None,
+    ):
+        """Heavy half of gallery persistence: dedupe, embed, write snapshot
+        files. MUST run OUTSIDE ``self._lock`` — it does model inference and
+        disk I/O, and every camera thread's per-frame identity lookups block
+        on that lock. Returns ``(ordered_images, feature_vectors,
+        stored_paths)`` or ``None`` when no usable image remains.
+
+        ``precomputed_features`` lets a caller that already embedded the same
+        (deduped) image list — e.g. the B1 confirmation match — skip a second
+        identical inference pass. It is only trusted when its length matches
+        the deduped image list; otherwise features are re-extracted.
+        """
+        ordered_images = self._dedupe_valid_images(images)
+        if not ordered_images:
+            return None
+        if (
+            precomputed_features is not None
+            and len(precomputed_features) == len(ordered_images)
+        ):
+            feature_vectors = list(precomputed_features)
+        else:
+            feature_vectors = self.reid_matcher.extract_features_batch(ordered_images)
+        stored_paths = self._store_session_reference_snapshots(
+            ordered_images,
+            timestamp=timestamp,
+        )
+        return ordered_images, feature_vectors, stored_paths
+
+    def _apply_session_gallery(
+        self,
+        session: VehicleSession,
+        prepared,
+        primary_snapshot_index: int = 0,
+    ) -> bool:
+        """Cheap half of gallery persistence: assign the prepared gallery onto
+        the session. Safe under ``self._lock`` — no inference, no disk I/O."""
+        ordered_images, feature_vectors, stored_paths = prepared
+        primary_snapshot_index = max(
+            0,
+            min(primary_snapshot_index, len(ordered_images) - 1),
+        )
+        session.reference_snapshot_paths = stored_paths
+        session.reference_feature_vectors = [
+            feature for feature in feature_vectors if feature is not None
+        ]
+        if stored_paths:
+            session.snapshot_path = stored_paths[
+                min(primary_snapshot_index, len(stored_paths) - 1)
+            ]
+        if feature_vectors:
+            primary_feature = feature_vectors[primary_snapshot_index]
+            if primary_feature is not None:
+                session.feature_vector = primary_feature
+        return True
+
     def _persist_session_gallery(
         self,
         session: VehicleSession,
@@ -226,30 +286,15 @@ class VehicleRegistryIdentityMixin:
         primary_snapshot_index: int = 0,
         seed_gallery: bool = False,
     ) -> bool:
-        ordered_images = self._dedupe_valid_images(images)
-        if not ordered_images:
+        """Prepare + apply in one call, for callers NOT holding ``self._lock``
+        (e.g. ``confirm_anpr_session_directly``). Lock-holding callers must
+        instead call ``_prepare_session_gallery`` outside the lock and
+        ``_apply_session_gallery`` inside it, so inference and disk I/O never
+        run under the registry lock."""
+        prepared = self._prepare_session_gallery(images, timestamp=now)
+        if prepared is None:
             return False
-
-        primary_snapshot_index = max(
-            0,
-            min(primary_snapshot_index, len(ordered_images) - 1),
-        )
-        feature_vectors = self.reid_matcher.extract_features_batch(ordered_images)
-        stored_paths = self._store_session_reference_snapshots(
-            ordered_images,
-            timestamp=now,
-        )
-
-        session.reference_snapshot_paths = stored_paths
-        session.reference_feature_vectors = [
-            feature for feature in feature_vectors if feature is not None
-        ]
-        if stored_paths:
-            session.snapshot_path = stored_paths[primary_snapshot_index]
-        if feature_vectors:
-            primary_feature = feature_vectors[primary_snapshot_index]
-            if primary_feature is not None:
-                session.feature_vector = primary_feature
+        self._apply_session_gallery(session, prepared, primary_snapshot_index)
 
         # Seed the durable per-plate gallery folder (vehicle_images/gallery/
         # <plate>/) so a folder exists on disk the moment a car is confirmed —
@@ -262,8 +307,12 @@ class VehicleRegistryIdentityMixin:
         # persisting it would reintroduce the false-match-against-a-parked-car
         # risk on warm-start (build_session_from_gallery loads it primary-first).
         if seed_gallery:
+            ordered_images, feature_vectors, _ = prepared
             self._seed_plate_gallery_reference(
-                session, ordered_images, feature_vectors, primary_snapshot_index
+                session,
+                ordered_images,
+                feature_vectors,
+                max(0, min(primary_snapshot_index, len(ordered_images) - 1)),
             )
         return True
 
@@ -772,6 +821,16 @@ class VehicleRegistryIdentityMixin:
             feature for feature in session_reference_features if feature is not None
         ]
 
+        # Heavy half of gallery persistence (embedding + snapshot writes)
+        # happens BEFORE the registry lock; only the cheap assignment runs
+        # under it. Reuses the features already extracted for the match above
+        # instead of re-embedding the same images a second time.
+        prepared_gallery = self._prepare_session_gallery(
+            session_reference_images,
+            timestamp=now,
+            precomputed_features=session_reference_features,
+        )
+
         evicted_slots: List[str] = []
         result_plate: Optional[str] = None
         with self._lock:
@@ -866,12 +925,12 @@ class VehicleRegistryIdentityMixin:
                 session.last_seen_track_id = track_id
                 if session_feature_vector is not None:
                     session.feature_vector = session_feature_vector
-                self._persist_session_gallery(
-                    session,
-                    session_reference_images,
-                    now,
-                    primary_snapshot_index=primary_snapshot_index,
-                )
+                if prepared_gallery is not None:
+                    self._apply_session_gallery(
+                        session,
+                        prepared_gallery,
+                        primary_snapshot_index=primary_snapshot_index,
+                    )
                 # The primary reference is now the live CAM-03 crop, not the wide
                 # gate image — this session is a trustworthy global-match target.
                 session.gate_reference_only = False
@@ -907,12 +966,12 @@ class VehicleRegistryIdentityMixin:
                     old_pipeline_score=getattr(best_candidate, "old_pipeline_score", best_score),
                     gate_snapshot_paths=self._candidate_snapshot_paths(live_candidate),
                 )
-                self._persist_session_gallery(
-                    session,
-                    session_reference_images,
-                    now,
-                    primary_snapshot_index=primary_snapshot_index,
-                )
+                if prepared_gallery is not None:
+                    self._apply_session_gallery(
+                        session,
+                        prepared_gallery,
+                        primary_snapshot_index=primary_snapshot_index,
+                    )
                 self._sessions[session.session_id] = session
                 self._drop_other_track_mappings_for_session(
                     session.session_id,
@@ -974,29 +1033,45 @@ class VehicleRegistryIdentityMixin:
         if image is None or getattr(image, "size", 0) == 0:
             return None
         now = timestamp or self._clock()
-        evicted_slots: List[str] = []
-        result_sid: Optional[str] = None
-        with self._lock:
-            session = None
+
+        def _find_session_id() -> Optional[str]:
+            best = None
             for s in self._sessions.values():
                 if s.plate != plate:
                     continue
                 if s.status not in ("confirmed", "parked", "provisional"):
                     continue
-                if session is None or s.last_seen_at > session.last_seen_at:
-                    session = s
-            if session is None:
-                return None
+                if best is None or s.last_seen_at > best.last_seen_at:
+                    best = s
+            return best.session_id if best is not None else None
+
+        with self._lock:
+            session_id = _find_session_id()
+        if session_id is None:
+            return None
+
+        # Heavy half (embedding + snapshot write) OFF the registry lock; only
+        # the cheap assignment below runs under it.
+        prepared = self._prepare_session_gallery([image], timestamp=now)
+        if prepared is None:
+            return None
+
+        evicted_slots: List[str] = []
+        result_sid: Optional[str] = None
+        seeded_session = None
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.plate != plate:
+                # The session was closed/rebound while we were embedding —
+                # re-resolve once; a genuine miss aborts.
+                session_id = _find_session_id()
+                session = self._sessions.get(session_id) if session_id else None
+                if session is None:
+                    return None
 
             session.last_seen_at = now
             session.last_seen_camera = "CAM-03"
-            # seed_gallery=True: the CAM-03 B-entry crop is the authoritative
-            # primary identity reference — safe to persist to the durable gallery
-            # (unlike the wide gate-only shot in confirm_anpr_session_directly).
-            if not self._persist_session_gallery(
-                session, [image], now, primary_snapshot_index=0, seed_gallery=True
-            ):
-                return None
+            self._apply_session_gallery(session, prepared, primary_snapshot_index=0)
             # The primary reference is now the real CAM-03 shot, not the wide gate
             # image — the session is a trustworthy match target again.
             session.gate_reference_only = False
@@ -1014,10 +1089,19 @@ class VehicleRegistryIdentityMixin:
                 session.session_id,
             )
             result_sid = session.session_id
+            seeded_session = session
 
-        # DB clear off-lock — never hold self._lock across DB I/O.
+        # Off-lock: DB clears and the durable per-plate gallery seed (disk
+        # write). The CAM-03 B-entry crop is the authoritative primary identity
+        # reference — safe to persist (unlike the wide gate-only shot in
+        # confirm_anpr_session_directly).
         for slot_id in evicted_slots:
             self._clear_slot_db_binding(slot_id)
+        if seeded_session is not None:
+            ordered_images, feature_vectors, _ = prepared
+            self._seed_plate_gallery_reference(
+                seeded_session, ordered_images, feature_vectors, 0
+            )
         return result_sid
 
     def add_gallery_snapshot_by_plate(
@@ -1084,17 +1168,24 @@ class VehicleRegistryIdentityMixin:
         now = timestamp or self._clock()
         with self._lock:
             session_id = self._track_session_map.get((camera_id, track_id))
-            session = self._sessions.get(session_id) if session_id else None
-            if session is None:
+            if session_id is None or session_id not in self._sessions:
                 return False
 
+        # Heavy half (embedding + snapshot writes) OFF the registry lock.
+        prepared = self._prepare_session_gallery(ordered_images, timestamp=now)
+        if prepared is None:
+            return False
+
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
             session.last_seen_at = now
             session.last_seen_camera = camera_id
             session.last_seen_track_id = track_id
-            return self._persist_session_gallery(
+            return self._apply_session_gallery(
                 session,
-                ordered_images,
-                now,
+                prepared,
                 primary_snapshot_index=primary_snapshot_index,
             )
 
@@ -1293,6 +1384,20 @@ class VehicleRegistryIdentityMixin:
         """
         with self._lock:
             return self._track_session_map.get((camera_id, track_id))
+
+    def get_session_plate(self, session_id: str) -> Optional[str]:
+        """Plate bound to ``session_id``, regardless of camera ownership.
+
+        Unlike :meth:`get_plate_for_track` this is NOT filtered by the
+        single-camera ownership rule — it answers "is this session already
+        identified?", not "may this camera display/attribute the plate?".
+        Callers deciding whether to run identity matching at all should use
+        this; without it, a non-owner camera sees ``None`` for a plated
+        session and re-enters the anonymous-track ReID path.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            return session.plate if session is not None else None
 
     def get_display_id_for_track(
         self,
@@ -1709,7 +1814,9 @@ class VehicleRegistryIdentityMixin:
         cfg = self._matching_config
         _best = top_candidates[0][1] if top_candidates else -1.0
         _runner = top_candidates[1][1] if len(top_candidates) > 1 else -1.0
-        _solo = getattr(cfg, "reid_solo_confirm", 0.68) or 0.68
+        # Fallback mirrors the MatchingConfig.reid_solo_confirm default (0.70)
+        # so a stub config without the attribute behaves like a real one.
+        _solo = getattr(cfg, "reid_solo_confirm", 0.70) or 0.70
         _margin = getattr(cfg, "global_match_margin", 0.05) or 0.0
         _ocr_worth_it = (_best < _solo) or ((_best - _runner) < _margin)
         if query_crop is not None and top_candidates and _ocr_worth_it:
@@ -2002,7 +2109,28 @@ class VehicleRegistryIdentityMixin:
             target_session.last_seen_camera = camera_id
             target_session.last_seen_track_id = track_id
             if query_vector is not None:
-                target_session.feature_vector = query_vector
+                # Append as a secondary reference instead of replacing the
+                # primary identity vector: reattach can confirm as low as the
+                # cross-camera threshold, and one borderline false match must
+                # not poison the authoritative B1/ANPR embedding. Dedup + FIFO
+                # cap mirror accumulate_reference.
+                cfg = self._matching_config
+                known_vectors = [target_session.feature_vector] + list(
+                    target_session.reference_feature_vectors
+                )
+                is_duplicate = any(
+                    ref is not None
+                    and self.reid_matcher.compute_similarity(query_vector, ref)
+                    > cfg.gallery_dedup_cosine
+                    for ref in known_vectors
+                )
+                if not is_duplicate:
+                    target_session.reference_feature_vectors.append(query_vector)
+                    cap = max(1, int(cfg.gallery_max_refs_per_car))
+                    if len(target_session.reference_feature_vectors) > cap:
+                        target_session.reference_feature_vectors = (
+                            target_session.reference_feature_vectors[-cap:]
+                        )
                 # Phase 3 / T3.2 — refresh the gallery index with the new
                 # query vector so subsequent FAISS searches see this view.
                 self._gallery_index_upsert(target_session)

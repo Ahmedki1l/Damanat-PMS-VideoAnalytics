@@ -842,33 +842,42 @@ class ParkingEngineTrackingMixin:
             )
 
             if session_id:
-                # If this track already has a confirmed plate, the car is
-                # already identified — skip all ReID computation.
-                # Only refresh timestamps to keep the binding alive.
-                plate = self.vehicle_registry.get_plate_for_track(cam_id, detection.track_id)
-                if plate:
+                # If the session already has a confirmed plate, the car is
+                # identified — skip all ReID computation. Gate on the
+                # SESSION's plate, not the ownership-filtered
+                # get_plate_for_track(): on a non-owner camera that getter
+                # returns None even for a plated session, which used to drop
+                # us into the anonymous-track branch below and overwrite the
+                # confirmed session's primary feature vector with this
+                # camera's (possibly clipped) view every frame.
+                if self.vehicle_registry.get_session_plate(session_id):
                     self.vehicle_registry.refresh_track_binding(cam_id, detection.track_id, session_id)
-                    # Persist "where is this car right now" — vehicles.floor /
-                    # last_seen_at — so the Gateway can answer presence queries
-                    # for cars driving across the floor without parking. The
-                    # writer is rate-gated (see _PRESENCE_MIN_INTERVAL_S),
-                    # so calling it on every frame is cheap.
-                    pipeline = self.pipelines.get(cam_id)
-                    if pipeline is not None:
-                        self.update_vehicle_presence(
-                            plate, floor=pipeline.floor, camera_id=cam_id,
-                        )
-                    # Grow this car's persistent gallery with a fresh full-view
-                    # crop (throttled/gated/deduped inside the registry) so its
-                    # ReID profile keeps improving and survives restart.
-                    ref_crop = self._crop_detection(frame, detection)
-                    if ref_crop is not None:
-                        self.vehicle_registry.record_reference_for_track(
-                            cam_id,
-                            detection.track_id,
-                            ref_crop,
-                            self._bbox_view_quality(frame, detection),
-                        )
+                    # Presence writes and gallery accumulation remain
+                    # owner-only side effects, attributed via the
+                    # ownership-filtered getter.
+                    plate = self.vehicle_registry.get_plate_for_track(cam_id, detection.track_id)
+                    if plate:
+                        # Persist "where is this car right now" — vehicles.floor /
+                        # last_seen_at — so the Gateway can answer presence queries
+                        # for cars driving across the floor without parking. The
+                        # writer is rate-gated (see _PRESENCE_MIN_INTERVAL_S),
+                        # so calling it on every frame is cheap.
+                        pipeline = self.pipelines.get(cam_id)
+                        if pipeline is not None:
+                            self.update_vehicle_presence(
+                                plate, floor=pipeline.floor, camera_id=cam_id,
+                            )
+                        # Grow this car's persistent gallery with a fresh full-view
+                        # crop (throttled/gated/deduped inside the registry) so its
+                        # ReID profile keeps improving and survives restart.
+                        ref_crop = self._crop_detection(frame, detection)
+                        if ref_crop is not None:
+                            self.vehicle_registry.record_reference_for_track(
+                                cam_id,
+                                detection.track_id,
+                                ref_crop,
+                                self._bbox_view_quality(frame, detection),
+                            )
                     continue
 
                 if tracking_manager:
