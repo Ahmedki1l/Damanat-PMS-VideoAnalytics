@@ -950,6 +950,9 @@ class ParkingEngineRuntimeMixin:
                         track_id=track_id,
                         timestamp=datetime.now(),
                         snapshot_path=snapshot_path,
+                        # Real vacant->occupied transition: the only place the
+                        # single-slot/single-pending-plate auto-lock may fire.
+                        allow_auto_lock=True,
                     )
                     if linked_plate:
                         event.plate_number = linked_plate
@@ -1054,6 +1057,10 @@ class ParkingEngineRuntimeMixin:
             floor=pipeline.floor,
             track_id=track_id,
             timestamp=datetime.now(),
+            # Per-frame resolver for an ALREADY-occupied slot: never auto-lock
+            # here, or a slot occupied since startup would grab the next
+            # arrival's pending plate at conf 1.0 (the B25=LLJ-9005 bug).
+            allow_auto_lock=False,
         )
 
         if not plate:

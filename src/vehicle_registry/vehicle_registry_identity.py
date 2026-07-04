@@ -2383,10 +2383,22 @@ class VehicleRegistryIdentityMixin:
         track_id: Optional[int],
         timestamp: datetime,
         snapshot_path: Optional[str] = None,
+        allow_auto_lock: bool = True,
     ) -> Optional[str]:
         """
         Link a slot only from a confirmed session.
         No blind fallback to recent ANPR events.
+
+        ``allow_auto_lock`` gates the deterministic "single unlocked occupied
+        slot + single pending ANPR plate" auto-lock heuristic. It must be True
+        ONLY on a real vacant->occupied transition (the ``vehicle_parked``
+        event); the per-frame resolver for an already-occupied slot passes
+        False. Without this gate a slot that was already occupied at startup (or
+        parked earlier, before its plate was known) keeps hitting the per-frame
+        path and would grab the next arrival's pending plate at confidence 1.0 —
+        stamping a stranger's plate onto a long-parked car. The existing
+        anti-swap guard does not catch this because the parked car has no plate
+        yet (it only blocks overwriting a DIFFERENT plate).
         """
         if track_id is None:
             return None
@@ -2422,7 +2434,7 @@ class VehicleRegistryIdentityMixin:
             ]
             unique_candidate_plates = list(set(e.plate for e in valid_pending_events))
 
-            if len(other_unlocked) == 0 and len(unique_candidate_plates) == 1:
+            if allow_auto_lock and len(other_unlocked) == 0 and len(unique_candidate_plates) == 1:
                 suggested_plate = unique_candidate_plates[0]
                 plate_locked_elsewhere = any(
                     s.plate == suggested_plate and sid in self._locked_slots

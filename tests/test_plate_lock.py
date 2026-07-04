@@ -461,6 +461,66 @@ class TestRegistryAutoLock(unittest.TestCase):
         self.assertFalse(self.registry.is_slot_locked("Slot_B"))
         self.assertFalse(self.registry.is_slot_locked("Slot_A"))
 
+    def test_already_occupied_slot_does_not_grab_pending_plate_when_disallowed(self):
+        """Regression (B25=LLJ-9005 bug): the per-frame resolver passes
+        allow_auto_lock=False, so a slot that was already occupied — before its
+        plate was known — must NOT auto-lock the single pending ANPR plate onto
+        its long-parked car. The anti-swap guard does not catch this because the
+        parked car has no plate yet, so the allow_auto_lock gate is what stops
+        it."""
+        # The just-arrived car's gate read: a single pending ANPR entry.
+        event = self.registry.register_anpr_event(
+            plate=self.PLATE, direction="entry", camera_id="ANPR",
+        )
+        # A car already parked in Slot_A with NO plate yet (e.g. occupied since
+        # startup); it owns the track the per-frame resolver runs on.
+        track_id = 2222
+        sess = VehicleSession(
+            session_id="sess_occ",
+            plate=None,
+            status="parked",
+            linked_slot="Slot_A",
+        )
+        self.registry._sessions["sess_occ"] = sess
+        self.registry._parked["Slot_A"] = sess
+        self.registry._track_session_map[(self.CAM, track_id)] = "sess_occ"
+
+        # Per-frame resolver path: auto-lock disallowed.
+        result = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=track_id,
+            timestamp=datetime.now(),
+            allow_auto_lock=False,
+        )
+
+        # The occupied car must NOT be relabelled with the new arrival's plate.
+        self.assertIsNone(result)
+        self.assertFalse(self.registry.is_slot_locked("Slot_A"))
+        self.assertIsNone(self.registry._parked["Slot_A"].plate)
+        self.assertEqual(event.status, "pending")
+
+        # Sanity: the SAME scenario WOULD auto-lock when allowed (proving the
+        # gate — not some other guard — is what suppressed it above). Only the
+        # real vacant->occupied `vehicle_parked` path passes allow_auto_lock=True.
+        result_allowed = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=track_id,
+            timestamp=datetime.now(),
+            allow_auto_lock=True,
+        )
+        self.assertEqual(result_allowed, self.PLATE)
+        self.assertTrue(self.registry.is_slot_locked("Slot_A"))
+
     def test_sequential_parking_multiple_cars(self):
         event1 = self.registry.register_anpr_event(
             plate="123-ABC",
