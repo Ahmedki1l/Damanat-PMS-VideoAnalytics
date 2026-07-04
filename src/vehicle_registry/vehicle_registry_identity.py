@@ -2146,6 +2146,22 @@ class VehicleRegistryIdentityMixin:
             session.observing_tracks[camera_id] = track_id
             self._mark_track_seen(camera_id, track_id, now)
 
+    def _session_floor(self, session) -> str:
+        """Resolve a session's floor for the reattach same-floor guard.
+
+        Prefers the area the car is currently settled in (``current_area``);
+        falls back to its last-seen camera's area. Returns "" when zoning is off
+        or the session isn't placed in any area yet — callers treat "" as
+        "unknown floor" (excluded when the querying camera is zoned)."""
+        if self._area_registry is None or not self._area_registry.enabled:
+            return ""
+        area = getattr(session, "current_area", "") or ""
+        if not area:
+            last_cam = getattr(session, "last_seen_camera", "") or ""
+            if last_cam:
+                area = self._area_registry.area_for_camera(last_cam)
+        return self._area_registry.floor(area) if area else ""
+
     def reattach_track_to_confirmed_session(
         self,
         camera_id: str,
@@ -2174,6 +2190,20 @@ class VehicleRegistryIdentityMixin:
             if current_session is None or current_session.plate:
                 return current_sid
 
+            # Same-floor guard: an anonymous track must not reattach to a plated
+            # session on a DIFFERENT floor. aca072f bounded the global-match fork
+            # by area but left this reattach fork unbounded — letting a B2 track
+            # adopt a B1 car's plate on a cross-camera ReID score as low as
+            # reattach_cross_camera (0.43). Only enforced when the querying camera
+            # is zoned; un-zoned (Ground / unmapped) keeps the legacy all-sessions
+            # pool. Floor (not area) is the right granularity: a legitimate
+            # reattach is a car moving between aisles on ONE floor.
+            query_floor = ""
+            if self._area_registry is not None and self._area_registry.enabled:
+                query_floor = self._area_registry.floor(
+                    self._area_registry.area_for_camera(camera_id)
+                )
+
             candidates = [
                 session
                 for sid, session in self._sessions.items()
@@ -2182,6 +2212,7 @@ class VehicleRegistryIdentityMixin:
                     and session.status in ("confirmed", "parked")
                     and session.plate
                     and session.feature_vector is not None
+                    and (not query_floor or self._session_floor(session) == query_floor)
                     and (
                         (session.last_seen_camera, session.last_seen_track_id)
                         == (camera_id, track_id)
