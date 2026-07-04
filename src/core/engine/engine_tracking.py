@@ -556,7 +556,17 @@ class ParkingEngineTrackingMixin:
                         quality,
                     )
 
-                self.vehicle_registry.bind_next_pending_anpr_to_candidate(candidate_id)
+                bound_plate = self.vehicle_registry.bind_next_pending_anpr_to_candidate(
+                    candidate_id
+                )
+                # A successful bind fires once (the candidate leaves "open"), so
+                # this is the natural moment to create the car's durable per-plate
+                # gallery folder from its first good Park_Entry view — guaranteeing
+                # every entering car gets a folder here, at CAM-23, not the gate.
+                if bound_plate:
+                    self.vehicle_registry.seed_gallery_from_park_entry(
+                        candidate_id, bound_plate
+                    )
 
         last_track_ids = self._tracks_inside_zones.get((cam_id, zone.id), set())
         left_zone = last_track_ids - currently_inside

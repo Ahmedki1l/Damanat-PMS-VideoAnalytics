@@ -145,13 +145,12 @@ class TestGallerySeedAtConfirm(unittest.TestCase):
     def _plate_dir(self, image_dir, plate):
         return os.path.join(image_dir, "gallery", safe_plate(plate))
 
-    def test_gate_entry_seeds_folder_but_not_matchable_refs(self):
+    def test_gate_entry_does_not_seed_folder(self):
         registry, image_dir = _make_registry(gallery=True)
         plate = "SEED-01"
-        # The direct ANPR gate path creates the confirmed session AND seeds the
-        # durable per-plate folder immediately — so every car that passes the
-        # gate has a folder from that moment, even if a CAM-03 B-entry reference
-        # never arrives.
+        # The wide external gate ANPR shot must NOT create the durable folder —
+        # folder creation is owned by the CAM-23 Park_Entry stage, which captures
+        # the car's first good in-garage view.
         sid = registry.confirm_anpr_session_directly(
             plate=plate,
             image=_image(120),
@@ -160,27 +159,64 @@ class TestGallerySeedAtConfirm(unittest.TestCase):
             gate_snapshot_paths=[],
         )
         self.assertIsNotNone(sid)
-        pdir = self._plate_dir(image_dir, plate)
-        self.assertTrue(
-            os.path.isdir(pdir),
-            "gate entry must create gallery/<plate>/ for every entering car",
+        self.assertFalse(
+            os.path.isdir(self._plate_dir(image_dir, plate)),
+            "gate ANPR shot must not seed the durable folder",
         )
-        # ...but the wide gate-only shot is flagged and excluded from matching,
-        # so a warm-start can never false-match it against a parked car.
+
+    def test_park_entry_seeds_folder_but_not_matchable_refs(self):
+        registry, image_dir = _make_registry(gallery=True)
+        plate = "SEED-PE"
+        # A car enters: gate ANPR registers the pending plate and creates the
+        # confirmed session (no folder seed), then the car is seen in the CAM-23
+        # Park_Entry zone and bound to that plate.
+        registry.register_anpr_event(plate, "entry")
+        registry.confirm_anpr_session_directly(
+            plate=plate, image=_image(120), event_id="evt-pe",
+            candidate_id="cand-pe", gate_snapshot_paths=[],
+        )
+        candidate = registry.open_park_entry_candidate("CAM-23", 7)
+        registry.update_park_entry_candidate_snapshot(
+            candidate.candidate_id, _image(120), quality_score=5.0
+        )
+        bound = registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id)
+        self.assertEqual(bound, plate)
+
+        # Park_Entry is the seeder — the folder exists the moment the car enters
+        # the parking, even if it never reaches the CAM-03 confirmation zone.
+        self.assertTrue(
+            registry.seed_gallery_from_park_entry(candidate.candidate_id, plate)
+        )
+        pdir = self._plate_dir(image_dir, plate)
+        self.assertTrue(os.path.isdir(pdir), "Park_Entry must create gallery/<plate>/")
+        self.assertTrue(os.path.isfile(os.path.join(pdir, "meta.json")))
+        self.assertTrue([f for f in os.listdir(pdir) if f.endswith(".jpg")])
+        # ...but the provisional Park_Entry crop is flagged out of matching, so a
+        # warm-start can never false-match it against a parked car.
         vectors, _ = registry.gallery_store.load_vectors(plate)
         self.assertEqual(
-            vectors, [], "gate-only shot must not be a matchable reference"
+            vectors, [], "Park_Entry seed must not be a matchable reference"
         )
         # The authoritative CAM-03 B-entry reference adds the first matchable ref.
-        self.assertEqual(
-            registry.confirm_b1_entrance_by_plate(plate, _image(200)), sid
-        )
-        self.assertTrue(os.path.isfile(os.path.join(pdir, "meta.json")))
-        crops = [f for f in os.listdir(pdir) if f.endswith(".jpg")]
-        self.assertTrue(crops, "expected at least one crop written")
+        registry.confirm_b1_entrance_by_plate(plate, _image(200))
         matchable, _ = registry.gallery_store.load_vectors(plate)
+        self.assertTrue(matchable, "B-entry must add a matchable reference vector")
+
+    def test_park_entry_seed_is_idempotent_per_visit(self):
+        registry, image_dir = _make_registry(gallery=True)
+        plate = "SEED-PE2"
+        registry.register_anpr_event(plate, "entry")
+        candidate = registry.open_park_entry_candidate("CAM-23", 9)
+        registry.update_park_entry_candidate_snapshot(
+            candidate.candidate_id, _image(120), quality_score=5.0
+        )
+        registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id)
         self.assertTrue(
-            matchable, "B-entry must add a matchable reference vector"
+            registry.seed_gallery_from_park_entry(candidate.candidate_id, plate)
+        )
+        # A second call (a later frame) must not re-seed the already-created folder.
+        self.assertFalse(
+            registry.seed_gallery_from_park_entry(candidate.candidate_id, plate)
         )
 
     def test_no_folder_when_persistence_disabled(self):

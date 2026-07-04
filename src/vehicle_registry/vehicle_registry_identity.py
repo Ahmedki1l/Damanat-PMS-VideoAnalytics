@@ -359,6 +359,54 @@ class VehicleRegistryIdentityMixin:
         except Exception as exc:  # pragma: no cover - disk best-effort
             logger.debug("[gallery] seed for %s failed: %r", plate, exc)
 
+    def seed_gallery_from_park_entry(self, candidate_id: str, plate: str) -> bool:
+        """Create the durable per-plate gallery folder the moment a car is seen
+        in the CAM-23 Park_Entry zone and bound to a plate — so every car that
+        enters the parking gets a folder, sourced from its first good in-garage
+        view rather than the wide external gate ANPR shot.
+
+        The Park_Entry crop is persisted as a gate_only (non-matchable) ref: the
+        folder and photo exist immediately, but because the plate binding here is
+        still provisional (FIFO), the crop is kept out of warm-start matching
+        until CAM-03 confirmation attaches the authoritative matchable reference.
+        No-op when persistence is off, the plate is unknown, the candidate has no
+        usable crop, or the folder already exists (returning car / earlier
+        frame). Best-effort — disk errors are swallowed."""
+        store = self.gallery_store
+        if store is None or not plate:
+            return False
+        # Already seeded (a prior frame this visit, or a returning car's retained
+        # gallery) — don't append a redundant gate crop.
+        if store.has(plate):
+            return False
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if candidate is None:
+                return False
+            crop = candidate.snapshot_image
+            feature = candidate.feature_vector
+            quality = float(candidate.quality_score)
+            camera_id = candidate.camera_id or "CAM-23"
+        if crop is None or getattr(crop, "size", 0) == 0:
+            return False
+        if feature is None:
+            feature = self.reid_matcher.extract_feature(crop)
+            if feature is None:
+                return False
+        try:
+            store.save_ref(
+                plate, crop, feature, quality=quality, camera_id=camera_id,
+                gate_only=True,
+            )
+        except Exception as exc:  # pragma: no cover - disk best-effort
+            logger.debug("[gallery] park-entry seed for %s failed: %r", plate, exc)
+            return False
+        logger.info(
+            "[gallery] Park_Entry (%s) seeded folder for plate=%s (non-matchable "
+            "until CAM-03 confirmation)", camera_id, plate,
+        )
+        return True
+
     def confirm_anpr_session_directly(
         self,
         plate: str,
@@ -412,19 +460,12 @@ class VehicleRegistryIdentityMixin:
 
         # Persist the ANPR image as the primary gallery reference so it appears
         # in reference_snapshot_paths (the UI gallery) alongside any future
-        # CAM_03 confirmation images that get added later. seed_gallery +
-        # gate_only guarantee the durable vehicle_images/gallery/<plate>/ folder
-        # exists from the moment the car enters — even if the CAM-03 B-entry /
-        # zone confirmation never fires — while keeping the wide gate shot out
-        # of warm-start matching (the ref is gate-flagged in meta.json).
-        self._persist_session_gallery(
-            session,
-            [image],
-            now,
-            primary_snapshot_index=0,
-            seed_gallery=True,
-            gate_only=True,
-        )
+        # CAM_03 confirmation images that get added later. This does NOT seed the
+        # durable per-plate folder: folder creation is owned by the CAM-23
+        # Park_Entry stage (see VehicleRegistry.seed_gallery_from_park_entry),
+        # which captures the car's first good in-garage view — not the wide gate
+        # ANPR shot.
+        self._persist_session_gallery(session, [image], now, primary_snapshot_index=0)
 
         evicted_slots: List[str] = []
         with self._lock:
