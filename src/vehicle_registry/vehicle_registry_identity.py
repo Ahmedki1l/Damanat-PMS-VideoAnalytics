@@ -500,14 +500,25 @@ class VehicleRegistryIdentityMixin:
             gate_reference_only=True,
         )
 
-        # Persist the ANPR image as the primary gallery reference so it appears
-        # in reference_snapshot_paths (the UI gallery) alongside any future
-        # CAM_03 confirmation images that get added later. This does NOT seed the
-        # durable per-plate folder: folder creation is owned by the CAM-23
-        # Park_Entry stage (see VehicleRegistry.seed_gallery_from_park_entry),
-        # which captures the car's first good in-garage view — not the wide gate
-        # ANPR shot.
-        self._persist_session_gallery(session, [image], now, primary_snapshot_index=0)
+        # Persist the ANPR image as the primary gallery reference (UI gallery /
+        # reference_snapshot_paths) AND seed the durable per-plate folder
+        # (vehicle_images/gallery/<plate>/) the moment the car passes the gate —
+        # so EVERY entering car has a folder even if the CAM-03 B-entry reference
+        # never arrives. The wide gate shot is written gate_only=True, so
+        # VehicleGalleryStore.load_vectors/load_crops exclude it: the folder and
+        # entry photo exist, yet the gate shot can never false-match a parked car.
+        # CAM-03 B-entry (confirm_b1_entrance_by_plate) adds the first *matchable*
+        # reference. seed_gallery_from_park_entry remains a fallback seeder for a
+        # car whose gate image never yielded a feature (it no-ops once a folder
+        # exists).
+        self._persist_session_gallery(
+            session,
+            [image],
+            now,
+            primary_snapshot_index=0,
+            seed_gallery=True,
+            gate_only=True,
+        )
 
         evicted_slots: List[str] = []
         with self._lock:

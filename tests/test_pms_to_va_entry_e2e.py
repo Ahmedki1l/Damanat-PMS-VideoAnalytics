@@ -122,22 +122,22 @@ def test_entry_then_b_entry_creates_session_and_seeds_folder():
     r1 = _pms_forward(client, plate, "entry", 120)
     assert r1["image_saved"] is True
     assert _sessions_for(registry, plate), "entry must create a confirmed session"
-    # The wide gate ANPR shot does NOT seed the durable folder — folder creation
-    # is owned by the CAM-23 Park_Entry stage (an engine/video path, not this API
-    # surface). See test_anpr_identity_and_gallery for the Park_Entry seed.
+    # The gate ANPR read seeds the durable folder immediately (gate_only) — so
+    # every entering car has a folder even if CAM-03 B-entry never fires (the
+    # exact DJS-7842 / LLJ-9005 "no folder was created" gap)...
     pdir = _plate_dir(image_dir, plate)
-    assert not os.path.isdir(pdir), (
-        "the wide gate ANPR shot must not seed the gallery folder"
-    )
+    assert os.path.isdir(pdir), "gate entry must seed gallery/<plate>/"
+    assert os.path.isfile(os.path.join(pdir, "meta.json"))
+    # ...but the wide gate shot is flagged out of matching (no vector yet).
+    vectors, _ = registry.gallery_store.load_vectors(plate)
+    assert vectors == [], "gate shot must be a gate_only (non-matchable) reference"
 
     # 2. PMS forwards the CAM-03 in-garage confirmation (direction "B-entry").
     r2 = _pms_forward(client, plate, "B-entry", 200)
     assert r2["image_saved"] is True
 
-    # VA's reaction: the authoritative CAM-03 reference now creates the folder
-    # with a matchable vector.
-    assert os.path.isdir(pdir), "B-entry must create gallery/<plate>/"
-    assert os.path.isfile(os.path.join(pdir, "meta.json"))
+    # VA's reaction: the authoritative CAM-03 reference now adds a matchable vector.
+    assert os.path.isdir(pdir)
     assert [f for f in os.listdir(pdir) if f.endswith(".jpg")], "expected a crop"
     matchable, _ = registry.gallery_store.load_vectors(plate)
     assert matchable, "B-entry must add a matchable reference vector"
