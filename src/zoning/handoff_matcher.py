@@ -59,6 +59,14 @@ class CrossAreaHandoffMatcher:
         if not adjacency:
             return out
 
+        # Same-floor-only handoff: a car that is handing over through an
+        # inter-floor ramp (a floorless area) must never become eligible in
+        # another floor's candidate pool. Admitting only sources on the querying
+        # area's own floor keeps within-floor aisle-to-aisle handoff intact while
+        # guaranteeing a B1 car can never ReID-match a B2 car (or the reverse) —
+        # the cross-floor leak the ramp adjacency edges would otherwise open.
+        query_floor = self._areas.floor(area_id)
+
         now = self._clock()
         for session in sessions:
             if getattr(session, "area_state", "IN_AREA") not in _IN_FLIGHT_STATES:
@@ -67,6 +75,8 @@ class CrossAreaHandoffMatcher:
             transit = adjacency.get(source)
             if transit is None:
                 continue  # not departing from an adjacent area
+            if self._areas.floor(source) != query_floor:
+                continue  # cross-floor (ramp) handoff — never eligible
             entered = session.area_entered_at
             if entered is None:
                 # No timestamp yet — be permissive and include it.

@@ -239,6 +239,46 @@ class TestHandoffMatcher(unittest.TestCase):
                                             [within, expired, not_adj, settled])
         self.assertEqual(ids, {"a"})
 
+    def test_cross_floor_handoff_is_excluded(self):
+        """A car handing over through a FLOORLESS inter-floor ramp (production
+        topology) must never enter the other floor's candidate pool — the
+        same-floor-only guarantee. Mirrors config.yaml's RAMP-DN bridging
+        B1-A <-> B2-A."""
+        cfg = AppConfig()
+        cfg.cameras = [
+            CameraEntry(id="CAM-03", floor="B1", area="B1-A"),
+            CameraEntry(id="CAM-09", floor="B2", area="B2-A"),
+        ]
+        cfg.areas = [
+            AreaEntry("B1-A", "B1 A", "B1", 30, {"RAMP-DN": 20.0}),
+            AreaEntry("B2-A", "B2 A", "B2", 30, {"RAMP-DN": 20.0}),
+            # Inter-floor ramp: no fixed floor, bridges both A aisles.
+            AreaEntry("RAMP-DN", "Down Ramp", "", 6, {"B1-A": 20.0, "B2-A": 20.0}),
+        ]
+        hm = CrossAreaHandoffMatcher(AreaRegistry(cfg))
+        now = datetime.now()
+        # A car descending from B1: it left the ramp heading into B2-A.
+        descending = self._session("x", "IN_TRANSIT", "RAMP-DN", now)
+
+        # Query from B2-A must NOT admit the ramp car (cross-floor).
+        self.assertEqual(hm.candidate_session_ids("B2-A", [descending]), set())
+        # And a car departing B2-A into the ramp must NOT surface on B1-A.
+        ascending = self._session("y", "IN_TRANSIT", "RAMP-DN", now)
+        self.assertEqual(hm.candidate_session_ids("B1-A", [ascending]), set())
+
+    def test_same_floor_handoff_still_works(self):
+        """The floor guard must not disturb within-floor aisle-to-aisle handoff."""
+        cfg = AppConfig()
+        cfg.cameras = [CameraEntry(id="CAM-03", floor="B1", area="B1-A")]
+        cfg.areas = [
+            AreaEntry("B1-A", "B1 A", "B1", 30, {"B1-B": 15.0}),
+            AreaEntry("B1-B", "B1 B", "B1", 30, {"B1-A": 15.0}),
+        ]
+        hm = CrossAreaHandoffMatcher(AreaRegistry(cfg))
+        now = datetime.now()
+        crossing = self._session("z", "IN_TRANSIT", "B1-B", now)
+        self.assertEqual(hm.candidate_session_ids("B1-A", [crossing]), {"z"})
+
 
 class TestBoundaryDetector(unittest.TestCase):
     def test_crossing_edge(self):
