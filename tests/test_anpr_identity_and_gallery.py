@@ -5,11 +5,13 @@ C1 — the ANPR-image entry path must bind a candidate to the SPECIFIC plate who
 image it is (by event_id), never the FIFO-oldest pending entry, so two cars
 entering close together cannot swap plates.
 
-A1 — a confirmed car must get a durable per-plate gallery folder
-(vehicle_images/gallery/<plate>/) the moment the authoritative CAM-03 B-entry
-reference arrives — but the wide gate-only ANPR shot (kept out of matching by
-gate_reference_only) must NOT be seeded, or warm-start would reintroduce the
-false-match-against-a-parked-car risk.
+A1 — a car must get a durable per-plate gallery folder
+(vehicle_images/gallery/<plate>/) the moment it enters the gate, so EVERY
+entering car has a folder even if the CAM-03 B-entry reference never arrives.
+The wide gate-only ANPR shot is persisted but flagged (gate_only) so it is
+excluded from warm-start matching — the folder exists, yet the gate shot can
+never false-match against a parked car. The authoritative CAM-03 B-entry
+reference is what adds the first *matchable* vector.
 """
 
 import os
@@ -143,10 +145,13 @@ class TestGallerySeedAtConfirm(unittest.TestCase):
     def _plate_dir(self, image_dir, plate):
         return os.path.join(image_dir, "gallery", safe_plate(plate))
 
-    def test_b_entry_seeds_the_per_plate_folder(self):
+    def test_gate_entry_seeds_folder_but_not_matchable_refs(self):
         registry, image_dir = _make_registry(gallery=True)
         plate = "SEED-01"
-        # A confirmed session must exist first (the direct ANPR path creates it).
+        # The direct ANPR gate path creates the confirmed session AND seeds the
+        # durable per-plate folder immediately — so every car that passes the
+        # gate has a folder from that moment, even if a CAM-03 B-entry reference
+        # never arrives.
         sid = registry.confirm_anpr_session_directly(
             plate=plate,
             image=_image(120),
@@ -155,20 +160,28 @@ class TestGallerySeedAtConfirm(unittest.TestCase):
             gate_snapshot_paths=[],
         )
         self.assertIsNotNone(sid)
-        # The gate-only direct session must NOT have seeded a durable folder.
-        self.assertFalse(
-            os.path.isdir(self._plate_dir(image_dir, plate)),
-            "gate-only ANPR shot must not be persisted to the gallery",
+        pdir = self._plate_dir(image_dir, plate)
+        self.assertTrue(
+            os.path.isdir(pdir),
+            "gate entry must create gallery/<plate>/ for every entering car",
         )
-        # The authoritative CAM-03 B-entry reference seeds the folder.
+        # ...but the wide gate-only shot is flagged and excluded from matching,
+        # so a warm-start can never false-match it against a parked car.
+        vectors, _ = registry.gallery_store.load_vectors(plate)
+        self.assertEqual(
+            vectors, [], "gate-only shot must not be a matchable reference"
+        )
+        # The authoritative CAM-03 B-entry reference adds the first matchable ref.
         self.assertEqual(
             registry.confirm_b1_entrance_by_plate(plate, _image(200)), sid
         )
-        pdir = self._plate_dir(image_dir, plate)
-        self.assertTrue(os.path.isdir(pdir), "B-entry must create gallery/<plate>/")
         self.assertTrue(os.path.isfile(os.path.join(pdir, "meta.json")))
         crops = [f for f in os.listdir(pdir) if f.endswith(".jpg")]
         self.assertTrue(crops, "expected at least one crop written")
+        matchable, _ = registry.gallery_store.load_vectors(plate)
+        self.assertTrue(
+            matchable, "B-entry must add a matchable reference vector"
+        )
 
     def test_no_folder_when_persistence_disabled(self):
         registry, image_dir = _make_registry(gallery=False)

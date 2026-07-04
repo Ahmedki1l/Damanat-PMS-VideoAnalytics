@@ -7,8 +7,11 @@ image_base64, camera_id}`` — and asserts what VA does in response:
 
   * a confirmed ``VehicleSession`` is created for the plate, and
   * the durable per-plate gallery folder ``vehicle_images/gallery/<plate>/`` is
-    seeded the moment the CAM-03 ``B-entry`` reference arrives (the A1 fix — the
-    exact DJS-7842 / LLJ-9005 "no folder was created" gap), and
+    seeded the moment the car passes the gate (direction ``entry``) — so EVERY
+    entering car has a folder even when the CAM-03 ``B-entry`` reference never
+    fires (the exact DJS-7842 / LLJ-9005 "no folder was created" gap); the wide
+    gate-only shot is flagged out of matching, and ``B-entry`` adds the first
+    matchable reference, and
   * two cars entering sequentially keep their OWN plate + folder (no swap).
 
 The two repos run in separate venvs, so this cannot import PMS-AI in-process.
@@ -119,21 +122,28 @@ def test_entry_then_b_entry_creates_session_and_seeds_folder():
     r1 = _pms_forward(client, plate, "entry", 120)
     assert r1["image_saved"] is True
     assert _sessions_for(registry, plate), "entry must create a confirmed session"
-    # Gate-only shot must NOT have seeded the durable folder yet (gate_reference_only).
-    assert not os.path.isdir(_plate_dir(image_dir, plate)), (
-        "the wide gate-only ANPR shot must not be persisted to the gallery"
+    # The gate entry seeds the durable folder immediately, so every entering car
+    # has one even if the CAM-03 B-entry reference never arrives — the exact gap
+    # that left DJS-7842 / LLJ-9005 with no folder.
+    pdir = _plate_dir(image_dir, plate)
+    assert os.path.isdir(pdir), (
+        "gate entry must seed gallery/<plate>/ for every entering car"
     )
+    # ...but the wide gate-only shot is flagged out of matching (no matchable ref
+    # yet), so a warm-start can never false-match it against a parked car.
+    vectors, _ = registry.gallery_store.load_vectors(plate)
+    assert vectors == [], "gate-only shot must not be a matchable reference"
 
     # 2. PMS forwards the CAM-03 in-garage confirmation (direction "B-entry").
     r2 = _pms_forward(client, plate, "B-entry", 200)
     assert r2["image_saved"] is True
 
-    # VA's reaction: the per-plate gallery folder now exists on disk — the exact
-    # gap that left DJS-7842 / LLJ-9005 with no folder.
-    pdir = _plate_dir(image_dir, plate)
-    assert os.path.isdir(pdir), "B-entry must seed gallery/<plate>/"
+    # VA's reaction: the folder now holds a matchable CAM-03 reference.
+    assert os.path.isdir(pdir), "B-entry must keep gallery/<plate>/"
     assert os.path.isfile(os.path.join(pdir, "meta.json"))
     assert [f for f in os.listdir(pdir) if f.endswith(".jpg")], "expected a crop"
+    matchable, _ = registry.gallery_store.load_vectors(plate)
+    assert matchable, "B-entry must add a matchable reference vector"
 
 
 # ── Anti-swap: two cars entering sequentially keep their OWN identity ─────────

@@ -609,6 +609,50 @@ class TestRegistryAutoLock(unittest.TestCase):
         self.assertEqual(len(self.registry._sessions), 0)
         self.assertEqual(len(self.registry._track_session_map), 0)
 
+    def test_existing_session_with_different_plate_is_not_swapped(self):
+        # Anti-swap guard: car X is already parked (plate X) in the ONLY unlocked
+        # slot; a new arrival Y fires a pending entry. Auto-lock must NOT
+        # overwrite X's identity with Y — that is the "cars getting swapped" bug.
+        existing = VehicleSession(
+            session_id="sess_x",
+            plate="XXX-000",
+            first_seen_at=datetime.now(),
+            last_seen_at=datetime.now(),
+            last_seen_camera=self.CAM,
+            last_seen_track_id=1111,
+            status="parked",
+            linked_slot="Slot_A",
+            linked_slot_name="Slot A",
+            linked_camera=self.CAM,
+            linked_floor="B1",
+        )
+        self.registry._sessions["sess_x"] = existing
+        self.registry._parked["Slot_A"] = existing
+        self.registry._track_session_map[(self.CAM, 1111)] = "sess_x"
+
+        # New arrival Y at the gate — the only pending plate.
+        event = self.registry.register_anpr_event(
+            plate="456-DEF", direction="entry", camera_id="ANPR",
+        )
+
+        result = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+
+        # X keeps its own plate; Y's pending event is untouched; no auto-lock.
+        self.assertEqual(existing.plate, "XXX-000")
+        self.assertNotEqual(result, "456-DEF")
+        self.assertFalse(self.registry.is_slot_locked("Slot_A"))
+        self.assertEqual(event.status, "pending")
+        self.assertIsNone(event.session_id)
+
     def test_concurrent_try_link_to_slot_executions_cannot_claim_same_plate_twice(self):
         event = self.registry.register_anpr_event(
             plate=self.PLATE,

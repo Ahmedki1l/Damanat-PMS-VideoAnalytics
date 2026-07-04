@@ -2277,7 +2277,31 @@ class VehicleRegistryIdentityMixin:
                     for sid, s in self._parked.items()
                 )
 
-                if not plate_locked_elsewhere:
+                # Anti-swap guard: never auto-lock over an already-identified car.
+                # If the track's session already carries a DIFFERENT plate, this
+                # "one slot + one pending plate" heuristic would overwrite a real
+                # identity — car X sitting in the only unlocked slot relabelled
+                # with a new arrival Y's plate. Skip auto-lock and let the normal
+                # ReID/OCR path below keep X's existing binding.
+                _existing_sid = self._track_session_map.get((camera_id, track_id))
+                _existing_sess = (
+                    self._sessions.get(_existing_sid) if _existing_sid else None
+                )
+                would_swap_identity = (
+                    _existing_sess is not None
+                    and bool(_existing_sess.plate)
+                    and _existing_sess.plate != suggested_plate
+                )
+                if would_swap_identity:
+                    logger.info(
+                        "[AUTO-LOCK] Skipped: track (%s, %s) session %s already "
+                        "bound to plate=%s (auto-lock would swap it for pending "
+                        "plate=%s)",
+                        camera_id, track_id, _existing_sid,
+                        _existing_sess.plate, suggested_plate,
+                    )
+
+                if not plate_locked_elsewhere and not would_swap_identity:
                     session_id = self._track_session_map.get((camera_id, track_id))
                     evicted_slots = self._claim_plate_globally(
                         plate=suggested_plate,
