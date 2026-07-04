@@ -21,7 +21,7 @@ Typical workflow
     # 2) Copy b1_geometry.json to the production server.
 
     # 3) On PRODUCTION (its config.yaml points at the prod DB):
-    python tools/sync_geometry.py seed --in b1_geometry.json
+    python tools/sync_geometry.py seed --in geometry.json
     #    add --dry-run first to preview, or --mode replace to wipe+load the floor
 
 Which DB it talks to is decided by the config.yaml you point at (``--config``),
