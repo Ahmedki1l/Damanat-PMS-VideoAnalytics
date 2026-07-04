@@ -357,5 +357,289 @@ class TestRegistryLock(unittest.TestCase):
         self.assertTrue(self.registry.is_slot_locked("Slot_B"))
 
 
+# --------------------------------------------------------------------------- #
+# 4. Auto-lock single parked car to single pending plate
+# --------------------------------------------------------------------------- #
+class TestRegistryAutoLock(unittest.TestCase):
+    PLATE = "123-ABC"
+    CAM = "CAM_03"
+
+    def setUp(self):
+        self.registry = VehicleRegistry(image_dir="tests/test_images")
+
+    def test_single_parked_slot_single_pending_plate_auto_lock(self):
+        # 1. Register a single pending ANPR entry event
+        event = self.registry.register_anpr_event(
+            plate=self.PLATE,
+            direction="entry",
+            camera_id="ANPR",
+        )
+        self.assertEqual(event.status, "pending")
+
+        # 2. Link a slot
+        result = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+
+        # 3. Verify auto-lock succeeded
+        self.assertEqual(result, self.PLATE)
+        self.assertTrue(self.registry.is_slot_locked("Slot_A"))
+        
+        # Pending event should be confirmed
+        self.assertEqual(event.status, "confirmed")
+        self.assertIsNotNone(event.session_id)
+
+        # The session should be parked in Slot_A
+        session = self.registry._parked.get("Slot_A")
+        self.assertIsNotNone(session)
+        self.assertEqual(session.plate, self.PLATE)
+        self.assertEqual(session.new_pipeline_score, 1.0)
+
+    def test_multiple_pending_plates_no_auto_lock(self):
+        event1 = self.registry.register_anpr_event(
+            plate="123-ABC",
+            direction="entry",
+            camera_id="ANPR",
+        )
+        event2 = self.registry.register_anpr_event(
+            plate="456-DEF",
+            direction="entry",
+            camera_id="ANPR",
+        )
+
+        result = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+
+        self.assertIsNone(result)
+        self.assertFalse(self.registry.is_slot_locked("Slot_A"))
+        self.assertEqual(event1.status, "pending")
+        self.assertEqual(event2.status, "pending")
+
+    def test_multiple_unlocked_parked_slots_no_auto_lock(self):
+        self.registry.register_anpr_event(
+            plate="123-ABC",
+            direction="entry",
+            camera_id="ANPR",
+        )
+
+        sess = VehicleSession(
+            session_id="sess_a",
+            plate="789-XYZ",
+            status="parked",
+            linked_slot="Slot_A",
+        )
+        self.registry._sessions["sess_a"] = sess
+        self.registry._parked["Slot_A"] = sess
+
+        result = self.registry.try_link_to_slot(
+            slot_id="Slot_B",
+            slot_name="Slot B",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+
+        self.assertIsNone(result)
+        self.assertFalse(self.registry.is_slot_locked("Slot_B"))
+        self.assertFalse(self.registry.is_slot_locked("Slot_A"))
+
+    def test_sequential_parking_multiple_cars(self):
+        event1 = self.registry.register_anpr_event(
+            plate="123-ABC",
+            direction="entry",
+            camera_id="ANPR",
+        )
+        res1 = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+        self.assertEqual(res1, "123-ABC")
+        self.assertTrue(self.registry.is_slot_locked("Slot_A"))
+
+        event2 = self.registry.register_anpr_event(
+            plate="456-DEF",
+            direction="entry",
+            camera_id="ANPR",
+        )
+        res2 = self.registry.try_link_to_slot(
+            slot_id="Slot_B",
+            slot_name="Slot B",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=2222,
+            timestamp=datetime.now(),
+        )
+        self.assertEqual(res2, "456-DEF")
+        self.assertTrue(self.registry.is_slot_locked("Slot_B"))
+
+    def test_plate_already_actively_locked_elsewhere(self):
+        sess = VehicleSession(
+            session_id="sess_a",
+            plate="123-ABC",
+            status="parked",
+            linked_slot="Slot_A",
+        )
+        self.registry._sessions["sess_a"] = sess
+        self.registry._parked["Slot_A"] = sess
+        self.registry._locked_slots.add("Slot_A")
+
+        self.registry.register_anpr_event(
+            plate="123-ABC",
+            direction="entry",
+            camera_id="ANPR",
+        )
+
+        result = self.registry.try_link_to_slot(
+            slot_id="Slot_B",
+            slot_name="Slot B",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+        self.assertIsNone(result)
+        self.assertFalse(self.registry.is_slot_locked("Slot_B"))
+
+    def test_stale_pending_events_are_ignored(self):
+        event = self.registry.register_anpr_event(
+            plate=self.PLATE,
+            direction="entry",
+            camera_id="ANPR",
+        )
+        event.timestamp = datetime.now() - timedelta(minutes=10)
+
+        result = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+        self.assertIsNone(result)
+        self.assertFalse(self.registry.is_slot_locked("Slot_A"))
+
+    def test_existing_session_is_reused_instead_of_creating_duplicate(self):
+        sess_existing = VehicleSession(
+            session_id="sess_existing",
+            first_seen_at=datetime.now(),
+            last_seen_at=datetime.now(),
+            last_seen_camera=self.CAM,
+            last_seen_track_id=1111,
+            status="confirmed",
+        )
+        self.registry._sessions["sess_existing"] = sess_existing
+        self.registry._track_session_map[(self.CAM, 1111)] = "sess_existing"
+
+        self.registry.register_anpr_event(
+            plate=self.PLATE,
+            direction="entry",
+            camera_id="ANPR",
+        )
+
+        result = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+        self.assertEqual(result, self.PLATE)
+        self.assertTrue(self.registry.is_slot_locked("Slot_A"))
+        self.assertEqual(sess_existing.plate, self.PLATE)
+        self.assertIs(self.registry._parked["Slot_A"], sess_existing)
+
+    def test_failure_while_synchronizing_gallery_does_not_confirm_pending_event(self):
+        from unittest.mock import patch
+        
+        event = self.registry.register_anpr_event(
+            plate=self.PLATE,
+            direction="entry",
+            camera_id="ANPR",
+        )
+
+        with patch.object(self.registry, "_gallery_index_upsert", side_effect=Exception("FAISS failure")):
+            with self.assertRaises(Exception):
+                self.registry.try_link_to_slot(
+                    slot_id="Slot_A",
+                    slot_name="Slot A",
+                    zone_id="Z1",
+                    zone_name="Zone 1",
+                    camera_id=self.CAM,
+                    floor="B1",
+                    track_id=1111,
+                    timestamp=datetime.now(),
+                )
+
+        self.assertEqual(event.status, "pending")
+        self.assertIsNone(event.session_id)
+        self.assertEqual(len(self.registry._sessions), 0)
+        self.assertEqual(len(self.registry._track_session_map), 0)
+
+    def test_concurrent_try_link_to_slot_executions_cannot_claim_same_plate_twice(self):
+        event = self.registry.register_anpr_event(
+            plate=self.PLATE,
+            direction="entry",
+            camera_id="ANPR",
+        )
+
+        result1 = self.registry.try_link_to_slot(
+            slot_id="Slot_A",
+            slot_name="Slot A",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=1111,
+            timestamp=datetime.now(),
+        )
+        self.assertEqual(result1, self.PLATE)
+
+        result2 = self.registry.try_link_to_slot(
+            slot_id="Slot_B",
+            slot_name="Slot B",
+            zone_id="Z1",
+            zone_name="Zone 1",
+            camera_id=self.CAM,
+            floor="B1",
+            track_id=2222,
+            timestamp=datetime.now(),
+        )
+        self.assertIsNone(result2)
+
+
 if __name__ == "__main__":
     unittest.main()

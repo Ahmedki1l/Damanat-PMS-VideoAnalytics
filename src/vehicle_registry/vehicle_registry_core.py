@@ -28,6 +28,30 @@ REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "
 # differs (e.g. an OCR refinement). Each new read slides the window.
 ANPR_COALESCE_SECONDS = 3.0
 
+# Two burst reads only coalesce when their plate texts are within this many
+# edits of each other. A genuine re-read of the same plate differs by an OCR
+# slip (1-2 characters); a bigger distance means a SECOND car tailgated into
+# the window, and collapsing the two (last-plate-wins) would rename the first
+# car's session to the second car's plate — the burst-coalesce swap vector.
+ANPR_COALESCE_MAX_PLATE_EDITS = 2
+
+
+def _plate_edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance between two plate strings (case-insensitive)."""
+    a = (a or "").strip().upper()
+    b = (b or "").strip().upper()
+    if a == b:
+        return 0
+    if not a or not b:
+        return max(len(a), len(b))
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
 
 class VehicleRegistryCoreMixin:
     def _gc_loop(self) -> None:
@@ -271,6 +295,13 @@ class VehicleRegistryCoreMixin:
                         # session inside the window (bind-now, overwrite-within-3s).
                         and burst.status in ("pending", "provisional", "confirmed")
                         and (now - burst.timestamp).total_seconds() <= ANPR_COALESCE_SECONDS
+                        # Only a plausible re-read of the SAME plate coalesces.
+                        # A very different plate inside the window is a second
+                        # car tailgating — it must get its own event, or
+                        # last-plate-wins renames car A's session to car B's
+                        # plate and the two cars swap identities.
+                        and _plate_edit_distance(burst.plate, plate)
+                        <= ANPR_COALESCE_MAX_PLATE_EDITS
                     ):
                         old_plate = burst.plate
                         burst.timestamp = now  # slide the window

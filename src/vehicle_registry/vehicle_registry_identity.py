@@ -285,6 +285,7 @@ class VehicleRegistryIdentityMixin:
         now: datetime,
         primary_snapshot_index: int = 0,
         seed_gallery: bool = False,
+        gate_only: bool = False,
     ) -> bool:
         """Prepare + apply in one call, for callers NOT holding ``self._lock``
         (e.g. ``confirm_anpr_session_directly``). Lock-holding callers must
@@ -300,12 +301,12 @@ class VehicleRegistryIdentityMixin:
         # <plate>/) so a folder exists on disk the moment a car is confirmed —
         # instead of only when live-tracking accumulation happens to fire (which
         # may never happen for a short-lived / low-FPS car). Reuses the
-        # already-extracted feature. ONLY when the caller passes seed_gallery:
-        # the authoritative CAM-03 B-entry reference (confirm_b1_entrance_by_plate)
-        # is safe to persist, but the wide gate-only ANPR shot from the direct
-        # session is NOT — it is kept out of matching by gate_reference_only, and
-        # persisting it would reintroduce the false-match-against-a-parked-car
-        # risk on warm-start (build_session_from_gallery loads it primary-first).
+        # already-extracted feature. ONLY when the caller passes seed_gallery.
+        # The wide gate-only ANPR shot from the direct session must pass
+        # gate_only=True: the folder (and entry photo) are created, but the ref
+        # is flagged so warm-start matching ignores it — persisting it as a
+        # matchable ref would reintroduce the false-match-against-a-parked-car
+        # risk (build_session_from_gallery loads matchable refs primary-first).
         if seed_gallery:
             ordered_images, feature_vectors, _ = prepared
             self._seed_plate_gallery_reference(
@@ -313,6 +314,7 @@ class VehicleRegistryIdentityMixin:
                 ordered_images,
                 feature_vectors,
                 max(0, min(primary_snapshot_index, len(ordered_images) - 1)),
+                gate_only=gate_only,
             )
         return True
 
@@ -322,11 +324,16 @@ class VehicleRegistryIdentityMixin:
         ordered_images: List[np.ndarray],
         feature_vectors: List[Optional[np.ndarray]],
         primary_snapshot_index: int,
+        gate_only: bool = False,
     ) -> None:
         """Persist the primary confirmation crop + embedding to the plate's
         on-disk gallery. No-op when persistence is off, the plate is unknown, or
         the primary image/feature is missing. Best-effort — disk errors are
-        swallowed so confirmation never fails on a storage hiccup."""
+        swallowed so confirmation never fails on a storage hiccup.
+
+        ``gate_only`` seeds the wide gate ANPR shot: the folder is created the
+        moment the car enters, but the ref is excluded from warm-start matching
+        (see VehicleGalleryStore.save_ref)."""
         store = self.gallery_store
         plate = getattr(session, "plate", None)
         if store is None or not plate:
@@ -343,8 +350,11 @@ class VehicleRegistryIdentityMixin:
                 plate,
                 image,
                 feature,
-                quality=999.0,  # authoritative reference — keep over live views
+                # Authoritative references outrank live views at prune time;
+                # the gate shot sits just below them so it never displaces one.
+                quality=998.0 if gate_only else 999.0,
                 camera_id=getattr(session, "last_seen_camera", "") or "ANPR",
+                gate_only=gate_only,
             )
         except Exception as exc:  # pragma: no cover - disk best-effort
             logger.debug("[gallery] seed for %s failed: %r", plate, exc)
@@ -402,8 +412,19 @@ class VehicleRegistryIdentityMixin:
 
         # Persist the ANPR image as the primary gallery reference so it appears
         # in reference_snapshot_paths (the UI gallery) alongside any future
-        # CAM_03 confirmation images that get added later.
-        self._persist_session_gallery(session, [image], now, primary_snapshot_index=0)
+        # CAM_03 confirmation images that get added later. seed_gallery +
+        # gate_only guarantee the durable vehicle_images/gallery/<plate>/ folder
+        # exists from the moment the car enters — even if the CAM-03 B-entry /
+        # zone confirmation never fires — while keeping the wide gate shot out
+        # of warm-start matching (the ref is gate-flagged in meta.json).
+        self._persist_session_gallery(
+            session,
+            [image],
+            now,
+            primary_snapshot_index=0,
+            seed_gallery=True,
+            gate_only=True,
+        )
 
         evicted_slots: List[str] = []
         with self._lock:
@@ -833,6 +854,7 @@ class VehicleRegistryIdentityMixin:
 
         evicted_slots: List[str] = []
         result_plate: Optional[str] = None
+        confirmed_session = None
         with self._lock:
             live_candidate = self._park_entry_candidates.get(best_candidate.candidate_id)
             if live_candidate is None or live_candidate.status != "provisional":
@@ -1004,10 +1026,24 @@ class VehicleRegistryIdentityMixin:
                 best_score,
             )
             result_plate = session.plate
+            confirmed_session = session
 
         # DB clear off-lock — never hold self._lock across DB I/O.
         for slot_id in evicted_slots:
             self._clear_slot_db_binding(slot_id)
+        # Off-lock: seed the durable per-plate gallery folder with the live
+        # CAM-03 confirmation crop. This is the in-engine counterpart of the
+        # seed in confirm_b1_entrance_by_plate — without it, a car whose
+        # B-entry API push never arrives gets no folder until live-tracking
+        # accumulation happens to pass its quality gates (which it may never).
+        if confirmed_session is not None and prepared_gallery is not None:
+            ordered, feature_vectors, _ = prepared_gallery
+            self._seed_plate_gallery_reference(
+                confirmed_session,
+                ordered,
+                feature_vectors,
+                max(0, min(primary_snapshot_index, len(ordered) - 1)),
+            )
         return result_plate
 
     def confirm_b1_entrance_by_plate(
@@ -1183,11 +1219,24 @@ class VehicleRegistryIdentityMixin:
             session.last_seen_at = now
             session.last_seen_camera = camera_id
             session.last_seen_track_id = track_id
-            return self._apply_session_gallery(
+            applied = self._apply_session_gallery(
                 session,
                 prepared,
                 primary_snapshot_index=primary_snapshot_index,
             )
+
+        # Off-lock: persist the final CAM-03 timeline's primary crop to the
+        # durable per-plate folder, same as the confirm paths — this is often
+        # the best full-view reference the car ever produces.
+        if applied:
+            ordered, feature_vectors, _ = prepared
+            self._seed_plate_gallery_reference(
+                session,
+                ordered,
+                feature_vectors,
+                max(0, min(primary_snapshot_index, len(ordered) - 1)),
+            )
+        return applied
 
     def drop_provisional_binding(self, candidate_id: str) -> None:
         """Remove a failed provisional match."""
@@ -2192,161 +2241,288 @@ class VehicleRegistryIdentityMixin:
         if is_reid_disabled_floor(floor):
             return None
 
+        evicted_slots_to_clear = []
+        result_plate = None
+
         with self._lock:
-            session_id = self._track_session_map.get((camera_id, track_id))
-            if session_id is None:
-                return None
-
-            session = self._sessions.get(session_id)
-            if session is None:
-                return None
-
-            # Refuse to bind a plate whose latest parking_sessions row is
-            # closed — the car has exited the garage (per PMS-AI) and any
-            # further re-id match would be ghost activity. The check fails
-            # open if the DB is unreachable so a blip doesn't strand traffic.
-            if not self.is_plate_inside(session.plate):
-                logger.warning(
-                    "[try_link_to_slot] refused: plate=%s already exited "
-                    "(no open parking_sessions row); skipping bind to %s",
-                    session.plate, slot_id,
-                )
-                return None
-
-            existing = self._parked.get(slot_id)
-            if existing is not None:
-                if existing.session_id == session.session_id:
+            # 1. Skip if slot already locked
+            if slot_id in self._locked_slots:
+                existing = self._parked.get(slot_id)
+                if existing is not None:
                     return existing.plate
-                return existing.plate
+                return None
 
-            # Plate-keyed defence: release any OTHER slot currently held by a
-            # DIFFERENT session for the same plate. Catches the rare case
-            # where two sessions for the same plate end up in _parked (the
-            # 120 s duplicate-session guard at confirm_anpr_session_directly
-            # missed because the prior session was created longer ago, or a
-            # service restart rebuilt _parked from observation). Same-session
-            # moves are handled by the block further down. The engine's slot
-            # state machine will write the slot-free DB event when it next
-            # observes the released slot as empty — same as the same-session
-            # release path below.
-            if session.plate:
-                stale_slots = [
-                    sid
+            # 2. Count other unlocked occupied slots
+            other_unlocked = [
+                sid for sid in self._parked
+                if sid != slot_id and sid not in self._locked_slots
+            ]
+
+            # 3. Determine unique candidate plate values
+            now = self._clock()
+            active_pending_events = [
+                e for e in self._pending_events.values()
+                if e.direction == "entry" and e.status in ("pending", "provisional")
+            ]
+            valid_pending_events = [
+                e for e in active_pending_events
+                if (now - e.timestamp).total_seconds() <= self.PENDING_ANPR_EXPIRY_SECONDS
+            ]
+            unique_candidate_plates = list(set(e.plate for e in valid_pending_events))
+
+            if len(other_unlocked) == 0 and len(unique_candidate_plates) == 1:
+                suggested_plate = unique_candidate_plates[0]
+                plate_locked_elsewhere = any(
+                    s.plate == suggested_plate and sid in self._locked_slots
                     for sid, s in self._parked.items()
-                    if sid != slot_id
-                    and s.session_id != session.session_id
-                    and s.plate == session.plate
-                    and sid not in self._locked_slots  # never release a frozen slot
-                ]
-                for stale_sid in stale_slots:
-                    stale = self._parked.pop(stale_sid, None)
-                    if stale is None:
-                        continue
-                    logger.warning(
-                        "[REGISTRY] Plate %s was already linked to slot %s via "
-                        "stale session %s; releasing it in favour of session %s "
-                        "-> slot %s",
-                        session.plate,
-                        stale_sid,
-                        stale.session_id,
-                        session.session_id,
-                        slot_id,
-                    )
-                    stale.linked_slot = None
-                    stale.linked_slot_name = None
-                    stale.linked_camera = None
-                    stale.linked_floor = None
-                    stale.linked_zone_id = None
-                    stale.linked_zone_name = None
-                    stale.linked_at = None
-                    stale.status = "confirmed"
-
-            # Phase 2 / T2.2 — temporal voting. When enabled, the commit
-            # is gated by ``MatchVoter`` so a single noisy frame cannot
-            # parked-flip a session on its own. The voter returns ``None``
-            # while the buffer is still filling or no plate has won the
-            # K-of-N vote yet; callers in engine_runtime.py:678 / :715
-            # already tolerate ``None`` (rate-gated retry next frame).
-            voter = getattr(self, "_match_voter", None)
-            if voter is not None and self.matching_config.voting_enabled:
-                vote_input = Decision(
-                    verdict="confirm",
-                    reason="try_link_to_slot",
-                    scores={
-                        "plate": session.plate,
-                        "session_id": session.session_id,
-                        "slot_id": slot_id,
-                        "camera_id": camera_id,
-                        "track_id": int(track_id) if track_id is not None else None,
-                    },
                 )
-                commit = voter.submit(camera_id, track_id, vote_input)
-                if commit is None:
-                    logger.debug(
-                        "[try_link_to_slot] voter deferred commit for plate=%s "
-                        "session=%s slot=%s (window not yet decisive)",
-                        session.plate,
-                        session.session_id,
-                        slot_id,
+
+                if not plate_locked_elsewhere:
+                    session_id = self._track_session_map.get((camera_id, track_id))
+                    evicted_slots = self._claim_plate_globally(
+                        plate=suggested_plate,
+                        keep_session_id=session_id,
+                        reason="plate_reclaimed_elsewhere",
+                        timestamp=now,
+                    )
+                    evicted_slots_to_clear.extend(evicted_slots)
+
+                    is_new_session = False
+                    if session_id is None:
+                        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+                        session = VehicleSession(
+                            session_id=session_id,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                            last_seen_camera=camera_id,
+                            last_seen_track_id=track_id,
+                            status="confirmed",
+                        )
+                        is_new_session = True
+                    else:
+                        session = self._sessions.get(session_id)
+                        if session is None:
+                            session = VehicleSession(
+                                session_id=session_id,
+                                first_seen_at=now,
+                                last_seen_at=now,
+                                last_seen_camera=camera_id,
+                                last_seen_track_id=track_id,
+                                status="confirmed",
+                            )
+                            is_new_session = True
+
+                    session_backup = None
+                    if not is_new_session:
+                        session_backup = {
+                            "plate": session.plate,
+                            "status": session.status,
+                            "new_pipeline_score": session.new_pipeline_score,
+                            "old_pipeline_score": session.old_pipeline_score,
+                            "linked_slot": session.linked_slot,
+                            "linked_slot_name": session.linked_slot_name,
+                            "linked_camera": session.linked_camera,
+                            "linked_floor": session.linked_floor,
+                            "linked_zone_id": session.linked_zone_id,
+                            "linked_zone_name": session.linked_zone_name,
+                            "linked_at": session.linked_at,
+                        }
+
+                    try:
+                        session.plate = suggested_plate
+                        session.new_pipeline_score = 1.0
+                        session.old_pipeline_score = 1.0
+                        session.status = "parked"
+                        session.linked_slot = slot_id
+                        session.linked_slot_name = slot_name
+                        session.linked_camera = camera_id
+                        session.linked_floor = floor
+                        session.linked_zone_id = zone_id
+                        session.linked_zone_name = zone_name
+                        session.linked_at = timestamp
+
+                        if is_new_session:
+                            self._sessions[session_id] = session
+                            self._track_session_map[(camera_id, track_id)] = session_id
+
+                        self._gallery_index_upsert(session)
+
+                        self._locked_slots.add(slot_id)
+                        self._parked[slot_id] = session
+                        self._drop_other_track_mappings_for_session(
+                            session_id,
+                            keep=(camera_id, track_id),
+                        )
+
+                        target_event = None
+                        for event in valid_pending_events:
+                            if event.plate == suggested_plate:
+                                target_event = event
+                                break
+                        if target_event is not None:
+                            target_event.status = "confirmed"
+                            target_event.session_id = session_id
+
+                        logger.info(
+                            "[AUTO-LOCK] Auto-locked suggested plate=%s to slot=%s (track=%d, session=%s, reason=%s)",
+                            suggested_plate,
+                            slot_id,
+                            track_id,
+                            session_id,
+                            "single_unlocked_slot_single_pending_plate",
+                        )
+
+                        result_plate = suggested_plate
+
+                    except Exception as e:
+                        if is_new_session:
+                            self._sessions.pop(session_id, None)
+                            self._track_session_map.pop((camera_id, track_id), None)
+                        elif session_backup is not None:
+                            for k, v in session_backup.items():
+                                setattr(session, k, v)
+                            try:
+                                self._gallery_index_upsert(session)
+                            except Exception:
+                                pass
+                        logger.exception("[AUTO-LOCK] Failed during lock transaction: %r", e)
+                        raise e
+
+            if result_plate is None:
+                session_id = self._track_session_map.get((camera_id, track_id))
+                if session_id is None:
+                    return None
+
+                session = self._sessions.get(session_id)
+                if session is None:
+                    return None
+
+                if not self.is_plate_inside(session.plate):
+                    logger.warning(
+                        "[try_link_to_slot] refused: plate=%s already exited "
+                        "(no open parking_sessions row); skipping bind to %s",
+                        session.plate, slot_id,
                     )
                     return None
 
-            # Enforce one-slot-per-vehicle rule: if this session is already
-            # linked to a different slot, remove that old linkage first.
-            if session.linked_slot and session.linked_slot != slot_id:
-                old_slot_id = session.linked_slot
-                # Plate-lock: a session frozen into a locked slot must not be
-                # relocated. A mis-association at another (unlocked) slot would
-                # otherwise pop the locked slot and move the plate — exactly the
-                # drift this feature prevents. Refuse; keep the frozen binding.
-                if old_slot_id in self._locked_slots:
-                    logger.debug(
-                        "[REGISTRY] Refusing to move session %s (plate %s) off "
-                        "LOCKED slot %s to %s — binding frozen.",
-                        session.session_id, session.plate, old_slot_id, slot_id,
+                existing = self._parked.get(slot_id)
+                if existing is not None:
+                    if existing.session_id == session.session_id:
+                        return existing.plate
+                    return existing.plate
+
+                if session.plate:
+                    stale_slots = [
+                        sid
+                        for sid, s in self._parked.items()
+                        if sid != slot_id
+                        and s.session_id != session.session_id
+                        and s.plate == session.plate
+                        and sid not in self._locked_slots
+                    ]
+                    for stale_sid in stale_slots:
+                        stale = self._parked.pop(stale_sid, None)
+                        if stale is None:
+                            continue
+                        logger.warning(
+                            "[REGISTRY] Plate %s was already linked to slot %s via "
+                            "stale session %s; releasing it in favour of session %s "
+                            "-> slot %s",
+                            session.plate,
+                            stale_sid,
+                            stale.session_id,
+                            session.session_id,
+                            slot_id,
+                        )
+                        stale.linked_slot = None
+                        stale.linked_slot_name = None
+                        stale.linked_camera = None
+                        stale.linked_floor = None
+                        stale.linked_zone_id = None
+                        stale.linked_zone_name = None
+                        stale.linked_at = None
+                        stale.status = "confirmed"
+
+                voter = getattr(self, "_match_voter", None)
+                if voter is not None and self.matching_config.voting_enabled:
+                    vote_input = Decision(
+                        verdict="confirm",
+                        reason="try_link_to_slot",
+                        scores={
+                            "plate": session.plate,
+                            "session_id": session.session_id,
+                            "slot_id": slot_id,
+                            "camera_id": camera_id,
+                            "track_id": int(track_id) if track_id is not None else None,
+                        },
                     )
-                    return session.plate
-                logger.info(
-                    "[REGISTRY] Vehicle session %s (plate %s) moving from slot %s to %s",
-                    session.session_id,
+                    commit = voter.submit(camera_id, track_id, vote_input)
+                    if commit is None:
+                        logger.debug(
+                            "[try_link_to_slot] voter deferred commit for plate=%s "
+                            "session=%s slot=%s (window not yet decisive)",
+                            session.plate,
+                            session.session_id,
+                            slot_id,
+                        )
+                        return None
+
+                if session.linked_slot and session.linked_slot != slot_id:
+                    old_slot_id = session.linked_slot
+                    if old_slot_id in self._locked_slots:
+                        logger.debug(
+                            "[REGISTRY] Refusing to move session %s (plate %s) off "
+                            "LOCKED slot %s to %s — binding frozen.",
+                            session.session_id, session.plate, old_slot_id, slot_id,
+                        )
+                        return session.plate
+                    logger.info(
+                        "[REGISTRY] Vehicle session %s (plate %s) moving from slot %s to %s",
+                        session.session_id,
+                        session.plate,
+                        old_slot_id,
+                        slot_id,
+                    )
+                    self._parked.pop(old_slot_id, None)
+
+                session.linked_slot = slot_id
+                session.linked_slot_name = slot_name
+                session.linked_camera = camera_id
+                session.linked_floor = floor
+                session.linked_zone_id = zone_id
+                session.linked_zone_name = zone_name
+                session.linked_at = timestamp
+                session.status = "parked"
+                self._parked[slot_id] = session
+
+                # Detailed Match Performance Logging
+                cfg = self.matching_config
+                flags = {
+                    "CLAHE": cfg.use_lab_clahe,
+                    "MULTISHOT": cfg.use_multishot,
+                    "COLOR_FILTER": cfg.use_color_filter,
+                }
+                match_logger.info(
+                    "MATCH_EVENT | Plate: %s | Slot: %s | Time: %s | "
+                    "NewCost: %.4f | OldCost: %.4f | Flags: %s | "
+                    "GateSnapshots: %s | SlotSnapshot: %s",
                     session.plate,
-                    old_slot_id,
                     slot_id,
+                    timestamp.isoformat(),
+                    session.new_pipeline_score,
+                    session.old_pipeline_score,
+                    flags,
+                    session.gate_snapshot_paths,
+                    snapshot_path or "N/A"
                 )
-                self._parked.pop(old_slot_id, None)
 
-            session.linked_slot = slot_id
-            session.linked_slot_name = slot_name
-            session.linked_camera = camera_id
-            session.linked_floor = floor
-            session.linked_zone_id = zone_id
-            session.linked_zone_name = zone_name
-            session.linked_at = timestamp
-            session.status = "parked"
-            self._parked[slot_id] = session
+                result_plate = session.plate
 
-            # Detailed Match Performance Logging
-            cfg = self.matching_config
-            flags = {
-                "CLAHE": cfg.use_lab_clahe,
-                "MULTISHOT": cfg.use_multishot,
-                "COLOR_FILTER": cfg.use_color_filter,
-            }
-            match_logger.info(
-                "MATCH_EVENT | Plate: %s | Slot: %s | Time: %s | "
-                "NewCost: %.4f | OldCost: %.4f | Flags: %s | "
-                "GateSnapshots: %s | SlotSnapshot: %s",
-                session.plate,
-                slot_id,
-                timestamp.isoformat(),
-                session.new_pipeline_score,
-                session.old_pipeline_score,
-                flags,
-                session.gate_snapshot_paths,
-                snapshot_path or "N/A"
-            )
+        # DB clear off-lock - never hold self._lock across DB I/O.
+        for sid in evicted_slots_to_clear:
+            self._clear_slot_db_binding(sid)
 
-            return session.plate
+        return result_plate
 
     def unlink_slot(self, slot_id: str) -> Optional[str]:
         """

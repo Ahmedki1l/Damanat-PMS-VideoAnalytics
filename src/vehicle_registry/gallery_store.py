@@ -92,11 +92,17 @@ class VehicleGalleryStore:
         quality: float,
         camera_id: str = "",
         timestamp: Optional[datetime] = None,
+        gate_only: bool = False,
     ) -> Optional[str]:
         """Persist one reference (crop + embedding), append to meta, prune to cap.
 
         Returns the crop filename on success, else None. Eviction keeps the
         highest-``quality`` refs when the folder exceeds ``max_refs``.
+
+        ``gate_only`` marks the wide gate-camera ANPR shot: the folder (and the
+        entry photo) exist on disk from the moment the car enters, but the ref
+        is excluded from :meth:`load_vectors` / :meth:`load_crops` so a
+        warm-start can never ReID-match against the untrustworthy gate view.
         """
         if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0 or vector is None:
             return None
@@ -121,15 +127,16 @@ class VehicleGalleryStore:
         meta["updated_at"] = now.isoformat()
         if camera_id:
             meta.setdefault("last_camera", camera_id)
-        meta.setdefault("refs", []).append(
-            {
-                "crop": stem + ".jpg",
-                "vec": stem + ".npy",
-                "quality": float(quality),
-                "camera": camera_id,
-                "ts": now.isoformat(),
-            }
-        )
+        ref = {
+            "crop": stem + ".jpg",
+            "vec": stem + ".npy",
+            "quality": float(quality),
+            "camera": camera_id,
+            "ts": now.isoformat(),
+        }
+        if gate_only:
+            ref["gate"] = True
+        meta.setdefault("refs", []).append(ref)
         self._prune_meta_inplace(d, meta)
         self._write_meta(plate, meta)
         return stem + ".jpg"
@@ -191,14 +198,18 @@ class VehicleGalleryStore:
         """Return (vectors, stored_model_tag). Empty list when absent/unreadable.
 
         Vectors are returned primary-first (highest quality first) so the caller
-        can use ``vectors[0]`` as the session's primary feature.
+        can use ``vectors[0]`` as the session's primary feature. Gate-only refs
+        are excluded — they exist for the folder/photo guarantee, never for
+        matching (see :meth:`save_ref`).
         """
         meta = self._read_meta(plate)
         if not meta:
             return [], None
         d = self._plate_dir(plate)
         refs = sorted(
-            meta.get("refs", []), key=lambda r: r.get("quality", 0.0), reverse=True
+            (r for r in meta.get("refs", []) if not r.get("gate")),
+            key=lambda r: r.get("quality", 0.0),
+            reverse=True,
         )
         vectors: List[np.ndarray] = []
         for r in refs:
@@ -213,13 +224,16 @@ class VehicleGalleryStore:
 
     def load_crops(self, plate: str) -> List[np.ndarray]:
         """Load the reference crop images (highest quality first) for re-embedding
-        when the stored ``model_tag`` no longer matches the running model."""
+        when the stored ``model_tag`` no longer matches the running model.
+        Gate-only refs are excluded, mirroring :meth:`load_vectors`."""
         meta = self._read_meta(plate)
         if not meta:
             return []
         d = self._plate_dir(plate)
         refs = sorted(
-            meta.get("refs", []), key=lambda r: r.get("quality", 0.0), reverse=True
+            (r for r in meta.get("refs", []) if not r.get("gate")),
+            key=lambda r: r.get("quality", 0.0),
+            reverse=True,
         )
         crops: List[np.ndarray] = []
         for r in refs:

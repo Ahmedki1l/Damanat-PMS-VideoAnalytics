@@ -445,16 +445,28 @@ def create_app(
                 # Bind this candidate to the SPECIFIC ANPR event we just
                 # registered — the candidate's image is that plate's own car, so
                 # pairing by identity avoids the FIFO cross-bind that swaps two
-                # cars entering close together. Fall back to FIFO if the event is
-                # no longer bindable (e.g. already confirmed via a race).
-                bound_plate = (
-                    registry.bind_anpr_event_to_candidate(
+                # cars entering close together. When the specific bind fails
+                # (event already confirmed / expired / coalesced), do NOT fall
+                # back to FIFO: this image belongs to THIS plate's car, and
+                # FIFO would attach it to the oldest pending entry — a
+                # different car — cementing exactly the swap the event-specific
+                # bind exists to prevent. FIFO remains only for callers without
+                # an event_id (the plate-less line-crossing / zone-crop paths).
+                if event_id:
+                    bound_plate = registry.bind_anpr_event_to_candidate(
                         candidate.candidate_id, event_id
                     )
-                    if event_id
-                    else None
-                )
-                if not bound_plate:
+                    if not bound_plate:
+                        # Retire the just-opened candidate so it cannot linger
+                        # and match a future B1 confirmation for another car.
+                        registry.drop_provisional_binding(candidate.candidate_id)
+                        print(
+                            f"[API] ANPR-image candidate for plate {plate}: event "
+                            f"{event_id} no longer bindable (already confirmed or "
+                            f"expired) — skipped, NOT falling back to FIFO"
+                        )
+                        return False
+                else:
                     bound_plate = registry.bind_next_pending_anpr_to_candidate(
                         candidate.candidate_id
                     )
