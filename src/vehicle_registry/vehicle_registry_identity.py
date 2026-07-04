@@ -2226,10 +2226,22 @@ class VehicleRegistryIdentityMixin:
             # pool. Floor (not area) is the right granularity: a legitimate
             # reattach is a car moving between aisles on ONE floor.
             query_floor = ""
+            handoff_eligible_ids: set = set()
             if self._area_registry is not None and self._area_registry.enabled:
-                query_floor = self._area_registry.floor(
-                    self._area_registry.area_for_camera(camera_id)
-                )
+                query_area = self._area_registry.area_for_camera(camera_id)
+                query_floor = self._area_registry.floor(query_area)
+                # Cross-floor exception: a car that is genuinely transiting the
+                # inter-floor ramp toward THIS camera's area (departed a
+                # ramp-adjacent area, still inside the transit window) is a
+                # legitimate arrival — the same eligibility the bounded global
+                # matcher uses. Without this the same-floor filter below would
+                # strand the plate on the origin floor when the car drives the
+                # ramp (e.g. B1->RAMP-DN->B2). An unrelated cross-floor car has
+                # no in-transit record, so it stays refused (the B1<->B2 leak).
+                if self._handoff_matcher is not None and query_area:
+                    handoff_eligible_ids = self._handoff_matcher.candidate_session_ids(
+                        query_area, list(self._sessions.values())
+                    )
 
             candidates = [
                 session
@@ -2239,7 +2251,11 @@ class VehicleRegistryIdentityMixin:
                     and session.status in ("confirmed", "parked")
                     and session.plate
                     and session.feature_vector is not None
-                    and (not query_floor or self._session_floor(session) == query_floor)
+                    and (
+                        not query_floor
+                        or self._session_floor(session) == query_floor
+                        or sid in handoff_eligible_ids
+                    )
                     and (
                         (session.last_seen_camera, session.last_seen_track_id)
                         == (camera_id, track_id)

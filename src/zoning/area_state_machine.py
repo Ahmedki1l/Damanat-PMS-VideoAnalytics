@@ -42,6 +42,12 @@ class AreaStateMachine:
         self._areas = area_registry
         self._clock = clock or datetime.now
 
+    def _is_ramp(self, area_id: str) -> bool:
+        """True for a defined inter-floor ramp: it exists in the topology but
+        carries no floor (``floor == ""``). An unknown/blank area is not a
+        ramp."""
+        return bool(area_id) and self._areas.exists(area_id) and not self._areas.floor(area_id)
+
     def on_boundary_cross(self, session, area_from: str, area_to: str) -> None:
         """A boundary connecting two areas was crossed. The boundary's stored
         direction is ``area_from -> area_to``, but the same band can be crossed
@@ -52,7 +58,20 @@ class AreaStateMachine:
             src, dst = area_to, area_from            # reverse crossing
         else:
             src, dst = area_from, area_to            # forward (or unknown area)
-        session.departed_from_area = src or session.current_area
+        # Crossing INTO an inter-floor ramp: record the ramp itself as the
+        # departure area. A ramp with no interior camera (the DOWN ramp: only
+        # entrance/exit bands on the adjacent aisle cameras) never settles a car
+        # into its own area, so ``departed_from_area`` would otherwise stay the
+        # source aisle. But the aisle the car later emerges into is adjacent to
+        # the RAMP, not to that source aisle — so the far-end handoff would never
+        # match. Keying the departure to the ramp lets the emerging aisle
+        # recognise the car as an in-transit arrival off that ramp (and makes the
+        # entrance band's source-aisle label irrelevant). Normal aisle→aisle
+        # crossings keep the source area unchanged.
+        if self._is_ramp(dst):
+            session.departed_from_area = dst
+        else:
+            session.departed_from_area = src or session.current_area
         session.area_state = "IN_TRANSIT"
         session.area_entered_at = self._clock()
         # The car has left the source area — remove it from that area's in-area

@@ -239,11 +239,13 @@ class TestHandoffMatcher(unittest.TestCase):
                                             [within, expired, not_adj, settled])
         self.assertEqual(ids, {"a"})
 
-    def test_cross_floor_handoff_is_excluded(self):
-        """A car handing over through a FLOORLESS inter-floor ramp (production
-        topology) must never enter the other floor's candidate pool — the
-        same-floor-only guarantee. Mirrors config.yaml's RAMP-DN bridging
-        B1-A <-> B2-A."""
+    def test_ramp_transit_admitted_cross_floor(self):
+        """Cross-floor handover IS allowed through a floorless inter-floor ramp
+        — the legitimate B1<->B2 descent/ascent (a car confirmed at the B1 gate
+        drives the ramp to park on B2). Mirrors config.yaml's RAMP-DN bridging
+        B1-A <-> B2-A. (Previously this was refused outright, which stranded the
+        plate on B1; the leak protection now lives in the transit-window +
+        adjacency gating plus the reattach ownership guards.)"""
         cfg = AppConfig()
         cfg.cameras = [
             CameraEntry(id="CAM-03", floor="B1", area="B1-A"),
@@ -257,14 +259,29 @@ class TestHandoffMatcher(unittest.TestCase):
         ]
         hm = CrossAreaHandoffMatcher(AreaRegistry(cfg))
         now = datetime.now()
-        # A car descending from B1: it left the ramp heading into B2-A.
+        # A car descending from B1: it left the ramp heading into B2-A — admitted.
         descending = self._session("x", "IN_TRANSIT", "RAMP-DN", now)
-
-        # Query from B2-A must NOT admit the ramp car (cross-floor).
-        self.assertEqual(hm.candidate_session_ids("B2-A", [descending]), set())
-        # And a car departing B2-A into the ramp must NOT surface on B1-A.
+        self.assertEqual(hm.candidate_session_ids("B2-A", [descending]), {"x"})
+        # And a car ascending toward B1-A is admitted at B1-A.
         ascending = self._session("y", "IN_TRANSIT", "RAMP-DN", now)
-        self.assertEqual(hm.candidate_session_ids("B1-A", [ascending]), set())
+        self.assertEqual(hm.candidate_session_ids("B1-A", [ascending]), {"y"})
+
+    def test_cross_floor_aisle_source_still_refused(self):
+        """The one thing the ramp exception must NOT open: a source that is a
+        real aisle on a DIFFERENT floor is still refused, even if a broken
+        topology declares it directly adjacent. Only a floorless ramp bridges
+        floors."""
+        cfg = AppConfig()
+        cfg.cameras = [CameraEntry(id="CAM-09", floor="B2", area="B2-A")]
+        cfg.areas = [
+            # Pathological: a direct B2-A <-> B1-A adjacency with NO ramp between.
+            AreaEntry("B2-A", "B2 A", "B2", 30, {"B1-A": 20.0}),
+            AreaEntry("B1-A", "B1 A", "B1", 30, {"B2-A": 20.0}),
+        ]
+        hm = CrossAreaHandoffMatcher(AreaRegistry(cfg))
+        now = datetime.now()
+        leaker = self._session("z", "IN_TRANSIT", "B1-A", now)  # B1 aisle source
+        self.assertEqual(hm.candidate_session_ids("B2-A", [leaker]), set())
 
     def test_same_floor_handoff_still_works(self):
         """The floor guard must not disturb within-floor aisle-to-aisle handoff."""

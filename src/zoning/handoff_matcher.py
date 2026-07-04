@@ -59,12 +59,13 @@ class CrossAreaHandoffMatcher:
         if not adjacency:
             return out
 
-        # Same-floor-only handoff: a car that is handing over through an
-        # inter-floor ramp (a floorless area) must never become eligible in
-        # another floor's candidate pool. Admitting only sources on the querying
-        # area's own floor keeps within-floor aisle-to-aisle handoff intact while
-        # guaranteeing a B1 car can never ReID-match a B2 car (or the reverse) —
-        # the cross-floor leak the ramp adjacency edges would otherwise open.
+        # Cross-floor handoff is allowed ONLY through an inter-floor ramp. A
+        # source on the querying area's own floor is a normal within-floor
+        # aisle-to-aisle handoff. A source that is a floorless RAMP is the one
+        # legitimate cross-floor case — a car transiting the ramp between floors;
+        # adjacency already proves the ramp connects to THIS area and the transit
+        # window below bounds it. Any source on a DIFFERENT real floor (an aisle
+        # on the other floor) is refused — that is the B1<->B2 ReID leak.
         query_floor = self._areas.floor(area_id)
 
         now = self._clock()
@@ -75,8 +76,13 @@ class CrossAreaHandoffMatcher:
             transit = adjacency.get(source)
             if transit is None:
                 continue  # not departing from an adjacent area
-            if self._areas.floor(source) != query_floor:
-                continue  # cross-floor (ramp) handoff — never eligible
+            source_floor = self._areas.floor(source)
+            # Block only a DIFFERENT real floor. An empty source_floor means the
+            # source is a floorless ramp (``source`` passed the adjacency check
+            # above, so it is a defined neighbour) — the legitimate cross-floor
+            # transit, which we admit.
+            if source_floor and source_floor != query_floor:
+                continue  # cross-floor aisle-to-aisle — the B1<->B2 leak
             entered = session.area_entered_at
             if entered is None:
                 # No timestamp yet — be permissive and include it.
