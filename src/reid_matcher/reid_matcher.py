@@ -289,7 +289,22 @@ class VehicleReIDMatcher:
         except ImportError:
             self.device = getattr(backend_impl, "device", "cpu")
 
-        pp_status = "ON" if self.preprocessing_config.enabled else "OFF"
+        if self.backend == "openvino":
+            # The OpenVINO path deliberately applies NO CLAHE: the production
+            # IR (e.g. PS_carMatching) is trained and calibrated on raw
+            # squish-resized crops, so luminance normalisation here would
+            # shift embeddings off the trained distribution.
+            # ReIDPreprocessingConfig only affects the torchreid fallback.
+            pp_status = "OFF (model contract: squish, no CLAHE)"
+            if self.preprocessing_config.enabled:
+                logger.info(
+                    "[REID] Note: ReID preprocessing (CLAHE) is configured ON "
+                    "but is NOT applied by the OpenVINO backend — the IR's "
+                    "trained contract is squish-resize without CLAHE. The "
+                    "flag only affects the legacy torchreid fallback."
+                )
+        else:
+            pp_status = "ON" if self.preprocessing_config.enabled else "OFF"
         logger.info(
             "[REID] Active backend: %s (preprocessing=%s, input=%dx%d)",
             self.backend, pp_status,

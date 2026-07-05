@@ -3,6 +3,7 @@ api.py — FastAPI server for ANPR integration and slot status queries.
 
 Endpoints:
   POST /api/anpr/event               — Receive plate + image from ANPR server
+  POST /api/line-crossing            — Receive B1-entry crossing image (CAM-03); crop car; seed ReID
   GET  /api/slots                     — All slot statuses across all cameras
   GET  /api/slots/{floor}             — Slot statuses for a specific floor
   GET  /api/vehicle/{plate}           — Find where a plate is parked
@@ -48,6 +49,25 @@ class ANPREventRequest(BaseModel):
     image_base64: Optional[str] = None  # Base64-encoded JPEG image
     camera_id: Optional[str] = None     # Which ANPR camera sent this
     timestamp: Optional[str] = None     # ISO timestamp (defaults to now)
+
+
+class LineCrossingRequest(BaseModel):
+    """B1-entrance line-crossing image from the external detector (CAM-03),
+    sent after the ANPR event. The entering car is detected, cropped, and used
+    to seed the ReID candidate for the pending plate."""
+    image_base64: str                    # Base64-encoded JPEG of the full CAM-03 frame
+    camera_id: Optional[str] = "CAM-03"  # Camera that produced the crossing
+    plate: Optional[str] = None          # Optional ANPR plate for correlation/logging
+    timestamp: Optional[str] = None      # ISO timestamp (defaults to now)
+
+
+class LineCrossingResponse(BaseModel):
+    """Response after processing a line-crossing image."""
+    status: str
+    plate: Optional[str] = None
+    cropped: bool          # whether a vehicle was detected & cropped
+    bound: bool            # whether it bound to a pending ANPR entry
+    timestamp: str
 
 
 class ANPREventResponse(BaseModel):
@@ -121,6 +141,7 @@ def create_app(
     get_camera_frame=None,
     get_slot_snapshot_source=None,
     get_park_entry_crop=None,
+    detect_vehicle_crop=None,
     get_engine_status=None,
     event_bus: Optional[EventBus] = None,
     db_manager=None,
@@ -322,20 +343,106 @@ def create_app(
         direction: str,
         camera_id: Optional[str] = None,
         image_bytes: Optional[bytes] = None,
+        frame=None,
+        event_id: Optional[str] = None,
     ) -> bool:
+        # B-entry = the CAM-03 B1 confirmation snapshot pushed via the ANPR API
+        # (plate + image). Attach it to the plate's session as the primary ReID
+        # identity reference at B1, rather than opening a new gate candidate.
+        if direction == "B-entry":
+            import cv2
+            import numpy as np
+
+            if frame is None and image_bytes:
+                frame = cv2.imdecode(
+                    np.frombuffer(image_bytes, dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+            if frame is None or frame.size == 0:
+                print(f"[API] B-entry for plate {plate}: no usable image — skipped")
+                return False
+            # Crop to the entering car: the CAM-03 frame is a wide fisheye view
+            # with the car in a corner (+ parked cars in the background), so
+            # embedding the full frame is the dominant cause of low ReID scores.
+            # Store a tight crop instead; fall back to the full frame if the
+            # detector isn't wired or finds nothing.
+            if detect_vehicle_crop is not None:
+                try:
+                    _c = detect_vehicle_crop(frame)
+                    if _c is not None and getattr(_c, "size", 0) > 0:
+                        frame = _c
+                except Exception as _exc:
+                    print(f"[API] B-entry vehicle crop failed: {_exc!r}")
+            session_id = registry.confirm_b1_entrance_by_plate(plate, frame)
+            if session_id:
+                print(
+                    f"[API] CAM-03 B-entry snapshot attached for plate {plate} "
+                    f"-> session {session_id} (primary ReID reference at B1)"
+                )
+                return True
+            print(
+                f"[API] B-entry for plate {plate}: no matching session yet "
+                f"(gate entry not seen?) — snapshot not attached"
+            )
+            return False
+
+        # ramp-entry = the CAM-23 ramp-top snapshot pushed via the ANPR API. Add
+        # it to the plate's session gallery as a SECONDARY appearance reference
+        # (an extra viewpoint for cross-camera ReID) — it does NOT override the
+        # primary B-entry (CAM-03) reference.
+        if direction == "ramp-entry":
+            import cv2
+            import numpy as np
+
+            if frame is None and image_bytes:
+                frame = cv2.imdecode(
+                    np.frombuffer(image_bytes, dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+            if frame is None or frame.size == 0:
+                print(f"[API] ramp-entry for plate {plate}: no usable image — skipped")
+                return False
+            # Crop to the car before storing as a gallery reference (same reason
+            # as B-entry — a wide frame embeds poorly). Fall back to full frame.
+            if detect_vehicle_crop is not None:
+                try:
+                    _c = detect_vehicle_crop(frame)
+                    if _c is not None and getattr(_c, "size", 0) > 0:
+                        frame = _c
+                except Exception as _exc:
+                    print(f"[API] ramp-entry vehicle crop failed: {_exc!r}")
+            session_id = registry.add_gallery_snapshot_by_plate(
+                plate, frame, source_cam=camera_id or "CAM-23",
+            )
+            if session_id:
+                print(
+                    f"[API] CAM-23 ramp-entry snapshot added for plate {plate} "
+                    f"-> session {session_id} (secondary ReID reference)"
+                )
+                return True
+            print(
+                f"[API] ramp-entry for plate {plate}: no matching session yet "
+                f"(gate entry not seen?) — snapshot not added"
+            )
+            return False
+
         if direction != "entry":
             return False
 
-        if image_bytes:
-            import cv2
-            import numpy as np
-            import time
+        import cv2
+        import numpy as np
+        import time
 
+        # Accept either a pre-decoded BGR frame (e.g. an already-cropped car
+        # from the line-crossing endpoint) or raw JPEG bytes to decode here.
+        if frame is None and image_bytes:
             frame = cv2.imdecode(
                 np.frombuffer(image_bytes, dtype=np.uint8),
                 cv2.IMREAD_COLOR,
             )
-            if frame is not None and frame.size > 0:
+
+        if frame is not None:
+            if frame.size > 0:
                 fake_track_id = -int(time.time() * 1000) % 100000
                 candidate = registry.open_park_entry_candidate(
                     camera_id or "ANPR",
@@ -356,9 +463,34 @@ def create_app(
                     if live_candidate is not None:
                         live_candidate.source = "anpr_image"
 
-                bound_plate = registry.bind_next_pending_anpr_to_candidate(
-                    candidate.candidate_id
-                )
+                # Bind this candidate to the SPECIFIC ANPR event we just
+                # registered — the candidate's image is that plate's own car, so
+                # pairing by identity avoids the FIFO cross-bind that swaps two
+                # cars entering close together. When the specific bind fails
+                # (event already confirmed / expired / coalesced), do NOT fall
+                # back to FIFO: this image belongs to THIS plate's car, and
+                # FIFO would attach it to the oldest pending entry — a
+                # different car — cementing exactly the swap the event-specific
+                # bind exists to prevent. FIFO remains only for callers without
+                # an event_id (the plate-less line-crossing / zone-crop paths).
+                if event_id:
+                    bound_plate = registry.bind_anpr_event_to_candidate(
+                        candidate.candidate_id, event_id
+                    )
+                    if not bound_plate:
+                        # Retire the just-opened candidate so it cannot linger
+                        # and match a future B1 confirmation for another car.
+                        registry.drop_provisional_binding(candidate.candidate_id)
+                        print(
+                            f"[API] ANPR-image candidate for plate {plate}: event "
+                            f"{event_id} no longer bindable (already confirmed or "
+                            f"expired) — skipped, NOT falling back to FIFO"
+                        )
+                        return False
+                else:
+                    bound_plate = registry.bind_next_pending_anpr_to_candidate(
+                        candidate.candidate_id
+                    )
                 if bound_plate:
                     # Retrieve gate snapshot paths and bound event_id from the candidate
                     # so the direct session is wired to the same ANPR event record.
@@ -372,9 +504,24 @@ def create_app(
                             )
                             _event_id = live_cand.bound_event_id or ""
 
+                    # Crop the ANPR frame to the car so the held-back reference is
+                    # a tight vehicle crop — the frame is a wide gate shot (road,
+                    # buildings, sun) that embeds poorly. Falls back to the full
+                    # frame if the detector isn't wired or finds nothing. This crop
+                    # is stashed as the session's pending_anpr_vector and only
+                    # promoted to a matchable reference after CAM-03 confirmation.
+                    _anpr_ref = frame
+                    if detect_vehicle_crop is not None:
+                        try:
+                            _car = detect_vehicle_crop(frame)
+                            if _car is not None and getattr(_car, "size", 0) > 0:
+                                _anpr_ref = _car
+                        except Exception as _exc:
+                            print(f"[API] ANPR vehicle crop failed: {_exc!r}")
+
                     registry.confirm_anpr_session_directly(
                         plate=bound_plate,
-                        image=frame,
+                        image=_anpr_ref,
                         event_id=_event_id,
                         candidate_id=candidate.candidate_id,
                         gate_snapshot_paths=_gate_paths,
@@ -575,7 +722,7 @@ def create_app(
         elif event.image_base64 == "":
             img_status = "no (empty string)"
         else:
-            img_status = f"yes ({len(event.image_base64)} base64 chars ≈ {len(event.image_base64)*3//4//1024}KB)"
+            img_status = f"yes ({len(event.image_base64)} base64 chars ~ {len(event.image_base64)*3//4//1024}KB)"
 
         print(f"\n{'='*60}")
         print(f"[API] ANPR EVENT RECEIVED (JSON)")
@@ -600,13 +747,14 @@ def create_app(
             camera_id=event.camera_id,
         )
 
-        print(f"[API] ✓ Plate {record.plate} registered")
+        print(f"[API] [OK] Plate {record.plate} registered")
         
         image_saved = _capture_instant_snapshot(
             record.plate,
             record.direction,
             camera_id=event.camera_id,
             image_bytes=image_bytes,
+            event_id=record.event_id,
         )
 
         return ANPREventResponse(
@@ -645,12 +793,13 @@ def create_app(
             direction=direction,
         )
 
-        print(f"[API] ✓ Plate {record.plate} registered")
+        print(f"[API] [OK] Plate {record.plate} registered")
 
         image_saved = _capture_instant_snapshot(
             record.plate,
             record.direction,
             image_bytes=image_bytes,
+            event_id=record.event_id,
         )
 
         return ANPREventResponse(
@@ -659,6 +808,65 @@ def create_app(
             direction=record.direction,
             image_saved=image_saved,
             timestamp=record.timestamp.isoformat(),
+        )
+
+    @app.post("/api/line-crossing", response_model=LineCrossingResponse)
+    async def line_crossing(event: LineCrossingRequest):
+        """
+        Receive a B1-entrance line-crossing image from the external detector
+        (CAM-03), sent AFTER the ANPR event. We detect & crop the entering car
+        from the frame (it also contains parked cars), then seed the Park_Entry
+        ReID candidate and bind it to the pending plate.
+
+        ``plate`` is optional: when given it is logged for correlation; the
+        crop is bound to the oldest pending ANPR entry either way.
+        """
+        import base64 as _b64
+        import cv2
+        import numpy as np
+
+        print(f"\n{'='*60}")
+        print(f"[API] LINE-CROSSING IMAGE RECEIVED (CAM={event.camera_id})")
+        print(f"[API]   Plate (hint): {event.plate or 'N/A'}")
+        print(f"[API]   Time        : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}")
+
+        if not event.image_base64:
+            raise HTTPException(status_code=400, detail="image_base64 is required")
+        try:
+            frame = cv2.imdecode(
+                np.frombuffer(_b64.b64decode(event.image_base64), dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 image data")
+        if frame is None or frame.size == 0:
+            raise HTTPException(status_code=400, detail="Could not decode image")
+
+        # Detect & crop the entering car (the frame also has parked cars). Fall
+        # back to the whole frame if no detector is wired or nothing is found.
+        crop = None
+        if detect_vehicle_crop is not None:
+            try:
+                crop = detect_vehicle_crop(frame)
+            except Exception as exc:
+                print(f"[API] line-crossing vehicle crop failed: {exc!r}")
+        cropped = crop is not None and getattr(crop, "size", 0) > 0
+        car = crop if cropped else frame
+        print(f"[API]   Vehicle crop: {'yes' if cropped else 'no (using full frame)'}")
+
+        bound = _capture_instant_snapshot(
+            event.plate or "",
+            "entry",
+            camera_id=event.camera_id or "CAM-03",
+            frame=car,
+        )
+        return LineCrossingResponse(
+            status="ok",
+            plate=event.plate,
+            cropped=cropped,
+            bound=bool(bound),
+            timestamp=(event.timestamp or datetime.now().isoformat()),
         )
 
     # ── Slot Status Endpoints ───────────────────────────────

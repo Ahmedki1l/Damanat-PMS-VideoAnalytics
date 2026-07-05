@@ -10,5 +10,5 @@ onnx_opset: 14
 export_timestamp: 2026-06-23T21:18:11.250880+00:00
 input_name: images
 output_name: features
-calibration_dir: ".\Cropped_Vehicles"
+calibration_dir: './Cropped_Vehicles'
 finetuned: true

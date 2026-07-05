@@ -185,6 +185,269 @@ state_machine:
 
 ---
 
+## Zoning (Parking Areas)
+
+Zoning subdivides a floor into **areas** (aisles + ramps) so the ReID matcher
+only searches cars that can physically be where the query is — cheaper *and*
+more accurate. Zoning applies to **B1/B2 only**; Ground floor stays un-zoned.
+
+### The model — three nested levels
+
+```
+floor  (B1)                         ← physical level
+  └─ area  (B1-D, B1-E, B1-F, B1-RAMP)   ← a camera group within the floor
+       └─ cameras  (CAM-03 … CAM-08)      ← each camera belongs to ONE area
+            └─ slots / boundaries          ← drawn per camera
+```
+
+- **area** — a camera group within a floor (e.g. North/Center/South aisle, plus
+  the ramp as its own area). A car has exactly one `current_area` at a time.
+- **camera → area** — every B1/B2 camera is assigned **one** `area`. Its slots
+  inherit that area automatically (you never tag a slot with an area).
+- **boundary** — a polygon across a lane where two areas meet (e.g. a ramp
+  throat). It connects exactly two areas (`area_from → area_to`). Crossing it
+  moves a car between areas. Most cameras need **no** boundary — only the ones
+  that physically see a transition (ramps).
+
+Where data lives at runtime: areas → **`parking_areas`** table, boundaries →
+**`boundaries`** table, slots → **`parking_slots`** table. `config.yaml` is the
+**seed**: on the first run an empty `parking_areas` table is populated from it;
+after that the **database is the source of truth** (edit it with the tool below).
+
+### Setting up zones from zero — step by step
+
+**1. Sketch the areas.** Decide how each floor splits into aisles + ramp(s) and
+which cameras cover each. (One area can have several cameras; a camera belongs
+to one area.)
+
+**2. Define the areas** in `config.yaml` under a top-level `areas:` block:
+
+```yaml
+areas:
+  - area_id: "B1-E"            # unique id; referenced by cameras + adjacency
+    name: "B1 Center Aisle"
+    floor: B1
+    capacity: 30               # physical car limit (soft cap on the gallery)
+    adjacency: { "B1-F": 15, "B1-D": 15 }   # {neighbor: transit_seconds}
+  - area_id: "B1-RAMP"
+    name: "B1 Ramp (Down from B2)"
+    floor: B1
+    capacity: 6
+    adjacency: { "B2-RAMP": 30, "B1-F": 20 }   # the cross-floor link
+  # … one entry per aisle + ramp on B1 and B2
+```
+
+- **`adjacency`** is the topology graph: list each *directly reachable*
+  neighbour and the expected travel time in seconds. It gates the cross-area
+  handoff (a car entering an area is only matched against cars that just left an
+  adjacent area within its transit window). The only inter-floor edge is
+  `B2-RAMP ↔ B1-RAMP`.
+- **`capacity`** bounds how many cars an area's gallery holds.
+
+**3. Assign each camera its area** in `config.yaml` (one line per B1/B2 camera;
+Ground cameras get no `area`):
+
+```yaml
+cameras:
+  - id: "CAM-05"
+    name: "B1 Parking — Camera 05"
+    floor: B1
+    area: "B1-E"          # ← the only zoning field on a camera
+    ip: "10.1.13.64"
+    # …
+```
+
+**4. First run seeds the database.** Start the engine once; an empty
+`parking_areas` table is seeded from the `areas:` block, then becomes
+authoritative:
+
+```bash
+python main.py --config config.yaml
+```
+
+**5. Draw slots** per camera as usual (`python draw_slots.py --camera CAM-05`).
+Slots need no area tag — they inherit the camera's area.
+
+**6. Draw boundaries** only where two areas physically meet (the ramps). In
+`draw_slots.py` press **`b`** to enter BOUNDARY mode, click a thin band across
+the lane (perpendicular to traffic), right-click to finish, then answer the
+prompts:
+
+```
+Enter boundary name (default: boundary_1): ramp_C_to_RAMP
+Boundary FROM area (area_from): B2-C
+Boundary TO area   (area_to):   B2-RAMP
+```
+
+Boundaries render magenta and save to the `boundaries` table. A junction where
+3+ areas meet = draw one band per crossable pair.
+
+`area_from` / `area_to` are **validated** against your configured areas (read
+from the `parking_areas` table): a typo re-prompts with the list of valid area
+ids, a blank entry cancels the boundary, and `area_from == area_to` is rejected.
+
+A single boundary is **bidirectional** — the stored `area_from → area_to` is the
+nominal direction, but a car crossing the *other* way is detected automatically
+from its current area (e.g. a ramp used both down and up). So you draw **one**
+band per gate, not two.
+
+**7. Verify** the wiring:
+
+```bash
+python -c "from src.config import load_config; c=load_config('config.yaml'); \
+print('areas:', [a.area_id for a in c.areas]); \
+print('CAM-05 ->', c.area_for_camera('CAM-05')); \
+print('B1-E adj:', c.adjacency_for('B1-E'))"
+```
+
+### Editing the database after the first seed
+
+Because the DB (not YAML) is authoritative after the first run, edit areas with
+the management tool — see [`tools/manage_areas.py`](#manage_areaspy--areaboundary-db-editor)
+below (list / push from YAML / set a field / delete / re-seed).
+
+### Entry ReID — line-crossing image (CAM-03)
+
+A car enters via the ground ramp; the **ANPR server** sends the plate to
+`POST /api/anpr/event`, then an **external line-crossing detector** sends the
+B1-entrance frame from **CAM-03** to `POST /api/line-crossing`. The engine
+**detects and crops the entering car** from that frame (it also contains parked
+cars), seeds the Park_Entry ReID candidate, and binds it to the pending plate —
+which confirms the car at the B1 entrance, placing it `IN_AREA(B1-A)`.
+
+Send the **full CAM-03 frame** (not a pre-cropped car) as JSON, like the ANPR
+image:
+
+```json
+POST /api/line-crossing
+{
+  "image_base64": "<base64 JPEG of the full CAM-03 frame, no data: prefix>",
+  "camera_id": "CAM-03",     // optional, defaults to CAM-03
+  "plate": "4976RZD",        // optional, the ANPR plate it follows (correlation)
+  "timestamp": "2026-05-17T08:32:29"   // optional ISO, defaults to now
+}
+```
+
+Response: `{ "status": "ok", "plate": ..., "cropped": <bool>, "bound": <bool>, "timestamp": ... }`
+— `cropped` = a vehicle was detected & cropped; `bound` = tied to a pending ANPR
+entry. The vehicle crop is done server-side (largest vehicle in the frame), so
+the sender never needs to crop.
+
+### Notes
+
+- **Ground floor** (CAM-01/CAM-02) has no areas and is unaffected.
+- **Ramps are their own area** — a car is "in" the ramp while on it; the ramp
+  areas are the only link between floors.
+- **Un-zoned fallback:** remove the `areas:` block (and camera `area` fields) and
+  the system runs exactly as before (all-sessions matching).
+- **Camera → area lives in `config.yaml`** for now; reading it from the Gateway
+  cameras table is a planned follow-up.
+
+---
+
+## Production Database Setup
+
+Everything the analytics engine needs in the database. The engine **owns and
+auto-creates** its tables — you never write DDL by hand. The only manual work is
+(1) pointing it at the right DB and (2) moving the geometry you drew on the
+testing PC over to production.
+
+> The camera roster (`cameras` table) is owned by the **API Gateway**, not this
+> service — it is not part of these steps. This service only manages
+> `parking_areas`, `parking_slots`, `boundaries`, and its runtime tables.
+
+### Tables this service creates
+
+| Table | Holds | Seeded from | Authoritative source after first run |
+|-------|-------|-------------|--------------------------------------|
+| `parking_areas` | area defs (capacity, adjacency) | `config.yaml` `areas:` block | the database |
+| `parking_slots` | slot polygons you drew | `draw_slots.py` (writes the DB directly) | the database |
+| `boundaries` | area-crossing polygons you drew | `draw_slots.py` `b` mode | the database |
+| `slot_status`, `alerts`, `camera_feeds`, `config`, `preprocessing_config` | runtime state / events | created empty, filled at runtime | the database |
+
+All of them are created automatically by `Base.metadata.create_all` on the first
+run — including the `parking_slots` column back-fills in `_ensure_schema_updates`.
+There is **no migration step to run**.
+
+### Step-by-step (production bring-up)
+
+**1. Point the engine at the production database.** Edit `database.DATABASE_URL`
+in the production `config.yaml`:
+
+```yaml
+database:
+  DATABASE_URL: "mssql+pyodbc://USER:PASS@DB_HOST:1433/damanat_pms?driver=ODBC+Driver+17+for+SQL+Server&TrustServerCertificate=yes"
+```
+
+The engine auto-creates the database itself if it does not yet exist (see
+`init_db` — it connects to `master` and issues `CREATE DATABASE` when missing),
+so the SQL Server login just needs `dbcreator` (or the DB pre-created with an
+`db_owner` login).
+
+**2. Make sure `config.yaml` has the real `areas:` block and per-camera `area:`
+fields** (see [Zoning](#zoning-parking-areas)). This block seeds `parking_areas`
+on first run.
+
+**3. First run — creates every table and seeds the areas:**
+
+```bash
+python main.py --config config.yaml          # let it start once, then Ctrl-C
+# or, to seed areas without starting the full engine:
+python tools/manage_areas.py push
+```
+
+Verify the areas landed:
+
+```bash
+python tools/manage_areas.py list
+python tools/manage_areas.py boundaries        # empty until step 4
+```
+
+**4. Move the geometry you drew on the testing PC → production.** Slots and
+boundaries live in the DB, so they don't travel with `config.yaml` — use
+[`tools/sync_geometry.py`](#sync_geometrypy--migrate-slotsboundariesareas-between-dbs):
+
+```bash
+# On the TESTING PC (its config.yaml points at the test DB) — dump all floors:
+python tools/sync_geometry.py export --out geometry.json
+
+# Copy geometry.json to the production server, then on PRODUCTION:
+python tools/sync_geometry.py seed --in geometry.json --dry-run   # preview counts
+python tools/sync_geometry.py seed --in geometry.json             # apply (upsert)
+```
+
+This carries **areas + slots + boundaries for both B1 and B2** in one file. The
+seed is an idempotent upsert by primary key, and it resets each slot's runtime
+fields (`is_available`, `last_snapshot_path`) so prod keeps its own live state.
+
+**5. Verify the geometry landed:**
+
+```bash
+python tools/manage_areas.py list          # areas + camera counts
+python tools/manage_areas.py boundaries    # boundaries now populated
+python -c "from src.database import init_db; from src.config import load_config; \
+c=load_config('config.yaml'); s=init_db(c.database.url).SessionLocal(); \
+from src.model.parkingslot import ParkingSlot; \
+print('slots:', s.query(ParkingSlot).count())"
+```
+
+**6. Start the engine for real:**
+
+```bash
+python main.py --config config.yaml
+```
+
+### Updating geometry later
+
+After the first run the **database is authoritative**, not `config.yaml`. To change things in production:
+
+- **Areas** (capacity / adjacency / add / remove): `python tools/manage_areas.py …` (see below).
+- **Slots / boundaries**: re-draw on the testing PC, then re-run the
+  `sync_geometry.py` export → seed from step 4. Use `--floor B1` (or `B2`) to push
+  just one floor, or `--mode replace` to wipe-and-reload a floor cleanly.
+
+---
+
 ## Tools & Utilities
 
 ### `draw_slots.py` — Slot Polygon Drawing Tool
@@ -202,11 +465,59 @@ python draw_slots.py --image snapshot.jpg  # From saved image
 | Key | Mode | Description |
 |-----|------|-------------|
 | *(default)* | **DRAW** | Left-click adds polygon corners, right-click finishes and prompts for a custom slot name |
+| `b` | **BOUNDARY** | Draw an area-to-area crossing band (magenta); on finish, prompts for `area_from` / `area_to`. See [Zoning](#zoning-parking-areas). |
 | `e` | **EDIT** | Drag existing polygon vertices to reposition |
 | `r` | **REMOVE** | Click inside a slot polygon to delete it |
 | `n` | **RENAME** | Click inside a slot, then type a new name in the terminal |
 
 Other keys: `u` = undo last point, `d` = delete last slot, `s` = save & quit, `q` = quit without saving.
+
+Slots save to the `parking_slots` table; boundaries save to the `boundaries` table.
+
+### `manage_areas.py` — Area/Boundary DB Editor
+
+Edits the zoning tables (`parking_areas`, `boundaries`) in the live database.
+`config.yaml` only **seeds** `parking_areas` on the first run — after that the
+database is authoritative, so use this tool to change areas.
+
+```bash
+python tools/manage_areas.py list             # Show areas in the DB (+ camera counts)
+python tools/manage_areas.py boundaries        # Show boundaries in the DB
+python tools/manage_areas.py push              # Apply config.yaml's areas: block to the DB (upsert)
+python tools/manage_areas.py set --id B1-E --capacity 28              # Update one field
+python tools/manage_areas.py set --id B1-E --name "B1 Center" \
+    --floor B1 --capacity 30 --adjacency "B1-F:15,B1-D:15"            # Add/replace an area
+python tools/manage_areas.py delete --id B1-E                        # Remove an area
+python tools/manage_areas.py delete-boundary --id ramp_C_to_RAMP      # Remove a boundary
+python tools/manage_areas.py reseed --yes                            # Wipe + re-seed from config.yaml
+```
+
+Typical workflow after editing `config.yaml`: `python tools/manage_areas.py push`.
+
+### `sync_geometry.py` — Migrate slots/boundaries/areas between DBs
+
+Dumps the authored zoning geometry (`parking_areas`, `parking_slots`,
+`boundaries`) to a portable JSON file on one machine and re-applies it on
+another — the canonical way to push what you drew on the testing PC into
+production. The camera roster is untouched (that's the Gateway's).
+
+```bash
+# Export from the DB this config points at (all floors):
+python tools/sync_geometry.py export --out geometry.json
+python tools/sync_geometry.py export --out b1.json --floor B1     # one floor only
+
+# Seed into the DB this config points at:
+python tools/sync_geometry.py seed --in geometry.json --dry-run   # preview, no writes
+python tools/sync_geometry.py seed --in geometry.json             # upsert by primary key
+python tools/sync_geometry.py seed --in geometry.json --mode replace --floor B1  # wipe+reload a floor
+```
+
+- `--config` picks the DB (default `config.yaml`); `--db-url` overrides it to hit
+  either DB directly if both are reachable from one box.
+- Seeding is an idempotent **upsert by primary key**; runtime-only slot fields
+  (`is_available`, `last_snapshot_path`) are reset so prod keeps its own live state.
+
+See [Production Database Setup](#production-database-setup) for the full bring-up sequence.
 
 ### `grid_view.py` — Multi-Camera Grid Display
 
@@ -402,6 +713,73 @@ python main.py --video parking_video.mp4 --show   # Local video file
 | 1 camera | 4 cores | 4 GB |
 | 6 cameras (one floor) | 6 cores | 8 GB |
 | 12 cameras (full system) | 8+ cores | 8-16 GB |
+
+### CPU Throughput Optimization (INT8 + AMX, 25-camera scale)
+
+For the 25-camera deployment targeting **4–5 fps/camera** on the production
+server (Intel Xeon Silver 4410Y, **16 vCPU**, with `avx512_vnni` + `amx_int8`),
+three levers cut per-frame cost. They are independent — apply them together.
+
+**1. INT8 @ imgsz 320 detection model (AMX path).** The quantized YOLO IR runs
+several × faster than FP32@640 on AMX hardware.
+
+- Build the INT8 IR (already committed as `models/yolo11m_320_int8_openvino_model`,
+  rebuild only to recalibrate):
+  ```bash
+  python tools/export_yolo_int8_openvino.py --calib-dir <full parking-cam frames> --min-side 640
+  ```
+  > Calibration quality affects **accuracy, not speed**. Use full frames from the
+  > actual B1/B2/ground parking cameras for a production-accuracy IR; entry-cam or
+  > mixed frames are fine only for measuring latency.
+- Point the runtime at it via the **DB `Config` table** (the DB is authoritative
+  at runtime, not `config.yaml` — see [Production Database Setup](#production-database-setup)):
+  | DB `Config` field | Value |
+  |---|---|
+  | `model_path` | `models/yolo11m_320_int8_openvino_model` |
+  | `imgsz` | `320` |
+  | `target_fps` | `5` |
+
+**2. Decode throttle.** Unthrottled HEVC decode pulls every camera at full stream
+rate (~21 fps), burning ~10 of 16 cores on decode alone and starving inference.
+Cap it in the **server's `config.yaml`** (this knob is YAML-only — *not* synced
+from the DB):
+```yaml
+processing:
+  max_grab_fps: 6        # ≈ target_fps + headroom; 0 = unthrottled (do NOT use in prod)
+```
+Cleanest production equivalent: lower the NVR **sub-stream FPS to ~6** (avoids the
+benign `Could not find ref with POC` HEVC log spam the sleep-throttle causes).
+> `per_camera_tracker` in `config.yaml` is **dead** (parsed but never read —
+> detection is always a shared model with per-camera ByteTrack state). Safe to delete.
+
+**3. Ground-floor ReID off (automatic, by floor).** Ground-floor cameras run YOLO
+occupancy only — no ReID embedding compute and no plate/identity matching. This is
+gated by floor (`is_reid_disabled_floor`), so any camera on the `Ground` floor is
+covered automatically; identity for ground is established via the external ANPR
+gate plates. No configuration needed.
+
+**Measure the parallel ceiling on the box** (THROUGHPUT mode — what fps/camera is
+achievable once inference is parallelised; on Linux pin cores with `taskset`):
+```bash
+python tools/bench_yolo.py \
+  --model models/yolo11m_320_int8_openvino_model --imgsz 320 \
+  --threads 8 --threads 16 --cameras 23
+```
+
+**Measured impact** (10 B1 cameras, server, steady state):
+
+| Metric | FP32 @ 640, unthrottled | INT8 @ 320, throttled |
+|---|---|---|
+| decode | ~10 cores | ~0.2 cores |
+| `infer` | ~1400–2000 ms | ~200 ms |
+| total / frame | ~1500–2500 ms | ~290 ms |
+
+> **Known limitation:** the pipeline still runs **one inference at a time**
+> (OpenVINO LATENCY mode, serial round-robin), so per-camera fps improves ~5× but
+> does not yet reach 5 fps. Hitting the target needs a **parallel inference pool**
+> (or N per-floor processes via `--floor`); `bench_yolo.py` reports that ceiling.
+> Once detection is cheap, the per-frame CLAHE preprocessing (~55 ms,
+> `preprocessing.detector.enabled`) becomes a meaningful slice worth A/B-testing.
 
 ---
 

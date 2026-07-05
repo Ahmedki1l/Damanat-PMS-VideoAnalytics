@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Boolean, Float, DateTime, JSON
 from sqlalchemy.orm import relationship
 from src.database import Base
 
@@ -17,6 +17,14 @@ class ParkingSlot(Base):
     is_violation_zone = Column(Boolean, default=False)
     reservation_type = Column(String(20), nullable=False, default="GENERAL")
     reserved_for = Column(String(255), nullable=True)
+
+    # Plate-lock runtime binding: the plate frozen onto this slot while a car is
+    # parked. Persisted so the binding survives a restart (see restart recovery
+    # in engine_runtime._load_camera_db_state). Cleared when the slot goes VACANT.
+    current_plate = Column(String(50), nullable=True)
+    plate_confidence = Column(Float, nullable=False, default=0.0)
+    plate_locked = Column(Boolean, nullable=False, default=False)
+    plate_locked_at = Column(DateTime, nullable=True)
 
     statuses = relationship(
         "SlotStatus",          

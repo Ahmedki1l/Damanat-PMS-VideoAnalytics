@@ -22,6 +22,36 @@ logger = logging.getLogger(__name__)
 REID_USE_MULTISHOT = os.getenv("REID_USE_MULTISHOT", "false").lower() == "true"
 REID_USE_COLOR_FILTER = os.getenv("REID_USE_COLOR_FILTER", "false").lower() == "true"
 
+# ANPR burst coalescing: consecutive entry reads on the SAME ANPR camera that
+# arrive within this many seconds of each other are treated as one passing car;
+# the latest plate wins (overwrites the earlier read), even if the plate text
+# differs (e.g. an OCR refinement). Each new read slides the window.
+ANPR_COALESCE_SECONDS = 3.0
+
+# Two burst reads only coalesce when their plate texts are within this many
+# edits of each other. A genuine re-read of the same plate differs by an OCR
+# slip (1-2 characters); a bigger distance means a SECOND car tailgated into
+# the window, and collapsing the two (last-plate-wins) would rename the first
+# car's session to the second car's plate — the burst-coalesce swap vector.
+ANPR_COALESCE_MAX_PLATE_EDITS = 2
+
+
+def _plate_edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance between two plate strings (case-insensitive)."""
+    a = (a or "").strip().upper()
+    b = (b or "").strip().upper()
+    if a == b:
+        return 0
+    if not a or not b:
+        return max(len(a), len(b))
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
 
 class VehicleRegistryCoreMixin:
     def _gc_loop(self) -> None:
@@ -40,7 +70,10 @@ class VehicleRegistryCoreMixin:
         timestamp: Optional[datetime] = None,
     ) -> None:
         """Refresh the last-seen time for a camera-local track binding."""
-        self._track_last_seen[(camera_id, track_id)] = timestamp or self._clock()
+        ts = timestamp or self._clock()
+        self._track_last_seen[(camera_id, track_id)] = ts
+        # Stamp the first sighting once — the entry anchor for match_global_session.
+        self._track_first_seen.setdefault((camera_id, track_id), ts)
 
     def _drop_other_track_mappings_for_session(
         self,
@@ -77,6 +110,7 @@ class VehicleRegistryCoreMixin:
         for key in keys_to_remove:
             self._track_session_map.pop(key, None)
             self._track_last_seen.pop(key, None)
+            self._track_first_seen.pop(key, None)
 
     @property
     def matcher(self):
@@ -244,35 +278,174 @@ class VehicleRegistryCoreMixin:
         )
 
         if direction == "entry":
+            # Re-entry grace: record the latest ANPR entry time for this plate
+            # BEFORE the coalesce/duplicate logic, so every entry sub-path (fresh
+            # event, burst-coalesced re-read, duplicate-ignored) refreshes it.
+            # Pairs with _last_anpr_exit_at (stamped in _handle_exit) so a genuine
+            # exit->re-entry is honored while PMS-AI's open row is still lagging.
+            self._last_anpr_entry_at[plate] = now
+            # Set inside the lock: the pending event to return early (a coalesced
+            # burst or an ignored duplicate), and any slots freed by a burst
+            # rebind eviction. DB clear + early return happen off the lock below.
+            coalesced_event = None
+            evicted_slots: List[str] = []
             with self._lock:
-                for event_id in reversed(self._pending_event_order):
-                    existing = self._pending_events.get(event_id)
-                    if not existing:
-                        continue
-                    if existing.direction != "entry" or existing.plate != plate:
-                        continue
-                    if existing.status not in ("pending", "provisional"):
-                        continue
-                    age = (now - existing.timestamp).total_seconds()
-                    if age <= 600.0:
-                        logger.info(
-                            "[ANPR] Duplicate entry ignored for plate=%s (age=%.1fs, status=%s)",
-                            plate,
-                            age,
-                            existing.status,
-                        )
-                        return existing
+                # Burst coalescing: a rapid re-read on the same ANPR camera
+                # within ANPR_COALESCE_SECONDS is the same passing car — keep the
+                # open burst event and let the latest plate win (overwrite now),
+                # even if the plate text differs. The window slides on each read.
+                if camera_id is not None:
+                    burst_eid = self._last_anpr_entry.get(camera_id)
+                    burst = self._pending_events.get(burst_eid) if burst_eid else None
+                    if (
+                        burst is not None
+                        and burst.direction == "entry"
+                        # "confirmed" is included so a corrected read still
+                        # coalesces when the first read was already bound to a
+                        # session inside the window (bind-now, overwrite-within-3s).
+                        and burst.status in ("pending", "provisional", "confirmed")
+                        and (now - burst.timestamp).total_seconds() <= ANPR_COALESCE_SECONDS
+                        # Only a plausible re-read of the SAME plate coalesces.
+                        # A very different plate inside the window is a second
+                        # car tailgating — it must get its own event, or
+                        # last-plate-wins renames car A's session to car B's
+                        # plate and the two cars swap identities.
+                        and _plate_edit_distance(burst.plate, plate)
+                        <= ANPR_COALESCE_MAX_PLATE_EDITS
+                    ):
+                        old_plate = burst.plate
+                        burst.timestamp = now  # slide the window
+                        if old_plate != plate:
+                            burst.plate = plate
+                            evicted_slots = self._rebind_anpr_plate(
+                                burst.event_id, plate, timestamp=now
+                            )
+                            logger.info(
+                                "[ANPR] Burst re-read on %s: plate %s -> %s (last wins)",
+                                camera_id,
+                                old_plate,
+                                plate,
+                            )
+                        coalesced_event = burst
 
-                self._pending_events[event.event_id] = event
-                self._pending_event_order.append(event.event_id)
-                logger.info("[ANPR] Entry: plate=%s", plate)
+                if coalesced_event is None:
+                    for event_id in reversed(self._pending_event_order):
+                        existing = self._pending_events.get(event_id)
+                        if not existing:
+                            continue
+                        if existing.direction != "entry" or existing.plate != plate:
+                            continue
+                        if existing.status not in ("pending", "provisional"):
+                            continue
+                        age = (now - existing.timestamp).total_seconds()
+                        if age <= 600.0:
+                            logger.info(
+                                "[ANPR] Duplicate entry ignored for plate=%s (age=%.1fs, status=%s)",
+                                plate,
+                                age,
+                                existing.status,
+                            )
+                            coalesced_event = existing
+                            break
+
+                if coalesced_event is None:
+                    self._pending_events[event.event_id] = event
+                    self._pending_event_order.append(event.event_id)
+                    if camera_id is not None:
+                        self._last_anpr_entry[camera_id] = event.event_id
+                    logger.info("[ANPR] Entry: plate=%s", plate)
+
+            # DB clear off-lock — never hold self._lock across DB I/O. Then return
+            # the coalesced/duplicate event early (skipping warm-start, as before).
+            for slot_id in evicted_slots:
+                self._clear_slot_db_binding(slot_id)
+            if coalesced_event is not None:
+                return coalesced_event
         elif direction == "exit":
             self._handle_exit(plate, now)
             logger.info("[ANPR] Exit: plate=%s", plate)
+        elif direction == "B-entry":
+            # The B1 (CAM-03) confirmation snapshot, pushed via the ANPR API as
+            # plate + image. It does NOT open a new pending entry — it confirms
+            # an existing gate read. The image is attached to the plate's session
+            # (and used for ReID) by confirm_b1_entrance_by_plate in the API
+            # layer, which has the decoded frame. Nothing to record here.
+            logger.info("[ANPR] B1 confirmation (CAM-03) snapshot: plate=%s", plate)
         else:
-            raise ValueError(f"Unsupported ANPR direction: {direction}")
+            # Be defensive: an unrecognised direction from the ANPR client must
+            # not 500 the webhook (which would drop the event). Log and no-op.
+            logger.warning("[ANPR] Ignoring unsupported direction %r (plate=%s)", direction, plate)
+
+        # Warm-start: a returning car with a retained gallery is re-loaded now so
+        # ReID can re-identify it immediately on this visit (no-op when disabled,
+        # no folder, or already live). Off the lock — build_session_from_gallery
+        # takes it itself.
+        if direction == "entry" and plate and self.gallery_store is not None:
+            try:
+                self.build_session_from_gallery(plate)
+            except Exception as exc:  # pragma: no cover - warm-start best-effort
+                logger.debug("[gallery] warm-start failed for %s: %r", plate, exc)
 
         return event
+
+    def _rebind_anpr_plate(
+        self, event_id: str, new_plate: str, timestamp: Optional[datetime] = None
+    ) -> List[str]:
+        """Propagate a burst plate overwrite to state already derived from an
+        ANPR event.
+
+        "Bind now, overwrite within 3s" means the first read of a burst may have
+        already produced a confirmed session before the corrected read arrives.
+        This updates the pending event and any session created from it directly,
+        intentionally bypassing ``link_plate_to_session``'s no-overwrite guard
+        (that guard protects ReID-fusion callers, not ANPR self-correction).
+
+        The displayed plate label and any linked-slot label follow ``session.plate``
+        through ``get_display_id_for_track`` / ``get_plate_for_track`` on the next
+        frame, so no direct state-machine poke is needed. In the common case the
+        3s burst completes while the car is still at the gate, before parking.
+
+        Returns the parking ``slot_id``s freed by evicting any stale same-plate
+        session as the corrected plate becomes authoritative; the caller clears
+        those DB rows off-lock (this method does no DB I/O).
+        """
+        now = timestamp or self._clock()
+        released: List[str] = []
+        with self._lock:
+            event = self._pending_events.get(event_id)
+            if event is not None:
+                event.plate = new_plate
+
+            # Prefer the event's recorded session_id; fall back to a scan in case
+            # the session was created via a path that did not back-link it.
+            target_sid = event.session_id if event else None
+            sessions = (
+                [self._sessions[target_sid]]
+                if target_sid and target_sid in self._sessions
+                else [s for s in self._sessions.values() if s.event_id == event_id]
+            )
+            for session in sessions:
+                old = session.plate
+                if old != new_plate:
+                    # The corrected plate is authoritative: evict any OTHER stale
+                    # same-plate session before this one adopts the plate, so one
+                    # plate never holds two active slots.
+                    released.extend(
+                        self._claim_plate_globally(
+                            new_plate,
+                            keep_session_id=session.session_id,
+                            timestamp=now,
+                        )
+                    )
+                session.plate = new_plate
+                self._gallery_index_upsert(session)
+                logger.info(
+                    "[ANPR] Rebound session %s plate %s -> %s (burst last-wins)",
+                    session.session_id,
+                    old,
+                    new_plate,
+                )
+        return released
 
     def _cleanup_stale_data(self, now: datetime):
         """Garbage collection for expired candidates and pending events."""
@@ -284,12 +457,35 @@ class VehicleRegistryCoreMixin:
             ]
             for key in stale_track_keys:
                 self._track_last_seen.pop(key, None)
+                self._track_first_seen.pop(key, None)
+                self._track_view_quality.pop(key, None)
                 session_id = self._track_session_map.pop(key, None)
                 # Also clean up the session's observing_tracks entry
                 if session_id:
                     session = self._sessions.get(session_id)
                     if session and key[0] in session.observing_tracks:
                         del session.observing_tracks[key[0]]
+                        # Keep ownership maps in sync: a camera that no longer
+                        # observes the car cannot keep its score or ownership.
+                        session.observing_scores.pop(key[0], None)
+                        if session.owner_camera == key[0]:
+                            session.owner_camera = None
+
+            # Orphan sweep: match_global_session also stamps _track_first_seen
+            # for query tracks that never bind to a session (so _mark_track_seen
+            # never fires). Those keys have no _track_last_seen twin, so the pass
+            # above never reaches them. Age them out by their own timestamp —
+            # otherwise the dict grows unboundedly, and worse, a stale anchor
+            # survives to silently disable the temporal entry gate if the tracker
+            # later reuses that integer track id for a different car.
+            orphan_first_seen = [
+                key
+                for key, seen_at in self._track_first_seen.items()
+                if key not in self._track_last_seen
+                and (now - seen_at).total_seconds() > self.TRACK_MAPPING_EXPIRY_SECONDS
+            ]
+            for key in orphan_first_seen:
+                self._track_first_seen.pop(key, None)
 
             active_orders = []
             for event_id in self._pending_event_order:
@@ -310,6 +506,30 @@ class VehicleRegistryCoreMixin:
                     else:
                         active_orders.append(event_id)
             self._pending_event_order = active_orders
+
+            # Drop burst pointers whose event has expired/closed so a new read
+            # on that camera starts a fresh burst instead of resurrecting one.
+            # "confirmed" is kept: the 3s window guard still gates coalescing,
+            # and the pointer is overwritten on the next non-coalesced entry.
+            for cam_id, eid in list(self._last_anpr_entry.items()):
+                ev = self._pending_events.get(eid)
+                if ev is None or ev.status not in ("pending", "provisional", "confirmed"):
+                    self._last_anpr_entry.pop(cam_id, None)
+
+            # Prune re-entry-grace stamps far past any useful window (memory
+            # hygiene; a plate this old can never satisfy _has_fresh_reentry).
+            _reentry_ttl = (
+                max(self.REENTRY_DB_GRACE_SECONDS, self.PENDING_ANPR_EXPIRY_SECONDS)
+                + 300
+            )
+            for _plate, _entry_at in list(self._last_anpr_entry_at.items()):
+                _exit_at = self._last_anpr_exit_at.get(_plate, _entry_at)
+                if (
+                    (now - _entry_at).total_seconds() > _reentry_ttl
+                    and (now - _exit_at).total_seconds() > _reentry_ttl
+                ):
+                    self._last_anpr_entry_at.pop(_plate, None)
+                    self._last_anpr_exit_at.pop(_plate, None)
 
             candidates_to_delete = []
             for candidate_id, candidate in self._park_entry_candidates.items():

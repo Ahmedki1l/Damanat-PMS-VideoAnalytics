@@ -29,7 +29,10 @@ from src.database import init_db
 from src.core.engine import ParkingEngine
 from src.vehicle_registry import VehicleRegistry
 from src.repositories.slot_status_repository import SlotStatusRepository
-from src.services.parking_service import sync_slots_from_config
+from src.services.parking_service import (
+    SLOT_TYPE_PARKING,
+    sync_camera_slot_definitions,
+)
 from src.models.state_machine import SlotEvent
 
 def test_full_process():
@@ -58,7 +61,16 @@ def test_full_process():
             zone_id="TEST-ZONE",
             zone_name="TEST-ZONE-NAME"
         )
-        sync_slots_from_config(db_session, [mock_pipeline_slot], floor=1)
+        # sync_slots_from_config was replaced by the per-camera definition
+        # sync; "SLOT_TEST_E2E" classifies as a plain parking slot so the
+        # resolved DB id stays test_slot_id.
+        sync_camera_slot_definitions(
+            db_session,
+            camera_id="CAM-E2E",
+            floor="1",
+            slot_entries=[mock_pipeline_slot],
+            managed_slot_types=(SLOT_TYPE_PARKING,),
+        )
         print(f"[TEST] Mock slot {test_slot_id} created in DB.")
 
     # --- Step 0.1: Register DB Subscriber (The Bridge) ---

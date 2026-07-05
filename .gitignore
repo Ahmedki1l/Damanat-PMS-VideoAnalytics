@@ -119,3 +119,5 @@ test_sse_logic.py
 migrate_slots.py
 
 .claude
+
+graphify-out

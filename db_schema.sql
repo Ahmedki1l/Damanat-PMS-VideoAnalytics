@@ -11,8 +11,8 @@ CREATE TABLE [config] (
     [stream_channel] INT NOT NULL DEFAULT 102,                  -- Enum: 101 (Main), 102 (Sub)
     
     -- Slot reference resolution
-    [slot_ref_width] INT NOT NULL DEFAULT 640,
-    [slot_ref_height] INT NOT NULL DEFAULT 360,
+    [slot_ref_width] INT NOT NULL DEFAULT 1280,
+    [slot_ref_height] INT NOT NULL DEFAULT 720,
     
     -- Detector settings
     [device] VARCHAR(20) NOT NULL DEFAULT 'cpu',                -- Enum: cpu, cuda

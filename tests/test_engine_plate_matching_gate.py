@@ -1,7 +1,6 @@
 """Regression: _update_slot_state must skip plate-related registry calls on
-cameras in IDENTITY_MATCHING_DISABLED_CAMERAS (currently CAM-01, CAM-02), but
-must still call them on cameras that DO participate in identity matching
-(e.g. CAM-03 on B1)."""
+ground-floor cameras (gated by ``is_reid_disabled_floor``), but must still call
+them on cameras that DO participate in identity matching (e.g. CAM-03 on B1)."""
 import importlib.util
 import os
 import sys
@@ -41,7 +40,7 @@ sys.modules.setdefault(
     types.SimpleNamespace(
         sync_slots_from_config=lambda *args, **kwargs: None,
         bootstrap_camera_slots_from_json=lambda *args, **kwargs: None,
-        load_camera_slots=lambda *args, **kwargs: ([], None),
+        load_camera_slots=lambda *args, **kwargs: ([], [], None, []),
     ),
 )
 
@@ -53,7 +52,7 @@ engine_runtime_module = importlib.util.module_from_spec(engine_runtime_spec)
 assert engine_runtime_spec.loader is not None
 engine_runtime_spec.loader.exec_module(engine_runtime_module)
 ParkingEngineRuntimeMixin = engine_runtime_module.ParkingEngineRuntimeMixin
-IDENTITY_MATCHING_DISABLED_CAMERAS = engine_runtime_module.IDENTITY_MATCHING_DISABLED_CAMERAS
+is_reid_disabled_floor = engine_runtime_module.is_reid_disabled_floor
 
 
 class _DummyEngine(ParkingEngineRuntimeMixin):
@@ -107,8 +106,8 @@ def _vehicle_parked_event(engine, cam_id: str, slot_id: str, floor: str):
 
 def test_disabled_camera_skips_plate_registry_calls():
     cam_id = "CAM-01"
-    assert cam_id in IDENTITY_MATCHING_DISABLED_CAMERAS, (
-        "Sanity check: CAM-01 must be in the disabled set"
+    assert is_reid_disabled_floor("Ground Floor"), (
+        "Sanity check: the ground floor must be identity-disabled"
     )
     engine = _DummyEngine()
     engine.pipelines[cam_id] = _build_pipeline("G1", "Ground Floor")
@@ -131,8 +130,8 @@ def test_disabled_camera_skips_plate_registry_calls():
 
 def test_enabled_camera_still_calls_plate_registry():
     cam_id = "CAM-03"
-    assert cam_id not in IDENTITY_MATCHING_DISABLED_CAMERAS, (
-        "Sanity check: CAM-03 must NOT be in the disabled set"
+    assert not is_reid_disabled_floor("B1"), (
+        "Sanity check: B1 must NOT be identity-disabled"
     )
     engine = _DummyEngine()
     engine.pipelines[cam_id] = _build_pipeline("B1_01", "B1")

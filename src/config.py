@@ -7,9 +7,26 @@ Supports both single-camera (legacy) and multi-camera configurations.
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import yaml
+
+
+@dataclass
+class AreaEntry:
+    """
+    A parking *area* — a camera group within a floor (zoning).
+
+    Zoning applies to B1/B2 only. ``adjacency`` maps a neighbouring area_id to
+    the expected transit time (seconds) for a car to travel between the two
+    areas; it gates the cross-area handoff matcher. ``capacity`` is the physical
+    car/plate limit for the area (used as a soft cap on the bounded gallery).
+    """
+    area_id: str = ""
+    name: str = ""
+    floor: str = ""
+    capacity: int = 0
+    adjacency: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -18,9 +35,14 @@ class CameraEntry:
     id: str = ""
     name: str = ""
     floor: str = ""
+    # Parking area this camera covers (zoning). Empty = un-zoned (e.g. Ground
+    # floor gate cameras), which preserves the legacy all-sessions behaviour.
+    area: str = ""
     ip: str = ""
     user: str = ""
     password: str = ""
+    # RTSP port (from the DB cameras table; 554 keeps the legacy default).
+    rtsp_port: int = 554
     slots_file: str = ""
 
 
@@ -30,10 +52,15 @@ class ProcessingConfig:
     mode: str = "round_robin"
     target_fps_per_camera: int = 1
     stream_channel: int = 102  # 101=main(4K), 102=sub(720p)
+    # Cap how often each camera's background grabber decodes a frame (frames/sec).
+    # 0 = unthrottled (decode every frame — the legacy behaviour). Decoding all
+    # streams at full rate when only ~target_fps_per_camera is consumed wastes a
+    # lot of CPU; set this to ~target_fps + a little headroom (e.g. 8) to cut it.
+    max_grab_fps: int = 0
     # Resolution that slot polygons (slots/*.json) were drawn at.
     # The runtime will scale polygon coords from this to the actual stream resolution.
-    slot_ref_width: int = 640
-    slot_ref_height: int = 360
+    slot_ref_width: int = 1280
+    slot_ref_height: int = 720
     # When True, each camera gets its own TrackedDetector so ByteTrack state
     # is not corrupted by round-robin (Ultralytics' persist=True is per-model).
     # False reverts to the legacy single shared tracker (lower RAM, worse IDs).
@@ -81,7 +108,13 @@ class DetectorPreprocessingConfig:
 
 @dataclass
 class ReIDPreprocessingConfig:
-    """Luminance normalization settings for the ReID path."""
+    """Luminance normalization settings for the ReID path.
+
+    NOTE: applies to the legacy torchreid fallback ONLY. The production
+    OpenVINO backend never applies CLAHE — its IRs (e.g. PS_carMatching) are
+    trained and calibrated on raw squish-resized crops, and normalising
+    luminance at inference would shift embeddings off the trained
+    distribution (see VehicleReIDMatcher backend selection logging)."""
     enabled: bool = True
     clip_limit: float = 2.0
     grid_size: tuple = (8, 8)
@@ -156,6 +189,26 @@ class MatchingConfig:
     reattach_default: float = 0.52
     reattach_cross_camera: float = 0.43
 
+    # Abstain-on-ambiguity margin for match_global_session: when the best and
+    # second-best candidates score within this distance of each other, the
+    # match is ambiguous (visually similar cars) and NO session is returned —
+    # a missing label is recoverable on a later frame, a wrong plate is not.
+    # 0 disables the gate.
+    global_match_margin: float = 0.05
+
+    # --- Per-car persistent multi-shot gallery (folder per plate) --------- #
+    # A growing set of quality-gated reference crops+vectors per plate, kept on
+    # disk so a car's appearance profile survives restart and warm-starts a
+    # returning car. All gated by ``gallery_persist_enabled`` — off ⇒ today's
+    # in-memory-only behaviour.
+    gallery_persist_enabled: bool = False
+    gallery_max_refs_per_car: int = 10        # cap crops/vectors per plate folder
+    gallery_retention_days: float = 5.0       # GC folders idle longer than this
+    gallery_min_view_quality: float = 0.9     # full-view gate (see _bbox_view_quality)
+    gallery_min_sharpness: float = 40.0       # reject blurry crops (sharpness_score)
+    gallery_dedup_cosine: float = 0.97        # skip near-duplicate refs
+    gallery_accumulate_interval_s: float = 3.0  # throttle per (plate, camera)
+
     # Legacy multi-feature fallback path (image_matcher.VehicleImageMatcher).
     legacy_color_fallback: float = 0.35
 
@@ -171,6 +224,11 @@ class MatchingConfig:
     # If ReID cosine clears this bar on its own, ensemble agreement is
     # optional (a "solo confirm"). Used by Phase 2 ensemble wiring.
     reid_solo_confirm: float = 0.70
+
+    # Plate-lock bar: a voting-committed plate freezes onto a parked slot when
+    # its ReID score clears this (OR OCR agreement, see engine_runtime). Defaults
+    # to reid_solo_confirm; kept separate so the freeze bar can be tuned alone.
+    lock_confidence: float = 0.70
 
     # --- HSV tolerances for color_compatible() ---
     # Tightened from 25 -> 12 in Phase 2 / T2.1: the learned 11-class color
@@ -238,6 +296,9 @@ class AlertsConfig:
 class AppConfig:
     """Root configuration container."""
     cameras: List[CameraEntry] = field(default_factory=list)
+    # Parking areas (zoning). Empty on un-zoned deployments — every helper and
+    # the bounded matcher degrade to the legacy all-sessions behaviour then.
+    areas: List[AreaEntry] = field(default_factory=list)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
@@ -249,6 +310,10 @@ class AppConfig:
     matching: MatchingConfig = field(default_factory=MatchingConfig)
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
 
+    # Fernet key (urlsafe-base64, 32 bytes) shared with the API Gateway to
+    # decrypt cameras.password_encrypted. Blank = fall back to YAML passwords.
+    cameras_encryption_key: str = ""
+
     # Legacy single-camera support
     video_source: str = ""
     video_target_fps: int = 2
@@ -258,6 +323,32 @@ class AppConfig:
     def is_multi_camera(self) -> bool:
         """True if config has multiple cameras defined."""
         return len(self.cameras) > 0
+
+    # --- Zoning helpers -------------------------------------------------
+    def area_for_camera(self, camera_id: str) -> str:
+        """Return the area_id a camera belongs to, or "" if un-zoned."""
+        for cam in self.cameras:
+            if cam.id == camera_id:
+                return cam.area
+        return ""
+
+    def cameras_in_area(self, area_id: str) -> List[str]:
+        """Return the camera ids assigned to an area."""
+        if not area_id:
+            return []
+        return [cam.id for cam in self.cameras if cam.area == area_id]
+
+    def area_by_id(self, area_id: str) -> Optional[AreaEntry]:
+        """Return the AreaEntry for an area_id, or None if undefined."""
+        for area in self.areas:
+            if area.area_id == area_id:
+                return area
+        return None
+
+    def adjacency_for(self, area_id: str) -> Dict[str, float]:
+        """Return {neighbor_area_id: transit_seconds} for an area (empty if none)."""
+        area = self.area_by_id(area_id)
+        return dict(area.adjacency) if area else {}
 
 
 def load_config(config_path: str = "config.yaml") -> AppConfig:
@@ -285,6 +376,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     if "database" in raw:
         config.database.url = raw["database"].get("DATABASE_URL", "")
 
+    # Fernet key for decrypting cameras.password_encrypted (env overrides YAML).
+    config.cameras_encryption_key = (
+        raw.get("CAMERAS_ENCRYPTION_KEY", "")
+        or os.environ.get("CAMERAS_ENCRYPTION_KEY", "")
+    )
+
     # --- Cameras (multi-camera mode) ---
     if "cameras" in raw:
         for cam_raw in raw["cameras"]:
@@ -292,12 +389,28 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
                 id=cam_raw.get("id", ""),
                 name=cam_raw.get("name", ""),
                 floor=cam_raw.get("floor", ""),
+                area=cam_raw.get("area", ""),
                 ip=cam_raw.get("ip", ""),
                 user=cam_raw.get("user", ""),
                 password=cam_raw.get("password", ""),
                 slots_file=cam_raw.get("slots_file", ""),
             )
             config.cameras.append(cam)
+
+    # --- Areas (zoning; optional — absent on un-zoned deployments) ---
+    if "areas" in raw:
+        for area_raw in raw["areas"] or []:
+            adj_raw = area_raw.get("adjacency", {}) or {}
+            # adjacency: {neighbor_area_id: transit_seconds}
+            adjacency = {str(k): float(v) for k, v in adj_raw.items()}
+            area = AreaEntry(
+                area_id=area_raw.get("area_id", area_raw.get("id", "")),
+                name=area_raw.get("name", ""),
+                floor=area_raw.get("floor", ""),
+                capacity=int(area_raw.get("capacity", 0) or 0),
+                adjacency=adjacency,
+            )
+            config.areas.append(area)
 
     # --- Processing ---
     if "processing" in raw:
@@ -317,6 +430,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         config.processing.per_camera_tracker = bool(p.get(
             "per_camera_tracker", config.processing.per_camera_tracker
+        ))
+        config.processing.max_grab_fps = int(p.get(
+            "max_grab_fps", config.processing.max_grab_fps
         ))
 
     # --- Legacy single-camera support ---
@@ -437,6 +553,33 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.ocr_marginal_low = m.get("ocr_marginal_low", cm.ocr_marginal_low)
         cm.ocr_marginal_high = m.get("ocr_marginal_high", cm.ocr_marginal_high)
         cm.reid_solo_confirm = m.get("reid_solo_confirm", cm.reid_solo_confirm)
+        cm.lock_confidence = m.get("lock_confidence", cm.lock_confidence)
+        cm.global_match_margin = m.get(
+            "global_match_margin", cm.global_match_margin
+        )
+
+        # Per-car persistent gallery
+        cm.gallery_persist_enabled = m.get(
+            "gallery_persist_enabled", cm.gallery_persist_enabled
+        )
+        cm.gallery_max_refs_per_car = m.get(
+            "gallery_max_refs_per_car", cm.gallery_max_refs_per_car
+        )
+        cm.gallery_retention_days = m.get(
+            "gallery_retention_days", cm.gallery_retention_days
+        )
+        cm.gallery_min_view_quality = m.get(
+            "gallery_min_view_quality", cm.gallery_min_view_quality
+        )
+        cm.gallery_min_sharpness = m.get(
+            "gallery_min_sharpness", cm.gallery_min_sharpness
+        )
+        cm.gallery_dedup_cosine = m.get(
+            "gallery_dedup_cosine", cm.gallery_dedup_cosine
+        )
+        cm.gallery_accumulate_interval_s = m.get(
+            "gallery_accumulate_interval_s", cm.gallery_accumulate_interval_s
+        )
 
         # HSV tolerances
         cm.hsv_h_tol = m.get("hsv_h_tol", cm.hsv_h_tol)

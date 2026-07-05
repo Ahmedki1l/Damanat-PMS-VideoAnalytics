@@ -182,3 +182,68 @@ def get_vehicle_current_location(db: Session, plate: str):
     if last_event and last_event.status == "occupied":
         return last_event
     return None
+
+
+def reset_all_slot_plates(db: Session) -> int:
+    """Wipe every plate identity from the parking (VA-local, occupancy intact).
+
+    Nulls the persisted identity columns on every ``parking_slots`` row
+    (``current_plate`` / ``plate_confidence`` / ``plate_locked`` /
+    ``plate_locked_at`` — the fields ``_load_camera_db_state`` restores on boot)
+    and clears the ``plate_number`` on each slot's latest ``slot_status`` row so
+    the live API/UI shows no plate. ``is_available`` / occupancy is left
+    untouched — only identities are cleared.
+
+    Deliberately VA-local: it does NOT call ``pms_api_client.unbind_slot_session``
+    (unlike ``update_current_slot_plate``), so no cross-system side effects.
+
+    Returns the number of slots whose plate binding was cleared.
+    """
+    cleared = 0
+    slots = ParkingSlotRepository.get_all(db)
+    for slot in slots:
+        had_plate = bool(getattr(slot, "current_plate", None))
+        slot.current_plate = None
+        slot.plate_confidence = 0.0
+        slot.plate_locked = False
+        slot.plate_locked_at = None
+
+        latest_status = SlotStatusRepository.get_latest_by_slot(db, slot.slot_id)
+        if latest_status is not None and latest_status.plate_number:
+            latest_status.plate_number = None
+            had_plate = True
+
+        if had_plate:
+            cleared += 1
+
+    db.commit()
+    return cleared
+
+
+def clear_slot_plate_binding(db: Session, slot_id: str) -> bool:
+    """Wipe the plate identity from a single ``parking_slots`` row (VA-local).
+
+    One-slot analogue of :func:`reset_all_slot_plates`: nulls ``current_plate`` /
+    ``plate_confidence`` / ``plate_locked`` / ``plate_locked_at`` (the fields
+    ``_load_camera_db_state`` restores on boot) and clears ``plate_number`` on the
+    slot's latest ``slot_status`` row so the live API/UI shows no plate.
+    Occupancy (``is_available``) is left untouched — only the identity is cleared.
+
+    Deliberately VA-local: does NOT call ``pms_api_client`` (the external session
+    table is out of scope for this eviction). Returns True if the row existed.
+    """
+    slot = ParkingSlotRepository.get_by_id(db, slot_id)
+    if slot is None:
+        return False
+
+    slot.current_plate = None
+    slot.plate_confidence = 0.0
+    slot.plate_locked = False
+    slot.plate_locked_at = None
+
+    latest_status = SlotStatusRepository.get_latest_by_slot(db, slot_id)
+    if latest_status is not None and latest_status.plate_number:
+        latest_status.plate_number = None
+
+    db.commit()
+    return True

@@ -22,10 +22,27 @@ import os
 import sys
 import threading
 
+# Force UTF-8 console output. Windows consoles default to a legacy code page
+# (e.g. cp1252), which renders UTF-8 names like "B1 Parking — Camera 08" as
+# mojibake ("B1 Parking â€” Camera 08"). The names are stored correctly; only
+# the printout was garbled. reconfigure() is a no-op where stdout isn't a
+# regular stream (e.g. already-wrapped pipes), so guard it defensively.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 from src.config import load_config
 from src.core.engine import ParkingEngine
 from src.database import init_db
-from src.services.config_service import ensure_config_initialized, sync_app_config_from_db
+from src.services.config_service import (
+    ensure_areas_initialized,
+    ensure_config_initialized,
+    load_cameras_from_db,
+    sync_app_config_from_db,
+    sync_areas_from_db,
+)
 
 def start_api_server(engine, registry, host="0.0.0.0", port=8000):
     """Start the FastAPI server in a background thread."""
@@ -76,12 +93,43 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
             return True, crop
         return False, None
 
+    def detect_vehicle_crop(frame):
+        """Detect vehicles in a one-off image (e.g. a CAM-03 line-crossing
+        frame) and return the largest vehicle crop — the entering car, which
+        dominates the frame over background/parked cars. Returns None if no
+        vehicle is found. Uses a plain predict (no tracker state mutation)."""
+        try:
+            det = engine.detector
+            results = det.model.predict(
+                frame,
+                conf=det.detector_config.confidence,
+                classes=det.detector_config.classes,
+                imgsz=det.detector_config.imgsz,
+                device=det.device,
+                verbose=False,
+            )
+            if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+                return None
+            xyxy = results[0].boxes.xyxy.cpu().numpy()
+            areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+            x1, y1, x2, y2 = (int(v) for v in xyxy[int(areas.argmax())])
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                return None
+            return frame[y1:y2, x1:x2].copy()
+        except Exception as exc:
+            print(f"[API] detect_vehicle_crop failed: {exc!r}")
+            return None
+
     app = create_app(
         vehicle_registry=registry,
         get_slot_statuses=get_slot_statuses,
         get_camera_frame=get_camera_frame,
         get_slot_snapshot_source=get_slot_snapshot_source,
         get_park_entry_crop=get_park_entry_crop,
+        detect_vehicle_crop=detect_vehicle_crop,
         get_engine_status=engine.get_engine_status,
         event_bus=engine.event_bus,
         db_manager=engine.db_manager,
@@ -121,6 +169,8 @@ Examples:
   python main.py --camera CAM_04 --show           # Single camera with visualization
   python main.py --video sample.mp4 --show        # Legacy single-file mode
   python main.py --show --show-camera CAM_04      # Multi-cam, show one camera
+  python main.py --reset-plates-only              # Wipe all slot plates, then exit
+  python main.py --reset-plates --api             # Clear plates, then run clean
         """,
     )
     parser.add_argument(
@@ -134,6 +184,31 @@ Examples:
     parser.add_argument(
         "--camera", type=str, default=None,
         help="Run only a specific camera by ID (e.g., CAM_04).",
+    )
+    parser.add_argument(
+        "--floor", type=str, default=None,
+        help="Run only the cameras on a given floor (e.g., B1) — for testing "
+             "one floor in isolation. Applies to multi-camera mode.",
+    )
+    parser.add_argument(
+        "--cameras", type=str, default=None,
+        help="Run only a comma-separated subset of cameras by ID (e.g. "
+             "'CAM-03,CAM-04,CAM-05'). Splits a floor across parallel processes "
+             "to raise aggregate FPS (each process is one serial inference "
+             "worker; keep <=6 cameras per process to approach 5 fps/cam). "
+             "Case-insensitive; '_' and '-' are interchangeable. Composes with "
+             "--floor. Applies to multi-camera mode.",
+    )
+    parser.add_argument(
+        "--reset-plates", action="store_true",
+        help="Wipe every slot's plate identity (current_plate / lock + latest "
+             "slot_status plate) at startup, then run with a clean slate. "
+             "Occupancy is left untouched; nothing is restored on next boot. "
+             "VA-local only (does not notify PMS-AI).",
+    )
+    parser.add_argument(
+        "--reset-plates-only", action="store_true",
+        help="Same clear as --reset-plates, then exit without running the engine.",
     )
     parser.add_argument(
         "--show", action="store_true",
@@ -166,15 +241,90 @@ Examples:
     config = load_config(args.config)
     db = init_db(config.database.url)
     db.create_tables()
-    
+
+    # Plate reset: wipe every slot's persisted plate identity so the parking
+    # starts with no plate numbers. Runs before pipelines build, so the fresh
+    # engine also starts with empty in-memory state and _load_camera_db_state
+    # finds nothing to restore. --reset-plates-only clears and exits.
+    if args.reset_plates or args.reset_plates_only:
+        from src.services.slot_status_service import reset_all_slot_plates
+        from src.vehicle_registry.gallery_store import VehicleGalleryStore
+
+        session = db.SessionLocal()
+        try:
+            cleared = reset_all_slot_plates(session)
+            print(f"[RESET] Cleared plate identity on {cleared} slot(s).")
+        finally:
+            session.close()
+        # Also wipe the persisted per-car galleries — otherwise a returning car
+        # would warm-start its just-cleared plate identity back from disk.
+        wiped = VehicleGalleryStore.clear_all(config.output.snapshot_base_dir)
+        print(f"[RESET] Removed {wiped} per-car gallery folder(s).")
+        if args.reset_plates_only:
+            sys.exit(0)
+
     # Initialize Config table if empty
     session = db.SessionLocal()
     try:
         ensure_config_initialized(session, config)
         # Link DB config to runtime app_config
         sync_app_config_from_db(session, config)
+        # Zoning: seed parking_areas from YAML when empty, then make the DB the
+        # runtime source of truth for areas (mirrors the Config flow above).
+        ensure_areas_initialized(session, config)
+        sync_areas_from_db(session, config)
+        # DB-first camera roster (enabled rows from the cameras table); falls
+        # back to YAML cameras when the table is absent/empty. Runs after areas
+        # so a camera's `area` resolves against the synced parking_areas.
+        load_cameras_from_db(session, config)
     finally:
         session.close()
+
+    # Restrict the roster to a single floor when --floor is given. Useful for
+    # bringing up / load-testing one floor (e.g. B1) in isolation without the
+    # full 25-camera deployment. Match is case-insensitive on the floor label.
+    if args.floor:
+        want = args.floor.strip().lower()
+        filtered = [c for c in config.cameras if (c.floor or "").strip().lower() == want]
+        if not filtered:
+            floors = sorted({(c.floor or "").strip() for c in config.cameras})
+            print(f"\n[ERROR] No cameras on floor '{args.floor}'.")
+            print(f"[HINT] Available floors: {floors}")
+            sys.exit(1)
+        config.cameras = filtered
+        print(
+            f"[INFO] --floor {args.floor}: running {len(filtered)} camera(s): "
+            f"{[c.id for c in filtered]}"
+        )
+
+    # Restrict the roster to an explicit camera subset when --cameras is given.
+    # This is the parallel-scaling lever: each process runs one serial inference
+    # worker (~fixed inferences/sec), so fps/camera scales as that budget split
+    # over fewer cameras. Launch several processes (each with its own --cameras
+    # group and --port) to use more cores concurrently. Composes with --floor.
+    if args.cameras:
+        def _norm(cid: str) -> str:
+            return cid.strip().upper().replace("_", "-")
+
+        wanted = [_norm(c) for c in args.cameras.split(",") if c.strip()]
+        by_id = {_norm(c.id): c for c in config.cameras}
+        unknown = [c for c in wanted if c not in by_id]
+        if unknown:
+            print(f"\n[ERROR] Unknown camera id(s) for --cameras: {unknown}")
+            print(f"[HINT] Available: {sorted(by_id)}")
+            sys.exit(1)
+        # Preserve request order, drop duplicates.
+        seen = set()
+        filtered = []
+        for c in wanted:
+            if c not in seen:
+                seen.add(c)
+                filtered.append(by_id[c])
+        config.cameras = filtered
+        print(
+            f"[INFO] --cameras: running {len(filtered)} camera(s): "
+            f"{[c.id for c in filtered]}"
+        )
 
     # Apply CLI overrides
     if args.show:
@@ -188,15 +338,50 @@ Examples:
         print(f"[HINT] Run 'python setup_model.py' first to download the model.")
         sys.exit(1)
 
+    # --- Prime the ReID matcher singleton with the runtime config ---
+    # The matcher is a process-wide singleton. If it is first constructed by a
+    # camera tracker / the registry (which call get_reid_matcher() with no
+    # args) it silently uses MatchingConfig() defaults and ignores config.yaml
+    # — falling back to the slow torchreid ImageNet path. Build it here, once,
+    # with the loaded matching config so the OpenVINO IR (e.g. PS_carMatching)
+    # is actually used.
+    from src.reid_matcher import get_reid_matcher
+    matcher = get_reid_matcher(config.preprocessing.reid, config.matching)
+    print(
+        f"[INFO] ReID matcher backend: {matcher.backend} "
+        f"(model_dir='{config.matching.reid_openvino_model_dir}')"
+    )
+
     # --- Initialize vehicle registry (shared between engine and API) ---
     registry = None
     if args.api:
         from src.vehicle_registry import VehicleRegistry
+        from src.zoning import AreaRegistry
+
+        # Zoning: a read-only camera↔area index built from config. When no areas
+        # are defined it reports enabled=False and the registry stays in legacy
+        # un-zoned mode (area-bounded ReID + per-area ownership are no-ops).
+        area_registry = AreaRegistry(config)
         registry = VehicleRegistry(
             image_dir=config.output.snapshot_base_dir,
+            # Without this the registry silently falls back to MatchingConfig()
+            # DEFAULTS — ignoring every YAML-tuned threshold AND leaving
+            # gallery_persist_enabled at its False default, so no per-plate
+            # gallery folder is ever seeded. Pass the loaded matching config so
+            # the tuned Youden thresholds + gallery persistence actually apply.
+            matching_config=config.matching,
             public_base_url=config.output.public_base_url,
             snapshot_url_prefix=config.output.snapshot_url_prefix,
             gateway_path_prefix=config.output.gateway_path_prefix,
+            area_registry=area_registry,
+            # camera_id → floor, so the identity gate can skip ReID/plate
+            # matching on ground-floor cameras by floor rather than a hardcoded
+            # camera-id set.
+            camera_floors={c.id: c.floor for c in config.cameras},
+            # Best-effort DB handle for clearing a stale slot's plate binding
+            # after an ANPR eviction (_clear_slot_db_binding). Same handle the
+            # engine uses below.
+            db_manager=db,
         )
 
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)

@@ -17,7 +17,7 @@ from src.services.parking_service import (
     load_camera_slots,
 )
 from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
-from src.vehicle_registry.vehicle_registry_identity import IDENTITY_MATCHING_DISABLED_CAMERAS
+from src.vehicle_registry.vehicle_registry_identity import is_reid_disabled_floor
 
 
 logger = logging.getLogger(__name__)
@@ -236,6 +236,51 @@ class ParkingEngineRuntimeMixin:
     # without VA seeing the corresponding ANPR exit event.
     _EXIT_JANITOR_INTERVAL_S = 30.0
 
+    def _restore_vehicle_galleries(self) -> None:
+        """Reload the persisted per-plate gallery for every car still inside the
+        facility (open ``parking_sessions``) so ReID can re-identify it after a
+        restart. Enriches the vectorless sessions created by
+        ``_restore_plate_locks``. No-op when the gallery feature is off or there
+        is no DB."""
+        if not self.db_manager or not self.vehicle_registry:
+            return
+        if getattr(self.vehicle_registry, "gallery_store", None) is None:
+            return
+        try:
+            from sqlalchemy import text as _text
+
+            session = self.db_manager.SessionLocal()
+            try:
+                # Startup restore probe — fail fast rather than hang the boot if
+                # another connection holds a lock on parking_sessions (NOLOCK +
+                # short LOCK_TIMEOUT; see _exit_janitor_tick for rationale).
+                session.execute(_text("SET LOCK_TIMEOUT 3000"))
+                rows = session.execute(
+                    _text(
+                        "SELECT plate_number, floor FROM dbo.parking_sessions WITH (NOLOCK) "
+                        "WHERE status = 'open'"
+                    )
+                ).fetchall()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning("[gallery] restore query failed: %r", exc)
+            return
+
+        restored = 0
+        for row in rows:
+            plate = row[0]
+            floor = row[1] if len(row) > 1 else None
+            if not plate:
+                continue
+            try:
+                if self.vehicle_registry.build_session_from_gallery(plate, floor=floor):
+                    restored += 1
+            except Exception as exc:
+                logger.warning("[gallery] restore failed for plate=%s: %r", plate, exc)
+        if restored:
+            print(f"[INFO] Restored {restored} vehicle gallery(ies) from disk (cars still inside).")
+
     def _exit_janitor_tick(self) -> None:
         """Once per `_EXIT_JANITOR_INTERVAL_S`, find plates VA still has in
         memory whose latest parking_sessions row is closed (per PMS-AI), and
@@ -253,6 +298,18 @@ class ParkingEngineRuntimeMixin:
         if now_ts - last < self._EXIT_JANITOR_INTERVAL_S:
             return
         self._exit_janitor_last_run_at = now_ts
+
+        # Age out per-plate gallery folders idle past the retention TTL (checked
+        # hourly, piggy-backing the janitor cadence). No-op when disabled.
+        store = getattr(self.vehicle_registry, "gallery_store", None)
+        if store is not None:
+            gc_last = getattr(self, "_gallery_gc_last_run_at", 0.0)
+            if now_ts - gc_last > 3600.0:
+                self._gallery_gc_last_run_at = now_ts
+                try:
+                    store.gc(self.config.matching.gallery_retention_days)
+                except Exception as exc:
+                    logger.warning("[gallery] GC failed: %r", exc)
 
         # Snapshot the plates the registry currently holds. Done under the
         # registry's lock-protected accessor (or via a stable copy) so we
@@ -277,6 +334,13 @@ class ParkingEngineRuntimeMixin:
 
             session = self.db_manager.SessionLocal()
             try:
+                # This runs on the main loop thread, so it must never block the
+                # pipeline. LOCK_TIMEOUT makes a lock-blocked read raise (err
+                # 1222) after 3s instead of hanging forever (and un-killably,
+                # since the wait is a native ODBC socket call); the NOLOCK hint
+                # avoids taking shared locks at all. A stale/dirty read is fine —
+                # a plate that just closed is re-checked on the next tick.
+                session.execute(_text("SET LOCK_TIMEOUT 3000"))
                 # One round-trip: get the latest status per plate. Plates
                 # with no rows aren't in the result — those are fine, they
                 # haven't entered yet. `expanding=True` lets SQLAlchemy
@@ -285,7 +349,7 @@ class ParkingEngineRuntimeMixin:
                     "SELECT plate_number, status FROM ("
                     "  SELECT plate_number, status, "
                     "         ROW_NUMBER() OVER (PARTITION BY plate_number ORDER BY entry_time DESC) AS rn "
-                    "  FROM dbo.parking_sessions "
+                    "  FROM dbo.parking_sessions WITH (NOLOCK) "
                     "  WHERE plate_number IN :plates"
                     ") t WHERE rn = 1"
                 ).bindparams(bindparam("plates", expanding=True))
@@ -303,6 +367,17 @@ class ParkingEngineRuntimeMixin:
         purged_at = datetime.now()
         for plate in closed:
             try:
+                # Skip a plate VA itself just saw re-enter: the DB row is still
+                # the old 'closed' one because PMS-AI has not inserted the new
+                # open row yet. Pure in-memory check — no extra DB round-trip.
+                if getattr(self.vehicle_registry, "has_recent_reentry", None) and \
+                        self.vehicle_registry.has_recent_reentry(plate):
+                    logger.debug(
+                        "[exit_janitor] skip purge plate=%s: fresh re-entry "
+                        "within grace (DB open row still lagging)",
+                        plate,
+                    )
+                    continue
                 self.vehicle_registry._handle_exit(plate, purged_at)
                 logger.info(
                     "[exit_janitor] purged in-memory state for plate=%s "
@@ -433,6 +508,7 @@ class ParkingEngineRuntimeMixin:
                 user=camera.user,
                 password=camera.password,
                 slots_file=camera.slots_file,
+                rtsp_port=camera.rtsp_port,
             )
             camera_config.build_rtsp_url(channel=self.config.processing.stream_channel)
             camera_configs.append(camera_config)
@@ -457,11 +533,11 @@ class ParkingEngineRuntimeMixin:
 
     def _free_plates_on_disabled_cameras(self) -> None:
         """One-shot startup cleanup: for cameras whose plate matching is
-        disabled (IDENTITY_MATCHING_DISABLED_CAMERAS — currently the ground
-        floor), clear any plate left bound to one of their slots in
-        ``slot_status`` and notify the PMS API to unbind. The slot's
-        ``is_available`` flag is left untouched — only the plate identity
-        is freed. Idempotent: a no-op if there are no stale bindings."""
+        disabled (ground-floor cameras, via ``is_reid_disabled_floor``), clear
+        any plate left bound to one of their slots in ``slot_status`` and notify
+        the PMS API to unbind. The slot's ``is_available`` flag is left
+        untouched — only the plate identity is freed. Idempotent: a no-op if
+        there are no stale bindings."""
         if not self.db_manager:
             return
         cleared = []
@@ -469,9 +545,8 @@ class ParkingEngineRuntimeMixin:
         try:
             from src.repositories import SlotStatusRepository
 
-            for cam_id in IDENTITY_MATCHING_DISABLED_CAMERAS:
-                pipeline = self.pipelines.get(cam_id)
-                if pipeline is None:
+            for cam_id, pipeline in self.pipelines.items():
+                if not is_reid_disabled_floor(pipeline.floor):
                     continue
                 for slot in pipeline.slots:
                     latest = SlotStatusRepository.get_latest_by_slot(session, slot.id)
@@ -521,11 +596,12 @@ class ParkingEngineRuntimeMixin:
         parking_slots = []
         special_zones = []
         roi_polygon = None
+        boundaries = []
         self._bootstrap_camera_slots_if_needed(camera_config)
         if self.db_manager:
             session = self.db_manager.SessionLocal()
             try:
-                parking_slots, special_zones, roi_polygon = load_camera_slots(
+                parking_slots, special_zones, roi_polygon, boundaries = load_camera_slots(
                     session,
                     camera_id=camera_config.id,
                     ref_resolution=ref_res,
@@ -543,7 +619,19 @@ class ParkingEngineRuntimeMixin:
                 f"{[zone.id for zone in special_zones]}"
             )
 
-        violation_slots, initial_statuses = self._load_camera_db_state(
+        # Zoning: store per-camera boundary polygons (area-to-area crossings).
+        # Consumed by the BoundaryCrossingDetector when zoning is active; with
+        # no boundaries authored this is simply empty (no behaviour change).
+        if not hasattr(self, "boundaries"):
+            self.boundaries = {}
+        self.boundaries[camera_config.id] = {b.id: b for b in boundaries}
+        if boundaries:
+            print(
+                f"[INFO] {camera_config.id} has {len(boundaries)} boundary zone(s): "
+                f"{[(b.id, b.area_from, b.area_to) for b in boundaries]}"
+            )
+
+        violation_slots, initial_statuses, plate_bindings = self._load_camera_db_state(
             parking_slots,
             all_active_slot_ids,
         )
@@ -557,7 +645,56 @@ class ParkingEngineRuntimeMixin:
             initial_statuses=initial_statuses,
             roi_polygon=roi_polygon,
         )
+        # Restart recovery: re-seed persisted plate-lock bindings into the fresh
+        # state machines + registry so a restart doesn't drop or drift plates.
+        self._restore_plate_locks(pipeline, plate_bindings, camera_config.floor)
         return pipeline, parking_slots
+
+    def _restore_plate_locks(self, pipeline, plate_bindings, floor) -> None:
+        """Seed persisted plate bindings (locked or provisional) back into the
+        pipeline's state machines and the registry after a restart.
+
+        Ground floors run occupancy only (ReID disabled) and have no registry
+        bindings — skip them. If the car actually left during downtime, the
+        slot starts OCCUPIED and the normal LEAVING→VACANT debounce clears +
+        unlinks it, so no stale lock survives a departed car.
+        """
+        if not plate_bindings or not self.vehicle_registry:
+            return
+        if is_reid_disabled_floor(floor):
+            return
+        # Slots whose plate was restored from persistence but not yet re-derived
+        # by the (freshly empty) ReID gallery. Protected from the per-frame
+        # "clear on no-match" path so a restart doesn't drop the plate before a
+        # live track re-confirms it; cleared once re-derived or the slot vacates.
+        if not hasattr(self, "_restored_plate_slots"):
+            self._restored_plate_slots = set()
+        now = datetime.now()
+        for slot_id, b in plate_bindings.items():
+            sm = pipeline.state_machines.get(slot_id)
+            if sm is None:
+                continue
+            sm.bind_identity(
+                b["plate"],
+                self._build_slot_snapshot_url(slot_id),
+                confidence=b["confidence"],
+                lock=b["locked"],
+            )
+            self._restored_plate_slots.add(slot_id)
+            self.vehicle_registry.restore_parked_binding(
+                slot_id=slot_id,
+                slot_name=b["slot_name"],
+                plate=b["plate"],
+                confidence=b["confidence"],
+                camera_id=b["camera_id"] or pipeline.camera_id,
+                floor=floor,
+                locked=b["locked"],
+                timestamp=b["locked_at"] or now,
+            )
+            print(
+                f"[RESTORE] slot={slot_id} plate={b['plate']} "
+                f"conf={b['confidence']:.2f} locked={b['locked']}"
+            )
 
     def _bootstrap_camera_slots_if_needed(self, camera_config) -> None:
         if not self.db_manager:
@@ -593,11 +730,15 @@ class ParkingEngineRuntimeMixin:
     def _load_camera_db_state(self, parking_slots, all_active_slot_ids: set):
         violation_slots = set()
         initial_statuses = {}
+        # Restart recovery: persisted plate-lock bindings for occupied slots,
+        # seeded back into the state machines + registry after the pipeline is
+        # built (see _restore_plate_locks). slot_id -> binding dict.
+        plate_bindings = {}
         reserved_for_map = getattr(self, "_reserved_for_map", {})
         special_slots = getattr(self, "_special_slots", set())
 
         if not self.db_manager or not parking_slots:
-            return violation_slots, initial_statuses
+            return violation_slots, initial_statuses, plate_bindings
 
         session = self.db_manager.SessionLocal()
         try:
@@ -618,6 +759,19 @@ class ParkingEngineRuntimeMixin:
                     special_slots.add(db_slot.slot_id)
                 initial_statuses[db_slot.slot_id] = db_slot.is_available
                 all_active_slot_ids.add(db_slot.slot_id)
+
+                # A persisted plate on an occupied slot must be restored so the
+                # API reports it immediately and the first post-restart frame
+                # can't overwrite it with a fresh provisional guess.
+                if (not db_slot.is_available) and getattr(db_slot, "current_plate", None):
+                    plate_bindings[db_slot.slot_id] = {
+                        "plate": db_slot.current_plate,
+                        "confidence": float(getattr(db_slot, "plate_confidence", 0.0) or 0.0),
+                        "locked": bool(getattr(db_slot, "plate_locked", False)),
+                        "locked_at": getattr(db_slot, "plate_locked_at", None),
+                        "slot_name": db_slot.slot_name or db_slot.slot_id,
+                        "camera_id": db_slot.camera_id or "",
+                    }
         except Exception as exc:
             print(f"[ERROR] Failed to load initial slot states from DB: {exc}")
         finally:
@@ -625,7 +779,7 @@ class ParkingEngineRuntimeMixin:
 
         self._reserved_for_map = reserved_for_map
         self._special_slots = special_slots
-        return violation_slots, initial_statuses
+        return violation_slots, initial_statuses, plate_bindings
 
     def _build_floor_camera_groups(self, camera_configs: List[CameraConfig]) -> Dict[str, List[str]]:
         floor_cameras: Dict[str, List[str]] = {}
@@ -652,7 +806,7 @@ class ParkingEngineRuntimeMixin:
 
         camera_special_zones = self.special_zones.get(cam_id, {})
 
-        if cam_id == "CAM-01" and "Park_Entry" in camera_special_zones:
+        if cam_id == "CAM-23" and "Park_Entry" in camera_special_zones:
             self._process_park_entry_zone(
                 cam_id,
                 frame,
@@ -673,20 +827,71 @@ class ParkingEngineRuntimeMixin:
                     confirmation_zone,
                 )
 
-        if cam_id not in ["CAM-01", "CAM-02"] and detections:
+        # Ground-floor cameras run YOLO occupancy only — skip all ReID embedding
+        # compute (TrackingManager feature extraction + global tracking). This
+        # is the core-saving gate; identity for ground is via ANPR plates, not
+        # appearance. Gated by floor so any ground camera is covered, not just a
+        # hardcoded id pair.
+        floor = self.pipelines[cam_id].floor if cam_id in self.pipelines else ""
+        if not is_reid_disabled_floor(floor) and detections:
             if cam_id not in self._tracking_managers:
                 self._tracking_managers[cam_id] = TrackingManager(cam_id)
             tracking_manager = self._tracking_managers[cam_id]
             tracking_manager.process_detections(frame, detections)
             self._process_global_tracking(cam_id, frame, detections, tracking_manager)
+            self._drive_area_state(cam_id, detections)
+
+    def _drive_area_state(self, cam_id: str, detections) -> None:
+        """Feed per-frame observations + boundary crossings to the registry's
+        area state machine so ``current_area`` tracks where each car is.
+
+        No-op unless zoning is enabled (``boundary_crossing_detector`` is built
+        only then).
+
+        Order matters. Boundary geometry is evaluated first so we know which
+        tracks are *currently inside* a band; those are NOT settled — a car in
+        the band is in the ambiguous transition zone and must stay IN_TRANSIT
+        (eligible in both adjacent areas) until it leaves into a confirmed area.
+        Otherwise ``settle_track_area`` would re-settle it into the source area
+        every frame after the one-shot outside→inside crossing, collapsing
+        IN_TRANSIT to a single frame and breaking cross-area handoff.
+        """
+        if self.boundary_crossing_detector is None or not self.vehicle_registry:
+            return
+
+        boundaries = list(self.boundaries.get(cam_id, {}).values())
+        inside_band: set = set()
+        if boundaries:
+            tracks = [(d.track_id, d.bbox) for d in detections if d.track_id != -1]
+            crossings = self.boundary_crossing_detector.detect(
+                cam_id, tracks, boundaries
+            )
+            inside_band = self.boundary_crossing_detector.tracks_inside(cam_id)
+            for crossing in crossings:
+                self.vehicle_registry.apply_boundary_crossing(
+                    cam_id, crossing.track_id, crossing.area_from, crossing.area_to
+                )
+
+        for detection in detections:
+            tid = detection.track_id
+            if tid == -1 or tid in inside_band:
+                continue
+            self.vehicle_registry.settle_track_area(cam_id, tid)
+
+    # Plate-lock: cap on forced dead-zone OCR attempts per slot (§3b), so a
+    # genuinely-unreadable plate doesn't OCR every frame forever.
+    _LOCK_MAX_OCR_ATTEMPTS = 4
 
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
         all_events = []
-        # Ground-floor cameras (CAM-01/CAM-02) host real slots but must not
-        # participate in plate identity matching — they only run occupancy
-        # state machines. Short-circuit here so we don't even ask the
-        # registry; the registry guards remain as defense-in-depth.
-        plate_matching_enabled = cam_id not in IDENTITY_MATCHING_DISABLED_CAMERAS
+        # Per-slot forced-OCR attempt counter (bounded dead-zone pass, §3b).
+        if not hasattr(self, "_forced_ocr_attempts"):
+            self._forced_ocr_attempts = {}
+        # Ground-floor cameras host real slots but must not participate in plate
+        # identity matching — they only run occupancy state machines. Short-
+        # circuit here (by floor) so we don't even ask the registry; the
+        # registry guards remain as defense-in-depth.
+        plate_matching_enabled = not is_reid_disabled_floor(pipeline.floor)
 
         for slot in pipeline.slots:
             state_machine = pipeline.state_machines[slot.id]
@@ -745,25 +950,47 @@ class ParkingEngineRuntimeMixin:
                         track_id=track_id,
                         timestamp=datetime.now(),
                         snapshot_path=snapshot_path,
+                        # Real vacant->occupied transition: the only place the
+                        # single-slot/single-pending-plate auto-lock may fire.
+                        allow_auto_lock=True,
                     )
                     if linked_plate:
                         event.plate_number = linked_plate
                         location = self.vehicle_registry.get_plate_location(linked_plate)
                         if location:
                             event.snapshot_url = location.get("snapshot_url", "")
+                        # Bind the initial plate as PROVISIONAL (unlocked) with its
+                        # confidence; the per-frame resolver upgrades it and locks
+                        # once the confidence/OCR bar is met.
+                        conf = self.vehicle_registry.get_slot_binding_confidence(slot.id)
                         state_machine.bind_identity(
                             linked_plate,
                             self._build_slot_snapshot_url(slot.id),
+                            confidence=conf,
                         )
+                        if self.db_manager:
+                            self._persist_slot_plate_binding(
+                                slot.id, linked_plate, conf, False, cam_id
+                            )
                     else:
                         state_machine.bind_identity(
                             None,
                             self._build_slot_snapshot_url(slot.id),
                         )
                 elif event.event_type == "slot_vacant" and self.vehicle_registry:
+                    # unlink_slot also drops any plate-lock on the slot.
                     plate = self.vehicle_registry.unlink_slot(slot.id)
+                    self._forced_ocr_attempts.pop(slot.id, None)
+                    # Car left — the restored plate is no longer valid for this
+                    # slot; drop restart-stickiness so a new car is resolved fresh.
+                    if getattr(self, "_restored_plate_slots", None):
+                        self._restored_plate_slots.discard(slot.id)
                     if plate:
                         event.plate_number = plate
+                    if self.db_manager:
+                        self._persist_slot_plate_binding(
+                            slot.id, None, 0.0, False, cam_id
+                        )
 
             if (
                 self.vehicle_registry
@@ -772,36 +999,9 @@ class ParkingEngineRuntimeMixin:
                 and pipeline.state_machines[slot.id].state
                 in (SlotState.OCCUPIED, SlotState.LEAVING)
             ):
-                previous_plate = pipeline.state_machines[slot.id].plate_number
-                plate = self.vehicle_registry.try_link_to_slot(
-                    slot_id=slot.id,
-                    slot_name=slot.label,
-                    zone_id=slot.zone_id,
-                    zone_name=slot.zone_name,
-                    camera_id=cam_id,
-                    floor=pipeline.floor,
-                    track_id=track_id,
-                    timestamp=datetime.now(),
+                self._resolve_locked_plate(
+                    cam_id, frame, pipeline, slot, state_machine, track_id, detection
                 )
-                if plate:
-                    state_machine.bind_identity(
-                        plate,
-                        self._build_slot_snapshot_url(slot.id),
-                    )
-                    if self.db_manager and plate != previous_plate:
-                        self._persist_late_slot_plate(slot.id, plate, cam_id)
-                elif previous_plate:
-                    # Registry says no plate (moved or unlinked), but machine has one.
-                    # Clear it to avoid ghost labels in the UI. Also evict any
-                    # stale `_parked` entry so `/api/slots` (which reads from
-                    # registry.get_slot_plate) stops returning the old plate.
-                    state_machine.bind_identity(
-                        None,
-                        self._build_slot_snapshot_url(slot.id),
-                    )
-                    self.vehicle_registry.unlink_slot(slot.id)
-                    if self.db_manager:
-                        self._persist_late_slot_plate(slot.id, None, cam_id)
             elif (
                 self.vehicle_registry
                 and vehicle_in_slot
@@ -825,6 +1025,191 @@ class ParkingEngineRuntimeMixin:
             all_events.extend(events)
 
         return all_events
+
+    def _resolve_locked_plate(
+        self, cam_id, frame, pipeline, slot, state_machine, track_id, detection
+    ) -> None:
+        """Per-frame provisional→lock resolution for an OCCUPIED/LEAVING slot.
+
+        - If the slot is already LOCKED: freeze — do nothing (the plate cannot
+          change until the slot goes VACANT).
+        - Else resolve a voting-gated candidate and UPGRADE the bound plate only
+          to a strictly-higher-confidence reading (never downgrade to a weaker
+          different plate).
+        - LOCK when the plate is voting-committed AND (ReID >= lock_confidence
+          OR the bounded forced-OCR pass has OCR-confirmed the plate, §3b).
+        """
+        registry = self.vehicle_registry
+        # Freeze: a locked slot is never re-resolved. This is the engine-side
+        # half of the freeze; the registry refuses to relocate/clear it too.
+        if state_machine.is_plate_locked():
+            return
+
+        lock_conf = registry.matching_config.lock_confidence
+
+        previous_plate = state_machine.plate_number
+        plate = registry.try_link_to_slot(
+            slot_id=slot.id,
+            slot_name=slot.label,
+            zone_id=slot.zone_id,
+            zone_name=slot.zone_name,
+            camera_id=cam_id,
+            floor=pipeline.floor,
+            track_id=track_id,
+            timestamp=datetime.now(),
+            # Per-frame resolver for an ALREADY-occupied slot: never auto-lock
+            # here, or a slot occupied since startup would grab the next
+            # arrival's pending plate at conf 1.0 (the B25=LLJ-9005 bug).
+            allow_auto_lock=False,
+        )
+
+        if not plate:
+            # Restart stickiness: a plate restored from persistence has no
+            # gallery/track backing yet, so try_link_to_slot returns None on the
+            # first frames. Keep the restored plate on the still-occupied slot
+            # rather than dropping it — the whole point of persistence. It stays
+            # correctable (OCR/ReID can still upgrade it below once the car is
+            # re-identified) and is cleared only when the slot goes VACANT.
+            if previous_plate and slot.id in getattr(self, "_restored_plate_slots", ()):
+                return
+            # Registry says no plate (moved/unlinked, or the voter is still
+            # deferring). Only clear a PROVISIONAL binding — a locked one already
+            # returned above — to avoid ghost labels in the UI / API.
+            if previous_plate:
+                state_machine.bind_identity(
+                    None, self._build_slot_snapshot_url(slot.id)
+                )
+                registry.unlink_slot(slot.id)
+                self._forced_ocr_attempts.pop(slot.id, None)
+                if self.db_manager:
+                    self._persist_slot_plate_binding(
+                        slot.id, None, 0.0, False, cam_id
+                    )
+            return
+
+        # A live track re-derived a plate for this slot — it is now backed by
+        # the running registry, so drop the restart-stickiness protection and
+        # let normal clear/upgrade behaviour resume.
+        if getattr(self, "_restored_plate_slots", None):
+            self._restored_plate_slots.discard(slot.id)
+
+        new_conf = registry.get_slot_binding_confidence(slot.id)
+
+        # Upgrade-only: accept the first binding, a same-plate refresh (keep the
+        # higher score), or a strictly-more-confident different plate. Never
+        # downgrade to a weaker different plate — that is the drift we prevent.
+        if plate == previous_plate:
+            conf = max(new_conf, state_machine.plate_confidence)
+            state_machine.bind_identity(
+                plate, self._build_slot_snapshot_url(slot.id), confidence=conf
+            )
+        elif not previous_plate or new_conf > state_machine.plate_confidence:
+            conf = new_conf
+            state_machine.bind_identity(
+                plate, self._build_slot_snapshot_url(slot.id), confidence=conf
+            )
+            if self.db_manager:
+                self._persist_slot_plate_binding(
+                    slot.id, plate, conf, False, cam_id
+                )
+        else:
+            # Weaker different plate — keep the current provisional binding.
+            return
+
+        # §3b forced OCR: any parked provisional slot below the lock bar would
+        # never lock on ReID alone. Force a bounded OCR pass to break the tie so
+        # the slot can lock via the OCR arm. This covers the "dead zone" above
+        # the marginal band AND cars confirmed at low ReID via the OCR ensemble
+        # (which would otherwise be stuck provisional forever). The pass only
+        # confirms when OCR *agrees with the already-bound plate*, so it's a
+        # strong signal independent of the ReID score; capped per slot to bound
+        # cost. Cars already at/above the bar lock via ReID without any OCR.
+        ocr_ok = registry.get_slot_ocr_confirmed(slot.id)
+        if (
+            not ocr_ok
+            and detection is not None
+            and new_conf < lock_conf
+        ):
+            attempts = self._forced_ocr_attempts.get(slot.id, 0)
+            if attempts < self._LOCK_MAX_OCR_ATTEMPTS:
+                self._forced_ocr_attempts[slot.id] = attempts + 1
+                crop = self._bbox_crop(frame, detection)
+                if crop is not None:
+                    ocr_ok = registry.try_ocr_confirm_slot(slot.id, crop)
+                    if ocr_ok:
+                        # The OCR pass may have CORRECTED the binding (rebind
+                        # on confident mismatch) — re-read the slot's plate so
+                        # the lock below freezes the corrected identity, not
+                        # the stale local `plate`.
+                        corrected = registry.get_slot_plate(slot.id)
+                        if corrected and corrected != plate:
+                            plate = corrected
+                            new_conf = registry.get_slot_binding_confidence(slot.id)
+
+        # Lock gate. `plate` being non-None already means the voter committed
+        # (try_link_to_slot is voting-gated), so this is "voting AND (ReID bar
+        # OR OCR)".
+        if new_conf >= lock_conf or ocr_ok:
+            state_machine.bind_identity(
+                plate,
+                self._build_slot_snapshot_url(slot.id),
+                confidence=new_conf,
+                lock=True,
+            )
+            registry.lock_slot(slot.id)
+            self._forced_ocr_attempts.pop(slot.id, None)
+            # Evidence: persist the highest-confidence car crop as the slot
+            # snapshot at the moment of lock.
+            if detection is not None:
+                crop_name = self._save_car_crop(frame, detection, plate, cam_id)
+                if crop_name:
+                    self._persist_slot_snapshot_path(slot.id, crop_name)
+            if self.db_manager:
+                self._persist_slot_plate_binding(
+                    slot.id, plate, new_conf, True, cam_id
+                )
+
+    def _bbox_crop(self, frame, detection):
+        """Return a padded BGR crop of ``detection.bbox`` (or None) — used to
+        feed the forced-OCR pass without writing to disk."""
+        try:
+            x1, y1, x2, y2 = [int(v) for v in detection.bbox]
+            h, w = frame.shape[:2]
+            pad_x = int((x2 - x1) * 0.1)
+            pad_y = int((y2 - y1) * 0.1)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(w, x2 + pad_x)
+            y2 = min(h, y2 + pad_y)
+            crop = frame[y1:y2, x1:x2]
+            return crop if crop.size > 0 else None
+        except Exception:
+            return None
+
+    def _persist_slot_plate_binding(
+        self, slot_id: str, plate, confidence: float, locked: bool, camera_id: str
+    ) -> None:
+        """Persist the plate-lock binding onto the ``parking_slots`` row so it
+        survives a restart (read back by _load_camera_db_state)."""
+        if not self.db_manager:
+            return
+        session = self.db_manager.SessionLocal()
+        try:
+            from src.repositories import ParkingSlotRepository
+
+            db_slot = ParkingSlotRepository.get_by_id(session, slot_id)
+            if db_slot is None:
+                return
+            db_slot.current_plate = plate or None
+            db_slot.plate_confidence = float(confidence or 0.0)
+            db_slot.plate_locked = bool(locked)
+            db_slot.plate_locked_at = datetime.now() if locked else None
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            print(f"[ERROR] Failed to persist slot plate binding for {slot_id}: {exc}")
+        finally:
+            session.close()
 
     def _persist_late_slot_plate(self, slot_id: str, plate: str, camera_id: str) -> None:
         session = self.db_manager.SessionLocal()

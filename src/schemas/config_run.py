@@ -53,8 +53,8 @@ class ConfigSchema(BaseModel):
     target_fps: int = 20
     processing_mode: ProcessingModeEnum = ProcessingModeEnum.ROUND_ROBIN
     stream_channel: StreamChannelEnum = StreamChannelEnum.SUB
-    slot_ref_width: int = 640
-    slot_ref_height: int = 360
+    slot_ref_width: int = 1280
+    slot_ref_height: int = 720
     
     device: DeviceEnum = DeviceEnum.CPU
     model_path: str

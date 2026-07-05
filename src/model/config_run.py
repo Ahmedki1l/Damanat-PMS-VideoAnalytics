@@ -34,8 +34,8 @@ class Config(Base):
     )
 
     # Slot reference resolution
-    slot_ref_width = Column(Integer, nullable=False, default=640)
-    slot_ref_height = Column(Integer, nullable=False, default=360)
+    slot_ref_width = Column(Integer, nullable=False, default=1280)
+    slot_ref_height = Column(Integer, nullable=False, default=720)
 
     # =========================
     # Detector

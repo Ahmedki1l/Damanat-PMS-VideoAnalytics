@@ -160,7 +160,13 @@ class TestDuplicateSlotFix(unittest.TestCase):
             "There should only be ONE parked entry for the plate",
         )
         self.assertIsNone(stale.linked_slot, "Stale session's linked_slot must be cleared")
-        self.assertEqual(stale.status, "confirmed")
+        # The ANPR chokepoint (_claim_plate_globally, wired into
+        # confirm_at_b1_entrance) now force-evicts the stale same-plate session
+        # at confirmation time — a stronger guarantee than the old
+        # try_link_to_slot release, which left it "confirmed" but slot-less. The
+        # stale session is fully closed and removed from the live registry.
+        self.assertEqual(stale.status, "exited")
+        self.assertNotIn(stale_session_id, self.registry._sessions)
 
 
 if __name__ == "__main__":

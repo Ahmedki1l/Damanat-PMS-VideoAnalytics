@@ -23,7 +23,9 @@ from src.core.engine.engine_visualization import ParkingEngineVisualizationMixin
 from src.detection.tracker import TrackedDetector
 from src.events.event_bus import EventBus
 from src.models.slot import load_slots
+from src import perf_trace
 from src.services.parking_service import load_camera_slots
+from src.zoning import AreaRegistry, BoundaryCrossingDetector
 
 logger = logging.getLogger(__name__)
 
@@ -47,21 +49,22 @@ class ParkingEngine(
         self.vehicle_registry = vehicle_registry
         self.db_manager = db_manager
 
-        # Per-camera tracker: one TrackedDetector per camera so Ultralytics'
-        # persist=True ByteTrack state isn't shared across round-robin cameras
-        # (which makes it think every cycle the scene "teleports" and drops IDs).
-        # The shared-detector fallback stays available for low-RAM deployments.
-        self._shared_detector: Optional[TrackedDetector] = None
-        self._per_camera_detectors: Dict[str, TrackedDetector] = {}
-        if not config.processing.per_camera_tracker:
-            self._shared_detector = self._build_tracked_detector()
-            print("[INFO] Using single shared tracker across all cameras.")
-        else:
-            print("[INFO] Using per-camera tracker (one TrackedDetector instance per camera).")
+        # Detection / tracking are decoupled: ONE shared detection model (one
+        # set of weights / one OpenVINO compiled model → RAM stays flat at 27
+        # cameras), while ByteTrack *state* is kept per camera inside the
+        # TrackedDetector (keyed by camera_id). This gives both low RAM and
+        # stable per-camera track IDs — round-robin frames from different
+        # cameras no longer corrupt each other's tracker state.
+        self._shared_detector: Optional[TrackedDetector] = self._build_tracked_detector()
+        print("[INFO] Shared detection model + per-camera tracker state (decoupled).")
         self.event_bus = EventBus(log_file=config.output.log_file)
 
         self.pipelines: Dict[str, CameraPipeline] = {}
         self.special_zones: Dict[str, Dict] = {}
+        # camera_id -> {boundary_id: BoundaryZone}. Populated when pipelines load
+        # DB boundaries; initialized here so zoning hooks (_drive_area_state) are
+        # a safe no-op before/without any boundary polygons.
+        self.boundaries: Dict[str, Dict] = {}
         self._park_entry_track_to_candidate: Dict[int, str] = {}
         self._tracks_inside_zones: Dict[tuple, set] = {}
         self._confirmation_bursts: Dict[tuple, Dict] = {}
@@ -79,6 +82,10 @@ class ParkingEngine(
 
         self._frame_count = 0
         self._start_time = 0.0
+        # Window markers for the periodic effective-FPS readout: frame count
+        # and timestamp captured at the previous summary.
+        self._last_summary_frame = 0
+        self._last_summary_ts = 0.0
         self._reid_check_timer: Dict[tuple, float] = {}
         self._tracking_managers: Dict[str, object] = {}
         self._display_label_cache: Dict[tuple, Dict[str, object]] = {}
@@ -87,6 +94,23 @@ class ParkingEngine(
         # Legacy single-camera cooldown state.
         self._last_violation_alert_time = 0.0
         self._violation_cooldown_seconds = 5.0
+
+        # --- Zoning (no-ops on un-zoned deployments) ---------------------
+        # AreaRegistry is a cheap read-only camera↔area index. The per-car area
+        # lifecycle (AreaStateMachine) lives on the VehicleRegistry, alongside
+        # the sessions it mutates; the engine only owns the boundary-crossing
+        # *geometry* detector (it needs frame bboxes + polygons). Both are built
+        # only when areas are defined AND a registry exists (identity is an
+        # API-mode feature); otherwise the per-frame zoning hooks short-circuit
+        # and behaviour is byte-for-byte the legacy un-zoned path.
+        self.area_registry = AreaRegistry(config)
+        self.boundary_crossing_detector = None
+        if self.area_registry.enabled and self.vehicle_registry is not None:
+            self.boundary_crossing_detector = BoundaryCrossingDetector()
+            print(
+                f"[INFO] Zoning enabled: {len(self.area_registry.all_area_ids())} "
+                f"area(s) — per-area ownership active."
+            )
 
     def _build_tracked_detector(self) -> TrackedDetector:
         """Construct a fresh TrackedDetector using the current config."""
@@ -97,22 +121,13 @@ class ParkingEngine(
         )
 
     def _detector_for(self, camera_id: str) -> TrackedDetector:
-        """Return the detector responsible for tracking this camera's frames.
-
-        In per-camera mode, lazy-instantiates one TrackedDetector per camera
-        on first use. In shared mode, returns the singleton. Memory cost in
-        per-camera mode is ~one OpenVINO compiled model per camera (~100 MB
-        each for yolo11s at 640px); for 14 cameras that's ~1.4 GB, which is
-        within the 8-16 GB envelope listed in the README.
+        """Return the shared detector. Per-camera ByteTrack state is isolated
+        inside TrackedDetector (keyed by camera_id passed to detect_and_track),
+        so a single shared model serves every camera without mixing track IDs.
         """
-        if self._shared_detector is not None:
-            return self._shared_detector
-        detector = self._per_camera_detectors.get(camera_id)
-        if detector is None:
-            print(f"[INFO] Building tracker for {camera_id} (per-camera mode)...")
-            detector = self._build_tracked_detector()
-            self._per_camera_detectors[camera_id] = detector
-        return detector
+        if self._shared_detector is None:
+            self._shared_detector = self._build_tracked_detector()
+        return self._shared_detector
 
     @property
     def detector(self) -> TrackedDetector:
@@ -148,7 +163,10 @@ class ParkingEngine(
             return
 
         camera_configs = self._build_camera_configs()
-        self.cam_manager = CameraManager(camera_configs)
+        self.cam_manager = CameraManager(
+            camera_configs,
+            max_grab_fps=self.config.processing.max_grab_fps,
+        )
         opened = self.cam_manager.open_all()
         if opened == 0:
             print("[ERROR] No cameras could be opened. Exiting.")
@@ -156,6 +174,24 @@ class ParkingEngine(
 
         total_slots = self._initialize_camera_pipelines(camera_configs)
         print(f"[INFO] Total parking slots across all cameras: {total_slots}")
+
+        # Tell the registry which cameras host parking slots so ReID ownership
+        # prefers them over slotless transit/aisle cameras (a car's identity is
+        # attributed to the camera that can actually bind its plate to a slot).
+        if self.vehicle_registry is not None:
+            slotted = {
+                cam_id for cam_id, pipeline in self.pipelines.items() if pipeline.slots
+            }
+            self.vehicle_registry.set_cameras_with_slots(slotted)
+            print(
+                f"[INFO] Slot-hosting cameras (ReID ownership priority): "
+                f"{sorted(slotted)}"
+            )
+            # Reload each still-inside car's persisted per-plate gallery so ReID
+            # can re-identify it after a restart (enriches the vectorless
+            # sessions _restore_plate_locks just created). No-op when the gallery
+            # feature is disabled.
+            self._restore_vehicle_galleries()
         print(f"[INFO] Processing mode: {self.config.processing.mode}")
         print(
             f"[INFO] Target FPS per camera: "
@@ -168,8 +204,21 @@ class ParkingEngine(
         self.is_running = True
         self.start_time = time.time()
         self._start_time = self.start_time
+        self._last_summary_frame = 0
+        self._last_summary_ts = self.start_time
 
         summary_interval = max(1, len(camera_configs) * 10)
+
+        # Per-camera FPS pacing. ``target_fps_per_camera`` bounds how often any
+        # single camera is processed: each camera is handled at most once per
+        # ``min_interval`` seconds. A value <= 0 disables pacing (process as
+        # fast as the CPU allows, the historical behaviour).
+        target_fps = self.config.processing.target_fps_per_camera
+        min_interval = (1.0 / target_fps) if target_fps and target_fps > 0 else 0.0
+        last_processed: Dict[str, float] = {}
+        camera_ids = [c.id for c in camera_configs]
+        idle_cycles = 0
+
         grid_frames: Dict[str, np.ndarray] = {}
         grid_cell_width = 480
         grid_cell_height = 270
@@ -178,11 +227,26 @@ class ParkingEngine(
 
         try:
             while True:
-                cam_id, frame = self.cam_manager.next_frame()
+                with perf_trace.stage("fetch"):
+                    cam_id, frame = self.cam_manager.next_frame()
                 if cam_id is None:
                     print("[WARN] All cameras unavailable. Retrying in 5s...")
                     time.sleep(5)
                     continue
+
+                # Throttle to the configured per-camera FPS. Cameras still due
+                # are processed immediately; if a full round passes with none
+                # due we nap briefly so the loop doesn't busy-spin at 100% CPU.
+                if min_interval > 0.0:
+                    now = time.time()
+                    if now - last_processed.get(cam_id, 0.0) < min_interval:
+                        idle_cycles += 1
+                        if idle_cycles >= len(camera_ids):
+                            time.sleep(min(min_interval, 0.01))
+                            idle_cycles = 0
+                        continue
+                    last_processed[cam_id] = now
+                    idle_cycles = 0
 
                 self._cleanup_stale_data()
                 # Periodic sweep (gated to once per ~30s) that purges
@@ -198,12 +262,17 @@ class ParkingEngine(
                         self._store_passthrough_frame(frame, cam_id, grid_frames)
                     continue
 
-                detection_frame = pipeline.apply_roi_mask(frame)
-                detections = self._detector_for(cam_id).detect_and_track(detection_frame)
-                self._process_special_zones(cam_id, frame, detections)
+                with perf_trace.stage("roi"):
+                    detection_frame = pipeline.apply_roi_mask(frame)
+                # clahe + infer stages are timed inside detect_and_track.
+                detections = self._detector_for(cam_id).detect_and_track(detection_frame, cam_id)
+                with perf_trace.stage("zones"):
+                    self._process_special_zones(cam_id, frame, detections)
 
-                assignment = pipeline.assigner.assign(detections)
-                all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
+                with perf_trace.stage("assign"):
+                    assignment = pipeline.assigner.assign(detections)
+                with perf_trace.stage("slot"):
+                    all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
                 if all_events:
                     final_events = self._filter_violation_events(
                         frame,
@@ -214,6 +283,7 @@ class ParkingEngine(
                     self._persist_final_events(final_events)
 
                 self._frame_count += 1
+                perf_trace.frame_done()
                 if self._frame_count % summary_interval == 0:
                     self._emit_full_summary()
 
@@ -272,7 +342,7 @@ class ParkingEngine(
             )
             session = self.db_manager.SessionLocal()
             try:
-                slots, special_zones, roi_polygon = load_camera_slots(
+                slots, special_zones, roi_polygon, boundaries = load_camera_slots(
                     session,
                     camera_id=camera_id,
                     ref_resolution=ref_res,
@@ -281,6 +351,9 @@ class ParkingEngine(
             finally:
                 session.close()
             self.special_zones[camera_id] = {zone.id: zone for zone in special_zones}
+            if not hasattr(self, "boundaries"):
+                self.boundaries = {}
+            self.boundaries[camera_id] = {b.id: b for b in boundaries}
         else:
             slots_path = slots_file or self.config.slots_file
             slots, roi_polygon = load_slots(slots_path) if os.path.exists(slots_path) else ([], None)
@@ -321,7 +394,7 @@ class ParkingEngine(
 
                 self.last_processed_at = datetime.now()
                 detection_frame = pipeline.apply_roi_mask(frame)
-                detections = self._detector_for(camera_id).detect_and_track(detection_frame)
+                detections = self._detector_for(camera_id).detect_and_track(detection_frame, camera_id)
                 self._process_special_zones(camera_id, frame, detections)
                 assignment = pipeline.assigner.assign(detections)
 

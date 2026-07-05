@@ -343,6 +343,30 @@ class ParkingEngineTrackingMixin:
             selected.append(secondary)
         return selected
 
+    def _bbox_view_quality(self, frame: np.ndarray, detection) -> float:
+        """How fully this camera sees the car: 1.0 when the bbox sits entirely
+        inside the frame (with a 1% edge margin), decreasing toward 0.0 as the
+        box is clipped by a frame edge (part of the car out of view).
+
+        Estimated as the fraction of the detection's *reported* bbox area that
+        falls inside the frame — a box hard against an edge has been clamped by
+        the detector, so its reported extent beyond the border is the missing
+        part of the car. Used only as an ownership tie-breaker (display/
+        attribution), never a detection decision.
+        """
+        try:
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = (float(v) for v in detection.bbox)
+            bw, bh = x2 - x1, y2 - y1
+            if bw <= 0 or bh <= 0:
+                return 0.0
+            mx, my = 0.01 * w, 0.01 * h
+            ix = max(0.0, min(x2, w - mx) - max(x1, mx))
+            iy = max(0.0, min(y2, h - my) - max(y1, my))
+            return max(0.0, min(1.0, (ix * iy) / (bw * bh)))
+        except Exception:
+            return 0.0
+
     def _crop_detection(
         self,
         frame: np.ndarray,
@@ -532,7 +556,17 @@ class ParkingEngineTrackingMixin:
                         quality,
                     )
 
-                self.vehicle_registry.bind_next_pending_anpr_to_candidate(candidate_id)
+                bound_plate = self.vehicle_registry.bind_next_pending_anpr_to_candidate(
+                    candidate_id
+                )
+                # A successful bind fires once (the candidate leaves "open"), so
+                # this is the natural moment to create the car's durable per-plate
+                # gallery folder from its first good Park_Entry view — guaranteeing
+                # every entering car gets a folder here, at CAM-23, not the gate.
+                if bound_plate:
+                    self.vehicle_registry.seed_gallery_from_park_entry(
+                        candidate_id, bound_plate
+                    )
 
         last_track_ids = self._tracks_inside_zones.get((cam_id, zone.id), set())
         left_zone = last_track_ids - currently_inside
@@ -803,6 +837,14 @@ class ParkingEngineTrackingMixin:
             if detection.track_id == -1:
                 continue
 
+            # Record how fully this camera sees the car — feeds the ReID
+            # ownership tie-breaker (a full view outranks a clipped one).
+            self.vehicle_registry.record_track_view(
+                cam_id,
+                detection.track_id,
+                self._bbox_view_quality(frame, detection),
+            )
+
             track_key = (cam_id, detection.track_id)
             session_id = self.vehicle_registry.get_session_id_for_track(
                 cam_id,
@@ -810,22 +852,42 @@ class ParkingEngineTrackingMixin:
             )
 
             if session_id:
-                # If this track already has a confirmed plate, the car is
-                # already identified — skip all ReID computation.
-                # Only refresh timestamps to keep the binding alive.
-                plate = self.vehicle_registry.get_plate_for_track(cam_id, detection.track_id)
-                if plate:
+                # If the session already has a confirmed plate, the car is
+                # identified — skip all ReID computation. Gate on the
+                # SESSION's plate, not the ownership-filtered
+                # get_plate_for_track(): on a non-owner camera that getter
+                # returns None even for a plated session, which used to drop
+                # us into the anonymous-track branch below and overwrite the
+                # confirmed session's primary feature vector with this
+                # camera's (possibly clipped) view every frame.
+                if self.vehicle_registry.get_session_plate(session_id):
                     self.vehicle_registry.refresh_track_binding(cam_id, detection.track_id, session_id)
-                    # Persist "where is this car right now" — vehicles.floor /
-                    # last_seen_at — so the Gateway can answer presence queries
-                    # for cars driving across the floor without parking. The
-                    # writer is rate-gated (see _PRESENCE_MIN_INTERVAL_S),
-                    # so calling it on every frame is cheap.
-                    pipeline = self.pipelines.get(cam_id)
-                    if pipeline is not None:
-                        self.update_vehicle_presence(
-                            plate, floor=pipeline.floor, camera_id=cam_id,
-                        )
+                    # Presence writes and gallery accumulation remain
+                    # owner-only side effects, attributed via the
+                    # ownership-filtered getter.
+                    plate = self.vehicle_registry.get_plate_for_track(cam_id, detection.track_id)
+                    if plate:
+                        # Persist "where is this car right now" — vehicles.floor /
+                        # last_seen_at — so the Gateway can answer presence queries
+                        # for cars driving across the floor without parking. The
+                        # writer is rate-gated (see _PRESENCE_MIN_INTERVAL_S),
+                        # so calling it on every frame is cheap.
+                        pipeline = self.pipelines.get(cam_id)
+                        if pipeline is not None:
+                            self.update_vehicle_presence(
+                                plate, floor=pipeline.floor, camera_id=cam_id,
+                            )
+                        # Grow this car's persistent gallery with a fresh full-view
+                        # crop (throttled/gated/deduped inside the registry) so its
+                        # ReID profile keeps improving and survives restart.
+                        ref_crop = self._crop_detection(frame, detection)
+                        if ref_crop is not None:
+                            self.vehicle_registry.record_reference_for_track(
+                                cam_id,
+                                detection.track_id,
+                                ref_crop,
+                                self._bbox_view_quality(frame, detection),
+                            )
                     continue
 
                 if tracking_manager:
@@ -858,6 +920,7 @@ class ParkingEngineTrackingMixin:
             self._reid_check_timer[track_key] = now_ts
 
             query_vector = None
+            crop = None
             if tracking_manager:
                 query_vector = tracking_manager.get_track_feature(detection.track_id)
 
@@ -869,10 +932,29 @@ class ParkingEngineTrackingMixin:
             if query_vector is None:
                 continue
 
+            # Crop for rank-5 OCR disambiguation inside match_global_session
+            # (the smoothed-feature path above skips cropping). Gated to one
+            # ReID check/sec per track, so this extra crop is cheap.
+            if crop is None:
+                crop = self._crop_detection(frame, detection)
+
+            # Bound the candidate pool to this camera's area (+ the cross-area
+            # handoff pool of cars that recently departed an adjacent area) so a
+            # parked car can't be ReID-matched to a session sitting in an
+            # unrelated area/floor — the cross-area false-lock that mislabels a
+            # B2 car with a B1 entrant's plate. Resolves to "" when zoning is off
+            # or the camera is un-zoned, in which case match_global_session falls
+            # back to the legacy all-sessions pool (no behaviour change there).
+            area_id = ""
+            if self.area_registry is not None and self.area_registry.enabled:
+                area_id = self.area_registry.area_for_camera(cam_id)
+
             matched_session = self.vehicle_registry.match_global_session(
                 query_vector,
                 camera_id=cam_id,
                 track_id=detection.track_id,
+                area_id=area_id or None,
+                query_crop=crop,
             )
             if matched_session:
                 self.vehicle_registry.attach_session_to_track(

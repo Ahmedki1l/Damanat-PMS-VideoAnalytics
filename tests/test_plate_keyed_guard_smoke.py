@@ -119,8 +119,9 @@ class TestPlateKeyedGuardSmoke(unittest.TestCase):
         self.assertEqual(result, self.PLATE)
 
     def test_identity_disabled_camera_short_circuits(self):
-        # Regression: CAM-01/CAM-02 still bypass try_link_to_slot entirely,
-        # so the new guard cannot fire from those cameras.
+        # Regression: ground-floor cameras bypass try_link_to_slot entirely
+        # (gated by floor via is_reid_disabled_floor), so the new guard cannot
+        # fire from those cameras.
         stale = self._make_session(parked_slot="Slot_A", age_minutes=10)
         fresh = self._make_session(age_minutes=0)
         track_id = 7777
@@ -132,7 +133,7 @@ class TestPlateKeyedGuardSmoke(unittest.TestCase):
             zone_id="Z1",
             zone_name="Zone 1",
             camera_id="CAM-01",
-            floor="B1",
+            floor="Ground",
             track_id=track_id,
             timestamp=datetime.now(),
         )

@@ -42,6 +42,14 @@ class ParkingEngineVisualizationMixin:
             del self._display_label_cache[cache_key]
         return display_id, False
 
+    def _reid_score_suffix(self, cam_id: str, track_id: int) -> str:
+        """Return ``" 0.82"`` (leading space) for the bbox overlay, or ``""``
+        when no ReID score is known for this track. Display only."""
+        if not self.vehicle_registry:
+            return ""
+        score = self.vehicle_registry.get_reid_score_for_track(cam_id, track_id)
+        return f" {score:.2f}" if score is not None else ""
+
     def _emit_full_summary(self):
         """Emit status summary across all cameras."""
         all_statuses = []
@@ -52,6 +60,30 @@ class ParkingEngineVisualizationMixin:
                 status["floor"] = pipeline.floor
                 all_statuses.append(status)
         self.event_bus.emit_status_summary(all_statuses)
+
+        # Effective throughput — actual processed frames/sec per camera versus
+        # the configured target_fps_per_camera cap. Measured over the window
+        # since the previous summary (not cumulative) so it reflects the
+        # current sustained rate and isn't dragged down by startup model loads.
+        now = time.time()
+        last_ts = getattr(self, "_last_summary_ts", 0.0) or self.start_time
+        window_s = max(1e-6, now - last_ts)
+        window_frames = self._frame_count - getattr(self, "_last_summary_frame", 0)
+        n_cams = max(1, len(self.pipelines))
+        eff_per_cam = window_frames / window_s / n_cams
+        target = getattr(self.config.processing, "target_fps_per_camera", 0)
+        print(
+            f"[INFO] effective FPS/camera: {eff_per_cam:.1f} (target {target}) | "
+            f"window {window_s:.1f}s | +{window_frames} frames | "
+            f"total {self._frame_count}"
+        )
+        self._last_summary_ts = now
+        self._last_summary_frame = self._frame_count
+
+        # On-site zoning test trace: periodic map of cars per area + in transit.
+        # No-op unless ZONING_TRACE is set (see src/zoning/trace.py).
+        if self.vehicle_registry is not None:
+            self.vehicle_registry.log_area_snapshot()
 
     def _draw_frame(self, frame, pipeline, assignment, cam_id, all_detections=None):
         """Draw slot polygons and detections on a frame."""
@@ -115,6 +147,27 @@ class ParkingEngineVisualizationMixin:
                 2,
             )
 
+            # Plate-lock badge: show the bound plate beneath the slot label.
+            # [LOCK]+score once frozen (green), dim '?'+score while provisional.
+            # ASCII only — cv2.putText is Hershey-font, no Unicode glyphs.
+            plate = state_machine.plate_number
+            if plate:
+                if state_machine.plate_locked:
+                    badge = f"{plate} [LOCK] {state_machine.plate_confidence:.2f}"
+                    badge_color = (0, 255, 0)
+                else:
+                    badge = f"{plate} ? {state_machine.plate_confidence:.2f}"
+                    badge_color = (0, 200, 200)
+                cv2.putText(
+                    frame,
+                    badge,
+                    (cx - 40, cy + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    badge_color,
+                    1,
+                )
+
         for track_id, detection in assignment.slot_vehicle_map.values():
             x1, y1, x2, y2 = [int(v) for v in detection.bbox]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
@@ -124,9 +177,10 @@ class ParkingEngineVisualizationMixin:
             if self.vehicle_registry:
                 display_id, is_sticky_confirmed = self._resolve_display_label(cam_id, track_id)
 
+            label = f"{display_id}{self._reid_score_suffix(cam_id, track_id)}"
             cv2.putText(
                 frame,
-                f"{display_id}",
+                label,
                 (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -142,21 +196,22 @@ class ParkingEngineVisualizationMixin:
                 x1, y1, x2, y2 = [int(v) for v in detection.bbox]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
-                display_id = track_id
-                is_sticky_confirmed = False
-                if self.vehicle_registry:
-                    display_id, is_sticky_confirmed = self._resolve_display_label(
-                        cam_id,
-                        track_id,
-                    )
-
+                # A plate identity is shown ONLY on cars that occupy a slot (the
+                # slot_vehicle_map loop above). A car not assigned to any slot —
+                # an aisle / passing / transit car, and every car on a camera
+                # with no slots — is drawn WITHOUT a plate so an identity is never
+                # "locked" onto a car this camera has no slot to hold. This caps
+                # plated cars at len(slots) per camera (zero on a slotless one).
+                # Cross-camera ReID identity is still tracked internally for
+                # handoff; only the on-frame label is suppressed here.
+                label = f"{track_id} (?)"
                 cv2.putText(
                     frame,
-                    f"{display_id} (?)",
+                    label,
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
-                    (0, 255, 255) if is_sticky_confirmed else (0, 0, 255),
+                    (0, 0, 255),
                     2,
                 )
                 bc_x, bc_y = detection.bottom_center
