@@ -70,7 +70,10 @@ class VehicleRegistryCoreMixin:
         timestamp: Optional[datetime] = None,
     ) -> None:
         """Refresh the last-seen time for a camera-local track binding."""
-        self._track_last_seen[(camera_id, track_id)] = timestamp or self._clock()
+        ts = timestamp or self._clock()
+        self._track_last_seen[(camera_id, track_id)] = ts
+        # Stamp the first sighting once — the entry anchor for match_global_session.
+        self._track_first_seen.setdefault((camera_id, track_id), ts)
 
     def _drop_other_track_mappings_for_session(
         self,
@@ -107,6 +110,7 @@ class VehicleRegistryCoreMixin:
         for key in keys_to_remove:
             self._track_session_map.pop(key, None)
             self._track_last_seen.pop(key, None)
+            self._track_first_seen.pop(key, None)
 
     @property
     def matcher(self):
@@ -453,6 +457,7 @@ class VehicleRegistryCoreMixin:
             ]
             for key in stale_track_keys:
                 self._track_last_seen.pop(key, None)
+                self._track_first_seen.pop(key, None)
                 self._track_view_quality.pop(key, None)
                 session_id = self._track_session_map.pop(key, None)
                 # Also clean up the session's observing_tracks entry
@@ -465,6 +470,22 @@ class VehicleRegistryCoreMixin:
                         session.observing_scores.pop(key[0], None)
                         if session.owner_camera == key[0]:
                             session.owner_camera = None
+
+            # Orphan sweep: match_global_session also stamps _track_first_seen
+            # for query tracks that never bind to a session (so _mark_track_seen
+            # never fires). Those keys have no _track_last_seen twin, so the pass
+            # above never reaches them. Age them out by their own timestamp —
+            # otherwise the dict grows unboundedly, and worse, a stale anchor
+            # survives to silently disable the temporal entry gate if the tracker
+            # later reuses that integer track id for a different car.
+            orphan_first_seen = [
+                key
+                for key, seen_at in self._track_first_seen.items()
+                if key not in self._track_last_seen
+                and (now - seen_at).total_seconds() > self.TRACK_MAPPING_EXPIRY_SECONDS
+            ]
+            for key in orphan_first_seen:
+                self._track_first_seen.pop(key, None)
 
             active_orders = []
             for event_id in self._pending_event_order:

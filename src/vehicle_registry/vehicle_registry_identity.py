@@ -1825,6 +1825,35 @@ class VehicleRegistryIdentityMixin:
         )
         return session_id
 
+    @staticmethod
+    def _temporally_eligible(session, anchor: Optional[datetime]) -> bool:
+        """Temporal entry gate shared by both identity-match forks.
+
+        A query track may only bind to a car that is still NOT parked, or one
+        that parked (its slot went vacant->occupied) at or AFTER ``anchor`` —
+        the moment this car's appearance began. A car already parked before
+        that cannot be this moving track, and symmetrically an already-parked
+        (old) car is never re-labelled onto a newer track.
+
+        ``anchor`` derivation is the caller's responsibility and differs by
+        fork by design: ``match_global_session`` (no session exists yet) uses
+        the per-track first-seen time; ``reattach_track_to_confirmed_session``
+        uses the anonymous ``current_session.first_seen_at`` (the car's
+        appearance birth, which predates any single camera-local track). Both
+        are lower-bound proxies for "when this car entered".
+
+        Fail-open: a missing ``anchor`` (untracked / crop-only query) or a
+        parked car with no ``linked_at`` timestamp keeps the candidate eligible.
+        """
+        if anchor is None:
+            return True
+        if session.status != "parked" and not session.linked_slot:
+            return True
+        linked_at = session.linked_at
+        if linked_at is None:
+            return True
+        return linked_at >= anchor
+
     def match_global_session(
         self,
         query_vector: Optional[np.ndarray],
@@ -1880,6 +1909,22 @@ class VehicleRegistryIdentityMixin:
                 faiss_topk_ids = None
 
         with self._lock:
+            # Entry anchor: the first time we ever saw THIS query track. A car
+            # that was already parked BEFORE this moment cannot be the car we
+            # are now tracking (it was sitting stationary in a slot while this
+            # track was driving in), so parked-before candidates are dropped
+            # from the pool. This is the "a new entrant may only match cars that
+            # are still not parked, or cars that parked AFTER it entered" rule —
+            # equivalently, an already-parked (old) car is never matched to a
+            # newer track. Stamped once; an earlier stamp from a prior binding
+            # is kept. Untracked/crop-only queries (no camera/track) leave the
+            # anchor None and the rule stays inert (legacy all-sessions pool).
+            entry_anchor = None
+            if camera_id is not None and track_id is not None:
+                entry_anchor = self._track_first_seen.setdefault(
+                    (camera_id, track_id), now
+                )
+
             # Zoning: when an area is given (and the deployment is zoned), bound
             # the candidate pool to cars currently IN that area plus the
             # cross-area handoff pool (cars that recently departed an adjacent
@@ -1910,6 +1955,7 @@ class VehicleRegistryIdentityMixin:
                         and session.status in ("confirmed", "parked")
                         and session.feature_vector is not None
                         and not session.gate_reference_only
+                        and self._temporally_eligible(session, entry_anchor)
                         and (now - session.last_seen_at).total_seconds()
                         <= max_time_gap_seconds
                     )
@@ -1923,6 +1969,7 @@ class VehicleRegistryIdentityMixin:
                         and session.status in ("confirmed", "parked")
                         and session.feature_vector is not None
                         and not session.gate_reference_only
+                        and self._temporally_eligible(session, entry_anchor)
                         and (now - session.last_seen_at).total_seconds()
                         <= max_time_gap_seconds
                     )
@@ -2243,6 +2290,12 @@ class VehicleRegistryIdentityMixin:
                         query_area, list(self._sessions.values())
                     )
 
+            # Temporal gate (see _temporally_eligible): this anonymous track may
+            # only reattach to a car that is still not parked, or one that parked
+            # at or after this car's own appearance began. Anchored on the
+            # anonymous session's first_seen_at (its appearance birth).
+            reattach_anchor = current_session.first_seen_at
+
             candidates = [
                 session
                 for sid, session in self._sessions.items()
@@ -2251,6 +2304,7 @@ class VehicleRegistryIdentityMixin:
                     and session.status in ("confirmed", "parked")
                     and session.plate
                     and session.feature_vector is not None
+                    and self._temporally_eligible(session, reattach_anchor)
                     and (
                         not query_floor
                         or self._session_floor(session) == query_floor
@@ -3008,6 +3062,7 @@ class VehicleRegistryIdentityMixin:
         for obs_cam, obs_tid in list(session.observing_tracks.items()):
             self._track_session_map.pop((obs_cam, obs_tid), None)
             self._track_last_seen.pop((obs_cam, obs_tid), None)
+            self._track_first_seen.pop((obs_cam, obs_tid), None)
         session.observing_tracks.clear()
         session.observing_scores.clear()
         session.owner_camera = None
