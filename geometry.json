@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "exported_at": "2026-07-03T16:24:47.286284+00:00",
+  "exported_at": "2026-07-03T19:02:26.164483+00:00",
   "source_db": "localhost/damanat_pms",
   "floor_filter": null,
   "tables": {
@@ -2562,7 +2562,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G2_latest.jpg",
-        "is_available": false,
+        "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -2634,6 +2634,42 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G8_latest.jpg",
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "Park_Entry",
+        "slot_name": "Park_Entry",
+        "camera_id": "CAM-23",
+        "floor": "Ground",
+        "zone_id": "CAM-23",
+        "zone_name": "CAM-23",
+        "slot_type": "special_zone",
+        "polygon": [
+          [
+            369.0,
+            181.0
+          ],
+          [
+            622.0,
+            158.0
+          ],
+          [
+            782.0,
+            366.0
+          ],
+          [
+            390.0,
+            426.0
+          ]
+        ],
+        "last_snapshot_path": null,
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
