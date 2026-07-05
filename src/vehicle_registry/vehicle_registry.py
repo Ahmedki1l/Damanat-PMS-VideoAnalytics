@@ -119,6 +119,11 @@ class VehicleRegistry(
         self._sessions: Dict[str, VehicleSession] = {}
         self._track_session_map: Dict[Tuple[str, int], str] = {}
         self._track_last_seen: Dict[Tuple[str, int], datetime] = {}
+        # First time each camera-local track was observed. Stamped once (never
+        # overwritten) and used by match_global_session as the "entry anchor":
+        # a car already parked BEFORE this track first appeared cannot be this
+        # track, so parked-before candidates are excluded from its match pool.
+        self._track_first_seen: Dict[Tuple[str, int], datetime] = {}
         self._parked: Dict[str, VehicleSession] = {}
         # Plate-lock: slots whose plate binding has been frozen. A locked slot is
         # refused by the relocate / stale-release / theft paths in
