@@ -37,6 +37,8 @@ import os
 import sys
 from datetime import datetime, timezone
 
+from sqlalchemy import select
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.config import load_config
@@ -44,6 +46,8 @@ from src.database import init_db
 from src.model.parking_area import ParkingArea
 from src.model.parkingslot import ParkingSlot
 from src.model.boundary import Boundary
+from src.model.slots_status import SlotStatus
+from src.model.alert import Alert
 
 # Export order matters for seeding: areas first (slots/boundaries reference
 # area ids), then the geometry that points at them.
@@ -55,9 +59,18 @@ TABLES = [
 
 # Slot columns that are live runtime state, not authored geometry. Reset on
 # seed so we never carry the testing PC's occupancy / snapshot paths into prod.
+# The plate-lock binding (current_plate/plate_confidence/plate_locked/
+# plate_locked_at) is likewise live state, not geometry — carrying it over both
+# leaks the testing PC's occupancy AND breaks the seed, because json.dump turns
+# plate_locked_at into a microsecond string the SQL Server DateTime column can't
+# convert back on merge.
 SLOT_RUNTIME_RESET = {
     "is_available": True,
     "last_snapshot_path": None,
+    "current_plate": None,
+    "plate_confidence": 0.0,
+    "plate_locked": False,
+    "plate_locked_at": None,
 }
 
 SCHEMA_VERSION = 1
@@ -127,6 +140,32 @@ def _filter_cols(model, data: dict) -> dict:
     return {k: v for k, v in data.items() if k in cols}
 
 
+def _clear_slot_dependents(session, floor: str | None):
+    """Before a ``replace`` wipe of parking_slots, detach the child rows that
+    FK-reference it, or SQL Server rejects the DELETE (FK constraint 547).
+
+    - slot_status: ephemeral per-slot status log — deleted outright.
+    - alerts: historical records we keep; the FK is nullable and each alert
+      carries its own ``slot_number`` string, so we NULL slot_id (detach) rather
+      than destroy the alert.
+
+    When ``floor`` is given, only slots on that floor are affected.
+    """
+    slot_scope = select(ParkingSlot.slot_id)
+    if floor:
+        slot_scope = slot_scope.where(ParkingSlot.floor == floor)
+
+    ss = session.query(SlotStatus).filter(SlotStatus.slot_id.in_(slot_scope))
+    ss_deleted = ss.delete(synchronize_session=False)
+
+    al = session.query(Alert).filter(Alert.slot_id.in_(slot_scope))
+    al_detached = al.update({Alert.slot_id: None}, synchronize_session=False)
+
+    if ss_deleted or al_detached:
+        print(f"  {'slot_status':<16} -{ss_deleted} deleted, "
+              f"{al_detached} alert(s) detached")
+
+
 def cmd_seed(session, url, args):
     with open(args.infile, "r", encoding="utf-8") as fh:
         payload = json.load(fh)
@@ -159,6 +198,10 @@ def cmd_seed(session, url, args):
                 continue
 
         if args.mode == "replace":
+            # parking_slots is FK-referenced by slot_status / alerts; clear those
+            # child rows first or the bulk DELETE hits a constraint violation.
+            if model is ParkingSlot:
+                _clear_slot_dependents(session, args.floor)
             dq = session.query(model)
             if args.floor and floor_col:
                 dq = dq.filter(getattr(model, floor_col) == args.floor)
