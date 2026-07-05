@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "exported_at": "2026-07-03T19:02:26.164483+00:00",
+  "exported_at": "2026-07-05T12:30:54.277089+00:00",
   "source_db": "localhost/damanat_pms",
   "floor_filter": null,
   "tables": {
@@ -122,7 +122,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B1_CRO_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "CRO",
@@ -198,7 +198,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B10_CTO_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "CTO",
@@ -233,15 +233,15 @@
             263.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B11 CFO_latest.jpg",
-        "is_available": true,
+        "last_snapshot_path": "LNV-94_CAM-24_20260705_133244.jpg",
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "CFO",
-        "current_plate": null,
-        "plate_confidence": 0.0,
-        "plate_locked": false,
-        "plate_locked_at": null
+        "current_plate": "LNV-94",
+        "plate_confidence": 0.6230593919754028,
+        "plate_locked": true,
+        "plate_locked_at": "2026-07-05 13:32:44.200000"
       },
       {
         "slot_id": "B12 CCO",
@@ -270,7 +270,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B12 CCO_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "CCO",
@@ -306,7 +306,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B13 COO_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "COO",
@@ -342,7 +342,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B14_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -418,11 +418,11 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B16_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
-        "current_plate": null,
+        "current_plate": "ZRS-6511",
         "plate_confidence": 0.0,
         "plate_locked": false,
         "plate_locked_at": null
@@ -453,15 +453,15 @@
             277.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B17_latest.jpg",
-        "is_available": true,
+        "last_snapshot_path": "ZRS-6511_CAM-15_20260705_085732.jpg",
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
-        "current_plate": null,
-        "plate_confidence": 0.0,
-        "plate_locked": false,
-        "plate_locked_at": null
+        "current_plate": "ZRS-6511",
+        "plate_confidence": 0.5654336214065552,
+        "plate_locked": true,
+        "plate_locked_at": "2026-07-05 08:57:32.943000"
       },
       {
         "slot_id": "B18",
@@ -498,7 +498,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B18_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -538,7 +538,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B19_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -645,15 +645,15 @@
             195.0
           ]
         ],
-        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B21_latest.jpg",
-        "is_available": true,
+        "last_snapshot_path": "NDD-4141_CAM-25_20260705_091832.jpg",
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
-        "current_plate": null,
-        "plate_confidence": 0.0,
-        "plate_locked": false,
-        "plate_locked_at": null
+        "current_plate": "NDD-4141",
+        "plate_confidence": 0.5464778542518616,
+        "plate_locked": true,
+        "plate_locked_at": "2026-07-05 09:18:32.910000"
       },
       {
         "slot_id": "B22",
@@ -694,7 +694,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B22_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -802,7 +802,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B25_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -838,7 +838,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B26_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -874,7 +874,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B27_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -914,7 +914,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B28_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -950,7 +950,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B3_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "COS",
@@ -986,11 +986,11 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B5_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
-        "current_plate": null,
+        "current_plate": "RTB-2016",
         "plate_confidence": 0.0,
         "plate_locked": false,
         "plate_locked_at": null
@@ -1022,11 +1022,11 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B6_Reserved_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "Reserved",
-        "current_plate": null,
+        "current_plate": "DZD-9488",
         "plate_confidence": 0.0,
         "plate_locked": false,
         "plate_locked_at": null
@@ -1094,7 +1094,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B8_CSBDO_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "EMPLOYEE",
         "reserved_for": "CSBDO",
@@ -1130,7 +1130,7 @@
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_B9_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -2129,8 +2129,8 @@
         "slot_type": "roi",
         "polygon": [
           [
-            696.0,
-            264.0
+            693.0,
+            184.0
           ],
           [
             694.0,
@@ -2173,16 +2173,16 @@
             259.0
           ],
           [
-            360.0,
-            117.0
+            421.0,
+            304.0
           ],
           [
-            535.0,
-            85.0
+            498.0,
+            313.0
           ],
           [
-            532.0,
-            273.0
+            493.0,
+            202.0
           ]
         ],
         "last_snapshot_path": null,
@@ -2505,28 +2505,28 @@
         "slot_type": "parking",
         "polygon": [
           [
-            532.0,
-            406.0
+            586.0,
+            505.0
           ],
           [
             780.0,
             717.0
           ],
           [
-            928.0,
-            716.0
+            1033.0,
+            728.0
           ],
           [
-            1202.0,
+            1271.0,
             396.0
           ],
           [
-            967.0,
-            218.0
+            1067.0,
+            209.0
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G1_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "SPECIAL",
         "reserved_for": null,
@@ -2545,23 +2545,167 @@
         "slot_type": "parking",
         "polygon": [
           [
-            425.0,
-            204.0
+            440.0,
+            298.0
           ],
           [
-            523.0,
-            348.0
+            582.0,
+            423.0
           ],
           [
-            853.0,
-            209.0
+            1000.0,
+            202.0
           ],
           [
-            739.0,
-            131.0
+            907.0,
+            119.0
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G2_latest.jpg",
+        "is_available": false,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "G3",
+        "slot_name": "G3",
+        "camera_id": "CAM-00",
+        "floor": "Ground",
+        "zone_id": "CAM-00",
+        "zone_name": "CAM-00",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            1128.0,
+            659.0
+          ],
+          [
+            1061.0,
+            299.0
+          ],
+          [
+            904.0,
+            313.0
+          ],
+          [
+            978.0,
+            695.0
+          ]
+        ],
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G3_latest.jpg",
+        "is_available": false,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "G4",
+        "slot_name": "G4",
+        "camera_id": "CAM-00",
+        "floor": "Ground",
+        "zone_id": "CAM-00",
+        "zone_name": "CAM-00",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            679.0,
+            339.0
+          ],
+          [
+            869.0,
+            325.0
+          ],
+          [
+            912.0,
+            671.0
+          ],
+          [
+            702.0,
+            691.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "G5",
+        "slot_name": "G5",
+        "camera_id": "CAM-00",
+        "floor": "Ground",
+        "zone_id": "CAM-00",
+        "zone_name": "CAM-00",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            441.0,
+            357.0
+          ],
+          [
+            622.0,
+            350.0
+          ],
+          [
+            629.0,
+            696.0
+          ],
+          [
+            406.0,
+            682.0
+          ]
+        ],
+        "last_snapshot_path": null,
+        "is_available": true,
+        "is_violation_zone": false,
+        "reservation_type": "GENERAL",
+        "reserved_for": null,
+        "current_plate": null,
+        "plate_confidence": 0.0,
+        "plate_locked": false,
+        "plate_locked_at": null
+      },
+      {
+        "slot_id": "G6",
+        "slot_name": "G6",
+        "camera_id": "CAM-00",
+        "floor": "Ground",
+        "zone_id": "CAM-00",
+        "zone_name": "CAM-00",
+        "slot_type": "parking",
+        "polygon": [
+          [
+            241.0,
+            349.0
+          ],
+          [
+            385.0,
+            360.0
+          ],
+          [
+            343.0,
+            691.0
+          ],
+          [
+            209.0,
+            661.0
+          ]
+        ],
+        "last_snapshot_path": null,
         "is_available": true,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
@@ -2581,20 +2725,20 @@
         "slot_type": "parking",
         "polygon": [
           [
-            495.0,
-            313.0
+            573.0,
+            305.0
           ],
           [
-            773.0,
-            636.0
+            839.0,
+            609.0
           ],
           [
-            930.0,
-            540.0
+            1009.0,
+            522.0
           ],
           [
-            643.0,
-            289.0
+            765.0,
+            261.0
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G7_latest.jpg",
@@ -2617,24 +2761,24 @@
         "slot_type": "parking",
         "polygon": [
           [
-            730.0,
-            672.0
+            830.0,
+            715.0
           ],
           [
-            375.0,
+            347.0,
             718.0
           ],
           [
-            252.0,
-            354.0
+            214.0,
+            363.0
           ],
           [
-            456.0,
-            320.0
+            520.0,
+            308.0
           ]
         ],
         "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_G8_latest.jpg",
-        "is_available": true,
+        "is_available": false,
         "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
@@ -2680,34 +2824,34 @@
         "plate_locked_at": null
       },
       {
-        "slot_id": "V1_Violation_1",
-        "slot_name": "Slot V1 Violation 1",
-        "camera_id": "CAM-01",
-        "floor": "Ground",
-        "zone_id": "CAM-01",
-        "zone_name": "CAM-01",
+        "slot_id": "SLOT_TEST_E2E",
+        "slot_name": "E2E-TEST-SLOT",
+        "camera_id": "CAM-E2E",
+        "floor": "1",
+        "zone_id": "TEST-ZONE",
+        "zone_name": "TEST-ZONE-NAME",
         "slot_type": "parking",
         "polygon": [
           [
-            648.0,
+            0.0,
             0.0
           ],
           [
-            757.0,
-            10.0
+            1.0,
+            0.0
           ],
           [
-            1286.0,
-            275.0
+            1.0,
+            1.0
           ],
           [
-            1278.0,
-            382.0
+            0.0,
+            1.0
           ]
         ],
         "last_snapshot_path": null,
         "is_available": true,
-        "is_violation_zone": true,
+        "is_violation_zone": false,
         "reservation_type": "GENERAL",
         "reserved_for": null,
         "current_plate": null,
@@ -2716,33 +2860,37 @@
         "plate_locked_at": null
       },
       {
-        "slot_id": "V2_Violation_2",
-        "slot_name": "Slot V2 Violation 2",
-        "camera_id": "CAM-02",
+        "slot_id": "Violation-MAIN",
+        "slot_name": "Violation-MAIN",
+        "camera_id": "CAM-00",
         "floor": "Ground",
-        "zone_id": "CAM-02",
-        "zone_name": "CAM-02",
+        "zone_id": "CAM-00",
+        "zone_name": "CAM-00",
         "slot_type": "parking",
         "polygon": [
           [
-            4.0,
-            254.0
+            25.0,
+            152.0
           ],
           [
-            18.0,
-            359.0
+            6.0,
+            241.0
           ],
           [
-            938.0,
-            209.0
+            1276.0,
+            233.0
           ],
           [
-            867.0,
-            170.0
+            1269.0,
+            132.0
+          ],
+          [
+            635.0,
+            46.0
           ]
         ],
-        "last_snapshot_path": null,
-        "is_available": true,
+        "last_snapshot_path": "http://localhost:8000/pms-video-analytics/snapshots/slot_Violation-MAIN_latest.jpg",
+        "is_available": false,
         "is_violation_zone": true,
         "reservation_type": "GENERAL",
         "reserved_for": null,
