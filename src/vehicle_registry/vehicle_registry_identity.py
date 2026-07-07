@@ -695,12 +695,25 @@ class VehicleRegistryIdentityMixin:
             event = None
             for event_id in self._pending_event_order:
                 pending = self._pending_events.get(event_id)
-                if pending and pending.direction == "entry" and pending.status == "pending":
-                    age = (now - pending.timestamp).total_seconds()
-                    if age <= self.PENDING_ANPR_EXPIRY_SECONDS:
-                        event = pending
-                        break
+                if not (
+                    pending
+                    and pending.direction == "entry"
+                    and pending.status == "pending"
+                ):
+                    continue
+                age = (now - pending.timestamp).total_seconds()
+                if age > self.PENDING_ANPR_EXPIRY_SECONDS:
                     pending.status = "expired"
+                    continue
+                # Only FIFO-bind a FRESH pending plate to a plateless live-track
+                # candidate. An older-but-not-yet-expired plate is stale residue
+                # from a previous (lingering / mis-read) car — leaving it bindable
+                # for the full 30s let the NEXT car's candidate grab it and adopt
+                # its plate (the night gate identity-swap). It still lives out the
+                # expiry for specific-event binds and re-entry grace.
+                if age <= self.PENDING_ANPR_BIND_TTL_SECONDS:
+                    event = pending
+                    break
 
             if event is None:
                 return None
