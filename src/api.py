@@ -49,6 +49,12 @@ class ANPREventRequest(BaseModel):
     image_base64: Optional[str] = None  # Base64-encoded JPEG image
     camera_id: Optional[str] = None     # Which ANPR camera sent this
     timestamp: Optional[str] = None     # ISO timestamp (defaults to now)
+    # Optional per-read OCR confidence in [0,1] from the ANPR server. When
+    # supplied, an entry read below matching.anpr_min_accept_confidence is HELD
+    # (not registered as a pending plate) — this stops a low-confidence night
+    # misread from minting a second identity for one car. Omit (None) to accept
+    # every read, preserving current behaviour for servers that don't send it.
+    confidence: Optional[float] = None
 
 
 class LineCrossingRequest(BaseModel):
@@ -732,6 +738,32 @@ def create_app(
         print(f"[API]   Image     : {img_status}")
         print(f"[API]   Time      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
+
+        # Source-side confidence gate: hold a low-confidence entry read before it
+        # can mint a pending plate (a low-confidence night misread is the seed of
+        # the two-plate-for-one-car incident). No-op when the ANPR server omits a
+        # confidence or the threshold is 0.
+        min_conf = float(
+            getattr(registry.matching_config, "anpr_min_accept_confidence", 0.0)
+        )
+        if (
+            event.direction == "entry"
+            and event.confidence is not None
+            and min_conf > 0.0
+            and float(event.confidence) < min_conf
+        ):
+            print(
+                f"[API] ANPR entry for plate {event.plate} HELD: confidence "
+                f"{float(event.confidence):.2f} < {min_conf:.2f} — low-confidence "
+                f"read not registered (two-plate-genesis guard)"
+            )
+            return ANPREventResponse(
+                status="held_low_confidence",
+                plate=event.plate,
+                direction=event.direction,
+                image_saved=False,
+                timestamp=datetime.now().isoformat(),
+            )
 
         image_bytes = None
         if event.image_base64:

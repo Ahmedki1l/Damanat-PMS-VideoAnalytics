@@ -271,6 +271,15 @@ class MatchingConfig:
     # entry camera). Matching scores max-cosine over these references.
     multishot_ref_top_k: int = 3
 
+    # Minimum per-read OCR confidence to ACCEPT an ANPR entry read (source-side
+    # gate on the two-plate genesis). A read below this — when the ANPR server
+    # supplies a confidence — is held rather than minting a pending plate, so a
+    # low-confidence night misread cannot create a second identity for one car.
+    # Default 0.0 = accept all (and it is a no-op when the server omits
+    # confidence). Set once the ANPR server sends per-read confidence; typical
+    # ALPR practice gates around 0.8-0.9.
+    anpr_min_accept_confidence: float = 0.0
+
     # --- Ensemble / voting (Phase 2 wiring; defaults make them inert) ---
     ensemble_min_modalities_agree: int = 2
     reid_solo_confirm_threshold: float = 0.70
@@ -622,6 +631,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.use_lab_clahe = m.get("use_lab_clahe", cm.use_lab_clahe)
         cm.use_multishot = m.get("use_multishot", cm.use_multishot)
         cm.multishot_ref_top_k = m.get("multishot_ref_top_k", cm.multishot_ref_top_k)
+        cm.anpr_min_accept_confidence = m.get(
+            "anpr_min_accept_confidence", cm.anpr_min_accept_confidence
+        )
 
         # Ensemble / voting (Phase 2)
         cm.ensemble_min_modalities_agree = m.get(

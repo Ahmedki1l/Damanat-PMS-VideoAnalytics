@@ -1,4 +1,5 @@
 {
+  "anpr_min_accept_confidence": 0.0,
   "b1_anpr": 0.47,
   "b1_cross_camera": 0.43,
   "b1_zone": 0.55,
