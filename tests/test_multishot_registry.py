@@ -279,7 +279,11 @@ class TestMultishotRegistry(unittest.TestCase):
             registry._reid_matcher.extract_feature(deep),
         )
 
-    def test_update_confirmed_session_gallery_replaces_cam03_references_in_order(self):
+    def test_update_confirmed_session_gallery_merges_cam03_references(self):
+        """The confirmed-session gallery ACCUMULATES views across crossings
+        (front + rear, across cameras) instead of replacing them with the latest
+        camera's timeline. Distinct earlier refs are retained and new distinct
+        views appended; the primary tracks the newest crossing's chosen index."""
         registry = self._make_registry()
         event = registry.register_anpr_event("TIM-002", "entry", timestamp=datetime.now())
         candidate = registry.open_park_entry_candidate("CAM_01", 10)
@@ -298,6 +302,9 @@ class TestMultishotRegistry(unittest.TestCase):
             primary_snapshot_index=0,
         )
         self.assertEqual(plate, "TIM-002")
+        session_id = registry.get_session_id_for_track("CAM_03", 31)
+        session = registry._sessions[session_id]
+        refs_after_confirm = len(session.reference_feature_vectors)
 
         entry = self._image(60)
         deep = self._image(180)
@@ -310,10 +317,17 @@ class TestMultishotRegistry(unittest.TestCase):
         )
 
         self.assertTrue(updated)
-        session_id = registry.get_session_id_for_track("CAM_03", 31)
-        session = registry._sessions[session_id]
-        self.assertEqual(len(session.reference_snapshot_paths), 3)
-        self.assertEqual(len(session.reference_feature_vectors), 3)
+        # Merge: the two distinct confirm refs are retained AND the three new
+        # distinct views are appended (2 + 3 = 5), not replaced down to 3.
+        self.assertEqual(len(session.reference_snapshot_paths), 5)
+        self.assertEqual(len(session.reference_feature_vectors), 5)
+        self.assertGreater(len(session.reference_feature_vectors), refs_after_confirm)
+        # An earlier view (img255) survives the update — accumulation, not replace.
+        img255_vec = registry._reid_matcher.extract_feature(self._image(255))
+        self.assertTrue(
+            any(np.allclose(v, img255_vec) for v in session.reference_feature_vectors)
+        )
+        # Primary tracks the newest crossing's chosen index (deep).
         np.testing.assert_array_equal(
             session.feature_vector,
             registry._reid_matcher.extract_feature(deep),

@@ -172,8 +172,15 @@ class OpenVINOTypeClassifier(TypeClassifier):
 
         try:
             # Lazy import — openvino is a heavy dep, only required when an
-            # IR actually exists on disk.
-            from openvino.runtime import Core  # type: ignore
+            # IR actually exists on disk. OpenVINO 2024+ keeps Core on
+            # ``openvino.runtime``; 2026+ canonicalises it on the top-level
+            # package (``openvino.runtime`` is gone), so try that first —
+            # matching OpenVINOColorClassifier. Without this the type modality
+            # silently drops out of the ensemble under OpenVINO 2026.
+            try:
+                from openvino import Core  # type: ignore
+            except ImportError:
+                from openvino.runtime import Core  # type: ignore
         except Exception as exc:  # pragma: no cover - environment guard
             logger.warning(
                 "[OpenVINOTypeClassifier] OpenVINO runtime unavailable: %r",

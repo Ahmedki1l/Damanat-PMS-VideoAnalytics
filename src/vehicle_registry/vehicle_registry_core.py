@@ -615,7 +615,15 @@ class VehicleRegistryCoreMixin:
         """
         now = timestamp or self._clock()
 
-        if REID_USE_MULTISHOT:
+        # Multishot is on when either the legacy env-var shim
+        # (REID_USE_MULTISHOT) or the documented config flag
+        # (matching.use_multishot, e.g. from config.yaml) requests it. The
+        # env-var path is kept so tests that patch the module global still
+        # steer this branch; production now honours the YAML flag.
+        multishot_on = REID_USE_MULTISHOT or bool(
+            getattr(self._matching_config, "use_multishot", False)
+        )
+        if multishot_on:
             return self._update_park_entry_candidate_multishot(
                 candidate_id,
                 image,
@@ -692,7 +700,12 @@ class VehicleRegistryCoreMixin:
             candidate_images = existing_images + [image.copy()]
             camera_id = candidate.camera_id
 
-        top_k = 3 if camera_id == "CAM-03" else 1
+        # Keep up to multishot_ref_top_k sharpest references on EVERY camera
+        # (was hardcoded to only give the entry camera "CAM-03" a 3-shot
+        # gallery, leaving every other camera single-shot). Matching scores
+        # max-cosine over these references, so more good references = more
+        # robust identity without any model change.
+        top_k = max(1, int(getattr(self._matching_config, "multishot_ref_top_k", 3)))
         selected_images = select_best_frames(candidate_images, top_k=top_k)
         if not selected_images:
             return None

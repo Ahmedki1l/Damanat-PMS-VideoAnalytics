@@ -299,17 +299,96 @@ class VehicleRegistryIdentityMixin:
         prepared,
         primary_snapshot_index: int = 0,
     ) -> bool:
-        """Cheap half of gallery persistence: assign the prepared gallery onto
-        the session. Safe under ``self._lock`` — no inference, no disk I/O."""
+        """Cheap half of gallery persistence: MERGE the prepared gallery onto the
+        session. Safe under ``self._lock`` — no inference, no disk I/O.
+
+        Merges rather than replaces so a car's live gallery ACCUMULATES the
+        genuinely different viewpoints it produces across every camera/zone it
+        passes — a front view on an approaching camera, a rear view on the
+        exit-view of a zone it drives out of — instead of being overwritten with
+        only the latest camera's timeline (which left a cross-camera /
+        cross-floor query, e.g. a B1->B2 handover, scoring near-zero against its
+        own gallery). A new view that is a near-duplicate of one already held is
+        skipped (nothing new to learn); when the merged set exceeds the per-car
+        cap it is pruned to the most mutually-dissimilar subset — max viewpoint
+        coverage — the same policy the on-disk store uses. On the first
+        application the existing gallery is empty, so a merge is identical to the
+        old replace.
+        """
         ordered_images, feature_vectors, stored_paths = prepared
         primary_snapshot_index = max(
             0,
             min(primary_snapshot_index, len(ordered_images) - 1),
         )
-        session.reference_snapshot_paths = stored_paths
-        session.reference_feature_vectors = [
-            feature for feature in feature_vectors if feature is not None
+        cfg = self._matching_config
+        dedup = float(getattr(cfg, "gallery_dedup_cosine", 0.97))
+        cap = max(1, int(getattr(cfg, "gallery_max_refs_per_car", 20)))
+
+        # New (path, vector) pairs from this crossing (aligned; skip empty vecs).
+        new_pairs = [
+            (stored_paths[i] if i < len(stored_paths) else "", feature_vectors[i])
+            for i in range(len(feature_vectors))
+            if feature_vectors[i] is not None
         ]
+        if not new_pairs:
+            return False
+
+        # Existing gallery as aligned (path, vector) pairs.
+        existing_vecs = list(session.reference_feature_vectors or [])
+        existing_paths = list(session.reference_snapshot_paths or [])
+        merged = [
+            (existing_paths[i] if i < len(existing_paths) else "", existing_vecs[i])
+            for i in range(len(existing_vecs))
+            if existing_vecs[i] is not None
+        ]
+
+        # Identity gate (open-set novelty rejection): a new view may only join
+        # this identity's gallery when it agrees, in appearance, with the
+        # identity's ESTABLISHED refs. This stops a foreign car — wrongly bound
+        # to a plate at the gate — from grafting its crops into that plate's
+        # gallery (the reported contamination: "the other car's images ended up
+        # in my gallery"), and stops the diversity cap from preferentially
+        # keeping that foreign, dissimilar vector. Bootstrap (empty gallery)
+        # admits unconditionally; disabled when the floor is 0.
+        identity_floor = float(getattr(cfg, "gallery_min_identity_similarity", 0.0))
+        established_vecs = [v for _, v in merged]
+
+        # Append each new view that clears the identity floor and is not a
+        # near-duplicate of one already held.
+        for path, vec in new_pairs:
+            if identity_floor > 0.0 and established_vecs:
+                id_sim = max(
+                    self.reid_matcher.compute_similarity(vec, ev)
+                    for ev in established_vecs
+                )
+                if id_sim < identity_floor:
+                    logger.warning(
+                        "[gallery] Rejected foreign crop for session %s "
+                        "(plate=%s): identity similarity %.3f < floor %.2f — "
+                        "contamination guard.",
+                        getattr(session, "session_id", "?"),
+                        getattr(session, "plate", "") or "",
+                        id_sim,
+                        identity_floor,
+                    )
+                    continue
+            if all(
+                self.reid_matcher.compute_similarity(vec, kept_vec) <= dedup
+                for _, kept_vec in merged
+            ):
+                merged.append((path, vec))
+
+        # Diversity cap: keep the `cap` most mutually-dissimilar views.
+        if len(merged) > cap:
+            from src.vehicle_registry.gallery_store import select_diverse_indices
+
+            keep = set(select_diverse_indices([v for _, v in merged], cap))
+            merged = [pair for i, pair in enumerate(merged) if i in keep]
+
+        session.reference_snapshot_paths = [p for p, _ in merged]
+        session.reference_feature_vectors = [v for _, v in merged]
+
+        # Primary = this crossing's chosen canonical view (freshest best shot).
         if stored_paths:
             session.snapshot_path = stored_paths[
                 min(primary_snapshot_index, len(stored_paths) - 1)
@@ -387,6 +466,35 @@ class VehicleRegistryIdentityMixin:
         feature = feature_vectors[idx]
         if image is None or getattr(image, "size", 0) == 0 or feature is None:
             return
+        # Contamination guard on the durable folder (mirrors the in-memory
+        # identity gate): don't persist a crop whose appearance disagrees with the
+        # session's established gallery — otherwise a foreign car wrongly bound to
+        # this plate poisons the on-disk refs and warm-start reloads the mix. A
+        # legitimate primary is itself already in the (gated) session gallery, so
+        # it self-matches; a foreign primary was rejected there and scores low
+        # here. Skipped for gate_only seeds (bootstrap, non-matchable) and when
+        # the gallery is still empty.
+        identity_floor = float(
+            getattr(self._matching_config, "gallery_min_identity_similarity", 0.0)
+        )
+        established = [
+            v
+            for v in (getattr(session, "reference_feature_vectors", None) or [])
+            if v is not None
+        ]
+        if identity_floor > 0.0 and established and not gate_only:
+            id_sim = max(
+                self.reid_matcher.compute_similarity(feature, ev) for ev in established
+            )
+            if id_sim < identity_floor:
+                logger.warning(
+                    "[gallery] Skipped foreign on-disk seed for plate %s: identity "
+                    "similarity %.3f < floor %.2f (contamination guard).",
+                    plate,
+                    id_sim,
+                    identity_floor,
+                )
+                return
         try:
             store.save_ref(
                 plate,
@@ -907,12 +1015,29 @@ class VehicleRegistryIdentityMixin:
                 for pair in provisional_pairs
                 if pair[1].candidate_id not in hard_rejected_candidate_ids
             ]
-            # Re-ask MatchDecision with the surviving candidate count so the
-            # "single-candidate fallback" branch fires identically to the
-            # historical implementation. We feed it a 0.0 score so only the
-            # candidate_count==1 fallback path can produce a 'confirm'.
+            # Appearance floor on the single-candidate fallback: compute the lone
+            # survivor's actual ReID score against the crossing track and pass it
+            # to MatchDecision so the ``single_candidate_min_reid`` floor can
+            # reject an appearance-blind bind. Previously this passed 0.0, so the
+            # lone candidate was confirmed at ANY agreement — the mechanism by
+            # which the NEXT car adopted a PREVIOUS car's stale pending plate.
+            survivor_score = 0.0
+            if fallback_pairs and current_reid_feat is not None:
+                survivor = fallback_pairs[0][1]
+                survivor_vectors = [
+                    f
+                    for f in list(getattr(survivor, "feature_vectors", []) or [])
+                    if f is not None
+                ]
+                if not survivor_vectors and getattr(survivor, "feature_vector", None) is not None:
+                    survivor_vectors = [survivor.feature_vector]
+                if survivor_vectors:
+                    survivor_score = max(
+                        self.reid_matcher.compute_similarity(current_reid_feat, v)
+                        for v in survivor_vectors
+                    )
             fallback_verdict = decision.decide_b1(
-                0.0,
+                survivor_score,
                 is_anpr_candidate=False,
                 candidate_count=len(fallback_pairs),
             )
@@ -922,13 +1047,26 @@ class VehicleRegistryIdentityMixin:
             ):
                 best_candidate = fallback_pairs[0][1]
                 logger.warning(
-                    "[B1] Falling back to the only provisional candidate %s "
-                    "for track (%s, %d); strict visual threshold was not met",
+                    "[B1] Falling back to the only provisional candidate %s for "
+                    "track (%s, %d); ReID=%.3f cleared the single-candidate floor "
+                    "(strict visual threshold not met)",
                     best_candidate.candidate_id,
                     camera_id,
                     track_id,
+                    survivor_score,
                 )
             else:
+                if fallback_pairs:
+                    logger.info(
+                        "[B1] Refused appearance-blind single-candidate bind for "
+                        "track (%s, %d): lone candidate %s ReID=%.3f below floor "
+                        "single_candidate_min_reid — not adopting its plate (guards "
+                        "against the stale-pending-plate identity swap).",
+                        camera_id,
+                        track_id,
+                        fallback_pairs[0][1].candidate_id,
+                        survivor_score,
+                    )
                 return None
 
         session_feature_vector = (
@@ -1737,8 +1875,21 @@ class VehicleRegistryIdentityMixin:
             live.reference_feature_vectors.append(vec)
             cap = max(1, int(cfg.gallery_max_refs_per_car))
             if len(live.reference_feature_vectors) > cap:
-                # FIFO cap in memory; the disk store keeps the quality-best set.
-                live.reference_feature_vectors = live.reference_feature_vectors[-cap:]
+                # Diversity cap: keep the `cap` most mutually-dissimilar vectors
+                # (max viewpoint coverage) rather than FIFO, which collapses the
+                # gallery onto whichever viewpoint produced the most recent crops
+                # and leaves a query from another camera/angle unmatchable. Seed
+                # from the newest vector (just appended) so a genuinely novel view
+                # is always retained.
+                from src.vehicle_registry.gallery_store import select_diverse_indices
+
+                vecs = live.reference_feature_vectors
+                keep_idx = set(
+                    select_diverse_indices(vecs, cap, seed_index=len(vecs) - 1)
+                )
+                live.reference_feature_vectors = [
+                    v for i, v in enumerate(vecs) if i in keep_idx
+                ]
             self._gallery_index_upsert(live)
             plate = live.plate
 

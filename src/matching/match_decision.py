@@ -233,11 +233,20 @@ class MatchDecision:
         # warning. The callsite emits the warning log so the wording remains
         # identical to the pre-refactor message.
         if candidate_count == 1:
-            return Decision(
-                verdict="confirm",
-                reason="single_candidate_fallback",
-                scores=scores,
-            )
+            # Open-set appearance floor: a lone provisional candidate is confirmed
+            # only when its ReID clears ``single_candidate_min_reid``. The historical
+            # policy confirmed it at ANY score (the caller even passed 0.0), which
+            # let the NEXT car adopt a PREVIOUS car's stale pending plate at ~0
+            # appearance agreement — the gate identity-swap incident. The caller now
+            # passes the real survivor score so this floor can reject a blind bind.
+            floor = float(getattr(cfg, "single_candidate_min_reid", 0.0))
+            scores["single_candidate_floor"] = floor
+            if score_reid >= floor:
+                return Decision(
+                    verdict="confirm",
+                    reason="single_candidate_fallback",
+                    scores=scores,
+                )
 
         return Decision(verdict="reject", reason="below_threshold", scores=scores)
 
@@ -438,13 +447,33 @@ class MatchDecision:
                 scores=scores,
             )
 
-        # Rule 4 — K-of-N agreement.
+        # Rule 4 — K-of-N agreement, gated by a ReID floor and a high-entropy
+        # signal. Colour and body-type are LOW-entropy (many cars share them),
+        # so they must never confirm an identity on their own. A K-of-N confirm
+        # now requires BOTH:
+        #   (a) ReID above a floor (``ocr_marginal_low``) — a near-zero ReID is
+        #       a different car no matter what else agrees; and
+        #   (b) at least one high-entropy modality in the agreeing set — ReID
+        #       clearing its threshold, or an OCR plate match.
+        # This closes the "two white sedans confirmed at ReID 0.30" hole while
+        # still letting a marginal ReID be rescued by an OCR agreement (OCR at
+        # high confidence is already a hard confirm via Rule 3 above).
         reid_pass = score_reid >= threshold
+        reid_floor = float(getattr(cfg, "ocr_marginal_low", threshold))
+        reid_floor_pass = score_reid >= reid_floor
+        high_entropy_agree = reid_pass or ocr_match
         agree_count = sum([reid_pass, color_match, type_match, ocr_match])
         scores["agree_count"] = int(agree_count)
         scores["min_modalities_agree"] = int(cfg.ensemble_min_modalities_agree)
+        scores["reid_floor"] = round(reid_floor, 4)
+        scores["reid_floor_pass"] = bool(reid_floor_pass)
+        scores["high_entropy_agree"] = bool(high_entropy_agree)
 
-        if agree_count >= cfg.ensemble_min_modalities_agree:
+        if (
+            reid_floor_pass
+            and high_entropy_agree
+            and agree_count >= cfg.ensemble_min_modalities_agree
+        ):
             scores["ensemble_reason"] = f"k_of_n_{agree_count}"
             return Decision(
                 verdict="confirm",
