@@ -9,6 +9,7 @@ import numpy as np
 from shapely.geometry import Point, box
 
 from src.models.slot import ParkingSlot
+from src.models.state_machine import SlotState
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,42 @@ class ParkingEngineTrackingMixin:
         """Check if a detection's bottom-center is inside a zone polygon."""
         bc_x, bc_y = detection.bottom_center
         return zone_slot.polygon.contains(Point(bc_x, bc_y))
+
+    def _detection_in_occupied_slot(self, cam_id: str, detection) -> bool:
+        """True when this detection sits inside a slot that is ALREADY occupied
+        (or leaving) on this camera.
+
+        A car in an occupied slot is a parked car — it cannot be the newly
+        entered car we are building a reference for — so its crop must not be
+        pulled into a gallery. Uses the slot state from the previous frame's
+        occupancy pass (this runs before ``_update_slot_state`` for the current
+        frame), which is the correct "already occupied" signal. No-op (False)
+        when the camera has no pipeline / slots."""
+        pipeline = self.pipelines.get(cam_id) if hasattr(self, "pipelines") else None
+        if pipeline is None:
+            return False
+        for slot in getattr(pipeline, "slots", []) or []:
+            sm = pipeline.state_machines.get(slot.id)
+            if sm is None or sm.state not in (SlotState.OCCUPIED, SlotState.LEAVING):
+                continue
+            if self._detection_in_zone(detection, slot):
+                return True
+        return False
+
+    def _track_in_entrance_zone(self, cam_id: str, track_id: int) -> bool:
+        """True while ``track_id`` is currently inside a B1_Entrance
+        (``Entrence``) confirmation zone on this camera.
+
+        Reference snapshots must not be captured for a car until it has LEFT the
+        B1_Entrance (CAM-03) zone — while inside, the view is mid-transit /
+        partial, not the clean profile we want. ``_process_confirmation_zone``
+        refreshes ``_tracks_inside_zones`` earlier in the same frame, so this
+        reads the current-frame membership. Cameras without an entrance zone
+        simply have no such key → False (accumulation proceeds normally)."""
+        for (c, zone_id), ids in self._tracks_inside_zones.items():
+            if c == cam_id and "Entrence" in zone_id and track_id in ids:
+                return True
+        return False
 
     def _detection_overlaps_zone(
         self,
@@ -906,7 +943,19 @@ class ParkingEngineTrackingMixin:
                             )
                         # Grow this car's persistent gallery with a fresh full-view
                         # crop (throttled/gated/deduped inside the registry) so its
-                        # ReID profile keeps improving and survives restart.
+                        # ReID profile keeps improving and survives restart. Two
+                        # capture guards, so a reference is only ever taken from
+                        # the genuine moving entrant:
+                        #   * skip a car sitting in an already-occupied slot — it
+                        #     is parked, not the newly entered car (its crop must
+                        #     not enter a gallery);
+                        #   * skip while the car is still inside the B1_Entrance
+                        #     (CAM-03) zone — wait until it has LEFT, so the ref is
+                        #     a clean profile, not a mid-transit partial view.
+                        if self._detection_in_occupied_slot(cam_id, detection):
+                            continue
+                        if self._track_in_entrance_zone(cam_id, detection.track_id):
+                            continue
                         ref_crop = self._crop_detection(frame, detection)
                         if ref_crop is not None:
                             self.vehicle_registry.record_reference_for_track(

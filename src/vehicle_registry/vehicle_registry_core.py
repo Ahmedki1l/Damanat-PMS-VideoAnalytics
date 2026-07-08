@@ -557,8 +557,13 @@ class VehicleRegistryCoreMixin:
                 elif candidate.status in ("confirmed", "dropped", "expired"):
                     candidates_to_delete.append(candidate_id)
 
+            seeded = getattr(self, "_park_entry_gallery_seeded", None)
             for candidate_id in candidates_to_delete:
                 self._park_entry_candidates.pop(candidate_id, None)
+                # Drop the per-visit gallery-seed marker so the set can't grow
+                # without bound (see seed_gallery_from_park_entry).
+                if seeded is not None:
+                    seeded.discard(candidate_id)
 
         # Phase 2 / T2.2 — drop stale per-track vote buffers. Held outside
         # the registry lock so the voter's own RLock is the only contention

@@ -8,10 +8,11 @@ entering close together cannot swap plates.
 A1 — a car must get a durable per-plate gallery folder
 (vehicle_images/gallery/<plate>/) the moment it enters the gate, so EVERY
 entering car has a folder even if the CAM-03 B-entry reference never arrives.
-The wide gate-only ANPR shot is persisted but flagged (gate_only) so it is
-excluded from warm-start matching — the folder exists, yet the gate shot can
-never false-match against a parked car. The authoritative CAM-03 B-entry
-reference is what adds the first *matchable* vector.
+The ANPR front crop is persisted as a MATCHABLE ground-truth reference; the
+CAM-23 Park_Entry top view is later appended as a second distinct ground-truth
+viewpoint, and the CAM-03 B-entry reference adds the front+back profile. Live
+entry-time parked-car latching is prevented by the session-level
+``gate_reference_only`` guard, not by excluding crops from the gallery.
 """
 
 import os
@@ -179,12 +180,13 @@ class TestGallerySeedAtConfirm(unittest.TestCase):
         matchable, _, _ = registry.gallery_store.load_vectors(plate)
         self.assertTrue(matchable, "B-entry must add a matchable reference vector")
 
-    def test_park_entry_seed_is_noop_when_gate_already_seeded(self):
+    def test_park_entry_adds_top_view_even_when_gate_seeded(self):
         registry, image_dir = _make_registry(gallery=True)
         plate = "SEED-PE"
-        # Gate entry already seeds the folder with the matchable ANPR front ref.
-        # When the car later reaches the CAM-23 Park_Entry zone, the seed is a
-        # no-op — the folder is already there.
+        # Gate entry seeds the folder with the matchable ANPR front ref. When the
+        # car later reaches the CAM-23 Park_Entry zone, the top view is added as a
+        # DISTINCT ground-truth reference (not a no-op) even though the folder
+        # already exists — CAM-23 is a different canonical viewpoint.
         registry.register_anpr_event(plate, "entry")
         registry.confirm_anpr_session_directly(
             plate=plate, image=_image(120), event_id="evt-pe",
@@ -192,21 +194,23 @@ class TestGallerySeedAtConfirm(unittest.TestCase):
         )
         pdir = self._plate_dir(image_dir, plate)
         self.assertTrue(os.path.isdir(pdir), "gate entry seeds the folder")
+        before, _, _ = registry.gallery_store.load_vectors(plate)
+        self.assertEqual(len(before), 1, "gate entry contributes the front ref")
 
         candidate = registry.open_park_entry_candidate("CAM-23", 7)
         registry.update_park_entry_candidate_snapshot(
-            candidate.candidate_id, _image(120), quality_score=5.0
+            candidate.candidate_id, _image(80), quality_score=5.0
         )
         bound = registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id)
         self.assertEqual(bound, plate)
-        # Folder already exists → Park_Entry seed no-ops (returns False).
-        self.assertFalse(
-            registry.seed_gallery_from_park_entry(candidate.candidate_id, plate)
-        )
-        vectors, _, _ = registry.gallery_store.load_vectors(plate)
+        # CAM-23 top view is appended as a distinct matchable ref.
         self.assertTrue(
-            vectors, "ANPR front seed is a matchable ground-truth reference"
+            registry.seed_gallery_from_park_entry(candidate.candidate_id, plate),
+            "Park_Entry must add the CAM-23 top view",
         )
+        after, _, cams = registry.gallery_store.load_vectors(plate)
+        self.assertEqual(len(after), 2, "front + top view are both matchable")
+        self.assertIn("CAM-23", cams, "top view is tagged with its source camera")
         # The authoritative CAM-03 B-entry reference adds another matchable ref.
         registry.confirm_b1_entrance_by_plate(plate, _image(200))
         matchable, _, _ = registry.gallery_store.load_vectors(plate)

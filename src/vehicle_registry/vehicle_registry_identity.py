@@ -521,33 +521,40 @@ class VehicleRegistryIdentityMixin:
             logger.debug("[gallery] seed for %s failed: %r", plate, exc)
 
     def seed_gallery_from_park_entry(self, candidate_id: str, plate: str) -> bool:
-        """Create the durable per-plate gallery folder the moment a car is seen
-        in the CAM-23 Park_Entry zone and bound to a plate — so every car that
-        enters the parking gets a folder, sourced from its first good in-garage
-        view rather than the wide external gate ANPR shot.
+        """Persist the CAM-23 Park_Entry (top-view) crop as a MATCHABLE
+        ground-truth reference the moment a car is bound to a plate there.
 
-        The Park_Entry crop is persisted as a MATCHABLE reference: CAM-23 is an
-        in-garage camera whose crop is a genuinely useful ReID viewpoint, so it
-        is loaded for warm-start / cross-camera matching alongside the CAM-03
-        confirmation reference. NOTE: the plate binding here is still provisional
-        (FIFO) — a FIFO mis-bind therefore injects a wrong-plate CAM-23 crop as a
-        matchable ref, and the contamination guard cannot protect this first
-        (bootstrap) crop because the gallery is still empty. The shortened
+        CAM-23 is one of the three ground-truth cameras (top view); its crop is a
+        canonical viewpoint we want in every car's gallery. It is added even when
+        the folder ALREADY exists (the ANPR gate `entry` already seeded the front
+        view) — the top view is a distinct viewpoint, not a redundant re-seed.
+        The crop is written to the durable per-plate folder (survives restart /
+        warm-start) AND enriched onto the live session's in-memory gallery so it
+        is immediately match-usable once the session becomes active at CAM-03.
+
+        Fires once per visit (the caller only calls this on the one-shot
+        open->provisional bind). NOTE: the plate binding here is still provisional
+        (FIFO) — a mis-bind injects a wrong-plate CAM-23 crop; the shortened
         pending-bind TTL (PENDING_ANPR_BIND_TTL_SECONDS) is the mitigation.
-        No-op when persistence is off, the plate is unknown, the candidate has no
-        usable crop, or the folder already exists (returning car / earlier
-        frame). Best-effort — disk errors are swallowed."""
+        No-op when persistence is off, the plate is unknown, or the candidate has
+        no usable crop. Best-effort — disk errors are swallowed."""
         store = self.gallery_store
         if store is None or not plate:
             return False
-        # Already seeded (a prior frame this visit, or a returning car's retained
-        # gallery) — don't append a redundant gate crop.
-        if store.has(plate):
-            return False
+        # Idempotent per visit: each Park_Entry visit is one candidate, and the
+        # caller only fires on the one-shot open->provisional bind — but guard
+        # against any double-call so a single visit never adds two identical
+        # CAM-23 crops. (A returning car is a NEW candidate → a fresh top view.)
+        seeded = getattr(self, "_park_entry_gallery_seeded", None)
+        if seeded is None:
+            seeded = self._park_entry_gallery_seeded = set()
         with self._lock:
             candidate = self._park_entry_candidates.get(candidate_id)
             if candidate is None:
                 return False
+            if candidate_id in seeded:
+                return False
+            seeded.add(candidate_id)
             crop = candidate.snapshot_image
             feature = candidate.feature_vector
             quality = float(candidate.quality_score)
@@ -566,9 +573,49 @@ class VehicleRegistryIdentityMixin:
         except Exception as exc:  # pragma: no cover - disk best-effort
             logger.debug("[gallery] park-entry seed for %s failed: %r", plate, exc)
             return False
+
+        # Enrich the live session (created at the gate) so the top view is
+        # immediately match-usable, tagged with its ground-truth source camera.
+        # Deduped + capped, mirroring accumulate_reference. Best-effort: a car
+        # without a live session yet still has the durable disk ref above.
+        with self._lock:
+            session = next(
+                (
+                    s
+                    for s in self._sessions.values()
+                    if s.plate == plate
+                    and s.status in ("confirmed", "parked", "provisional")
+                ),
+                None,
+            )
+            if session is not None:
+                cfg = self._matching_config
+                known = [session.feature_vector] + list(
+                    session.reference_feature_vectors
+                )
+                is_dup = any(
+                    ref is not None
+                    and self.reid_matcher.compute_similarity(feature, ref)
+                    > cfg.gallery_dedup_cosine
+                    for ref in known
+                )
+                if not is_dup:
+                    session.reference_feature_vectors.append(feature)
+                    self._sync_reference_cameras(session)
+                    session.reference_source_cameras[-1] = camera_id
+                    cap = max(1, int(cfg.gallery_max_refs_per_car))
+                    if len(session.reference_feature_vectors) > cap:
+                        session.reference_feature_vectors = (
+                            session.reference_feature_vectors[-cap:]
+                        )
+                        session.reference_source_cameras = (
+                            session.reference_source_cameras[-cap:]
+                        )
+                    self._gallery_index_upsert(session)
+
         logger.info(
-            "[gallery] Park_Entry (%s) seeded folder for plate=%s (matchable "
-            "in-garage reference)", camera_id, plate,
+            "[gallery] Park_Entry (%s) added top-view ground-truth reference for "
+            "plate=%s", camera_id, plate,
         )
         return True
 
