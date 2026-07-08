@@ -37,7 +37,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -148,6 +148,12 @@ def _clear_slot_dependents(session, floor: str | None):
     - alerts: historical records we keep; the FK is nullable and each alert
       carries its own ``slot_number`` string, so we NULL slot_id (detach) rather
       than destroy the alert.
+    - parking_sessions: owned by the PMS-AI side (no VA ORM model here), but it
+      also FK-references parking_slots.slot_id (fk_parking_sessions_slot_id).
+      These are live/historical occupancy rows we must NOT destroy, so we NULL
+      the slot binding (detach) via raw SQL — same intent as alerts. The seed
+      resets slot occupancy anyway, and re-seeded slots keep their PK, so a live
+      car re-binds to its slot afterwards.
 
     When ``floor`` is given, only slots on that floor are affected.
     """
@@ -161,9 +167,27 @@ def _clear_slot_dependents(session, floor: str | None):
     al = session.query(Alert).filter(Alert.slot_id.in_(slot_scope))
     al_detached = al.update({Alert.slot_id: None}, synchronize_session=False)
 
-    if ss_deleted or al_detached:
+    # parking_sessions has no ORM model here — detach via raw SQL, scoped to the
+    # same slots. IF NOT EXISTS guards machines/schemas where the table is absent.
+    ps_sql = (
+        "UPDATE dbo.parking_sessions SET slot_id = NULL "
+        "WHERE slot_id IN (SELECT slot_id FROM parking_slots"
+    )
+    ps_params = {}
+    if floor:
+        ps_sql += " WHERE floor = :floor"
+        ps_params["floor"] = floor
+    ps_sql += ")"
+    ps_detached = 0
+    if session.execute(
+        text("SELECT OBJECT_ID('dbo.parking_sessions')")
+    ).scalar() is not None:
+        ps_detached = session.execute(text(ps_sql), ps_params).rowcount
+
+    if ss_deleted or al_detached or ps_detached:
         print(f"  {'slot_status':<16} -{ss_deleted} deleted, "
-              f"{al_detached} alert(s) detached")
+              f"{al_detached} alert(s) detached, "
+              f"{ps_detached} session(s) detached")
 
 
 def cmd_seed(session, url, args):
