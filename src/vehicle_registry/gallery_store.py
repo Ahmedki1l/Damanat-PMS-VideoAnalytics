@@ -42,6 +42,39 @@ _META = "meta.json"
 _SAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
+def select_diverse_indices(
+    vectors: List[np.ndarray], cap: int, seed_index: int = 0
+) -> List[int]:
+    """Greedy farthest-point selection of the ``cap`` most mutually-dissimilar
+    vectors — the subset that maximally spans the appearance/viewpoint space.
+
+    Used to prune a per-car ReID gallery for *coverage* instead of by
+    sharpness/recency (which collapse it to one dominant viewpoint and make a
+    query from a different camera/angle unmatchable). Vectors are assumed
+    L2-normalised, so cosine similarity = dot product and distance = 1 - dot.
+
+    Returns the kept indices (order not significant). When ``len(vectors) <=
+    cap`` every index is returned.
+    """
+    n = len(vectors)
+    if cap <= 0:
+        return []
+    if n <= cap:
+        return list(range(n))
+    mat = np.stack([np.asarray(v, dtype=np.float32).ravel() for v in vectors])
+    seed = seed_index if 0 <= seed_index < n else 0
+    kept = [seed]
+    # nearest[i] = cosine similarity of vector i to its closest kept vector.
+    nearest = mat @ mat[seed]
+    while len(kept) < cap:
+        masked = nearest.copy()
+        masked[kept] = np.inf  # never re-pick a kept vector
+        nxt = int(np.argmin(masked))  # farthest from the kept set
+        kept.append(nxt)
+        nearest = np.maximum(nearest, mat @ mat[nxt])
+    return kept
+
+
 def safe_plate(plate: str) -> str:
     """Filesystem-safe folder name for a plate (keeps A-Z0-9 and ``-``/``_``)."""
     return _SAFE.sub("_", (plate or "").strip()).strip("._") or "UNKNOWN"
@@ -142,13 +175,45 @@ class VehicleGalleryStore:
         return stem + ".jpg"
 
     def _prune_meta_inplace(self, plate_dir: str, meta: dict) -> None:
-        """Keep the top ``max_refs`` refs by quality; delete evicted files."""
+        """Prune to ``max_refs``, keeping a spread across cameras/viewpoints.
+
+        Keeping the globally-sharpest refs collapses the gallery onto one
+        camera's viewpoint (a parked car in front of one camera generates the
+        sharpest, most numerous crops), which makes a returning car's query from
+        a different camera/angle unmatchable. Instead we round-robin across
+        cameras — each camera is a distinct position — taking the highest-quality
+        crop from each in turn until the cap is filled. Gate-only refs are kept
+        preferentially (the entry-photo guarantee). Within a single camera this
+        still falls back to quality order.
+        """
         refs = meta.get("refs", [])
         if len(refs) <= self._max_refs:
             return
-        refs.sort(key=lambda r: r.get("quality", 0.0), reverse=True)
-        keep, drop = refs[: self._max_refs], refs[self._max_refs :]
-        for r in drop:
+
+        gate_refs = [r for r in refs if r.get("gate")]
+        normal_refs = [r for r in refs if not r.get("gate")]
+
+        by_cam: dict = {}
+        for r in normal_refs:
+            by_cam.setdefault(r.get("camera", "") or "", []).append(r)
+        for cam_refs in by_cam.values():
+            cam_refs.sort(key=lambda r: r.get("quality", 0.0), reverse=True)
+
+        keep: list = list(gate_refs[: self._max_refs])
+        # Round-robin across cameras so every viewpoint is represented before
+        # any single camera contributes a second crop.
+        queues = [list(v) for v in by_cam.values()]
+        while len(keep) < self._max_refs and any(queues):
+            for q in queues:
+                if q:
+                    keep.append(q.pop(0))
+                    if len(keep) >= self._max_refs:
+                        break
+
+        keep_ids = {id(r) for r in keep}
+        for r in refs:
+            if id(r) in keep_ids:
+                continue
             for key in ("crop", "vec"):
                 fn = r.get(key)
                 if fn:

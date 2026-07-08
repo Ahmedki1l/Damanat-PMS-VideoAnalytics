@@ -45,6 +45,14 @@ class VehicleRegistry(
     """
 
     PENDING_ANPR_EXPIRY_SECONDS = 30
+    # How long an UNCONSUMED pending ANPR entry stays eligible to be FIFO-bound to
+    # a live-track Park_Entry candidate (which carries no plate of its own). Kept
+    # SHORTER than PENDING_ANPR_EXPIRY_SECONDS on purpose: a legitimate car reaches
+    # the B1 gate within a few seconds of its gate read, whereas a stale plate left
+    # over from a lingering/mis-read PREVIOUS car (the night gate identity-swap)
+    # must stop being bindable quickly so the NEXT car cannot inherit it. The event
+    # itself still lives the full expiry for re-entry grace / specific-event binds.
+    PENDING_ANPR_BIND_TTL_SECONDS = 10
     # Re-entry DB-grace: a car can exit (parking_sessions -> closed) and RE-ENTER
     # before PMS-AI inserts the new open row. During that window the freshest DB
     # row is still the exit's closed row, so is_plate_inside would wrongly report

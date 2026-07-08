@@ -151,20 +151,27 @@ class SlotAssigner:
     @staticmethod
     def _compute_overlap(det_box: Polygon, slot_polygon: Polygon) -> float:
         """
-        Compute the overlap ratio = intersection_area / detection_box_area.
+        Overlap ratio = intersection_area / detection_box_area — the fraction
+        of the *vehicle's* bounding box that lies inside the slot polygon.
 
-        This measures how much of the detection bbox is inside the slot polygon.
         A ratio > threshold means the vehicle is likely in the slot even if
-        its bottom-center point is slightly outside.
+        its ground-contact point is slightly outside. Normalising by the
+        detection box (not the slot) keeps the gate perspective-robust: a small
+        car fully inside a large near slot still scores ~1.0, and a truck merely
+        clipping a small far slot scores low. Previously this divided by
+        ``slot_polygon.area``, which scaled with slot pixel size under
+        perspective (a truck could "steal" a far slot; a small car in a near
+        slot was rejected). NOTE: ``overlap_threshold`` was tuned under the old
+        slot-area semantics — re-validate it on real footage.
         """
         if not det_box.intersects(slot_polygon):
             return 0.0
 
         try:
             intersection_area = det_box.intersection(slot_polygon).area
-            slot_area = slot_polygon.area
-            if slot_area == 0:
+            det_area = det_box.area
+            if det_area == 0:
                 return 0.0
-            return intersection_area / slot_area
+            return intersection_area / det_area
         except Exception:
             return 0.0

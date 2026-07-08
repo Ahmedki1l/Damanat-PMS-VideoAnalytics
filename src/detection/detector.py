@@ -41,14 +41,21 @@ class Detection:
     @property
     def bottom_center(self) -> Tuple[float, float]:
         """
-        Compute the center point of the bounding box.
+        Vehicle ground-contact point: horizontal center of the bbox at its
+        bottom edge ``(x_mid, y2)``.
 
-        Uses true center (not bottom) so it works reliably for both
-        fully visible and partially visible (half-shown) vehicles.
+        This is the point tested against slot polygons (``slot_assigner``) and
+        boundary/zone polygons, all of which are authored on the ground plane.
+        It must match ``zoning.boundary_detector._bottom_center`` exactly so
+        slot membership and boundary crossings reference the same point.
+
+        (Historically this returned ``cy = (y1 + y2) / 1.5`` — neither the
+        center nor the bottom; for boxes low in the frame it fell *below* the
+        box entirely and mis-attributed slot occupancy.)
         """
         x1, y1, x2, y2 = self.bbox
         cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 1.5
+        cy = y2
         return (cx, cy)
 
     @property

@@ -230,6 +230,27 @@ class MatchingConfig:
     # to reid_solo_confirm; kept separate so the freeze bar can be tuned alone.
     lock_confidence: float = 0.70
 
+    # Appearance floor for the B1 single-candidate fallback. When exactly one
+    # provisional candidate remains but its ReID did not clear the confirm bar,
+    # the historical policy confirmed it regardless of appearance — which let the
+    # NEXT car adopt a PREVIOUS car's stale pending plate at ~0 ReID agreement
+    # (the night gate identity-swap incident). The lone candidate is now confirmed
+    # only when its ReID clears this floor (open-set novelty rejection). Default
+    # 0.0 preserves legacy behaviour; production sets it in config.yaml. Calibrate
+    # on the gate cross-view FAR/DIR curve — do NOT reuse b1_zone.
+    single_candidate_min_reid: float = 0.0
+
+    # Appearance-consistency (open-set novelty) floor for gallery admission. A new
+    # reference crop is only merged into an identity's gallery when its ReID max-
+    # similarity to that identity's ESTABLISHED refs clears this — so a foreign
+    # car wrongly bound to a plate cannot poison that plate's gallery (the night
+    # gate contamination: "the other car's images ended up in my gallery"). Also
+    # makes the diversity-merge safe (a foreign vector is otherwise preferentially
+    # kept by the farthest-point cap). Default 0.0 = off (legacy). Set
+    # conservatively in config.yaml — reject only clearly-foreign crops (near-zero
+    # agreement); tune on the FAR/DIR curve. Bootstrap (empty gallery) always admits.
+    gallery_min_identity_similarity: float = 0.0
+
     # --- HSV tolerances for color_compatible() ---
     # Tightened from 25 -> 12 in Phase 2 / T2.1: the learned 11-class color
     # classifier is now the primary path. The legacy HSV gate is kept as a
@@ -245,6 +266,31 @@ class MatchingConfig:
     use_color_filter: bool = False
     use_lab_clahe: bool = False
     use_multishot: bool = False
+    # How many of the sharpest burst crops to keep as per-identity ReID
+    # references when multishot is on (applies to every camera, not just the
+    # entry camera). Matching scores max-cosine over these references.
+    multishot_ref_top_k: int = 3
+
+    # Minimum per-read OCR confidence to ACCEPT an ANPR entry read (source-side
+    # gate on the two-plate genesis). A read below this — when the ANPR server
+    # supplies a confidence — is held rather than minting a pending plate, so a
+    # low-confidence night misread cannot create a second identity for one car.
+    # Default 0.0 = accept all (and it is a no-op when the server omits
+    # confidence). Set once the ANPR server sends per-read confidence; typical
+    # ALPR practice gates around 0.8-0.9.
+    anpr_min_accept_confidence: float = 0.0
+
+    # Cross-session identity reconciliation: collapse two confirmed identities
+    # that are the SAME physical car the ANPR misread as two plates. At confirm
+    # time, a new session that has ReID similarity >= this floor to another
+    # freshly-confirmed (not-yet-parked, different-plate) session entered within
+    # identity_reconcile_window_seconds is treated as the same car and the
+    # duplicate is closed. HIGH floor on purpose (well above the same-car mean
+    # ~0.67) so only near-identical gate views trigger and two similar-but-
+    # different cars are never merged. Default 0.0 = OFF — enabling closes real
+    # sessions, so validate on multi-car footage first (recommended ~0.75 / 60s).
+    identity_reconcile_min_similarity: float = 0.0
+    identity_reconcile_window_seconds: float = 60.0
 
     # --- Ensemble / voting (Phase 2 wiring; defaults make them inert) ---
     ensemble_min_modalities_agree: int = 2
@@ -289,7 +335,7 @@ class MatchingConfig:
 @dataclass
 class AlertsConfig:
     """Alerting feature toggles."""
-    enable_restricted_zone_alerts: bool = False
+    enable_restricted_zone_alerts: bool = True
 
 
 @dataclass
@@ -554,6 +600,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.ocr_marginal_high = m.get("ocr_marginal_high", cm.ocr_marginal_high)
         cm.reid_solo_confirm = m.get("reid_solo_confirm", cm.reid_solo_confirm)
         cm.lock_confidence = m.get("lock_confidence", cm.lock_confidence)
+        cm.single_candidate_min_reid = m.get(
+            "single_candidate_min_reid", cm.single_candidate_min_reid
+        )
+        cm.gallery_min_identity_similarity = m.get(
+            "gallery_min_identity_similarity", cm.gallery_min_identity_similarity
+        )
         cm.global_match_margin = m.get(
             "global_match_margin", cm.global_match_margin
         )
@@ -590,6 +642,16 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.use_color_filter = m.get("use_color_filter", cm.use_color_filter)
         cm.use_lab_clahe = m.get("use_lab_clahe", cm.use_lab_clahe)
         cm.use_multishot = m.get("use_multishot", cm.use_multishot)
+        cm.multishot_ref_top_k = m.get("multishot_ref_top_k", cm.multishot_ref_top_k)
+        cm.anpr_min_accept_confidence = m.get(
+            "anpr_min_accept_confidence", cm.anpr_min_accept_confidence
+        )
+        cm.identity_reconcile_min_similarity = m.get(
+            "identity_reconcile_min_similarity", cm.identity_reconcile_min_similarity
+        )
+        cm.identity_reconcile_window_seconds = m.get(
+            "identity_reconcile_window_seconds", cm.identity_reconcile_window_seconds
+        )
 
         # Ensemble / voting (Phase 2)
         cm.ensemble_min_modalities_agree = m.get(
