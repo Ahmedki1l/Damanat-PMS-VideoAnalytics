@@ -554,11 +554,13 @@ class VehicleRegistryIdentityMixin:
                 return False
             if candidate_id in seeded:
                 return False
-            seeded.add(candidate_id)
             crop = candidate.snapshot_image
             feature = candidate.feature_vector
             quality = float(candidate.quality_score)
             camera_id = candidate.camera_id or "CAM-23"
+        # Only mark the candidate seeded on SUCCESS: a first frame whose crop was
+        # not yet usable must not permanently block the cross-frame retry (Fix 4)
+        # — the seed re-fires on a later, better in-zone crop.
         if crop is None or getattr(crop, "size", 0) == 0:
             return False
         if feature is None:
@@ -573,6 +575,7 @@ class VehicleRegistryIdentityMixin:
         except Exception as exc:  # pragma: no cover - disk best-effort
             logger.debug("[gallery] park-entry seed for %s failed: %r", plate, exc)
             return False
+        seeded.add(candidate_id)
 
         # Enrich the live session (created at the gate) so the top view is
         # immediately match-usable, tagged with its ground-truth source camera.
@@ -589,6 +592,9 @@ class VehicleRegistryIdentityMixin:
                 None,
             )
             if session is not None:
+                # Anchor the canonical colour from the CAM-23 top view if no
+                # earlier ground-truth crop did — a no-op once already set.
+                self._maybe_set_ground_truth_hsv(session, crop)
                 cfg = self._matching_config
                 known = [session.feature_vector] + list(
                     session.reference_feature_vectors
@@ -673,6 +679,10 @@ class VehicleRegistryIdentityMixin:
             # confirm_b1_entrance_by_plate. Excluded from matching until then.
             pending_anpr_vector=feature_vector,
         )
+        # Anchor the canonical body colour from the ANPR front crop — the
+        # earliest, most reliable frontal view. Drives the colour vetoes in
+        # accumulate_reference / match_global_session.
+        self._maybe_set_ground_truth_hsv(session, image)
 
         # Persist the ANPR image as the primary gallery reference (UI gallery /
         # reference_snapshot_paths) AND seed the durable per-plate folder
@@ -1433,6 +1443,9 @@ class VehicleRegistryIdentityMixin:
 
             session.last_seen_at = now
             session.last_seen_camera = "CAM-03"
+            # Anchor the canonical colour from CAM-03 if the ANPR front never did
+            # (e.g. the gate entry was missed) — a no-op once already set.
+            self._maybe_set_ground_truth_hsv(session, image)
             self._apply_session_gallery(
                 session, prepared, primary_snapshot_index=0, source_camera="CAM-03"
             )
@@ -1495,6 +1508,18 @@ class VehicleRegistryIdentityMixin:
             self._seed_plate_gallery_reference(
                 seeded_session, ordered_images, feature_vectors, 0
             )
+
+        # Fix 4 — CAM-23 fallback: if the in-zone Park_Entry seed never fired this
+        # visit (no CAM-23 top view on the session), pull the top view from the
+        # most recent Park_Entry candidate for this plate now that the car is
+        # confirmed. seed_gallery_from_park_entry is idempotent per candidate, so
+        # this is a no-op when Park_Entry already seeded it.
+        if seeded_session is not None and "CAM-23" not in (
+            getattr(seeded_session, "reference_source_cameras", None) or []
+        ):
+            fallback_cid = self.latest_park_entry_candidate_for_plate(plate)
+            if fallback_cid is not None:
+                self.seed_gallery_from_park_entry(fallback_cid, plate)
         return result_sid
 
     def add_gallery_snapshot_by_plate(
@@ -1944,6 +1969,18 @@ class VehicleRegistryIdentityMixin:
         cfg = self._matching_config
         if float(view_quality) < cfg.gallery_min_view_quality:
             return False
+        # Min-size gate: a distant, low-resolution crop makes a useless ReID
+        # reference (upscaling to the model input is mostly interpolation) and
+        # lets a far camera flood the gallery with tiny views. Reject on absolute
+        # crop resolution — independent of the caller's view_quality, so it holds
+        # for every accumulation caller. (Registry-side backstop to the engine's
+        # size-aware _bbox_view_quality.)
+        try:
+            ch, cw = crop_bgr.shape[:2]
+            if float(ch * cw) < float(getattr(cfg, "gallery_min_crop_area", 0.0) or 0.0):
+                return False
+        except Exception:
+            return False
 
         now_dt = self._clock()
         now_ts = now_dt.timestamp()
@@ -1962,8 +1999,38 @@ class VehicleRegistryIdentityMixin:
         except Exception:
             return False
 
+        # Fix 1 — colour veto: a floor-camera crop whose body colour is
+        # incompatible with the car's ground-truth colour is a DIFFERENT car
+        # (e.g. a white car passing next to a dark one). Reject it before it can
+        # poison the gallery, regardless of whatever ReID score bound the track.
+        # Fail-open when the session has no anchored ground-truth colour yet, and
+        # `color_compatible` only rejects obvious mismatches, so legitimate
+        # lighting/view variation still passes. Cheap: one centre-crop HSV.
+        gt_hsv = getattr(session, "ground_truth_hsv", None)
+        if gt_hsv is not None:
+            try:
+                from src.reid_matcher import body_colour_compatible, dominant_color_hsv
+
+                crop_hsv = dominant_color_hsv(crop_bgr)
+                if crop_hsv is not None and not body_colour_compatible(crop_hsv, gt_hsv):
+                    return False
+            except Exception:
+                pass
+
         vec = self.reid_matcher.extract_feature(crop_bgr)
         if vec is None:
+            return False
+
+        # Fix 3 — feedback-loop guard: a new reference must resemble the
+        # GROUND-TRUTH appearance (never the possibly-poisoned secondary refs),
+        # scoring at least a lenient floor against the best ground-truth anchor.
+        # This stops a wrong-car crop that slipped past matching from being added
+        # and then reinforcing more wrong matches. Fail-open (None) when there is
+        # no ground-truth appearance to compare against yet.
+        gt_sim = self._best_ground_truth_similarity(vec, session)
+        if gt_sim is not None and gt_sim < float(
+            getattr(cfg, "gallery_accumulate_min_gt_similarity", 0.0) or 0.0
+        ):
             return False
 
         with self._lock:
@@ -2125,6 +2192,59 @@ class VehicleRegistryIdentityMixin:
         if gt and camera_id in gt:
             return 1.0
         return float(getattr(cfg, "secondary_camera_weight", 1.0))
+
+    def _is_ground_truth_camera(self, camera_id: str) -> bool:
+        """True when ``camera_id`` is one of the canonical ground-truth cameras
+        (ANPR / CAM-23 / CAM-03). Mirrors :meth:`_reference_weight` semantics."""
+        gt = getattr(self._matching_config, "ground_truth_cameras", None)
+        return bool(gt and camera_id in gt)
+
+    def _maybe_set_ground_truth_hsv(self, session, image) -> None:
+        """Anchor ``session.ground_truth_hsv`` from a ground-truth camera crop,
+        once. Called from the ANPR / CAM-03 / CAM-23 seed paths with that
+        camera's image. The first ground-truth view seen wins (ANPR front is the
+        earliest and most reliable frontal colour); later ground-truth crops do
+        not overwrite it. Best-effort — a crop that yields no colour is a no-op.
+        This is the anchor for the colour vetoes in :meth:`accumulate_reference`
+        and :meth:`match_global_session`."""
+        if session is None or getattr(session, "ground_truth_hsv", None) is not None:
+            return
+        if image is None or getattr(image, "size", 0) == 0:
+            return
+        try:
+            from src.reid_matcher import dominant_color_hsv
+
+            hsv = dominant_color_hsv(image)
+        except Exception:
+            hsv = None
+        if hsv is not None:
+            session.ground_truth_hsv = hsv
+
+    def _best_ground_truth_similarity(self, vec, session) -> Optional[float]:
+        """Best cosine of ``vec`` against the session's GROUND-TRUTH appearance
+        only — the primary ``feature_vector`` plus references whose source camera
+        is a ground-truth camera. Poisoned secondary refs are excluded so they
+        cannot lower the bar for admitting yet another wrong-car crop.
+
+        Returns None when the session has no ground-truth appearance to compare
+        against yet (caller fails open)."""
+        anchors = []
+        primary = getattr(session, "feature_vector", None)
+        if primary is not None:
+            anchors.append(primary)
+        refs = getattr(session, "reference_feature_vectors", None) or []
+        cams = getattr(session, "reference_source_cameras", None) or []
+        for i, ref in enumerate(refs):
+            if ref is None:
+                continue
+            cam = cams[i] if i < len(cams) else ""
+            if self._is_ground_truth_camera(cam):
+                anchors.append(ref)
+        if not anchors:
+            return None
+        return max(
+            self.reid_matcher.compute_similarity(vec, a) for a in anchors
+        )
 
     def _best_weighted_score(self, query_vector, session) -> float:
         """Best source-camera-weighted ReID similarity of ``query_vector`` to a
@@ -2321,6 +2441,22 @@ class VehicleRegistryIdentityMixin:
         if not guarded_sessions:
             return None
 
+        # Fix 2 — colour veto at match time. The live crop is in hand here, but
+        # the modality cascade below is invoked with query_crop=None, so a
+        # confident colour contradiction (a white car querying a dark session)
+        # is otherwise treated as silence and the match rides on ReID alone.
+        # Compute the query colour once and drop any candidate whose anchored
+        # ground-truth colour is incompatible. Fail-open: no crop, or a
+        # candidate without an anchored colour, is not vetoed.
+        query_hsv = None
+        if query_crop is not None:
+            try:
+                from src.reid_matcher import dominant_color_hsv
+
+                query_hsv = dominant_color_hsv(query_crop)
+            except Exception:
+                query_hsv = None
+
         # Rank-5: score every guarded candidate once, then keep only the top-5
         # nearest by ReID similarity. The correct identity is far more reliably
         # within the 5 nearest than exactly rank-1 on these oblique views, so we
@@ -2328,6 +2464,16 @@ class VehicleRegistryIdentityMixin:
         # single argmax.
         scored = []
         for session in guarded_sessions:
+            if query_hsv is not None:
+                gt_hsv = getattr(session, "ground_truth_hsv", None)
+                if gt_hsv is not None:
+                    try:
+                        from src.reid_matcher import body_colour_compatible
+
+                        if not body_colour_compatible(query_hsv, gt_hsv):
+                            continue  # different-coloured car — cannot be this one
+                    except Exception:
+                        pass
             # Source-camera-weighted best score: ground-truth cameras (ANPR,
             # CAM-23, CAM-03) dominate; other cameras' refs are down-weighted.
             score = self._best_weighted_score(query_vector, session)

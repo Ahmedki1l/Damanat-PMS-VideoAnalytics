@@ -600,6 +600,42 @@ class VehicleRegistryCoreMixin:
 
         return candidate
 
+    def plate_for_park_entry_candidate(self, candidate_id: str) -> Optional[str]:
+        """Resolve the plate a Park_Entry candidate is bound to, if any.
+
+        After the one-shot ``bind_next_pending_anpr_to_candidate`` fires the
+        candidate goes ``open`` → ``provisional`` and later frames get None from
+        that method — but the binding persists on ``candidate.bound_event_id``.
+        This lets a later frame (with a better crop) still resolve the plate and
+        re-attempt the idempotent CAM-23 top-view seed. Returns None when the
+        candidate is unknown or not yet bound to a pending event."""
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if candidate is None or not candidate.bound_event_id:
+                return None
+            event = self._pending_events.get(candidate.bound_event_id)
+            return event.plate if event is not None else None
+
+    def latest_park_entry_candidate_for_plate(self, plate: str) -> Optional[str]:
+        """Most-recent Park_Entry candidate bound to ``plate`` that still holds a
+        usable crop. Used by the CAM-03 confirmation fallback to seed the CAM-23
+        top view when the in-zone Park_Entry seed never fired this visit."""
+        with self._lock:
+            best = None
+            for cand in self._park_entry_candidates.values():
+                if not cand.bound_event_id:
+                    continue
+                event = self._pending_events.get(cand.bound_event_id)
+                if event is None or event.plate != plate:
+                    continue
+                if cand.snapshot_image is None or getattr(
+                    cand.snapshot_image, "size", 0
+                ) == 0:
+                    continue
+                if best is None or cand.last_seen_at > best.last_seen_at:
+                    best = cand
+            return best.candidate_id if best is not None else None
+
     @staticmethod
     def _clear_candidate_references(candidate: ParkEntryCandidate) -> None:
         candidate.snapshot_image = None

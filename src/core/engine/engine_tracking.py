@@ -13,6 +13,14 @@ from src.models.state_machine import SlotState
 
 logger = logging.getLogger(__name__)
 
+# Apparent-size ramp for _bbox_view_quality: a car whose on-screen HEIGHT is at
+# or below _VQ_MIN_H px yields a useless upscaled crop for ReID and scores 0 on
+# size; at or above _VQ_GOOD_H px it is well-resolved and scores 1.0. This makes
+# a far camera whose tiny car is fully framed rank BELOW a near camera that sees
+# the car large — for both identity ownership and gallery reference capture.
+_VQ_MIN_H = 45.0
+_VQ_GOOD_H = 90.0
+
 
 class ParkingEngineTrackingMixin:
     def _find_special_zone(
@@ -408,15 +416,21 @@ class ParkingEngineTrackingMixin:
         return selected
 
     def _bbox_view_quality(self, frame: np.ndarray, detection) -> float:
-        """How fully this camera sees the car: 1.0 when the bbox sits entirely
-        inside the frame (with a 1% edge margin), decreasing toward 0.0 as the
-        box is clipped by a frame edge (part of the car out of view).
+        """How well this camera sees the car — the product of two factors:
 
-        Estimated as the fraction of the detection's *reported* bbox area that
-        falls inside the frame — a box hard against an edge has been clamped by
-        the detector, so its reported extent beyond the border is the missing
-        part of the car. Used only as an ownership tie-breaker (display/
-        attribution), never a detection decision.
+        * edge fraction: 1.0 when the bbox sits entirely inside the frame (1%
+          edge margin), toward 0.0 as an edge clips it (part of the car out of
+          view). A box hard against an edge was clamped by the detector, so its
+          reported extent beyond the border is the missing part of the car.
+        * apparent-size factor: ramps 0→1 with the car's on-screen HEIGHT
+          (_VQ_MIN_H → _VQ_GOOD_H). A distant, low-resolution car makes a poor
+          ReID crop regardless of framing, so it must NOT rank as a "full view".
+
+        Used as an ownership tie-breaker (display/attribution) AND as the
+        gallery-reference quality gate — so a far camera whose tiny car is fully
+        framed no longer outranks a near camera that sees the car large, and its
+        low-resolution crops are kept out of the gallery. Never a detection
+        decision.
         """
         try:
             h, w = frame.shape[:2]
@@ -427,7 +441,9 @@ class ParkingEngineTrackingMixin:
             mx, my = 0.01 * w, 0.01 * h
             ix = max(0.0, min(x2, w - mx) - max(x1, mx))
             iy = max(0.0, min(y2, h - my) - max(y1, my))
-            return max(0.0, min(1.0, (ix * iy) / (bw * bh)))
+            edge = max(0.0, min(1.0, (ix * iy) / (bw * bh)))
+            size = max(0.0, min(1.0, (bh - _VQ_MIN_H) / (_VQ_GOOD_H - _VQ_MIN_H)))
+            return edge * size
         except Exception:
             return 0.0
 
@@ -627,9 +643,20 @@ class ParkingEngineTrackingMixin:
                 # this is the natural moment to create the car's durable per-plate
                 # gallery folder from its first good Park_Entry view — guaranteeing
                 # every entering car gets a folder here, at CAM-23, not the gate.
-                if bound_plate:
+                # Retry across frames (Fix 4): even when THIS frame did not bind
+                # (already bound earlier, or the pending event was consumed), the
+                # candidate still carries its plate — resolve it and re-attempt the
+                # idempotent seed so a good LATER crop still lands the CAM-23 top
+                # view instead of being lost when the first in-zone frame was poor.
+                plate_for_seed = (
+                    bound_plate
+                    or self.vehicle_registry.plate_for_park_entry_candidate(
+                        candidate_id
+                    )
+                )
+                if plate_for_seed:
                     self.vehicle_registry.seed_gallery_from_park_entry(
-                        candidate_id, bound_plate
+                        candidate_id, plate_for_seed
                     )
 
         last_track_ids = self._tracks_inside_zones.get((cam_id, zone.id), set())

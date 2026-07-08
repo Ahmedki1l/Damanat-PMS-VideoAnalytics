@@ -107,7 +107,15 @@ class VehicleSession:
     # is treated as a non-ground-truth (secondary) reference — the conservative
     # default, so a ref never gets full weight by accident.
     reference_source_cameras: List[str] = field(default_factory=list)
-    
+
+    # Cached canonical body colour (mean HSV of a centre crop), anchored ONCE
+    # from the first ground-truth camera seen (ANPR front, then CAM-03 / CAM-23).
+    # It is the colour veto anchor: floor-camera reference crops and match-time
+    # queries whose colour is incompatible with this are rejected, so a
+    # different-coloured car passing next to this one cannot poison the gallery
+    # or bind to the session. None until a ground-truth crop sets it (fail-open).
+    ground_truth_hsv: Optional[Tuple[float, float, float]] = None
+
     gate_snapshot_paths: List[str] = field(default_factory=list)
 
     # True while the session's ONLY ReID reference is the wide ANPR gate image

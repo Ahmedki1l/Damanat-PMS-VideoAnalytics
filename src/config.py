@@ -208,6 +208,20 @@ class MatchingConfig:
     gallery_min_sharpness: float = 40.0       # reject blurry crops (sharpness_score)
     gallery_dedup_cosine: float = 0.97        # skip near-duplicate refs
     gallery_accumulate_interval_s: float = 3.0  # throttle per (plate, camera)
+    # Feedback-loop guard: a new floor-camera reference must resemble the car's
+    # GROUND-TRUTH references (ANPR/CAM-03/CAM-23 primary + refs), scoring at
+    # least this cosine against the best of them, before it is added. Deliberately
+    # LENIENT — legitimate oblique cross-view crops still pass; the colour veto is
+    # the strong filter. Prevents a wrong-car crop that slipped past matching from
+    # accumulating and then reinforcing more wrong matches. Fail-open when the
+    # session has no ground-truth reference yet.
+    gallery_accumulate_min_gt_similarity: float = 0.30
+    # Minimum reference-crop resolution (pixels, width*height). A distant car
+    # occupies too few pixels to make a useful ReID reference — upscaling it to
+    # the model input is mostly interpolation — and lets a far camera flood a
+    # plate's gallery with tiny crops. Reject crops below this area so only
+    # close, well-resolved views are stored. (A 110x110 car ~= 12k px.)
+    gallery_min_crop_area: float = 12000.0
 
     # CAM-03 confirmation-timeline size. The confirmation burst captures the car
     # front-to-rear as it crosses the B-entry zone; the timeline gallery emits
@@ -653,6 +667,13 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         cm.gallery_accumulate_interval_s = m.get(
             "gallery_accumulate_interval_s", cm.gallery_accumulate_interval_s
+        )
+        cm.gallery_accumulate_min_gt_similarity = m.get(
+            "gallery_accumulate_min_gt_similarity",
+            cm.gallery_accumulate_min_gt_similarity,
+        )
+        cm.gallery_min_crop_area = m.get(
+            "gallery_min_crop_area", cm.gallery_min_crop_area
         )
         cm.confirmation_extra_rear_views = m.get(
             "confirmation_extra_rear_views", cm.confirmation_extra_rear_views
