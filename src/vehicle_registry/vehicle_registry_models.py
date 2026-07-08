@@ -101,6 +101,12 @@ class VehicleSession:
     snapshot_path: Optional[str] = None
     reference_snapshot_paths: List[str] = field(default_factory=list)
     reference_feature_vectors: List[np.ndarray] = field(default_factory=list)
+    # Source camera id per entry in reference_feature_vectors (index-aligned).
+    # Drives source-camera trust weighting at match time (see MatchingConfig
+    # .ground_truth_cameras / .secondary_camera_weight). A missing / short entry
+    # is treated as a non-ground-truth (secondary) reference — the conservative
+    # default, so a ref never gets full weight by accident.
+    reference_source_cameras: List[str] = field(default_factory=list)
     
     gate_snapshot_paths: List[str] = field(default_factory=list)
 

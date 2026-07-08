@@ -298,6 +298,7 @@ class VehicleRegistryIdentityMixin:
         session: VehicleSession,
         prepared,
         primary_snapshot_index: int = 0,
+        source_camera: str = "",
     ) -> bool:
         """Cheap half of gallery persistence: MERGE the prepared gallery onto the
         session. Safe under ``self._lock`` — no inference, no disk I/O.
@@ -324,20 +325,26 @@ class VehicleRegistryIdentityMixin:
         dedup = float(getattr(cfg, "gallery_dedup_cosine", 0.97))
         cap = max(1, int(getattr(cfg, "gallery_max_refs_per_car", 20)))
 
-        # New (path, vector) pairs from this crossing (aligned; skip empty vecs).
+        # New (path, vector, source_camera) triples from this crossing (aligned;
+        # skip empty vecs). The source camera drives match-time trust weighting.
         new_pairs = [
-            (stored_paths[i] if i < len(stored_paths) else "", feature_vectors[i])
+            (stored_paths[i] if i < len(stored_paths) else "", feature_vectors[i], source_camera)
             for i in range(len(feature_vectors))
             if feature_vectors[i] is not None
         ]
         if not new_pairs:
             return False
 
-        # Existing gallery as aligned (path, vector) pairs.
+        # Existing gallery as aligned (path, vector, source_camera) triples.
         existing_vecs = list(session.reference_feature_vectors or [])
         existing_paths = list(session.reference_snapshot_paths or [])
+        existing_cams = list(session.reference_source_cameras or [])
         merged = [
-            (existing_paths[i] if i < len(existing_paths) else "", existing_vecs[i])
+            (
+                existing_paths[i] if i < len(existing_paths) else "",
+                existing_vecs[i],
+                existing_cams[i] if i < len(existing_cams) else "",
+            )
             for i in range(len(existing_vecs))
             if existing_vecs[i] is not None
         ]
@@ -351,11 +358,11 @@ class VehicleRegistryIdentityMixin:
         # keeping that foreign, dissimilar vector. Bootstrap (empty gallery)
         # admits unconditionally; disabled when the floor is 0.
         identity_floor = float(getattr(cfg, "gallery_min_identity_similarity", 0.0))
-        established_vecs = [v for _, v in merged]
+        established_vecs = [v for _, v, _ in merged]
 
         # Append each new view that clears the identity floor and is not a
         # near-duplicate of one already held.
-        for path, vec in new_pairs:
+        for path, vec, cam in new_pairs:
             if identity_floor > 0.0 and established_vecs:
                 id_sim = max(
                     self.reid_matcher.compute_similarity(vec, ev)
@@ -374,19 +381,20 @@ class VehicleRegistryIdentityMixin:
                     continue
             if all(
                 self.reid_matcher.compute_similarity(vec, kept_vec) <= dedup
-                for _, kept_vec in merged
+                for _, kept_vec, _ in merged
             ):
-                merged.append((path, vec))
+                merged.append((path, vec, cam))
 
         # Diversity cap: keep the `cap` most mutually-dissimilar views.
         if len(merged) > cap:
             from src.vehicle_registry.gallery_store import select_diverse_indices
 
-            keep = set(select_diverse_indices([v for _, v in merged], cap))
+            keep = set(select_diverse_indices([v for _, v, _ in merged], cap))
             merged = [pair for i, pair in enumerate(merged) if i in keep]
 
-        session.reference_snapshot_paths = [p for p, _ in merged]
-        session.reference_feature_vectors = [v for _, v in merged]
+        session.reference_snapshot_paths = [p for p, _, _ in merged]
+        session.reference_feature_vectors = [v for _, v, _ in merged]
+        session.reference_source_cameras = [c for _, _, c in merged]
 
         # Primary = this crossing's chosen canonical view (freshest best shot).
         if stored_paths:
@@ -407,6 +415,7 @@ class VehicleRegistryIdentityMixin:
         primary_snapshot_index: int = 0,
         seed_gallery: bool = False,
         gate_only: bool = False,
+        source_camera: str = "",
     ) -> bool:
         """Prepare + apply in one call, for callers NOT holding ``self._lock``
         (e.g. ``confirm_anpr_session_directly``). Lock-holding callers must
@@ -416,7 +425,9 @@ class VehicleRegistryIdentityMixin:
         prepared = self._prepare_session_gallery(images, timestamp=now)
         if prepared is None:
             return False
-        self._apply_session_gallery(session, prepared, primary_snapshot_index)
+        self._apply_session_gallery(
+            session, prepared, primary_snapshot_index, source_camera=source_camera
+        )
 
         # Seed the durable per-plate gallery folder (vehicle_images/gallery/
         # <plate>/) so a folder exists on disk the moment a car is confirmed —
@@ -515,10 +526,14 @@ class VehicleRegistryIdentityMixin:
         enters the parking gets a folder, sourced from its first good in-garage
         view rather than the wide external gate ANPR shot.
 
-        The Park_Entry crop is persisted as a gate_only (non-matchable) ref: the
-        folder and photo exist immediately, but because the plate binding here is
-        still provisional (FIFO), the crop is kept out of warm-start matching
-        until CAM-03 confirmation attaches the authoritative matchable reference.
+        The Park_Entry crop is persisted as a MATCHABLE reference: CAM-23 is an
+        in-garage camera whose crop is a genuinely useful ReID viewpoint, so it
+        is loaded for warm-start / cross-camera matching alongside the CAM-03
+        confirmation reference. NOTE: the plate binding here is still provisional
+        (FIFO) — a FIFO mis-bind therefore injects a wrong-plate CAM-23 crop as a
+        matchable ref, and the contamination guard cannot protect this first
+        (bootstrap) crop because the gallery is still empty. The shortened
+        pending-bind TTL (PENDING_ANPR_BIND_TTL_SECONDS) is the mitigation.
         No-op when persistence is off, the plate is unknown, the candidate has no
         usable crop, or the folder already exists (returning car / earlier
         frame). Best-effort — disk errors are swallowed."""
@@ -546,14 +561,14 @@ class VehicleRegistryIdentityMixin:
         try:
             store.save_ref(
                 plate, crop, feature, quality=quality, camera_id=camera_id,
-                gate_only=True,
+                gate_only=False,
             )
         except Exception as exc:  # pragma: no cover - disk best-effort
             logger.debug("[gallery] park-entry seed for %s failed: %r", plate, exc)
             return False
         logger.info(
-            "[gallery] Park_Entry (%s) seeded folder for plate=%s (non-matchable "
-            "until CAM-03 confirmation)", camera_id, plate,
+            "[gallery] Park_Entry (%s) seeded folder for plate=%s (matchable "
+            "in-garage reference)", camera_id, plate,
         )
         return True
 
@@ -616,20 +631,25 @@ class VehicleRegistryIdentityMixin:
         # reference_snapshot_paths) AND seed the durable per-plate folder
         # (vehicle_images/gallery/<plate>/) the moment the car passes the gate —
         # so EVERY entering car has a folder even if the CAM-03 B-entry reference
-        # never arrives. The wide gate shot is written gate_only=True, so
-        # VehicleGalleryStore.load_vectors/load_crops exclude it: the folder and
-        # entry photo exist, yet the gate shot can never false-match a parked car.
-        # CAM-03 B-entry (confirm_b1_entrance_by_plate) adds the first *matchable*
-        # reference. seed_gallery_from_park_entry remains a fallback seeder for a
-        # car whose gate image never yielded a feature (it no-ops once a folder
-        # exists).
+        # never arrives. The ANPR front crop (cropped to the car at the API
+        # boundary) is a GROUND-TRUTH front viewpoint, so it is written
+        # gate_only=False: VehicleGalleryStore.load_vectors/load_crops include it
+        # and a returning car can warm-start-match on its own ANPR front view.
+        # NOTE: live entry-time parked-car latching is still prevented by the
+        # SEPARATE session-level ``gate_reference_only`` guard (this session is
+        # excluded from match_global_session until CAM-03 attaches a floor
+        # reference) — flipping the disk flag does not touch that protection.
+        # CAM-03 B-entry (confirm_b1_entrance_by_plate) still adds the primary
+        # matchable reference; seed_gallery_from_park_entry remains a fallback
+        # seeder (it no-ops once a folder exists).
         self._persist_session_gallery(
             session,
             [image],
             now,
             primary_snapshot_index=0,
             seed_gallery=True,
-            gate_only=True,
+            gate_only=False,
+            source_camera=getattr(session, "last_seen_camera", "") or "ANPR",
         )
 
         evicted_slots: List[str] = []
@@ -1201,6 +1221,7 @@ class VehicleRegistryIdentityMixin:
                         session,
                         prepared_gallery,
                         primary_snapshot_index=primary_snapshot_index,
+                        source_camera=camera_id,
                     )
                 # The primary reference is now the live CAM-03 crop, not the wide
                 # gate image — this session is a trustworthy global-match target.
@@ -1242,6 +1263,7 @@ class VehicleRegistryIdentityMixin:
                         session,
                         prepared_gallery,
                         primary_snapshot_index=primary_snapshot_index,
+                        source_camera=camera_id,
                     )
                 self._sessions[session.session_id] = session
                 self._drop_other_track_mappings_for_session(
@@ -1364,7 +1386,9 @@ class VehicleRegistryIdentityMixin:
 
             session.last_seen_at = now
             session.last_seen_camera = "CAM-03"
-            self._apply_session_gallery(session, prepared, primary_snapshot_index=0)
+            self._apply_session_gallery(
+                session, prepared, primary_snapshot_index=0, source_camera="CAM-03"
+            )
             # The primary reference is now the real CAM-03 shot, not the wide gate
             # image — the session is a trustworthy match target again.
             session.gate_reference_only = False
@@ -1385,10 +1409,16 @@ class VehicleRegistryIdentityMixin:
                     for ref in known
                 ):
                     session.reference_feature_vectors.append(pend)
+                    # The stashed vector is the ANPR frontal crop — tag it so
+                    # match-time weighting treats it as a ground-truth reference.
+                    session.reference_source_cameras.append("ANPR")
                     cap = max(1, int(cfg.gallery_max_refs_per_car))
                     if len(session.reference_feature_vectors) > cap:
                         session.reference_feature_vectors = (
                             session.reference_feature_vectors[-cap:]
+                        )
+                        session.reference_source_cameras = (
+                            session.reference_source_cameras[-cap:]
                         )
                 session.pending_anpr_vector = None
             self._gallery_index_upsert(session)
@@ -1459,7 +1489,9 @@ class VehicleRegistryIdentityMixin:
             # add_session_snapshot appends to the gallery (does NOT touch the
             # primary feature_vector/snapshot_path); self._lock is a reentrant
             # RLock so the nested acquire is safe.
-            path = self.add_session_snapshot(session.session_id, image, timestamp=now)
+            path = self.add_session_snapshot(
+                session.session_id, image, timestamp=now, source_camera=source_cam
+            )
             if path is None:
                 return None
             self._gallery_index_upsert(session)
@@ -1503,6 +1535,7 @@ class VehicleRegistryIdentityMixin:
                 session,
                 prepared,
                 primary_snapshot_index=primary_snapshot_index,
+                source_camera=camera_id,
             )
 
         # Off-lock: persist the final CAM-03 timeline's primary crop to the
@@ -1894,6 +1927,10 @@ class VehicleRegistryIdentityMixin:
                 if ref is not None and self.reid_matcher.compute_similarity(vec, ref) > cfg.gallery_dedup_cosine:
                     return False  # near-duplicate — nothing new to learn
             live.reference_feature_vectors.append(vec)
+            # Keep the source-camera list aligned (index-parallel) so match-time
+            # trust weighting sees the right camera for this live reference.
+            self._sync_reference_cameras(live)
+            live.reference_source_cameras[-1] = camera_id or ""
             cap = max(1, int(cfg.gallery_max_refs_per_car))
             if len(live.reference_feature_vectors) > cap:
                 # Diversity cap: keep the `cap` most mutually-dissimilar vectors
@@ -1905,11 +1942,15 @@ class VehicleRegistryIdentityMixin:
                 from src.vehicle_registry.gallery_store import select_diverse_indices
 
                 vecs = live.reference_feature_vectors
+                cams = live.reference_source_cameras
                 keep_idx = set(
                     select_diverse_indices(vecs, cap, seed_index=len(vecs) - 1)
                 )
                 live.reference_feature_vectors = [
                     v for i, v in enumerate(vecs) if i in keep_idx
+                ]
+                live.reference_source_cameras = [
+                    cams[i] for i in range(len(vecs)) if i in keep_idx
                 ]
             self._gallery_index_upsert(live)
             plate = live.plate
@@ -1933,14 +1974,21 @@ class VehicleRegistryIdentityMixin:
         if store is None or not plate or not store.has(plate):
             return None
 
-        vectors, tag = store.load_vectors(plate)
+        vectors, tag, cameras = store.load_vectors(plate)
         if (not vectors) or tag != store._model_tag:
-            crops = store.load_crops(plate)
+            crops, crop_cameras = store.load_crops(plate)
             if crops:
                 feats = self.reid_matcher.extract_features_batch(crops)
-                vectors = [f for f in feats if f is not None]
+                vectors, cameras = [], []
+                for f, cam in zip(feats, crop_cameras):
+                    if f is not None:
+                        vectors.append(f)
+                        cameras.append(cam)
         if not vectors:
             return None
+        # Defensive: keep cameras index-aligned with vectors (secondary default).
+        if len(cameras) < len(vectors):
+            cameras = cameras + [""] * (len(vectors) - len(cameras))
 
         now = self._clock()
         with self._lock:
@@ -1955,12 +2003,14 @@ class VehicleRegistryIdentityMixin:
             if existing is not None:
                 # Attach the persisted appearance to the live (often vectorless)
                 # session so ReID can re-identify it — no duplicate session.
+                self._sync_reference_cameras(existing)
                 if existing.feature_vector is None:
                     existing.feature_vector = vectors[0]
-                    extra = vectors[1:]
+                    extra, extra_cams = vectors[1:], cameras[1:]
                 else:
-                    extra = vectors
+                    extra, extra_cams = vectors, cameras
                 existing.reference_feature_vectors.extend(extra)
+                existing.reference_source_cameras.extend(extra_cams)
                 # Cap after enrich: a repeated warm-start (duplicate ANPR entry,
                 # or a reload racing a live session) must not grow the ref list
                 # without bound — more refs cost matching time AND widen the
@@ -1969,6 +2019,9 @@ class VehicleRegistryIdentityMixin:
                 if len(existing.reference_feature_vectors) > cap:
                     existing.reference_feature_vectors = (
                         existing.reference_feature_vectors[-cap:]
+                    )
+                    existing.reference_source_cameras = (
+                        existing.reference_source_cameras[-cap:]
                     )
                 self._gallery_index_upsert(existing)
                 logger.info(
@@ -1983,6 +2036,7 @@ class VehicleRegistryIdentityMixin:
                 plate=plate,
                 feature_vector=vectors[0],
                 reference_feature_vectors=list(vectors[1:]),
+                reference_source_cameras=list(cameras[1:]),
                 first_seen_at=now,
                 last_seen_at=now,
                 last_seen_camera="",
@@ -1996,6 +2050,60 @@ class VehicleRegistryIdentityMixin:
             plate, session_id, len(vectors),
         )
         return session_id
+
+    @staticmethod
+    def _sync_reference_cameras(session) -> None:
+        """Pad/truncate ``reference_source_cameras`` to match the length of
+        ``reference_feature_vectors`` (index-aligned). Missing entries pad with
+        "" (treated as a non-ground-truth/secondary source at match time — the
+        conservative default). Called before writing a per-index camera so the
+        two lists never drift."""
+        vecs = session.reference_feature_vectors
+        cams = session.reference_source_cameras
+        if len(cams) < len(vecs):
+            cams.extend([""] * (len(vecs) - len(cams)))
+        elif len(cams) > len(vecs):
+            del cams[len(vecs):]
+
+    def _reference_weight(self, camera_id: str) -> float:
+        """Trust weight for a gallery reference by its SOURCE camera.
+
+        Ground-truth cameras (canonical viewpoints — ANPR front, CAM-23 top,
+        CAM-03 front+back) score at full weight; any other camera's crop is
+        down-weighted so an oblique side view can only win a match when it is
+        substantially stronger than every ground-truth view. Unknown / empty
+        source is treated as secondary (conservative)."""
+        cfg = self._matching_config
+        gt = getattr(cfg, "ground_truth_cameras", None)
+        if gt and camera_id in gt:
+            return 1.0
+        return float(getattr(cfg, "secondary_camera_weight", 1.0))
+
+    def _best_weighted_score(self, query_vector, session) -> float:
+        """Best source-camera-weighted ReID similarity of ``query_vector`` to a
+        session's gallery. The PRIMARY (``feature_vector``) is always full weight
+        (it is only ever set from a confirmation/seed path). Each entry in
+        ``reference_feature_vectors`` is weighted by its index-aligned source
+        camera in ``reference_source_cameras`` (missing -> secondary). Replaces
+        the plain ``max(similarity)`` so the three ground-truth cameras dominate
+        while other cameras still contribute recall. Returns 0.0 when nothing is
+        scorable."""
+        if query_vector is None:
+            return 0.0
+        best = 0.0
+        primary = getattr(session, "feature_vector", None)
+        if primary is not None:
+            best = self.reid_matcher.compute_similarity(query_vector, primary)
+        refs = getattr(session, "reference_feature_vectors", None) or []
+        cams = getattr(session, "reference_source_cameras", None) or []
+        for i, ref in enumerate(refs):
+            if ref is None:
+                continue
+            cam = cams[i] if i < len(cams) else ""
+            score = self.reid_matcher.compute_similarity(query_vector, ref) * self._reference_weight(cam)
+            if score > best:
+                best = score
+        return best
 
     @staticmethod
     def _temporally_eligible(session, anchor: Optional[datetime]) -> bool:
@@ -2173,17 +2281,9 @@ class VehicleRegistryIdentityMixin:
         # single argmax.
         scored = []
         for session in guarded_sessions:
-            session_vectors = [session.feature_vector] + list(
-                session.reference_feature_vectors
-            )
-            score = max(
-                (
-                    self.reid_matcher.compute_similarity(query_vector, ref_vec)
-                    for ref_vec in session_vectors
-                    if ref_vec is not None
-                ),
-                default=0.0,
-            )
+            # Source-camera-weighted best score: ground-truth cameras (ANPR,
+            # CAM-23, CAM-03) dominate; other cameras' refs are down-weighted.
+            score = self._best_weighted_score(query_vector, session)
             scored.append((session, score))
         scored.sort(key=lambda pair: pair[1], reverse=True)
         top_candidates = scored[:GLOBAL_MATCH_RANK]
@@ -2499,17 +2599,8 @@ class VehicleRegistryIdentityMixin:
         best_score = -1.0
         decision = self.match_decision
         for session in candidates:
-            session_vectors = [session.feature_vector] + list(
-                session.reference_feature_vectors
-            )
-            score = max(
-                (
-                    self.reid_matcher.compute_similarity(query_vector, ref_vec)
-                    for ref_vec in session_vectors
-                    if ref_vec is not None
-                ),
-                default=0.0,
-            )
+            # Source-camera-weighted best score (ground-truth cameras dominate).
+            score = self._best_weighted_score(query_vector, session)
             cross_camera = bool(
                 session.last_seen_camera
                 and camera_id
@@ -2569,10 +2660,15 @@ class VehicleRegistryIdentityMixin:
                 )
                 if not is_duplicate:
                     target_session.reference_feature_vectors.append(query_vector)
+                    self._sync_reference_cameras(target_session)
+                    target_session.reference_source_cameras[-1] = camera_id or ""
                     cap = max(1, int(cfg.gallery_max_refs_per_car))
                     if len(target_session.reference_feature_vectors) > cap:
                         target_session.reference_feature_vectors = (
                             target_session.reference_feature_vectors[-cap:]
+                        )
+                        target_session.reference_source_cameras = (
+                            target_session.reference_source_cameras[-cap:]
                         )
                 # Phase 3 / T3.2 — refresh the gallery index with the new
                 # query vector so subsequent FAISS searches see this view.

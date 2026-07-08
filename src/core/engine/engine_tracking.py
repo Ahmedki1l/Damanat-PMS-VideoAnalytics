@@ -268,6 +268,33 @@ class ParkingEngineTrackingMixin:
         if include_exit_view and exit_view and exit_view.get("crop") is not None:
             ordered_views.append(("exit", exit_view["crop"]))
 
+        # Extra rear-side views. The single `exit` frame above is only the last
+        # consistent crop and is often far/small, so the car's BACK is under-
+        # represented by a single frame. Sample additional frames from the
+        # crossing tail (car driving away = rear-facing) so the gallery carries
+        # real rear coverage. Consistency-gated against the entry crop so a
+        # mis-tracked frame (a different car) never enters; evenly spread in time
+        # so the frames are distinct rear viewpoints, not adjacent duplicates.
+        # Bounded by config; the downstream cosine-dedup drops any redundant one.
+        extra_rear = 0
+        if include_exit_view and self.vehicle_registry is not None:
+            cfg = getattr(self.vehicle_registry, "matching_config", None)
+            extra_rear = int(getattr(cfg, "confirmation_extra_rear_views", 0) or 0)
+        if extra_rear > 0:
+            tail = (burst.get("candidates") or [])[len(burst.get("candidates") or []) // 2:]
+            rear_pool = [
+                c for c in tail
+                if c.get("crop") is not None and c["crop"].size > 0
+                and (
+                    entry_crop is None
+                    or self._is_consistent_confirmation_crop(entry_crop, c["crop"])
+                )
+            ]
+            if rear_pool:
+                step = max(1, len(rear_pool) // extra_rear)
+                for c in rear_pool[::step][:extra_rear]:
+                    ordered_views.append(("rear", c["crop"]))
+
         images: List[np.ndarray] = []
         labels: List[str] = []
         for label, crop in ordered_views:

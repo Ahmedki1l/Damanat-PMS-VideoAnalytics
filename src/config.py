@@ -209,6 +209,28 @@ class MatchingConfig:
     gallery_dedup_cosine: float = 0.97        # skip near-duplicate refs
     gallery_accumulate_interval_s: float = 3.0  # throttle per (plate, camera)
 
+    # CAM-03 confirmation-timeline size. The confirmation burst captures the car
+    # front-to-rear as it crosses the B-entry zone; the timeline gallery emits
+    # entry (front) + deep (primary) + exit (rear) plus up to this many EXTRA
+    # rear-side frames sampled from the crossing tail, so the car's BACK is
+    # represented by more than a single far exit frame. Capped downstream by
+    # gallery_max_refs_per_car and the cosine-dedup, so redundant frames are
+    # dropped. Set 0 to keep the legacy fixed entry/deep/exit triple.
+    confirmation_extra_rear_views: int = 3
+
+    # Source-camera trust weighting for ReID gallery references. The parking has
+    # three GROUND-TRUTH cameras whose crops are canonical viewpoints — ANPR
+    # (front), CAM-23 (top), CAM-03 (upper-front + back). A reference captured by
+    # one of these scores at full weight; a reference from ANY other camera (an
+    # oblique in-garage side view) has its similarity multiplied by
+    # ``secondary_camera_weight`` (<1), so a secondary crop can only win a match
+    # when it is substantially stronger than every ground-truth view. The session
+    # PRIMARY (feature_vector, always set from a confirmation/seed path) is always
+    # full weight. A reference with no recorded source camera is treated as
+    # secondary (conservative default). Set weight = 1.0 for uniform/legacy.
+    ground_truth_cameras: tuple = ("ANPR", "ANPR-Entry", "ANPR-Exit", "CAM-23", "CAM-03")
+    secondary_camera_weight: float = 0.6
+
     # Legacy multi-feature fallback path (image_matcher.VehicleImageMatcher).
     legacy_color_fallback: float = 0.35
 
@@ -631,6 +653,14 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         cm.gallery_accumulate_interval_s = m.get(
             "gallery_accumulate_interval_s", cm.gallery_accumulate_interval_s
+        )
+        cm.confirmation_extra_rear_views = m.get(
+            "confirmation_extra_rear_views", cm.confirmation_extra_rear_views
+        )
+        if "ground_truth_cameras" in m:
+            cm.ground_truth_cameras = tuple(m.get("ground_truth_cameras") or ())
+        cm.secondary_camera_weight = m.get(
+            "secondary_camera_weight", cm.secondary_camera_weight
         )
 
         # HSV tolerances

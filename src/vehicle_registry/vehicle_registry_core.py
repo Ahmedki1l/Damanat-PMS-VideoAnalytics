@@ -216,10 +216,14 @@ class VehicleRegistryCoreMixin:
         session_id: str,
         image: np.ndarray,
         timestamp: Optional[datetime] = None,
+        source_camera: str = "",
     ) -> Optional[str]:
         """
         Append a new snapshot image to an existing session's reference gallery.
         Also extracts and adds a new ReID feature vector to improve matching accuracy.
+
+        ``source_camera`` tags the added reference so match-time trust weighting
+        knows which camera produced it (ground-truth vs secondary).
         """
         if image is None or image.size == 0:
             return None
@@ -245,7 +249,9 @@ class VehicleRegistryCoreMixin:
                 session.reference_snapshot_paths.append(path)
                 if feature_vector is not None:
                     session.reference_feature_vectors.append(feature_vector)
-                
+                    self._sync_reference_cameras(session)
+                    session.reference_source_cameras[-1] = source_camera or ""
+
                 logger.info(
                     "[REGISTRY] Added extra snapshot to session %s (total=%d)",
                     session_id,
