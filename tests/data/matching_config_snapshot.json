@@ -23,6 +23,8 @@
   "hsv_h_tol": 12.0,
   "hsv_s_tol": 80.0,
   "hsv_v_tol": 80.0,
+  "identity_reconcile_min_similarity": 0.0,
+  "identity_reconcile_window_seconds": 60.0,
   "legacy_color_fallback": 0.35,
   "lock_confidence": 0.7,
   "multishot_ref_top_k": 3,

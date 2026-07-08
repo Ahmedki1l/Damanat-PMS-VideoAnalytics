@@ -1277,6 +1277,14 @@ class VehicleRegistryIdentityMixin:
             result_plate = session.plate
             confirmed_session = session
 
+            # Cross-session identity reconciliation (config-gated, off by
+            # default): if this car is a near-identical duplicate of another
+            # freshly-confirmed identity — one physical car the ANPR misread as
+            # two plates — collapse the duplicate so the car keeps ONE identity.
+            reconciled_slots = self._reconcile_duplicate_identity(session, now)
+            if reconciled_slots:
+                evicted_slots.extend(reconciled_slots)
+
         # DB clear off-lock — never hold self._lock across DB I/O.
         for slot_id in evicted_slots:
             self._clear_slot_db_binding(slot_id)
@@ -3294,6 +3302,84 @@ class VehicleRegistryIdentityMixin:
                 "[REGISTRY] Failed to clear DB plate binding for slot %s: %r",
                 slot_id, exc,
             )
+
+    def _reconcile_duplicate_identity(self, session, now) -> List[str]:
+        """Collapse a near-identical DUPLICATE identity created for ONE physical
+        car that the ANPR misread as two different plates ("one car entered with
+        two plates"). Complements ``_claim_plate_globally`` (which enforces one
+        session per *plate string*) by enforcing one session per *car appearance*.
+
+        Called under ``self._lock`` from the B1 confirmation path. Conservative
+        and OFF by default (``identity_reconcile_min_similarity == 0``): fires
+        only when another CONFIRMED, not-yet-parked, DIFFERENT-plate session has a
+        max ReID similarity >= the (high) floor AND entered within one gate-dwell
+        window. The high floor sits well above the same-car mean, so only
+        near-identical gate views trigger and two similar-but-different cars are
+        never merged; parked/locked identities are never touched. Keeps THIS
+        (newer) session, closes the older duplicate, and returns the slot_ids it
+        released (for off-lock DB clearing by the caller)."""
+        cfg = self._matching_config
+        floor = float(getattr(cfg, "identity_reconcile_min_similarity", 0.0))
+        if floor <= 0.0 or session is None or not getattr(session, "plate", None):
+            return []
+        window = float(getattr(cfg, "identity_reconcile_window_seconds", 60.0))
+        my_vecs = [
+            v
+            for v in ([session.feature_vector] + list(session.reference_feature_vectors or []))
+            if v is not None
+        ]
+        if not my_vecs:
+            return []
+        my_start = getattr(session, "first_seen_at", None)
+
+        best = None
+        best_sim = 0.0
+        for other in list(self._sessions.values()):
+            if other.session_id == session.session_id:
+                continue
+            # Only a still-in-gate confirmed duplicate — never a parked/locked
+            # identity, whose slot binding is authoritative and costly to undo.
+            if other.status != "confirmed" or getattr(other, "linked_slot", None):
+                continue
+            if not other.plate or other.plate == session.plate:
+                continue  # same-plate collapse is _claim_plate_globally's job
+            if my_start is not None:
+                other_start = getattr(other, "first_seen_at", None)
+                if (
+                    other_start is not None
+                    and abs((my_start - other_start).total_seconds()) > window
+                ):
+                    continue
+            other_vecs = [
+                v
+                for v in ([other.feature_vector] + list(other.reference_feature_vectors or []))
+                if v is not None
+            ]
+            if not other_vecs:
+                continue
+            sim = max(
+                self.reid_matcher.compute_similarity(a, b)
+                for a in my_vecs
+                for b in other_vecs
+            )
+            if sim >= floor and sim > best_sim:
+                best_sim = sim
+                best = other
+        if best is None:
+            return []
+
+        logger.warning(
+            "[RECONCILE] Session %s (plate=%s) is the same physical car as %s "
+            "(plate=%s) at ReID %.3f — collapsing the duplicate so the car keeps "
+            "one identity (ANPR likely misread one car as two plates).",
+            session.session_id,
+            session.plate,
+            best.session_id,
+            best.plate,
+            best_sim,
+        )
+        released = self._close_session(best, reason="duplicate_identity_reconciled")
+        return [released] if released else []
 
     def _claim_plate_globally(
         self,

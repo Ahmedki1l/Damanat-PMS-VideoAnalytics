@@ -280,6 +280,18 @@ class MatchingConfig:
     # ALPR practice gates around 0.8-0.9.
     anpr_min_accept_confidence: float = 0.0
 
+    # Cross-session identity reconciliation: collapse two confirmed identities
+    # that are the SAME physical car the ANPR misread as two plates. At confirm
+    # time, a new session that has ReID similarity >= this floor to another
+    # freshly-confirmed (not-yet-parked, different-plate) session entered within
+    # identity_reconcile_window_seconds is treated as the same car and the
+    # duplicate is closed. HIGH floor on purpose (well above the same-car mean
+    # ~0.67) so only near-identical gate views trigger and two similar-but-
+    # different cars are never merged. Default 0.0 = OFF — enabling closes real
+    # sessions, so validate on multi-car footage first (recommended ~0.75 / 60s).
+    identity_reconcile_min_similarity: float = 0.0
+    identity_reconcile_window_seconds: float = 60.0
+
     # --- Ensemble / voting (Phase 2 wiring; defaults make them inert) ---
     ensemble_min_modalities_agree: int = 2
     reid_solo_confirm_threshold: float = 0.70
@@ -633,6 +645,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.multishot_ref_top_k = m.get("multishot_ref_top_k", cm.multishot_ref_top_k)
         cm.anpr_min_accept_confidence = m.get(
             "anpr_min_accept_confidence", cm.anpr_min_accept_confidence
+        )
+        cm.identity_reconcile_min_similarity = m.get(
+            "identity_reconcile_min_similarity", cm.identity_reconcile_min_similarity
+        )
+        cm.identity_reconcile_window_seconds = m.get(
+            "identity_reconcile_window_seconds", cm.identity_reconcile_window_seconds
         )
 
         # Ensemble / voting (Phase 2)
