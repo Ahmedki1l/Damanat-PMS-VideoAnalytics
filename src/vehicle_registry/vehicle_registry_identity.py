@@ -540,6 +540,10 @@ class VehicleRegistryIdentityMixin:
         no usable crop. Best-effort — disk errors are swallowed."""
         store = self.gallery_store
         if store is None or not plate:
+            logger.info(
+                "[gallery] seed_gallery_from_park_entry no-op: gallery_store=%s plate=%r",
+                store is not None, plate,
+            )
             return False
         # Idempotent per visit: each Park_Entry visit is one candidate, and the
         # caller only fires on the one-shot open->provisional bind — but guard
@@ -551,8 +555,10 @@ class VehicleRegistryIdentityMixin:
         with self._lock:
             candidate = self._park_entry_candidates.get(candidate_id)
             if candidate is None:
+                logger.info("[gallery] seed_gallery_from_park_entry: candidate=%s not found", candidate_id)
                 return False
             if candidate_id in seeded:
+                logger.debug("[gallery] seed_gallery_from_park_entry: candidate=%s already seeded this visit", candidate_id)
                 return False
             crop = candidate.snapshot_image
             feature = candidate.feature_vector
@@ -562,10 +568,12 @@ class VehicleRegistryIdentityMixin:
         # not yet usable must not permanently block the cross-frame retry (Fix 4)
         # — the seed re-fires on a later, better in-zone crop.
         if crop is None or getattr(crop, "size", 0) == 0:
+            logger.info("[gallery] seed_gallery_from_park_entry candidate=%s: crop is empty", candidate_id)
             return False
         if feature is None:
             feature = self.reid_matcher.extract_feature(crop)
             if feature is None:
+                logger.info("[gallery] seed_gallery_from_park_entry candidate=%s: ReID feature extraction failed", candidate_id)
                 return False
         try:
             store.save_ref(
@@ -573,7 +581,7 @@ class VehicleRegistryIdentityMixin:
                 gate_only=False,
             )
         except Exception as exc:  # pragma: no cover - disk best-effort
-            logger.debug("[gallery] park-entry seed for %s failed: %r", plate, exc)
+            logger.warning("[gallery] seed_gallery_from_park_entry candidate=%s: store.save_ref failed: %r", candidate_id, exc)
             return False
         seeded.add(candidate_id)
 
@@ -791,6 +799,14 @@ class VehicleRegistryIdentityMixin:
                 if age <= self.PENDING_ANPR_BIND_TTL_SECONDS:
                     event = pending
                     break
+                else:
+                    # Log when an event is skipped for being older than bind TTL
+                    logger.info(
+                        "[PARK_ENTRY] pending event %s (plate=%s) age=%.1fs > bind_ttl=%ss "
+                        "(but <= expiry=%ss) — skipped for bind",
+                        event_id, pending.plate, age, self.PENDING_ANPR_BIND_TTL_SECONDS,
+                        self.PENDING_ANPR_EXPIRY_SECONDS,
+                    )
 
             if event is None:
                 return None

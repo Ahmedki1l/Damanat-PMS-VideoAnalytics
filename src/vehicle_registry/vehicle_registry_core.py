@@ -684,6 +684,10 @@ class VehicleRegistryCoreMixin:
             if not candidate or quality_score <= candidate.quality_score:
                 if candidate:
                     candidate.last_seen_at = now
+                    logger.debug(
+                        "[PARK_ENTRY] candidate=%s snapshot rejected: new_quality=%.1f <= current=%.1f",
+                        candidate_id, quality_score, candidate.quality_score,
+                    )
                 return
 
         if feature_vector is None:

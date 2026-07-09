@@ -615,7 +615,13 @@ class ParkingEngineTrackingMixin:
             if detection.track_id == -1:
                 continue
 
-            if self._detection_in_zone(detection, zone):
+            in_zone = self._detection_in_zone(detection, zone)
+            if cam_id == "CAM-23":
+                logger.debug(
+                    "[PARK_ENTRY] Track %d zone-contains: %s (bottom_center=%s)",
+                    detection.track_id, in_zone, detection.bottom_center,
+                )
+            if in_zone:
                 currently_inside.add(detection.track_id)
 
                 candidate_id = self._park_entry_track_to_candidate.get(detection.track_id)
@@ -635,10 +641,17 @@ class ParkingEngineTrackingMixin:
                         crop,
                         quality,
                     )
+                elif cam_id == "CAM-23":
+                    logger.debug("[PARK_ENTRY] Track %d crop is None (bbox=%s)", detection.track_id, detection.bbox)
 
                 bound_plate = self.vehicle_registry.bind_next_pending_anpr_to_candidate(
                     candidate_id
                 )
+                if cam_id == "CAM-23":
+                    logger.info(
+                        "[PARK_ENTRY] Track %d bind_next_pending_anpr_to_candidate -> plate=%s",
+                        detection.track_id, bound_plate,
+                    )
                 # A successful bind fires once (the candidate leaves "open"), so
                 # this is the natural moment to create the car's durable per-plate
                 # gallery folder from its first good Park_Entry view — guaranteeing
@@ -655,9 +668,14 @@ class ParkingEngineTrackingMixin:
                     )
                 )
                 if plate_for_seed:
-                    self.vehicle_registry.seed_gallery_from_park_entry(
+                    seeded_ok = self.vehicle_registry.seed_gallery_from_park_entry(
                         candidate_id, plate_for_seed
                     )
+                    if cam_id == "CAM-23":
+                        logger.info(
+                            "[PARK_ENTRY] seed_gallery_from_park_entry candidate=%s plate=%s -> %s",
+                            candidate_id, plate_for_seed, seeded_ok,
+                        )
 
         last_track_ids = self._tracks_inside_zones.get((cam_id, zone.id), set())
         left_zone = last_track_ids - currently_inside

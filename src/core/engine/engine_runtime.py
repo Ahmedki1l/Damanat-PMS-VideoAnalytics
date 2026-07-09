@@ -801,6 +801,13 @@ class ParkingEngineRuntimeMixin:
         grid_frames[cam_id] = label_frame
 
     def _process_special_zones(self, cam_id: str, frame, detections) -> None:
+        if cam_id == "CAM-23":
+            logger.info(
+                "[PARK_ENTRY][DIAG] CAM-23 frame: registry=%s detections=%d track_ids=%s",
+                self.vehicle_registry is not None,
+                len(detections) if detections else 0,
+                [d.track_id for d in detections] if detections else [],
+            )
         if not self.vehicle_registry or not detections:
             return
 
