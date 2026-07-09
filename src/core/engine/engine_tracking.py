@@ -719,10 +719,12 @@ class ParkingEngineTrackingMixin:
                     continue
 
                 burst_key = (cam_id, detection.track_id)
-                crop = self._crop_detection(
+                crop = self._crop_detection_to_zone(
                     frame,
                     detection,
+                    zone,
                     padding_ratio=0.12,
+                    mask_outside_zone=True,
                 )
                 if crop is None:
                     continue
