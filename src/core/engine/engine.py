@@ -267,8 +267,8 @@ class ParkingEngine(
         floor_cameras = self._build_floor_camera_groups(camera_configs)
         floor_cols = 3
 
-        # Parallel processing: 4 workers to handle frame processing
-        num_workers = max(2, min(4, len(camera_ids) // 4))
+        # Parallel processing: 6-8 workers to maximize throughput on multi-core CPU
+        num_workers = max(2, min(8, len(camera_ids) // 3))
         frame_queue: Queue = Queue(maxsize=len(camera_ids) * 2)
         should_exit = threading.Event()
         exit_flag = False
