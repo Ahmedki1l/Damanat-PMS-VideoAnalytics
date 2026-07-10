@@ -608,8 +608,9 @@ class ParkingEngineTrackingMixin:
         detections: List,
         zone: ParkingSlot,
     ):
-        """Handle CAM_01 logic for Park_Entry."""
+        """Handle CAM_01 logic for Park_Entry. D1 fix: select primary car before binding."""
         currently_inside = set()
+        primary_detection = self._select_primary_zone_detection(frame, detections, zone)
 
         for detection in detections:
             if detection.track_id == -1:
@@ -623,6 +624,11 @@ class ParkingEngineTrackingMixin:
                 )
             if in_zone:
                 currently_inside.add(detection.track_id)
+
+                # D1: Only process the primary (best-overlap) car in the zone for plate binding.
+                # When multiple cars are in zone, bind only to the primary; others get candidates
+                # but no plate. This prevents tailgating (wrong car taking next plate).
+                is_primary = (primary_detection is not None and detection.track_id == primary_detection.track_id)
 
                 candidate_id = self._park_entry_track_to_candidate.get(detection.track_id)
                 if not candidate_id:
@@ -644,9 +650,16 @@ class ParkingEngineTrackingMixin:
                 elif cam_id == "CAM-23":
                     logger.debug("[PARK_ENTRY] Track %d crop is None (bbox=%s)", detection.track_id, detection.bbox)
 
-                bound_plate = self.vehicle_registry.bind_next_pending_anpr_to_candidate(
-                    candidate_id
-                )
+                bound_plate = None
+                if is_primary:
+                    bound_plate = self.vehicle_registry.bind_next_pending_anpr_to_candidate(
+                        candidate_id
+                    )
+                elif cam_id == "CAM-23" and primary_detection is not None:
+                    logger.info(
+                        "[PARK_ENTRY] Track %d skipped for binding: not primary. Primary is track %d",
+                        detection.track_id, primary_detection.track_id
+                    )
                 if cam_id == "CAM-23":
                     logger.info(
                         "[PARK_ENTRY] Track %d bind_next_pending_anpr_to_candidate -> plate=%s",
@@ -681,6 +694,11 @@ class ParkingEngineTrackingMixin:
         left_zone = last_track_ids - currently_inside
         for track_id in left_zone:
             if track_id in self._park_entry_track_to_candidate:
+                candidate_id = self._park_entry_track_to_candidate[track_id]
+                # D3: When a car leaves the zone, mark its candidate as expired if it hasn't bound yet.
+                # This prevents a car that queued, left, and re-entered from re-using the same candidate.
+                if candidate_id:
+                    self.vehicle_registry.expire_park_entry_candidate(candidate_id)
                 del self._park_entry_track_to_candidate[track_id]
 
         self._tracks_inside_zones[(cam_id, zone.id)] = currently_inside

@@ -540,7 +540,11 @@ class VehicleRegistryCoreMixin:
             candidates_to_delete = []
             for candidate_id, candidate in self._park_entry_candidates.items():
                 if candidate.status in ("open", "provisional"):
-                    age = (now - candidate.last_seen_at).total_seconds()
+                    # D3: Use entered_at (immutable, set once) instead of last_seen_at (refreshed every frame).
+                    # A stationary car refreshes last_seen_at perpetually and never expires.
+                    # Using entered_at ensures candidates expire after CANDIDATE_EXPIRY_SECONDS
+                    # regardless of whether the car is moving or still.
+                    age = (now - candidate.entered_at).total_seconds() if candidate.entered_at else 0
                     if age > self.CANDIDATE_EXPIRY_SECONDS:
                         candidate.status = "expired"
                         if candidate.bound_event_id:
@@ -599,6 +603,18 @@ class VehicleRegistryCoreMixin:
             self._park_entry_candidates[candidate.candidate_id] = candidate
 
         return candidate
+
+    def expire_park_entry_candidate(self, candidate_id: str) -> None:
+        """D3: Mark a Park_Entry candidate as expired when it leaves the zone.
+
+        Called by the exit path when a track leaves. Prevents a car that queued,
+        left, and re-entered from re-using an old candidate that may have been
+        sitting in zone for longer than PENDING_ANPR_BIND_TTL_SECONDS.
+        """
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if candidate and candidate.status in ("open", "provisional"):
+                candidate.status = "expired"
 
     def plate_for_park_entry_candidate(self, candidate_id: str) -> Optional[str]:
         """Resolve the plate a Park_Entry candidate is bound to, if any.

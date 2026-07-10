@@ -575,6 +575,26 @@ class VehicleRegistryIdentityMixin:
             if feature is None:
                 logger.info("[gallery] seed_gallery_from_park_entry candidate=%s: ReID feature extraction failed", candidate_id)
                 return False
+
+        # D2: Apply identity-similarity floor to prevent mis-binds from poisoning the gallery.
+        # When the gallery already has established references (i.e., not the first crop),
+        # check that the new crop matches the plate's existing identity. If not, reject it.
+        # This prevents a mis-bind at the gate from creating a permanent foreign ref.
+        identity_floor = float(
+            getattr(self._matching_config, "gallery_min_identity_similarity", 0.0)
+        )
+        established = store.load_vectors(plate)  # excludes gate_only refs
+        if identity_floor > 0.0 and established:
+            id_sim = max(
+                self.reid_matcher.compute_similarity(feature, ev) for ev in established
+            )
+            if id_sim < identity_floor:
+                logger.warning(
+                    "[gallery] Rejected foreign Park_Entry seed for %s (id_sim=%.3f < %.2f)",
+                    plate, id_sim, identity_floor
+                )
+                return False
+
         try:
             store.save_ref(
                 plate, crop, feature, quality=quality, camera_id=camera_id,
@@ -769,6 +789,11 @@ class VehicleRegistryIdentityMixin:
         """
         FIFO rule:
         the first pending ANPR entry is provisionally bound to the first Park_Entry candidate.
+
+        D1 fix: A candidate is bind-eligible only if it entered the zone recently
+        (within PENDING_ANPR_BIND_TTL_SECONDS). This prevents a lingering car from
+        grabbing the next car's plate. Uses entered_at (never refreshed) not last_seen_at
+        (refreshed every frame).
         """
         now = timestamp or self._clock()
 
@@ -776,6 +801,13 @@ class VehicleRegistryIdentityMixin:
             candidate = self._park_entry_candidates.get(candidate_id)
             if candidate is None or candidate.status != "open":
                 return None
+
+            # D1: Check bind eligibility on entered_at, not last_seen_at.
+            # A car lingering in zone has stale last_seen_at; entered_at is immutable.
+            if candidate.entered_at:
+                candidate_age = (now - candidate.entered_at).total_seconds()
+                if candidate_age > self.PENDING_ANPR_BIND_TTL_SECONDS:
+                    return None  # This candidate entered too long ago; it did not just trigger ANPR
 
             event = None
             for event_id in self._pending_event_order:
