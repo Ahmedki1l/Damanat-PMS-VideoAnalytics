@@ -99,6 +99,11 @@ class ParkingEngine(
         self._last_violation_alert_time = 0.0
         self._violation_cooldown_seconds = 5.0
 
+        # Thread safety locks for parallel processing
+        self._db_write_lock = threading.Lock()  # Serialize database writes
+        self._reid_lock = threading.Lock()      # Serialize ReID/gallery ops
+        self._vehicle_registry_lock = threading.Lock()  # Serialize session updates
+
         # --- Zoning (no-ops on un-zoned deployments) ---------------------
         # AreaRegistry is a cheap read-only camera↔area index. The per-car area
         # lifecycle (AreaStateMachine) lives on the VehicleRegistry, alongside
@@ -172,22 +177,30 @@ class ParkingEngine(
 
         with perf_trace.stage("roi"):
             detection_frame = pipeline.apply_roi_mask(frame)
+
+        # Detection/tracking: thread-safe per-camera
         detections = self._detector_for(cam_id).detect_and_track(detection_frame, cam_id)
+
         with perf_trace.stage("zones"):
             self._process_special_zones(cam_id, frame, detections)
 
         with perf_trace.stage("assign"):
             assignment = pipeline.assigner.assign(detections)
-        with perf_trace.stage("slot"):
-            all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
-        if all_events:
-            final_events = self._filter_violation_events(
-                frame,
-                assignment,
-                cam_id,
-                all_events,
-            )
-            self._persist_final_events(final_events)
+
+        # Slot state update + ReID/gallery ops: serialize all database and registry access
+        with self._reid_lock:
+            with self._db_write_lock:
+                with perf_trace.stage("slot"):
+                    all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
+
+                if all_events:
+                    final_events = self._filter_violation_events(
+                        frame,
+                        assignment,
+                        cam_id,
+                        all_events,
+                    )
+                    self._persist_final_events(final_events)
 
         with self._frame_count_lock:
             self._frame_count += 1
@@ -267,8 +280,8 @@ class ParkingEngine(
         floor_cameras = self._build_floor_camera_groups(camera_configs)
         floor_cols = 3
 
-        # Parallel processing: 6-8 workers to maximize throughput on multi-core CPU
-        num_workers = max(2, min(8, len(camera_ids) // 3))
+        # Parallel processing: 4-6 workers (reduced to avoid database contention)
+        num_workers = max(2, min(6, len(camera_ids) // 4))
         frame_queue: Queue = Queue(maxsize=len(camera_ids) * 2)
         should_exit = threading.Event()
         exit_flag = False
@@ -276,17 +289,22 @@ class ParkingEngine(
         def worker():
             while not should_exit.is_set():
                 try:
-                    cam_id, frame = frame_queue.get(timeout=0.1)
+                    cam_id, frame = frame_queue.get(timeout=0.5)
                     if cam_id is None:
                         break
-                    should_stop = self._process_frame_worker(
-                        cam_id, frame, show, grid_frames, floor_cameras,
-                        show_camera, floor_cols, grid_cell_width, grid_cell_height
-                    )
-                    if should_stop:
-                        should_exit.set()
-                except:
+                    try:
+                        should_stop = self._process_frame_worker(
+                            cam_id, frame, show, grid_frames, floor_cameras,
+                            show_camera, floor_cols, grid_cell_width, grid_cell_height
+                        )
+                        if should_stop:
+                            should_exit.set()
+                    except Exception as e:
+                        logger.error(f"[WORKER] Error processing {cam_id}: {e}", exc_info=True)
+                except TimeoutError:
                     pass
+                except Exception as e:
+                    logger.error(f"[WORKER] Queue error: {e}")
 
         # Start worker threads
         workers = [threading.Thread(target=worker, daemon=True) for _ in range(num_workers)]
@@ -295,26 +313,32 @@ class ParkingEngine(
 
         try:
             while not exit_flag:
-                # Fetch a batch of frames from available cameras
-                batch_size = min(4, len(camera_ids))
-                for _ in range(batch_size):
-                    with perf_trace.stage("fetch"):
-                        cam_id, frame = self.cam_manager.next_frame()
+                # Fetch frames one at a time (reduces queue contention)
+                with perf_trace.stage("fetch"):
+                    cam_id, frame = self.cam_manager.next_frame()
 
-                    if cam_id is None:
-                        continue
-
-                    if min_interval > 0.0:
-                        now = time.time()
-                        if now - last_processed.get(cam_id, 0.0) < min_interval:
-                            idle_cycles += 1
-                            continue
-                        last_processed[cam_id] = now
+                if cam_id is None:
+                    idle_cycles += 1
+                    if idle_cycles >= len(camera_ids):
+                        time.sleep(0.01)
                         idle_cycles = 0
+                    continue
 
-                    frame_queue.put((cam_id, frame))
+                if min_interval > 0.0:
+                    now = time.time()
+                    if now - last_processed.get(cam_id, 0.0) < min_interval:
+                        idle_cycles += 1
+                        continue
+                    last_processed[cam_id] = now
+                    idle_cycles = 0
 
-                # Periodic maintenance
+                try:
+                    frame_queue.put((cam_id, frame), timeout=0.5)
+                except Exception as e:
+                    logger.warning(f"[MAIN] Queue full for {cam_id}: {e}")
+                    continue
+
+                # Periodic maintenance (non-blocking)
                 with self._frame_count_lock:
                     frame_count = self._frame_count
                 if frame_count % summary_interval == 0 and frame_count > 0:
@@ -323,10 +347,6 @@ class ParkingEngine(
                     self.last_processed_at = datetime.now()
                     perf_trace.frame_done()
                     self._emit_full_summary()
-
-                if idle_cycles >= len(camera_ids):
-                    time.sleep(0.01)
-                    idle_cycles = 0
 
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted - shutting down.")
