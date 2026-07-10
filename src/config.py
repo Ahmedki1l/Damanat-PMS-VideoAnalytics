@@ -115,7 +115,7 @@ class ReIDPreprocessingConfig:
     trained and calibrated on raw squish-resized crops, and normalising
     luminance at inference would shift embeddings off the trained
     distribution (see VehicleReIDMatcher backend selection logging)."""
-    enabled: bool = True
+    enabled: bool = False
     clip_limit: float = 2.0
     grid_size: tuple = (8, 8)
 
