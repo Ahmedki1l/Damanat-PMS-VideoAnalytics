@@ -9,9 +9,6 @@ import os
 import time
 from datetime import datetime
 from typing import Dict, Optional
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-import threading
 
 import cv2
 import logging
@@ -84,7 +81,6 @@ class ParkingEngine(
         self.model_loaded = True
 
         self._frame_count = 0
-        self._frame_count_lock = threading.Lock()
         self._start_time = 0.0
         # Window markers for the periodic effective-FPS readout: frame count
         # and timestamp captured at the previous summary.
@@ -98,11 +94,6 @@ class ParkingEngine(
         # Legacy single-camera cooldown state.
         self._last_violation_alert_time = 0.0
         self._violation_cooldown_seconds = 5.0
-
-        # Thread safety locks for parallel processing
-        self._db_write_lock = threading.Lock()  # Serialize database writes
-        self._reid_lock = threading.Lock()      # Serialize ReID/gallery ops
-        self._vehicle_registry_lock = threading.Lock()  # Serialize session updates
 
         # --- Zoning (no-ops on un-zoned deployments) ---------------------
         # AreaRegistry is a cheap read-only camera↔area index. The per-car area
@@ -165,64 +156,8 @@ class ParkingEngine(
             "db_ok": self.db_manager is not None,
         }
 
-    def _process_frame_worker(self, cam_id: str, frame: np.ndarray, show: bool,
-                              grid_frames: Dict, floor_cameras: Dict, show_camera: Optional[str],
-                              floor_cols: int, grid_cell_width: int, grid_cell_height: int) -> bool:
-        """Process a single frame from one camera. Returns True if should exit."""
-        pipeline = self.pipelines.get(cam_id)
-        if pipeline is None:
-            if show:
-                self._store_passthrough_frame(frame, cam_id, grid_frames)
-            return False
-
-        with perf_trace.stage("roi"):
-            detection_frame = pipeline.apply_roi_mask(frame)
-
-        # Detection/tracking: thread-safe per-camera
-        detections = self._detector_for(cam_id).detect_and_track(detection_frame, cam_id)
-
-        with perf_trace.stage("zones"):
-            self._process_special_zones(cam_id, frame, detections)
-
-        with perf_trace.stage("assign"):
-            assignment = pipeline.assigner.assign(detections)
-
-        # Slot state update + ReID/gallery ops: serialize all database and registry access
-        with self._reid_lock:
-            with self._db_write_lock:
-                with perf_trace.stage("slot"):
-                    all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
-
-                if all_events:
-                    final_events = self._filter_violation_events(
-                        frame,
-                        assignment,
-                        cam_id,
-                        all_events,
-                    )
-                    self._persist_final_events(final_events)
-
-        with self._frame_count_lock:
-            self._frame_count += 1
-
-        if show and self._show_multi_camera_output(
-            cam_id,
-            frame,
-            pipeline,
-            assignment,
-            detections,
-            grid_frames,
-            floor_cameras,
-            show_camera,
-            floor_cols,
-            grid_cell_width,
-            grid_cell_height,
-        ):
-            return True
-        return False
-
     def run_multi_camera(self) -> None:
-        """Multi-camera processing with parallel frame processing."""
+        """Multi-camera round-robin processing loop."""
         if not self.config.cameras:
             print("[ERROR] No cameras defined in config.")
             return
@@ -240,6 +175,9 @@ class ParkingEngine(
         total_slots = self._initialize_camera_pipelines(camera_configs)
         print(f"[INFO] Total parking slots across all cameras: {total_slots}")
 
+        # Tell the registry which cameras host parking slots so ReID ownership
+        # prefers them over slotless transit/aisle cameras (a car's identity is
+        # attributed to the camera that can actually bind its plate to a slot).
         if self.vehicle_registry is not None:
             slotted = {
                 cam_id for cam_id, pipeline in self.pipelines.items() if pipeline.slots
@@ -249,9 +187,12 @@ class ParkingEngine(
                 f"[INFO] Slot-hosting cameras (ReID ownership priority): "
                 f"{sorted(slotted)}"
             )
+            # Reload each still-inside car's persisted per-plate gallery so ReID
+            # can re-identify it after a restart (enriches the vectorless
+            # sessions _restore_plate_locks just created). No-op when the gallery
+            # feature is disabled.
             self._restore_vehicle_galleries()
-
-        print(f"[INFO] Processing mode: {self.config.processing.mode} (parallel)")
+        print(f"[INFO] Processing mode: {self.config.processing.mode}")
         print(
             f"[INFO] Target FPS per camera: "
             f"{self.config.processing.target_fps_per_camera}\n"
@@ -268,6 +209,10 @@ class ParkingEngine(
 
         summary_interval = max(1, len(camera_configs) * 10)
 
+        # Per-camera FPS pacing. ``target_fps_per_camera`` bounds how often any
+        # single camera is processed: each camera is handled at most once per
+        # ``min_interval`` seconds. A value <= 0 disables pacing (process as
+        # fast as the CPU allows, the historical behaviour).
         target_fps = self.config.processing.target_fps_per_camera
         min_interval = (1.0 / target_fps) if target_fps and target_fps > 0 else 0.0
         last_processed: Dict[str, float] = {}
@@ -280,81 +225,86 @@ class ParkingEngine(
         floor_cameras = self._build_floor_camera_groups(camera_configs)
         floor_cols = 3
 
-        # Parallel processing: 4-6 workers (reduced to avoid database contention)
-        num_workers = max(2, min(6, len(camera_ids) // 4))
-        frame_queue: Queue = Queue(maxsize=len(camera_ids) * 2)
-        should_exit = threading.Event()
-        exit_flag = False
-
-        def worker():
-            while not should_exit.is_set():
-                try:
-                    cam_id, frame = frame_queue.get(timeout=0.5)
-                    if cam_id is None:
-                        break
-                    try:
-                        should_stop = self._process_frame_worker(
-                            cam_id, frame, show, grid_frames, floor_cameras,
-                            show_camera, floor_cols, grid_cell_width, grid_cell_height
-                        )
-                        if should_stop:
-                            should_exit.set()
-                    except Exception as e:
-                        logger.error(f"[WORKER] Error processing {cam_id}: {e}", exc_info=True)
-                except TimeoutError:
-                    pass
-                except Exception as e:
-                    logger.error(f"[WORKER] Queue error: {e}")
-
-        # Start worker threads
-        workers = [threading.Thread(target=worker, daemon=True) for _ in range(num_workers)]
-        for w in workers:
-            w.start()
-
         try:
-            while not exit_flag:
-                # Fetch frames one at a time (reduces queue contention)
+            while True:
                 with perf_trace.stage("fetch"):
                     cam_id, frame = self.cam_manager.next_frame()
-
                 if cam_id is None:
-                    idle_cycles += 1
-                    if idle_cycles >= len(camera_ids):
-                        time.sleep(0.01)
-                        idle_cycles = 0
+                    print("[WARN] All cameras unavailable. Retrying in 5s...")
+                    time.sleep(5)
                     continue
 
+                # Throttle to the configured per-camera FPS. Cameras still due
+                # are processed immediately; if a full round passes with none
+                # due we nap briefly so the loop doesn't busy-spin at 100% CPU.
                 if min_interval > 0.0:
                     now = time.time()
                     if now - last_processed.get(cam_id, 0.0) < min_interval:
                         idle_cycles += 1
+                        if idle_cycles >= len(camera_ids):
+                            time.sleep(min(min_interval, 0.01))
+                            idle_cycles = 0
                         continue
                     last_processed[cam_id] = now
                     idle_cycles = 0
 
-                try:
-                    frame_queue.put((cam_id, frame), timeout=0.5)
-                except Exception as e:
-                    logger.warning(f"[MAIN] Queue full for {cam_id}: {e}")
+                self._cleanup_stale_data()
+                # Periodic sweep (gated to once per ~30s) that purges
+                # in-memory tracking state for plates whose parking_sessions
+                # row has been closed by PMS-AI without VA observing the
+                # ANPR exit event. Catches missed CAM-EXIT triggers.
+                self._exit_janitor_tick()
+                self.last_processed_at = datetime.now()
+
+                pipeline = self.pipelines.get(cam_id)
+                if pipeline is None:
+                    if show:
+                        self._store_passthrough_frame(frame, cam_id, grid_frames)
                     continue
 
-                # Periodic maintenance (non-blocking)
-                with self._frame_count_lock:
-                    frame_count = self._frame_count
-                if frame_count % summary_interval == 0 and frame_count > 0:
-                    self._cleanup_stale_data()
-                    self._exit_janitor_tick()
-                    self.last_processed_at = datetime.now()
-                    perf_trace.frame_done()
+                with perf_trace.stage("roi"):
+                    detection_frame = pipeline.apply_roi_mask(frame)
+                # clahe + infer stages are timed inside detect_and_track.
+                detections = self._detector_for(cam_id).detect_and_track(detection_frame, cam_id)
+                with perf_trace.stage("zones"):
+                    self._process_special_zones(cam_id, frame, detections)
+
+                with perf_trace.stage("assign"):
+                    assignment = pipeline.assigner.assign(detections)
+                with perf_trace.stage("slot"):
+                    all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
+                if all_events:
+                    final_events = self._filter_violation_events(
+                        frame,
+                        assignment,
+                        cam_id,
+                        all_events,
+                    )
+                    self._persist_final_events(final_events)
+
+                self._frame_count += 1
+                perf_trace.frame_done()
+                if self._frame_count % summary_interval == 0:
                     self._emit_full_summary()
+
+                if show and self._show_multi_camera_output(
+                    cam_id,
+                    frame,
+                    pipeline,
+                    assignment,
+                    detections,
+                    grid_frames,
+                    floor_cameras,
+                    show_camera,
+                    floor_cols,
+                    grid_cell_width,
+                    grid_cell_height,
+                ):
+                    break
 
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted - shutting down.")
-            exit_flag = True
         finally:
-            should_exit.set()
-            for w in workers:
-                w.join(timeout=1.0)
             self.cam_manager.close_all()
             if show:
                 cv2.destroyAllWindows()
