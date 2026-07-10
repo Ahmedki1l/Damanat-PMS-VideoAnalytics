@@ -13,3 +13,12 @@ pytest-cache-files-*
 *.db
 *.sqlite3
 *.log
+
+# Host virtualenv - wrong-platform binaries, must NOT enter the Linux image
+# (the image builds its own venv at /opt/venv). Keeps the build context small.
+.venv
+venv
+
+# Runtime output that should be a mounted volume, not baked into the image.
+logs
+run_all.pids
