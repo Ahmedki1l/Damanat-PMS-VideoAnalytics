@@ -2451,7 +2451,20 @@ class VehicleRegistryIdentityMixin:
                     if last_seen and (now - last_seen).total_seconds() < ACTIVE_TRACK_STALENESS_SECONDS:
                         has_live_track_elsewhere = True
                         break
-                if not has_live_track_elsewhere:
+
+                # Slot transition override: same-camera recent parks can reattach
+                # even if parked BEFORE this new track's entry_anchor (handles
+                # adjacent slot movement, track dropout recovery). Typical case:
+                # car moves B2→B3 on same camera, ByteTrack loses track briefly,
+                # new track appears but entry_anchor blocks it. Solution: allow
+                # reattach if last parked on THIS camera < 120 seconds ago.
+                is_same_camera_recent_park = (
+                    session.linked_camera == camera_id
+                    and session.linked_at is not None
+                    and (now - session.linked_at).total_seconds() < 120.0
+                )
+
+                if not has_live_track_elsewhere or is_same_camera_recent_park:
                     guarded_sessions.append(session)
 
         if not guarded_sessions:

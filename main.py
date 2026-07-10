@@ -353,36 +353,34 @@ Examples:
     )
 
     # --- Initialize vehicle registry (shared between engine and API) ---
-    registry = None
-    if args.api:
-        from src.vehicle_registry import VehicleRegistry
-        from src.zoning import AreaRegistry
+    from src.vehicle_registry import VehicleRegistry
+    from src.zoning import AreaRegistry
 
-        # Zoning: a read-only camera↔area index built from config. When no areas
-        # are defined it reports enabled=False and the registry stays in legacy
-        # un-zoned mode (area-bounded ReID + per-area ownership are no-ops).
-        area_registry = AreaRegistry(config)
-        registry = VehicleRegistry(
-            image_dir=config.output.snapshot_base_dir,
-            # Without this the registry silently falls back to MatchingConfig()
-            # DEFAULTS — ignoring every YAML-tuned threshold AND leaving
-            # gallery_persist_enabled at its False default, so no per-plate
-            # gallery folder is ever seeded. Pass the loaded matching config so
-            # the tuned Youden thresholds + gallery persistence actually apply.
-            matching_config=config.matching,
-            public_base_url=config.output.public_base_url,
-            snapshot_url_prefix=config.output.snapshot_url_prefix,
-            gateway_path_prefix=config.output.gateway_path_prefix,
-            area_registry=area_registry,
-            # camera_id → floor, so the identity gate can skip ReID/plate
-            # matching on ground-floor cameras by floor rather than a hardcoded
-            # camera-id set.
-            camera_floors={c.id: c.floor for c in config.cameras},
-            # Best-effort DB handle for clearing a stale slot's plate binding
-            # after an ANPR eviction (_clear_slot_db_binding). Same handle the
-            # engine uses below.
-            db_manager=db,
-        )
+    # Zoning: a read-only camera↔area index built from config. When no areas
+    # are defined it reports enabled=False and the registry stays in legacy
+    # un-zoned mode (area-bounded ReID + per-area ownership are no-ops).
+    area_registry = AreaRegistry(config)
+    registry = VehicleRegistry(
+        image_dir=config.output.snapshot_base_dir,
+        # Without this the registry silently falls back to MatchingConfig()
+        # DEFAULTS — ignoring every YAML-tuned threshold AND leaving
+        # gallery_persist_enabled at its False default, so no per-plate
+        # gallery folder is ever seeded. Pass the loaded matching config so
+        # the tuned Youden thresholds + gallery persistence actually apply.
+        matching_config=config.matching,
+        public_base_url=config.output.public_base_url,
+        snapshot_url_prefix=config.output.snapshot_url_prefix,
+        gateway_path_prefix=config.output.gateway_path_prefix,
+        area_registry=area_registry,
+        # camera_id → floor, so the identity gate can skip ReID/plate
+        # matching on ground-floor cameras by floor rather than a hardcoded
+        # camera-id set.
+        camera_floors={c.id: c.floor for c in config.cameras},
+        # Best-effort DB handle for clearing a stale slot's plate binding
+        # after an ANPR eviction (_clear_slot_db_binding). Same handle the
+        # engine uses below.
+        db_manager=db,
+    )
 
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)
 

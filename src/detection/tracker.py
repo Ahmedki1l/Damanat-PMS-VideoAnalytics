@@ -108,6 +108,10 @@ class TrackedDetector:
         one — only their *state* is isolated.
         """
         cfg = IterableSimpleNamespace(**YAML.load(check_yaml(f"{self.tracker_config.type}.yaml")))
+        # Increase track buffer to handle detection gaps during slot transitions.
+        # Default 30 frames @ 1.3 FPS = ~23s buffer. Doubled to ~46s to tolerate
+        # brief occlusions when cars move between adjacent slots on same camera.
+        cfg.track_buffer = 60
         tracker_class = _TRACKER_MAP.get(cfg.tracker_type)
         if tracker_class is None:
             raise AssertionError(
