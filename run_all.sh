@@ -30,6 +30,7 @@
 #
 # USAGE
 #   ./run_all.sh                       # start all groups
+#   ./run_all.sh --reset-plates        # wipe ALL plate identities once, then start
 #   tail -f ./logs/va_b1-gate.out.log  # follow a group's log
 #   ./stop_all.sh                      # stop everything started here
 #
@@ -41,6 +42,22 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"   # so main.py / config.yaml resolve regardless of caller's cwd
+
+# Flags:
+#   --reset-plates : wipe ALL slot plate identities + per-car galleries ONCE.
+#   --foreground   : stay in the foreground as PID 1 (for use as a CONTAINER
+#                    entrypoint): mirror logs to stdout, forward SIGTERM from
+#                    `docker stop` to the group processes, and exit (non-zero)
+#                    if any group dies so the orchestrator restarts a clean set.
+RESET_PLATES=0
+FOREGROUND=0
+for arg in "$@"; do
+    case "$arg" in
+        --reset-plates) RESET_PLATES=1 ;;
+        --foreground|-f) FOREGROUND=1 ;;
+        *) echo "[run_all] unknown arg: '$arg' (usage: ./run_all.sh [--reset-plates] [--foreground])" >&2; exit 1 ;;
+    esac
+done
 
 # Prefer the project venv python; fall back to system python3/python.
 PYTHON="$ROOT/.venv/bin/python"
@@ -107,8 +124,20 @@ if [ "$api_count" -ne 1 ]; then
     exit 1
 fi
 
+# One-shot plate reset (opt-in via --reset-plates). Runs ONCE here, NOT inside
+# the per-group loop, because it is a GLOBAL wipe; running it per process would
+# race 5 wipes at startup. Clears then exits (main.py --reset-plates-only), so
+# the groups below start from a clean plate slate. Occupancy rows are untouched.
+if [ "$RESET_PLATES" = "1" ]; then
+    echo "[run_all] --reset-plates: wiping ALL slot plate identities + per-car galleries (one-shot)..."
+    "$PYTHON" main.py --reset-plates-only
+    echo "[run_all] reset complete."
+    echo
+fi
+
 PIDFILE="$ROOT/run_all.pids"
 : > "$PIDFILE"
+PIDS=()   # group process PIDs, for foreground wait / signal forwarding
 
 for g in "${GROUPS[@]}"; do
     IFS='|' read -r name cams api cores <<< "$g"
@@ -135,12 +164,51 @@ for g in "${GROUPS[@]}"; do
             >"$out" 2>"$err" &
 
     pid=$!
+    PIDS+=("$pid")
     echo "$pid" >> "$PIDFILE"
     printf '           pid=%-7s log=%s\n' "$pid" "$out"
 done
 
 echo
 echo "[run_all] PIDs written to $PIDFILE"
+
+if [ "$FOREGROUND" = "1" ]; then
+    # --- Container entrypoint mode: stay alive as PID 1 ---
+    # Mirror every group log to this process's stdout so `docker logs` shows the
+    # pipeline output (each process also keeps its own file under logs/).
+    tail -n +1 -F "$LOGDIR"/va_*.out.log "$LOGDIR"/va_*.err.log &
+    TAILPID=$!
+
+    # Clean shutdown: forward SIGTERM (docker stop) / SIGINT to every group,
+    # wait for them, then stop the log mirror and exit 0.
+    _shutdown() {
+        trap - TERM INT
+        echo "[run_all] signal received - stopping ${#PIDS[@]} group(s)..."
+        kill -TERM "${PIDS[@]}" 2>/dev/null || true
+        wait "${PIDS[@]}" 2>/dev/null || true
+        kill "$TAILPID" 2>/dev/null || true
+        exit 0
+    }
+    trap _shutdown TERM INT
+
+    echo "[run_all] foreground mode - PID $$ waiting on ${#PIDS[@]} group(s). SIGTERM to stop."
+
+    # Block until ANY background job exits, then tear the whole container down so
+    # the orchestrator restarts a clean set (fail-fast). Bare `wait -n` (no PID
+    # args) works on bash >=4.3; the only long-lived jobs are the groups + the
+    # `tail -F` (which never exits on its own), so a return here means a group
+    # died. set +e so a group's non-zero exit doesn't trip `set -e` first.
+    set +e
+    wait -n
+    ec=$?
+    set -e
+    echo "[run_all] a group process exited (code $ec) - stopping the rest and exiting." >&2
+    kill -TERM "${PIDS[@]}" 2>/dev/null || true
+    wait "${PIDS[@]}" 2>/dev/null || true
+    kill "$TAILPID" 2>/dev/null || true
+    exit 1
+fi
+
 echo "[run_all] follow a log:  tail -f $LOGDIR/va_b1-gate.out.log"
 echo "[run_all] health check:  curl -s http://localhost:$API_PORT/api/health"
 echo "[run_all] stop all:      ./stop_all.sh"

@@ -20,9 +20,17 @@
 
   USAGE
     .\run_all.ps1              # start all groups
+    .\run_all.ps1 -ResetPlates # wipe ALL plate identities once, then start
     Get-Content -Wait .\logs\va_b1-gate.out.log     # follow a group's log
     .\stop_all.ps1             # stop everything started by this script
 #>
+param(
+    # One-shot: wipe ALL slot plate identities + per-car gallery folders ONCE,
+    # BEFORE launching the groups (runs main.py --reset-plates-only and waits).
+    # Global and destructive; VA-local (does not notify PMS-AI). Occupancy rows
+    # are left untouched. Omit for a normal start.
+    [switch]$ResetPlates
+)
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
@@ -35,6 +43,11 @@ $Root = $PSScriptRoot
 $Python = Join-Path $Root '.venv\Scripts\pythonw.exe'
 if (-not (Test-Path $Python)) { $Python = Join-Path $Root '.venv\Scripts\python.exe' }
 if (-not (Test-Path $Python)) { $Python = 'python' }
+
+# Console python (has stdout) for the one-shot -ResetPlates step, so its report
+# ("[RESET] Cleared N slot(s)...") is visible. pythonw.exe would swallow it.
+$PythonExe = Join-Path $Root '.venv\Scripts\python.exe'
+if (-not (Test-Path $PythonExe)) { $PythonExe = 'python' }
 
 # Total logical cores, used to hand each group a slice of the CPU thread budget
 # so the parallel processes PARTITION the cores instead of each grabbing all of
@@ -74,6 +87,22 @@ $ApiPort = 8000
 $apiCount = @($Groups | Where-Object { $_.Api }).Count
 if ($apiCount -ne 1) {
     throw "Exactly one group must have Api=`$true (found $apiCount). Fix `$Groups."
+}
+
+# One-shot plate reset (opt-in via -ResetPlates). Runs ONCE here - NOT inside
+# the per-group loop - because it is a GLOBAL wipe; running it per process would
+# race 5 wipes at startup. Clears then exits (main.py --reset-plates-only), so
+# the groups below start from a clean plate slate. Occupancy rows are untouched.
+if ($ResetPlates) {
+    Write-Host "[run_all] -ResetPlates: wiping ALL slot plate identities + per-car galleries (one-shot)..."
+    Push-Location $Root
+    try {
+        & $PythonExe 'main.py' --reset-plates-only
+        if ($LASTEXITCODE -ne 0) { throw "reset-plates-only failed (exit code $LASTEXITCODE)." }
+    } finally {
+        Pop-Location
+    }
+    Write-Host "[run_all] reset complete.`n"
 }
 
 $pidFile = Join-Path $Root 'run_all.pids'
