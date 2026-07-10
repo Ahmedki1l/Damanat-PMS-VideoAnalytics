@@ -346,14 +346,14 @@ class MatchingConfig:
 
     # --- Fast ReID backend (Phase 1 / WS-A) ---
     # When ``use_openvino_reid`` is on AND an OpenVINO IR for OSNet exists at
-    # ``models/osnet_openvino_int8/model.xml`` the matcher uses the OpenVINO
-    # runtime path (target ≤40 ms/image on CPU). When the file is missing or
-    # the flag is off the matcher falls back to the legacy torchreid path
-    # (~1 s/image on CPU). ``reid_input_size`` is ``(height, width)`` and
-    # must agree with the size baked into the exported IR.
+    # the specified directory, the matcher uses the OpenVINO runtime path
+    # (target ≤40 ms/image on CPU). When the file is missing or the flag is off
+    # the matcher falls back to the legacy torchreid path (~1 s/image on CPU).
+    # ``reid_input_size`` is ``(height, width)`` and must agree with the size
+    # baked into the exported IR.
     use_openvino_reid: bool = True
-    reid_input_size: tuple = (192, 96)
-    reid_openvino_model_dir: str = "models/osnet_openvino_int8"
+    reid_input_size: tuple = (256, 128)
+    reid_openvino_model_dir: str = "models/PS_carMatching"
 
     # --- Phase 3 / T3.2 — FAISS-CPU gallery index ---
     # ``match_global_session`` defaults to the legacy O(n) linear scan
