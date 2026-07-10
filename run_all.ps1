@@ -20,7 +20,7 @@
 
   USAGE
     .\run_all.ps1              # start all groups
-    Get-Content -Wait .\logs\va_b1.out.log     # follow a group's log
+    Get-Content -Wait .\logs\va_b1-gate.out.log     # follow a group's log
     .\stop_all.ps1             # stop everything started by this script
 #>
 
@@ -86,5 +86,5 @@ foreach ($g in $Groups) {
 Write-Host ''
 $started | Format-Table -AutoSize
 Write-Host "[run_all] PIDs written to $pidFile"
-Write-Host "[run_all] follow a log:  Get-Content -Wait '$LogDir\va_b1.out.log'"
+Write-Host "[run_all] follow a log:  Get-Content -Wait '$LogDir\va_b1-gate.out.log'"
 Write-Host "[run_all] stop all:      .\stop_all.ps1"
