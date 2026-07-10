@@ -547,11 +547,13 @@ class VehicleRegistryCoreMixin:
             candidates_to_delete = []
             for candidate_id, candidate in self._park_entry_candidates.items():
                 if candidate.status in ("open", "provisional"):
-                    # D3: Use entered_at (immutable, set once) instead of last_seen_at (refreshed every frame).
-                    # A stationary car refreshes last_seen_at perpetually and never expires.
-                    # Using entered_at ensures candidates expire after CANDIDATE_EXPIRY_SECONDS
-                    # regardless of whether the car is moving or still.
-                    age = (now - candidate.entered_at).total_seconds() if candidate.entered_at else 0
+                    # Liveness clock: keep a candidate alive as long as the car is
+                    # still visible in the zone (last_seen_at is refreshed every
+                    # frame it is in-zone). A parking-entry car legitimately dwells
+                    # (barrier/maneuver/queue) for well over CANDIDATE_EXPIRY_SECONDS,
+                    # so expiring on entered_at would kill the candidate of a car
+                    # still standing in the zone and drop its plate bind.
+                    age = (now - candidate.last_seen_at).total_seconds()
                     if age > self.CANDIDATE_EXPIRY_SECONDS:
                         candidate.status = "expired"
                         if candidate.bound_event_id:

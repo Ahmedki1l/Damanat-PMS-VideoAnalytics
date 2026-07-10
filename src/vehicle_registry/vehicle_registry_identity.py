@@ -802,13 +802,6 @@ class VehicleRegistryIdentityMixin:
             if candidate is None or candidate.status != "open":
                 return None
 
-            # D1: Check bind eligibility on entered_at, not last_seen_at.
-            # A car lingering in zone has stale last_seen_at; entered_at is immutable.
-            if candidate.entered_at:
-                candidate_age = (now - candidate.entered_at).total_seconds()
-                if candidate_age > self.PENDING_ANPR_BIND_TTL_SECONDS:
-                    return None  # This candidate entered too long ago; it did not just trigger ANPR
-
             event = None
             for event_id in self._pending_event_order:
                 pending = self._pending_events.get(event_id)
