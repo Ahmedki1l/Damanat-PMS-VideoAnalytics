@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  run_all.ps1 — launch the Video Analytics pipeline as parallel per-process
+  run_all.ps1 - launch the Video Analytics pipeline as parallel per-process
   camera groups. This is the supported scaling lever (it replaces the reverted
   in-process threading). Each process is ONE serial inference worker, so
   fps/camera scales as that budget is split over fewer cameras. Keep <= 6
@@ -27,9 +27,19 @@
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 
-# Prefer the project venv python; fall back to whatever 'python' resolves to.
-$Python = Join-Path $Root '.venv\Scripts\python.exe'
+# Prefer the venv's WINDOWLESS python (pythonw.exe): it has no console, so
+# neither it nor the child processes it spawns pop up console windows - that is
+# what was opening "tons of PowerShell/console windows". stdout/stderr are
+# redirected to log files below, so losing the console costs nothing. Fall back
+# to python.exe, then to whatever 'python' resolves to.
+$Python = Join-Path $Root '.venv\Scripts\pythonw.exe'
+if (-not (Test-Path $Python)) { $Python = Join-Path $Root '.venv\Scripts\python.exe' }
 if (-not (Test-Path $Python)) { $Python = 'python' }
+
+# Total logical cores, used to hand each group a slice of the CPU thread budget
+# so the parallel processes PARTITION the cores instead of each grabbing all of
+# them (5 processes x all cores = oversubscription = every inference slower).
+$TotalCores = [int][Environment]::ProcessorCount
 
 $LogDir = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -38,7 +48,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 # EDIT THESE to match your DB camera roster.
 #   Name : short label used for log filenames
 #   Cams : comma-separated camera IDs passed to --cameras
-#   Api  : $true on EXACTLY ONE group — the one that owns the entrance camera
+#   Api  : $true on EXACTLY ONE group - the one that owns the entrance camera
 #
 # Roster below = the 26 enabled non-ANPR cameras from the DB (CAM-00..CAM-25).
 # ANPR-Entry / ANPR-Exit are read by the external ANPR server, not here.
@@ -58,7 +68,7 @@ $Groups = @(
 $ApiPort = 8000
 # ---------------------------------------------------------------------------
 
-# Sanity: exactly one API host. NOTE the @(...) wrap — without it, a single
+# Sanity: exactly one API host. NOTE the @(...) wrap - without it, a single
 # match returns the lone hashtable and .Count reads its KEY count (3), not the
 # collection size. @() forces an array so .Count is the number of API groups.
 $apiCount = @($Groups | Where-Object { $_.Api }).Count
@@ -70,16 +80,32 @@ $pidFile = Join-Path $Root 'run_all.pids'
 Remove-Item $pidFile -ErrorAction SilentlyContinue
 $started = @()
 
+# Total cameras across all groups - used to slice the CPU thread budget
+# proportionally to each group's camera count.
+$totalCams = ($Groups | ForEach-Object { ($_.Cams -split ',').Count } | Measure-Object -Sum).Sum
+
 foreach ($g in $Groups) {
     $cliArgs = @('main.py', '--cameras', $g.Cams)
     if ($g.Api) { $cliArgs += @('--api', '--port', "$ApiPort") }
+
+    # Give this group a slice of the cores proportional to its camera count so
+    # the parallel processes don't each spin up all-core thread pools and thrash
+    # (BLAS/OpenMP/OpenVINO all read these). At least 1.
+    $camCount = ($g.Cams -split ',').Count
+    $threads = [Math]::Max(1, [int][Math]::Floor($TotalCores * $camCount / $totalCams))
+    $env:OMP_NUM_THREADS      = "$threads"
+    $env:OPENBLAS_NUM_THREADS = "$threads"
+    $env:MKL_NUM_THREADS      = "$threads"
+    $env:NUMEXPR_NUM_THREADS  = "$threads"
+    $env:VECLIB_MAXIMUM_THREADS = "$threads"
 
     $out = Join-Path $LogDir ("va_{0}.out.log" -f $g.Name)
     $err = Join-Path $LogDir ("va_{0}.err.log" -f $g.Name)
     $label = if ($g.Api) { "$($g.Name) (+API :$ApiPort)" } else { $g.Name }
 
-    Write-Host "[run_all] starting group '$label' -> $($g.Cams)"
+    Write-Host "[run_all] starting group '$label' ($threads threads/$TotalCores cores) -> $($g.Cams)"
     $p = Start-Process -FilePath $Python -ArgumentList $cliArgs -WorkingDirectory $Root `
+            -WindowStyle Hidden `
             -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
     $p.Id | Add-Content -Path $pidFile
     $started += [pscustomobject]@{ Group = $g.Name; PID = $p.Id; Cameras = $g.Cams; Log = $out }
