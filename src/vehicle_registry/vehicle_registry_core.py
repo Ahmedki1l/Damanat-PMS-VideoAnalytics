@@ -377,6 +377,13 @@ class VehicleRegistryCoreMixin:
             # (and used for ReID) by confirm_b1_entrance_by_plate in the API
             # layer, which has the decoded frame. Nothing to record here.
             logger.info("[ANPR] B1 confirmation (CAM-03) snapshot: plate=%s", plate)
+        elif direction == "ramp-entry":
+            # The CAM-23 ramp-entry snapshot, pushed via the ANPR API as a
+            # SECONDARY appearance reference (not the primary). It does NOT open a
+            # pending entry — it enriches an existing gate-created session. The image
+            # is attached to the plate's session by add_gallery_snapshot_by_plate in
+            # the API layer, which has the decoded frame. Nothing to record here.
+            logger.info("[ANPR] CAM-23 ramp-entry snapshot: plate=%s", plate)
         else:
             # Be defensive: an unrecognised direction from the ANPR client must
             # not 500 the webhook (which would drop the event). Log and no-op.

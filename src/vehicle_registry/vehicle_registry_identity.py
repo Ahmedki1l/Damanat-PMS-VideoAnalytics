@@ -1594,6 +1594,10 @@ class VehicleRegistryIdentityMixin:
         if image is None or getattr(image, "size", 0) == 0:
             return None
         now = timestamp or self._clock()
+
+        # Extract feature vector for gallery persistence
+        feature_vector = self.reid_matcher.extract_feature(image)
+
         with self._lock:
             session = None
             for s in self._sessions.values():
@@ -1620,7 +1624,23 @@ class VehicleRegistryIdentityMixin:
                 "(secondary ReID reference)",
                 source_cam, plate, session.session_id,
             )
-            return session.session_id
+            session_id = session.session_id
+
+        # Persist to durable gallery folder OFF the registry lock
+        if feature_vector is not None:
+            try:
+                self.gallery_store.save_ref(
+                    plate,
+                    image,
+                    feature_vector,
+                    quality=900.0,  # Secondary ref, below primary (999.0)
+                    camera_id=source_cam,
+                    timestamp=now,
+                )
+            except Exception as exc:
+                logger.debug("[gallery] save_ref for ramp-entry %s failed: %r", plate, exc)
+
+        return session_id
 
     def update_confirmed_session_gallery(
         self,
@@ -2355,7 +2375,7 @@ class VehicleRegistryIdentityMixin:
         camera_id: Optional[str] = None,
         track_id: Optional[int] = None,
         max_time_gap_seconds: float = 600.0,
-        similarity_threshold: float = 0.55,
+        similarity_threshold: Optional[float] = None,
         area_id: Optional[str] = None,
         query_crop: Optional[np.ndarray] = None,
     ) -> Optional[str]:
@@ -2767,7 +2787,7 @@ class VehicleRegistryIdentityMixin:
         camera_id: str,
         track_id: int,
         query_vector: Optional[np.ndarray],
-        similarity_threshold: float = 0.52,
+        similarity_threshold: Optional[float] = None,
         reattach_dry_run: bool = False,
     ) -> Optional[str]:
         """
