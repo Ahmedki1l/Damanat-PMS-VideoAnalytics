@@ -58,8 +58,10 @@ $Groups = @(
 $ApiPort = 8000
 # ---------------------------------------------------------------------------
 
-# Sanity: exactly one API host.
-$apiCount = ($Groups | Where-Object { $_.Api }).Count
+# Sanity: exactly one API host. NOTE the @(...) wrap — without it, a single
+# match returns the lone hashtable and .Count reads its KEY count (3), not the
+# collection size. @() forces an array so .Count is the number of API groups.
+$apiCount = @($Groups | Where-Object { $_.Api }).Count
 if ($apiCount -ne 1) {
     throw "Exactly one group must have Api=`$true (found $apiCount). Fix `$Groups."
 }
