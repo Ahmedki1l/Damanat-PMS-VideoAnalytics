@@ -101,8 +101,8 @@ class ParkingEngine(
 
         # Thread safety locks for parallel processing
         self._db_write_lock = threading.Lock()  # Serialize database writes
-        self._reid_lock = threading.Lock()      # Serialize ReID/gallery ops
-        self._vehicle_registry_lock = threading.Lock()  # Serialize session updates
+        # Note: vehicle_registry and ReID already have their own internal locks,
+        # so we don't need wrapper locks here.
 
         # --- Zoning (no-ops on un-zoned deployments) ---------------------
         # AreaRegistry is a cheap read-only camera↔area index. The per-car area
@@ -187,20 +187,22 @@ class ParkingEngine(
         with perf_trace.stage("assign"):
             assignment = pipeline.assigner.assign(detections)
 
-        # Slot state update + ReID/gallery ops: serialize all database and registry access
-        with self._reid_lock:
-            with self._db_write_lock:
-                with perf_trace.stage("slot"):
-                    all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
+        # Slot state update: state machines can run in parallel per-camera
+        # ReID/gallery operations inside vehicle_registry use their own locking
+        # DB writes are batched at the end under a single lock
+        with perf_trace.stage("slot"):
+            all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
 
-                if all_events:
-                    final_events = self._filter_violation_events(
-                        frame,
-                        assignment,
-                        cam_id,
-                        all_events,
-                    )
-                    self._persist_final_events(final_events)
+        # Batch database writes under a single lock to avoid deadlocks
+        if all_events:
+            with self._db_write_lock:
+                final_events = self._filter_violation_events(
+                    frame,
+                    assignment,
+                    cam_id,
+                    all_events,
+                )
+                self._persist_final_events(final_events)
 
         with self._frame_count_lock:
             self._frame_count += 1
