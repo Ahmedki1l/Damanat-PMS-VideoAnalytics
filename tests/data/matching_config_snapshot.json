@@ -10,7 +10,7 @@
   "faiss_index_dimension": 512,
   "faiss_index_nlist": 8,
   "gallery_accumulate_interval_s": 3.0,
-  "gallery_accumulate_min_gt_similarity": 0.3,
+  "gallery_accumulate_min_gt_similarity": 0.45,
   "gallery_dedup_cosine": 0.97,
   "gallery_max_refs_per_car": 10,
   "gallery_min_crop_area": 12000.0,
@@ -43,11 +43,12 @@
   "plate_ocr_model": "",
   "reattach_cross_camera": 0.43,
   "reattach_default": 0.52,
+  "reattach_excluded_cameras": [],
   "reid_input_size": [
-    192,
-    96
+    256,
+    128
   ],
-  "reid_openvino_model_dir": "models/osnet_openvino_int8",
+  "reid_openvino_model_dir": "models/PS_carMatching",
   "reid_solo_confirm": 0.7,
   "reid_solo_confirm_threshold": 0.7,
   "secondary_camera_weight": 0.6,

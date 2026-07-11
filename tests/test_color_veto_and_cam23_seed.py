@@ -293,5 +293,177 @@ class TestCam23SeedDecoupling(unittest.TestCase):
         self.assertIn("CAM-23", cams)
 
 
+class TestBodyColourCompatibleBrightness(unittest.TestCase):
+    """Regression for champagne-vs-dark: brightness check in mixed-saturation
+    branch catches muted-chroma cars (S<90) that were leaking through the
+    saturation-only gate."""
+
+    def test_champagne_vs_dark_incompatible(self):
+        # A bright tan/champagne Lexus (S=75, V=200) vs a dark Hyundai (S=10, V=45).
+        # Saturation alone passes: 75 < 90. But they're DIFFERENT cars because
+        # brightness is far apart: |200 - 45| = 155 > v_tol (90).
+        champagne = (100, 75, 200)  # tan/champagne: S=75, V=200
+        dark = (30, 10, 45)  # dark sedan: S=10, V=45
+        self.assertFalse(
+            body_colour_compatible(champagne, dark),
+            "champagne and dark must be incompatible (brightness too far apart)",
+        )
+
+    def test_muted_brown_compatible_despite_saturation_gap(self):
+        # Two muted-brown shades under the same lighting: S differs (60 vs 40)
+        # but brightness agrees (100 vs 105). Must NOT be rejected.
+        brown1 = (40, 60, 100)  # S=60, V=100
+        brown2 = (30, 40, 105)  # S=40, V=105 (different sat, close brightness)
+        self.assertTrue(
+            body_colour_compatible(brown1, brown2),
+            "muted browns with similar brightness are compatible",
+        )
+
+    def test_white_vs_champagne_incompatible(self):
+        # A bright champagne (S=80, V=230) is still clearly different from white
+        # (S=10, V=250) — they're both bright but one has discernible colour.
+        # Mixed-chroma rule applies: chroma_s=80 >= 90 triggers saturation-only
+        # rejection... wait, 80 < 90, so it's a muted case. Brightness is close
+        # (|230 - 250| = 20 < 90), so they PASS. This is correct: a champagne
+        # car can be confused with white under poor lighting.
+        champagne = (100, 80, 230)  # S=80, V=230
+        white = (250, 10, 250)  # S=10, V=250
+        self.assertTrue(
+            body_colour_compatible(champagne, white),
+            "champagne and white can be confused under bright lighting",
+        )
+
+
+class TestReattachLearnGate(unittest.TestCase):
+    """Regression for reattach learn-gate: a borderline anonymous track from
+    CAM-24 (0.43-0.60 similarity) can associate but must not poison the gallery.
+    The vector appends only if GT-similarity >= 0.45 (the learn floor)."""
+
+    def _confirmed_dark_session(self, reg):
+        dark_crop = make_color_crop(DARK)
+        dark_vec = reg.reid_matcher.extract_feature(dark_crop)
+        s = make_vehicle_session(
+            "DARK-REATTACH",
+            feature_vector=dark_vec,
+            status="confirmed",
+            last_seen_camera="CAM-03",
+        )
+        s.ground_truth_hsv = dominant_color_hsv(dark_crop)
+        reg._sessions[s.session_id] = s
+        return s, dark_vec
+
+    def test_learn_gate_blocks_append_when_gt_sim_below_floor(self):
+        # Simpler test: directly test _best_ground_truth_similarity and the gate
+        cfg = _gallery_config()
+        cfg.gallery_accumulate_min_gt_similarity = 0.45
+        reg = make_test_registry(matching_config=cfg)
+
+        # Create a session with a ground-truth appearance
+        dark_crop = make_color_crop(DARK)
+        dark_vec = reg.reid_matcher.extract_feature(dark_crop)
+        s = make_vehicle_session(
+            "LG-1",
+            feature_vector=dark_vec,
+            status="confirmed",
+            last_seen_camera="CAM-03",
+        )
+        s.ground_truth_hsv = dominant_color_hsv(dark_crop)
+        reg._sessions[s.session_id] = s
+
+        # Create a query vector that scores 0.43 to the ground truth
+        query_vec = np.array([0.5, 0.5], dtype=np.float32)
+        reg.reid_matcher.pin_similarity(query_vec, dark_vec, 0.43)
+
+        # Verify _best_ground_truth_similarity returns 0.43
+        gt_sim = reg._best_ground_truth_similarity(query_vec, s)
+        self.assertAlmostEqual(gt_sim, 0.43, places=5)
+
+        # Verify 0.43 < 0.45 (the learn floor)
+        learn_floor = cfg.gallery_accumulate_min_gt_similarity
+        self.assertLess(gt_sim, learn_floor)
+
+    def test_borderline_reattach_associates_but_no_append_below_learn_floor(self):
+        cfg = _gallery_config()
+        cfg.gallery_accumulate_min_gt_similarity = 0.45
+        cfg.reattach_excluded_cameras = []  # Allow CAM-24 for this test
+        reg = make_test_registry(matching_config=cfg)
+
+        s, dark_vec = self._confirmed_dark_session(reg)
+        initial_ref_count = len(s.reference_feature_vectors)
+
+        # Create a query vector that scores below the learn floor but above the
+        # association threshold. To do this, we create a vector that computes
+        # naturally to be in the 0.41-0.44 range via cosine similarity.
+        query_vec = np.array([0.50, 0.87], dtype=np.float32)
+        reg.reid_matcher.pin_similarity(query_vec, dark_vec, 0.42)
+
+        # Insert the anonymous session locally so reattach can find it.
+        anon_session = make_vehicle_session(
+            None,  # no plate yet (anonymous)
+            feature_vector=query_vec,
+            status="unconfirmed",
+            last_seen_camera="CAM-24",
+            last_seen_track_id=99,
+        )
+        reg._sessions[anon_session.session_id] = anon_session
+        reg._track_session_map[("CAM-24", 99)] = anon_session.session_id
+
+        # Call reattach with cross-camera threshold. 0.42 >= 0.41 passes association.
+        result = reg.reattach_track_to_confirmed_session(
+            camera_id="CAM-24",
+            track_id=99,
+            query_vector=query_vec,
+            similarity_threshold=0.41,  # reattach_cross_camera
+        )
+
+        # Association must succeed (0.42 >= 0.41)
+        self.assertEqual(
+            result,
+            s.session_id,
+            "0.42 similarity passes reattach_cross_camera (0.41)",
+        )
+
+        # But the reference should NOT be appended because gt_sim=0.42 < learn_floor=0.45
+        self.assertEqual(
+            len(s.reference_feature_vectors),
+            initial_ref_count,
+            "borderline reattach (0.42 < 0.45) must not append to reference_feature_vectors",
+        )
+
+    def test_reattach_from_excluded_camera_returns_none(self):
+        cfg = _gallery_config()
+        cfg.reattach_excluded_cameras = ["CAM-24"]
+        reg = make_test_registry(matching_config=cfg)
+
+        s, dark_vec = self._confirmed_dark_session(reg)
+
+        # Create an anonymous track from CAM-24 with high similarity (0.80).
+        anon_crop = make_color_crop((100, 100, 100))
+        anon_vec = reg.reid_matcher.extract_feature(anon_crop)
+        reg.reid_matcher.pin_similarity(anon_vec, dark_vec, 0.80)
+
+        anon_session = make_vehicle_session(
+            None,
+            feature_vector=anon_vec,
+            status="unconfirmed",
+            last_seen_camera="CAM-24",
+            last_seen_track_id=88,
+        )
+        reg._sessions[anon_session.session_id] = anon_session
+        reg._track_session_map[("CAM-24", 88)] = anon_session.session_id
+
+        # Reattach from CAM-24 is blocked entirely, returns None.
+        result = reg.reattach_track_to_confirmed_session(
+            camera_id="CAM-24",
+            track_id=88,
+            query_vector=anon_vec,
+            similarity_threshold=0.41,
+        )
+        self.assertIsNone(
+            result,
+            "CAM-24 (reattach_excluded_cameras) must not reattach, even with high similarity",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

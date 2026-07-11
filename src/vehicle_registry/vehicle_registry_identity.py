@@ -2260,6 +2260,15 @@ class VehicleRegistryIdentityMixin:
         gt = getattr(self._matching_config, "ground_truth_cameras", None)
         return bool(gt and camera_id in gt)
 
+    def _is_reattach_excluded_camera(self, camera_id: str) -> bool:
+        """True when ``camera_id`` is a configured static slot camera whose
+        anonymous tracks must not donate an identity via reattach (see
+        ``MatchingConfig.reattach_excluded_cameras``). Such a camera permanently
+        frames a parked car and would otherwise adopt another car's session on a
+        borderline cross-camera score."""
+        excluded = getattr(self._matching_config, "reattach_excluded_cameras", None)
+        return bool(excluded and camera_id in excluded)
+
     def _maybe_set_ground_truth_hsv(self, session, image) -> None:
         """Anchor ``session.ground_truth_hsv`` from a ground-truth camera crop,
         once. Called from the ANPR / CAM-03 / CAM-23 seed paths with that
@@ -2796,6 +2805,12 @@ class VehicleRegistryIdentityMixin:
             return None
         if self._is_reid_disabled_camera(camera_id):
             return None
+        # Static slot cameras (permanently framing a parked car) must not donate
+        # their anonymous tracks into a confirmed session — that is the CAM-24
+        # parked-Lexus-adopts-the-entrant leak. They still track locally and can
+        # be found by the forward global-match path; they just cannot reattach.
+        if self._is_reattach_excluded_camera(camera_id):
+            return None
 
         with self._lock:
             current_sid = self._track_session_map.get((camera_id, track_id))
@@ -2925,7 +2940,22 @@ class VehicleRegistryIdentityMixin:
                     > cfg.gallery_dedup_cosine
                     for ref in known_vectors
                 )
-                if not is_duplicate:
+                # Learn-gate (Fix 1): associating a track can confirm as low as
+                # reattach_cross_camera (0.43), but LEARNING its appearance as a
+                # permanent gallery reference demands more — the vector must
+                # resemble the session's GROUND-TRUTH appearance (never the
+                # possibly-poisoned secondary refs) by the same floor the
+                # disk-accumulate path uses. A borderline 0.43-0.60 reattach of a
+                # wrong car (e.g. a static slot camera's parked neighbour) still
+                # moves the track below; it just never poisons the gallery.
+                # Fail-open when the session has no ground truth to compare yet.
+                gt_sim = self._best_ground_truth_similarity(
+                    query_vector, target_session
+                )
+                learn_floor = float(
+                    getattr(cfg, "gallery_accumulate_min_gt_similarity", 0.0) or 0.0
+                )
+                if not is_duplicate and (gt_sim is None or gt_sim >= learn_floor):
                     target_session.reference_feature_vectors.append(query_vector)
                     self._sync_reference_cameras(target_session)
                     target_session.reference_source_cameras[-1] = camera_id or ""

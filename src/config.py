@@ -189,6 +189,17 @@ class MatchingConfig:
     reattach_default: float = 0.52
     reattach_cross_camera: float = 0.43
 
+    # Cameras whose anonymous tracks must NOT donate their appearance into a
+    # confirmed session via reattach. A static parking-slot camera permanently
+    # frames the same parked car; it endlessly mints fresh anonymous tracks that
+    # hunt for any confirmed session scoring above reattach_cross_camera (0.43)
+    # and, on a borderline match, poison that session's gallery with a different
+    # car (the CAM-24 champagne-Lexus-into-a-dark-Hyundai leak). Listed cameras
+    # still detect, track locally, and can be identified by the forward
+    # global-match path — they just cannot ADOPT another car's identity by
+    # reattach. Same spirit as the gate-camera exclusion. Empty ⇒ legacy.
+    reattach_excluded_cameras: tuple = ()
+
     # Abstain-on-ambiguity margin for match_global_session: when the best and
     # second-best candidates score within this distance of each other, the
     # match is ambiguous (visually similar cars) and NO session is returned —
@@ -210,12 +221,15 @@ class MatchingConfig:
     gallery_accumulate_interval_s: float = 3.0  # throttle per (plate, camera)
     # Feedback-loop guard: a new floor-camera reference must resemble the car's
     # GROUND-TRUTH references (ANPR/CAM-03/CAM-23 primary + refs), scoring at
-    # least this cosine against the best of them, before it is added. Deliberately
-    # LENIENT — legitimate oblique cross-view crops still pass; the colour veto is
-    # the strong filter. Prevents a wrong-car crop that slipped past matching from
-    # accumulating and then reinforcing more wrong matches. Fail-open when the
+    # least this cosine against the best of them, before it is LEARNED as a
+    # gallery reference. Applies to BOTH the disk-accumulate path and the reattach
+    # append path (association can happen at reattach_cross_camera 0.43, but
+    # LEARNING an appearance requires clearing this higher bar). Legitimate
+    # oblique cross-view crops still pass; a wrong-car crop that slipped past
+    # matching (0.43-0.60) does not. 0.30 proved a formality — a night crop of a
+    # different car clears it — so the floor sits at 0.45. Fail-open when the
     # session has no ground-truth reference yet.
-    gallery_accumulate_min_gt_similarity: float = 0.30
+    gallery_accumulate_min_gt_similarity: float = 0.45
     # Minimum reference-crop resolution (pixels, width*height). A distant car
     # occupies too few pixels to make a useful ReID reference — upscaling it to
     # the model input is mostly interpolation — and lets a far camera flood a
@@ -626,6 +640,10 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.reattach_cross_camera = m.get(
             "reattach_cross_camera", cm.reattach_cross_camera
         )
+        if "reattach_excluded_cameras" in m:
+            cm.reattach_excluded_cameras = tuple(
+                m.get("reattach_excluded_cameras") or ()
+            )
         cm.legacy_color_fallback = m.get(
             "legacy_color_fallback", cm.legacy_color_fallback
         )
