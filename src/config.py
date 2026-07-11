@@ -216,6 +216,14 @@ class MatchingConfig:
     gallery_max_refs_per_car: int = 10        # cap crops/vectors per plate folder
     gallery_retention_days: float = 5.0       # GC folders idle longer than this
     gallery_min_view_quality: float = 0.9     # full-view gate (see _bbox_view_quality)
+    # D9 neighbour-clearance: a car parked shoulder-to-shoulder has a bbox that a
+    # neighbour's box overlaps, so its ReID crop is contaminated with the wrong
+    # car. When enforced, _bbox_view_quality is multiplied by the clearance
+    # (1.0 unobstructed → 0.0 fully covered), so an occluded crop falls below
+    # gallery_min_view_quality and is kept out of the gallery. Default OFF
+    # (log-only): the clearance is computed and logged to collect its
+    # distribution BEFORE it is allowed to gate anything.
+    gallery_neighbour_clearance_enforce: bool = False
     gallery_min_sharpness: float = 40.0       # reject blurry crops (sharpness_score)
     gallery_dedup_cosine: float = 0.97        # skip near-duplicate refs
     gallery_accumulate_interval_s: float = 3.0  # throttle per (plate, camera)
@@ -676,6 +684,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         cm.gallery_min_view_quality = m.get(
             "gallery_min_view_quality", cm.gallery_min_view_quality
+        )
+        cm.gallery_neighbour_clearance_enforce = bool(
+            m.get(
+                "gallery_neighbour_clearance_enforce",
+                cm.gallery_neighbour_clearance_enforce,
+            )
         )
         cm.gallery_min_sharpness = m.get(
             "gallery_min_sharpness", cm.gallery_min_sharpness

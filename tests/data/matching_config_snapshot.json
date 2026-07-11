@@ -17,6 +17,7 @@
   "gallery_min_identity_similarity": 0.0,
   "gallery_min_sharpness": 40.0,
   "gallery_min_view_quality": 0.9,
+  "gallery_neighbour_clearance_enforce": false,
   "gallery_persist_enabled": false,
   "gallery_retention_days": 5.0,
   "global_cross_camera": 0.43,

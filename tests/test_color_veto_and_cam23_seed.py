@@ -21,6 +21,7 @@ matches. These tests lock in:
     fallback.
 """
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -541,6 +542,75 @@ class TestSeedPathIdentityFloor(unittest.TestCase):
             reg.seed_gallery_from_park_entry(cand_id, "SEED-Z"),
             "at the inert 0.0 default the seed guard is a no-op (documented trap)",
         )
+
+
+class TestNeighbourClearanceD9(unittest.TestCase):
+    """D9: neighbour-clearance weights view quality so a car whose bbox is
+    overlapped by a parked neighbour makes a lower-quality (contaminated) ReID
+    reference. Log-only by default (no vehicle_registry / flag off); multiplied
+    into quality only when gallery_neighbour_clearance_enforce is set."""
+
+    class _Harness(ParkingEngineTrackingMixin):
+        pass
+
+    class _Det:
+        def __init__(self, bbox, track_id=1):
+            self.bbox = bbox
+            self.track_id = track_id
+
+    def setUp(self):
+        self.h = self._Harness()
+        self.frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    def test_lone_car_is_fully_clear(self):
+        det = self._Det((500, 200, 760, 520), track_id=1)
+        self.assertEqual(self.h._neighbour_clearance(det, [det]), 1.0)
+
+    def test_separated_cars_are_clear(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        b = self._Det((900, 200, 1100, 520), track_id=2)  # no x-overlap
+        self.assertEqual(self.h._neighbour_clearance(a, [a, b]), 1.0)
+
+    def test_overlapping_neighbour_reduces_clearance(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)  # 260x320, area 83200
+        b = self._Det((630, 200, 900, 520), track_id=2)  # covers right half of a
+        # intersection-over-A: x 630..760 = 130, y full 320 -> 41600 / 83200 = 0.5
+        self.assertAlmostEqual(self.h._neighbour_clearance(a, [a, b]), 0.5, places=3)
+
+    def test_asymmetric_small_box_swallowed_by_large(self):
+        small = self._Det((600, 300, 680, 353), track_id=1)  # tiny distant car
+        big = self._Det((500, 200, 900, 520), track_id=2)    # fully contains small
+        # intersection-over-SELF = 1.0 -> clearance 0: a symmetric IoU would have
+        # hidden this (the union is huge); intersection-over-self catches it.
+        self.assertAlmostEqual(
+            self.h._neighbour_clearance(small, [small, big]), 0.0, places=3
+        )
+
+    def test_untracked_neighbour_ignored(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        ghost = self._Det((630, 200, 900, 520), track_id=-1)  # untracked detection
+        self.assertEqual(self.h._neighbour_clearance(a, [a, ghost]), 1.0)
+
+    def test_log_only_does_not_change_quality(self):
+        # No vehicle_registry -> enforce False -> base returned even with overlap.
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        b = self._Det((630, 200, 900, 520), track_id=2)
+        base = self.h._bbox_view_quality(self.frame, a)  # detections=None
+        weighted = self.h._bbox_view_quality(self.frame, a, [a, b])
+        self.assertEqual(base, weighted, "log-only mode must not gate quality")
+
+    def test_enforce_multiplies_clearance(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        b = self._Det((630, 200, 900, 520), track_id=2)  # clearance 0.5
+        self.h.vehicle_registry = SimpleNamespace(
+            matching_config=SimpleNamespace(
+                gallery_neighbour_clearance_enforce=True
+            )
+        )
+        base = self.h._bbox_view_quality(self.frame, a)  # detections=None -> base
+        weighted = self.h._bbox_view_quality(self.frame, a, [a, b])
+        self.assertAlmostEqual(weighted, base * 0.5, places=3)
+        self.assertLess(weighted, base)
 
 
 if __name__ == "__main__":
