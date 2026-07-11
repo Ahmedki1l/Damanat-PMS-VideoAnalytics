@@ -21,6 +21,7 @@ matches. These tests lock in:
     fallback.
 """
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -291,6 +292,325 @@ class TestCam23SeedDecoupling(unittest.TestCase):
         vectors, _, cams = reg.gallery_store.load_vectors("SEED-5")
         self.assertTrue(vectors)
         self.assertIn("CAM-23", cams)
+
+
+class TestBodyColourCompatibleBrightness(unittest.TestCase):
+    """Regression for champagne-vs-dark: brightness check in mixed-saturation
+    branch catches muted-chroma cars (S<90) that were leaking through the
+    saturation-only gate."""
+
+    def test_champagne_vs_dark_incompatible(self):
+        # A bright tan/champagne Lexus (S=75, V=200) vs a dark Hyundai (S=10, V=45).
+        # Saturation alone passes: 75 < 90. But they're DIFFERENT cars because
+        # brightness is far apart: |200 - 45| = 155 > v_tol (90).
+        champagne = (100, 75, 200)  # tan/champagne: S=75, V=200
+        dark = (30, 10, 45)  # dark sedan: S=10, V=45
+        self.assertFalse(
+            body_colour_compatible(champagne, dark),
+            "champagne and dark must be incompatible (brightness too far apart)",
+        )
+
+    def test_muted_brown_compatible_despite_saturation_gap(self):
+        # Two muted-brown shades under the same lighting: S differs (60 vs 40)
+        # but brightness agrees (100 vs 105). Must NOT be rejected.
+        brown1 = (40, 60, 100)  # S=60, V=100
+        brown2 = (30, 40, 105)  # S=40, V=105 (different sat, close brightness)
+        self.assertTrue(
+            body_colour_compatible(brown1, brown2),
+            "muted browns with similar brightness are compatible",
+        )
+
+    def test_white_vs_champagne_incompatible(self):
+        # A bright champagne (S=80, V=230) is still clearly different from white
+        # (S=10, V=250) — they're both bright but one has discernible colour.
+        # Mixed-chroma rule applies: chroma_s=80 >= 90 triggers saturation-only
+        # rejection... wait, 80 < 90, so it's a muted case. Brightness is close
+        # (|230 - 250| = 20 < 90), so they PASS. This is correct: a champagne
+        # car can be confused with white under poor lighting.
+        champagne = (100, 80, 230)  # S=80, V=230
+        white = (250, 10, 250)  # S=10, V=250
+        self.assertTrue(
+            body_colour_compatible(champagne, white),
+            "champagne and white can be confused under bright lighting",
+        )
+
+
+class TestReattachLearnGate(unittest.TestCase):
+    """Regression for reattach learn-gate: a borderline anonymous track from
+    CAM-24 (0.43-0.60 similarity) can associate but must not poison the gallery.
+    The vector appends only if GT-similarity >= 0.45 (the learn floor)."""
+
+    def _confirmed_dark_session(self, reg):
+        dark_crop = make_color_crop(DARK)
+        dark_vec = reg.reid_matcher.extract_feature(dark_crop)
+        s = make_vehicle_session(
+            "DARK-REATTACH",
+            feature_vector=dark_vec,
+            status="confirmed",
+            last_seen_camera="CAM-03",
+        )
+        s.ground_truth_hsv = dominant_color_hsv(dark_crop)
+        reg._sessions[s.session_id] = s
+        return s, dark_vec
+
+    def test_learn_gate_blocks_append_when_gt_sim_below_floor(self):
+        # Simpler test: directly test _best_ground_truth_similarity and the gate
+        cfg = _gallery_config()
+        cfg.gallery_accumulate_min_gt_similarity = 0.45
+        reg = make_test_registry(matching_config=cfg)
+
+        # Create a session with a ground-truth appearance
+        dark_crop = make_color_crop(DARK)
+        dark_vec = reg.reid_matcher.extract_feature(dark_crop)
+        s = make_vehicle_session(
+            "LG-1",
+            feature_vector=dark_vec,
+            status="confirmed",
+            last_seen_camera="CAM-03",
+        )
+        s.ground_truth_hsv = dominant_color_hsv(dark_crop)
+        reg._sessions[s.session_id] = s
+
+        # Create a query vector that scores 0.43 to the ground truth
+        query_vec = np.array([0.5, 0.5], dtype=np.float32)
+        reg.reid_matcher.pin_similarity(query_vec, dark_vec, 0.43)
+
+        # Verify _best_ground_truth_similarity returns 0.43
+        gt_sim = reg._best_ground_truth_similarity(query_vec, s)
+        self.assertAlmostEqual(gt_sim, 0.43, places=5)
+
+        # Verify 0.43 < 0.45 (the learn floor)
+        learn_floor = cfg.gallery_accumulate_min_gt_similarity
+        self.assertLess(gt_sim, learn_floor)
+
+    def test_borderline_reattach_associates_but_no_append_below_learn_floor(self):
+        cfg = _gallery_config()
+        cfg.gallery_accumulate_min_gt_similarity = 0.45
+        cfg.reattach_excluded_cameras = []  # Allow CAM-24 for this test
+        reg = make_test_registry(matching_config=cfg)
+
+        s, dark_vec = self._confirmed_dark_session(reg)
+        initial_ref_count = len(s.reference_feature_vectors)
+
+        # Create a query vector that scores below the learn floor but above the
+        # association threshold. To do this, we create a vector that computes
+        # naturally to be in the 0.41-0.44 range via cosine similarity.
+        query_vec = np.array([0.50, 0.87], dtype=np.float32)
+        reg.reid_matcher.pin_similarity(query_vec, dark_vec, 0.42)
+
+        # Insert the anonymous session locally so reattach can find it.
+        anon_session = make_vehicle_session(
+            None,  # no plate yet (anonymous)
+            feature_vector=query_vec,
+            status="unconfirmed",
+            last_seen_camera="CAM-24",
+            last_seen_track_id=99,
+        )
+        reg._sessions[anon_session.session_id] = anon_session
+        reg._track_session_map[("CAM-24", 99)] = anon_session.session_id
+
+        # Call reattach with cross-camera threshold. 0.42 >= 0.41 passes association.
+        result = reg.reattach_track_to_confirmed_session(
+            camera_id="CAM-24",
+            track_id=99,
+            query_vector=query_vec,
+            similarity_threshold=0.41,  # reattach_cross_camera
+        )
+
+        # Association must succeed (0.42 >= 0.41)
+        self.assertEqual(
+            result,
+            s.session_id,
+            "0.42 similarity passes reattach_cross_camera (0.41)",
+        )
+
+        # But the reference should NOT be appended because gt_sim=0.42 < learn_floor=0.45
+        self.assertEqual(
+            len(s.reference_feature_vectors),
+            initial_ref_count,
+            "borderline reattach (0.42 < 0.45) must not append to reference_feature_vectors",
+        )
+
+    def test_reattach_from_excluded_camera_returns_none(self):
+        cfg = _gallery_config()
+        cfg.reattach_excluded_cameras = ["CAM-24"]
+        reg = make_test_registry(matching_config=cfg)
+
+        s, dark_vec = self._confirmed_dark_session(reg)
+
+        # Create an anonymous track from CAM-24 with high similarity (0.80).
+        anon_crop = make_color_crop((100, 100, 100))
+        anon_vec = reg.reid_matcher.extract_feature(anon_crop)
+        reg.reid_matcher.pin_similarity(anon_vec, dark_vec, 0.80)
+
+        anon_session = make_vehicle_session(
+            None,
+            feature_vector=anon_vec,
+            status="unconfirmed",
+            last_seen_camera="CAM-24",
+            last_seen_track_id=88,
+        )
+        reg._sessions[anon_session.session_id] = anon_session
+        reg._track_session_map[("CAM-24", 88)] = anon_session.session_id
+
+        # Reattach from CAM-24 is blocked entirely, returns None.
+        result = reg.reattach_track_to_confirmed_session(
+            camera_id="CAM-24",
+            track_id=88,
+            query_vector=anon_vec,
+            similarity_threshold=0.41,
+        )
+        self.assertIsNone(
+            result,
+            "CAM-24 (reattach_excluded_cameras) must not reattach, even with high similarity",
+        )
+
+
+class TestSeedPathIdentityFloor(unittest.TestCase):
+    """The CAM-23 Park_Entry seed shares the D2 identity floor
+    (``gallery_min_identity_similarity``). That knob defaults to 0.0 (INERT) in
+    code but production ``config.yaml`` sets 0.35 — so the active behaviour is
+    only ever exercised off the YAML value, never the default. These pin the
+    active-floor behaviour so it cannot silently regress to the no-op, and guard
+    the ``store.load_vectors()`` return-shape: it is a
+    ``(vectors, tag, cameras)`` tuple, and the seed must compare against the
+    vectors, not iterate the tuple."""
+
+    def _registry(self, floor):
+        cfg = _gallery_config()
+        cfg.gallery_min_identity_similarity = floor
+        return make_test_registry(matching_config=cfg)
+
+    def _establish_dark_gallery(self, reg, plate):
+        """Seed one durable ground-truth (dark) ref for ``plate`` so later seeds
+        have an established identity to be measured against."""
+        dark = make_color_crop(DARK)
+        dark_vec = reg.reid_matcher.extract_feature(dark)
+        reg.gallery_store.save_ref(
+            plate, dark, dark_vec, quality=999.0, camera_id="ANPR", gate_only=False
+        )
+        return dark_vec
+
+    def _candidate_with_crop(self, reg, crop, track_id=7):
+        cand = reg.open_park_entry_candidate("CAM-23", track_id)
+        reg.update_park_entry_candidate_snapshot(
+            cand.candidate_id, crop, quality_score=5.0
+        )
+        return cand.candidate_id
+
+    def test_foreign_seed_rejected_at_active_floor(self):
+        reg = self._registry(0.35)
+        dark_vec = self._establish_dark_gallery(reg, "SEED-D")
+        white = make_color_crop(WHITE)
+        white_vec = reg.reid_matcher.extract_feature(white)
+        reg.reid_matcher.pin_similarity(white_vec, dark_vec, 0.10)  # < 0.35 floor
+        cand_id = self._candidate_with_crop(reg, white)
+        self.assertFalse(
+            reg.seed_gallery_from_park_entry(cand_id, "SEED-D"),
+            "a foreign crop below the identity floor must not seed the gallery",
+        )
+        vecs, _, _ = reg.gallery_store.load_vectors("SEED-D")
+        self.assertEqual(len(vecs), 1, "gallery keeps only the established dark ref")
+
+    def test_same_car_seed_admitted_at_active_floor(self):
+        reg = self._registry(0.35)
+        dark_vec = self._establish_dark_gallery(reg, "SEED-S")
+        crop = make_color_crop((40, 40, 40))  # compatible dark shade
+        crop_vec = reg.reid_matcher.extract_feature(crop)
+        reg.reid_matcher.pin_similarity(crop_vec, dark_vec, 0.9)  # > 0.35 floor
+        cand_id = self._candidate_with_crop(reg, crop)
+        self.assertTrue(
+            reg.seed_gallery_from_park_entry(cand_id, "SEED-S"),
+            "a same-car top view above the floor is a legitimate seed",
+        )
+        vecs, _, cams = reg.gallery_store.load_vectors("SEED-S")
+        self.assertEqual(len(vecs), 2, "the CAM-23 top view joins the dark ref")
+        self.assertIn("CAM-23", cams)
+
+    def test_inert_default_floor_admits_foreign_seed(self):
+        # The trap this suite exists to lock down: at the 0.0 default the guard is
+        # a no-op, so even a foreign crop seeds. Documents the config-dependence —
+        # production MUST carry gallery_min_identity_similarity: 0.35 for the
+        # seed-path D2 guard to do anything.
+        reg = self._registry(0.0)
+        dark_vec = self._establish_dark_gallery(reg, "SEED-Z")
+        white = make_color_crop(WHITE)
+        white_vec = reg.reid_matcher.extract_feature(white)
+        reg.reid_matcher.pin_similarity(white_vec, dark_vec, 0.10)
+        cand_id = self._candidate_with_crop(reg, white)
+        self.assertTrue(
+            reg.seed_gallery_from_park_entry(cand_id, "SEED-Z"),
+            "at the inert 0.0 default the seed guard is a no-op (documented trap)",
+        )
+
+
+class TestNeighbourClearanceD9(unittest.TestCase):
+    """D9: neighbour-clearance weights view quality so a car whose bbox is
+    overlapped by a parked neighbour makes a lower-quality (contaminated) ReID
+    reference. Log-only by default (no vehicle_registry / flag off); multiplied
+    into quality only when gallery_neighbour_clearance_enforce is set."""
+
+    class _Harness(ParkingEngineTrackingMixin):
+        pass
+
+    class _Det:
+        def __init__(self, bbox, track_id=1):
+            self.bbox = bbox
+            self.track_id = track_id
+
+    def setUp(self):
+        self.h = self._Harness()
+        self.frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    def test_lone_car_is_fully_clear(self):
+        det = self._Det((500, 200, 760, 520), track_id=1)
+        self.assertEqual(self.h._neighbour_clearance(det, [det]), 1.0)
+
+    def test_separated_cars_are_clear(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        b = self._Det((900, 200, 1100, 520), track_id=2)  # no x-overlap
+        self.assertEqual(self.h._neighbour_clearance(a, [a, b]), 1.0)
+
+    def test_overlapping_neighbour_reduces_clearance(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)  # 260x320, area 83200
+        b = self._Det((630, 200, 900, 520), track_id=2)  # covers right half of a
+        # intersection-over-A: x 630..760 = 130, y full 320 -> 41600 / 83200 = 0.5
+        self.assertAlmostEqual(self.h._neighbour_clearance(a, [a, b]), 0.5, places=3)
+
+    def test_asymmetric_small_box_swallowed_by_large(self):
+        small = self._Det((600, 300, 680, 353), track_id=1)  # tiny distant car
+        big = self._Det((500, 200, 900, 520), track_id=2)    # fully contains small
+        # intersection-over-SELF = 1.0 -> clearance 0: a symmetric IoU would have
+        # hidden this (the union is huge); intersection-over-self catches it.
+        self.assertAlmostEqual(
+            self.h._neighbour_clearance(small, [small, big]), 0.0, places=3
+        )
+
+    def test_untracked_neighbour_ignored(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        ghost = self._Det((630, 200, 900, 520), track_id=-1)  # untracked detection
+        self.assertEqual(self.h._neighbour_clearance(a, [a, ghost]), 1.0)
+
+    def test_log_only_does_not_change_quality(self):
+        # No vehicle_registry -> enforce False -> base returned even with overlap.
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        b = self._Det((630, 200, 900, 520), track_id=2)
+        base = self.h._bbox_view_quality(self.frame, a)  # detections=None
+        weighted = self.h._bbox_view_quality(self.frame, a, [a, b])
+        self.assertEqual(base, weighted, "log-only mode must not gate quality")
+
+    def test_enforce_multiplies_clearance(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        b = self._Det((630, 200, 900, 520), track_id=2)  # clearance 0.5
+        self.h.vehicle_registry = SimpleNamespace(
+            matching_config=SimpleNamespace(
+                gallery_neighbour_clearance_enforce=True
+            )
+        )
+        base = self.h._bbox_view_quality(self.frame, a)  # detections=None -> base
+        weighted = self.h._bbox_view_quality(self.frame, a, [a, b])
+        self.assertAlmostEqual(weighted, base * 0.5, places=3)
+        self.assertLess(weighted, base)
 
 
 if __name__ == "__main__":

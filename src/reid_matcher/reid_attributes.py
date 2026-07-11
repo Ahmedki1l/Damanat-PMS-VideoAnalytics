@@ -69,7 +69,15 @@ def body_colour_compatible(hsv_a, hsv_b, v_tol=90) -> bool:
         return abs(va - vb) < v_tol
     if a_achro != b_achro:
         chroma_s = sb if a_achro else sa
-        return chroma_s < 90  # vivid colour vs neutral -> incompatible
+        if chroma_s >= 90:
+            return False  # vivid colour vs neutral -> incompatible
+        # A muted-chroma car (champagne / beige / tan) escapes the saturation
+        # test above, but it is still a DIFFERENT car from a dark neutral when
+        # brightness is far apart — a bright tan Lexus vs a black sedan. The
+        # saturation test alone missed this (the leak that poisoned a dark car's
+        # gallery with a champagne one); value catches it. Same v_tol as the
+        # both-achromatic branch, so genuine lighting variation still passes.
+        return abs(va - vb) < v_tol
     # Both chromatic. Use a wide hue tolerance: the gate (daylight) and the
     # garage floor cameras (artificial light) shift a car's apparent hue, so a
     # moderate difference is lighting, not a different car. Only a large hue gap

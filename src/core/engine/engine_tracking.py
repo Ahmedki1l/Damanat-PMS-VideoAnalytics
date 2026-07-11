@@ -415,8 +415,53 @@ class ParkingEngineTrackingMixin:
             selected.append(secondary)
         return selected
 
-    def _bbox_view_quality(self, frame: np.ndarray, detection) -> float:
-        """How well this camera sees the car — the product of two factors:
+    def _neighbour_clearance(self, detection, detections) -> float:
+        """1.0 when this car's box is unobstructed; →0 as other boxes cover it.
+
+        A car parked shoulder-to-shoulder in a garage has a box that overlaps its
+        neighbour's, so a crop of it contains part of the wrong car and makes a
+        contaminated ReID reference. Returns the fraction of THIS box NOT covered
+        by the single most-overlapping other detection — an asymmetric
+        intersection-over-self, not IoU, so a large neighbour that swallows a
+        small distant box correctly scores that small box as heavily occluded.
+        Fails open (1.0) on any error: clearance only ever WEIGHTS view quality,
+        it is never a detection decision.
+        """
+        try:
+            if not detections or len(detections) < 2:
+                return 1.0
+            ax1, ay1, ax2, ay2 = (float(v) for v in detection.bbox)
+            a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            if a_area <= 0.0:
+                return 1.0
+            self_tid = getattr(detection, "track_id", None)
+            worst = 0.0
+            for other in detections:
+                if other is detection:
+                    continue
+                other_tid = getattr(other, "track_id", None)
+                if other_tid == -1 or (
+                    self_tid is not None and other_tid == self_tid
+                ):
+                    continue
+                bx1, by1, bx2, by2 = (float(v) for v in other.bbox)
+                ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+                iy = max(0.0, min(ay2, by2) - max(ay1, by1))
+                worst = max(worst, (ix * iy) / a_area)
+            return max(0.0, 1.0 - worst)
+        except Exception:
+            return 1.0
+
+    def _clearance_enforced(self) -> bool:
+        """True when D9 neighbour-clearance should MULTIPLY view quality (gating
+        occluded crops out of the gallery). Default False ⇒ log-only. Reads the
+        registry's matching config; absent (bare mixin in a unit test) ⇒ False."""
+        cfg = getattr(getattr(self, "vehicle_registry", None), "matching_config", None)
+        return bool(getattr(cfg, "gallery_neighbour_clearance_enforce", False))
+
+    def _bbox_view_quality(self, frame: np.ndarray, detection, detections=None) -> float:
+        """How well this camera sees the car — the product of two (or three)
+        factors:
 
         * edge fraction: 1.0 when the bbox sits entirely inside the frame (1%
           edge margin), toward 0.0 as an edge clips it (part of the car out of
@@ -425,6 +470,11 @@ class ParkingEngineTrackingMixin:
         * apparent-size factor: ramps 0→1 with the car's on-screen HEIGHT
           (_VQ_MIN_H → _VQ_GOOD_H). A distant, low-resolution car makes a poor
           ReID crop regardless of framing, so it must NOT rank as a "full view".
+        * neighbour clearance (D9): 1.0 unobstructed → 0.0 covered by another
+          car's box. Folded in ONLY when ``detections`` is supplied AND
+          gallery_neighbour_clearance_enforce is set; otherwise it is computed
+          and logged (log-only) so its distribution can be studied before it
+          gates. Passing ``detections=None`` (e.g. unit tests) skips it entirely.
 
         Used as an ownership tie-breaker (display/attribution) AND as the
         gallery-reference quality gate — so a far camera whose tiny car is fully
@@ -443,7 +493,18 @@ class ParkingEngineTrackingMixin:
             iy = max(0.0, min(y2, h - my) - max(y1, my))
             edge = max(0.0, min(1.0, (ix * iy) / (bw * bh)))
             size = max(0.0, min(1.0, (bh - _VQ_MIN_H) / (_VQ_GOOD_H - _VQ_MIN_H)))
-            return edge * size
+            base = edge * size
+            if detections is None:
+                return base
+            clearance = self._neighbour_clearance(detection, detections)
+            enforce = self._clearance_enforced()
+            if clearance < 1.0:
+                logger.info(
+                    "[quality] track=%s clearance=%.3f base=%.3f -> %.3f (enforce=%s)",
+                    getattr(detection, "track_id", "?"),
+                    clearance, base, base * clearance, enforce,
+                )
+            return base * clearance if enforce else base
         except Exception:
             return 0.0
 
@@ -986,7 +1047,7 @@ class ParkingEngineTrackingMixin:
             self.vehicle_registry.record_track_view(
                 cam_id,
                 detection.track_id,
-                self._bbox_view_quality(frame, detection),
+                self._bbox_view_quality(frame, detection, detections),
             )
 
             track_key = (cam_id, detection.track_id)
@@ -1042,7 +1103,7 @@ class ParkingEngineTrackingMixin:
                                 cam_id,
                                 detection.track_id,
                                 ref_crop,
-                                self._bbox_view_quality(frame, detection),
+                                self._bbox_view_quality(frame, detection, detections),
                             )
                     continue
 
