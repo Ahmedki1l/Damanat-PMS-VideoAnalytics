@@ -267,10 +267,16 @@ class ParkingEngine(
                         self._store_passthrough_frame(frame, cam_id, grid_frames)
                     continue
 
-                with perf_trace.stage("roi"):
-                    detection_frame = pipeline.apply_roi_mask(frame)
                 # clahe + infer stages are timed inside detect_and_track.
-                detections = self._detector_for(cam_id).detect_and_track(detection_frame, cam_id)
+                # Detect on the FULL frame — masking to the ROI first blacks out
+                # ~a quarter of the frame, which wrecks detection after the model
+                # letterboxes to its small input (a fully-visible dark car went
+                # undetected at int8/320, so its slot never flipped). The ROI is
+                # applied AFTER detection as a bottom-center membership filter,
+                # preserving the "exclude out-of-area cars" behaviour at no cost.
+                detections = self._detector_for(cam_id).detect_and_track(frame, cam_id)
+                with perf_trace.stage("roi"):
+                    detections = pipeline.filter_detections_to_roi(detections)
                 with perf_trace.stage("zones"):
                     self._process_special_zones(cam_id, frame, detections)
 
@@ -398,8 +404,11 @@ class ParkingEngine(
                     continue
 
                 self.last_processed_at = datetime.now()
-                detection_frame = pipeline.apply_roi_mask(frame)
-                detections = self._detector_for(camera_id).detect_and_track(detection_frame, camera_id)
+                # Detect on the full frame, then filter to the ROI (see the
+                # multi-camera loop above — masking before detection wrecks the
+                # detector at the model's small input size).
+                detections = self._detector_for(camera_id).detect_and_track(frame, camera_id)
+                detections = pipeline.filter_detections_to_roi(detections)
                 self._process_special_zones(camera_id, frame, detections)
                 assignment = pipeline.assigner.assign(detections)
 
