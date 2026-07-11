@@ -196,6 +196,131 @@ def build_index(
 
 
 # --------------------------------------------------------------------------- #
+# View (camera-proxy) labels + the stricter cross-view protocols
+# --------------------------------------------------------------------------- #
+#
+# The held-out crops carry NO camera id in their filenames (all parse to the
+# training project's camid 0), so a literal Market-1501 cross-camera protocol is
+# impossible. The filename PREFIX, however, is a genuine viewpoint signal:
+# ``floor_*`` (a car on the parking floor) vs ``gate_*`` (a car at the entry
+# gate) are different views of the same car. We use that as a camera PROXY: the
+# cross-view protocol credits a match only when query and gallery come from
+# different views, which removes the same-camera near-duplicate frames that
+# saturate the self-gallery rank-1.
+
+VIEW_CODES = {"floor": 0, "gate": 1, "other": 2}
+
+
+def parse_view(filename: str) -> int:
+    """Map a crop filename to a coarse viewpoint code from its prefix token.
+    ``floor``/``gate`` are the two real facility viewpoints; everything else
+    (``crop_*`` etc.) is ``other`` and never yields a cross-view match."""
+    prefix = filename.split("_", 1)[0].lower()
+    return VIEW_CODES.get(prefix, VIEW_CODES["other"])
+
+
+def _evaluate_cross_view(
+    sim: np.ndarray, pids: np.ndarray, views: np.ndarray,
+) -> Optional[Dict]:
+    """Market-1501 evaluation with VIEW as the camera. Each image is a query in
+    turn; the gallery is every other image, but same-identity + same-view images
+    are dropped as junk so only CROSS-VIEW matches count. Queries with no
+    cross-view gallery mate of their identity are skipped (standard). Returns
+    rank-1/5 + mAP averaged over valid queries."""
+    n = sim.shape[0]
+    r1 = r5 = 0
+    aps: List[float] = []
+    valid = 0
+    for i in range(n):
+        order = np.argsort(-sim[i])
+        order = order[order != i]  # drop the query itself
+        # Junk = same identity AND same view (near-duplicate same-camera frames).
+        keep = ~((pids[order] == pids[i]) & (views[order] == views[i]))
+        order = order[keep]
+        good = (pids[order] == pids[i]).astype(np.float64)  # same id, other view
+        if good.sum() == 0:
+            continue  # no cross-view mate — not a valid cross-view query
+        valid += 1
+        first = int(np.flatnonzero(good)[0])
+        if first < 1:
+            r1 += 1
+        if first < 5:
+            r5 += 1
+        cum = np.cumsum(good)
+        ranks = np.arange(1, len(good) + 1)
+        aps.append(float((cum / ranks * good).sum() / good.sum()))
+    if valid == 0:
+        return None
+    return {
+        "rank1": round(r1 / valid, 4),
+        "rank5": round(r5 / valid, 4),
+        "mAP": round(float(np.mean(aps)), 4),
+        "valid_queries": valid,
+    }
+
+
+def _evaluate_single_shot_cross_view(
+    feats: np.ndarray, pids: np.ndarray, views: np.ndarray,
+    n_trials: int, base_seed: int,
+) -> Optional[Dict]:
+    """Strictest protocol: the gallery is ONE random crop per (identity, view);
+    every other crop is a query, scored cross-view (same id+view junked). This
+    removes the many-frames-per-car crutch entirely — a query must match a single
+    reference shot of its car taken from a different view, ranked against one
+    reference shot of every other car. Averaged over ``n_trials`` random gallery
+    draws for stability."""
+    from collections import defaultdict
+
+    n = len(pids)
+    pair_to_idxs: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for idx in range(n):
+        pair_to_idxs[(int(pids[idx]), int(views[idx]))].append(idx)
+
+    r1s: List[float] = []
+    maps: List[float] = []
+    valids: List[int] = []
+    for t in range(n_trials):
+        rng = np.random.RandomState(base_seed + t)
+        gallery = np.array(
+            sorted(int(rng.choice(idxs)) for idxs in pair_to_idxs.values())
+        )
+        gset = set(gallery.tolist())
+        queries = np.array([i for i in range(n) if i not in gset])
+        if queries.size == 0:
+            continue
+        g_pid, g_view = pids[gallery], views[gallery]
+        sims = feats[queries] @ feats[gallery].T
+        r1 = valid = 0
+        aps: List[float] = []
+        for qi, i in enumerate(queries):
+            order = np.argsort(-sims[qi])
+            keep = ~((g_pid[order] == pids[i]) & (g_view[order] == views[i]))
+            order = order[keep]
+            good = (g_pid[order] == pids[i]).astype(np.float64)
+            if good.sum() == 0:
+                continue
+            valid += 1
+            if int(np.flatnonzero(good)[0]) < 1:
+                r1 += 1
+            cum = np.cumsum(good)
+            ranks = np.arange(1, len(good) + 1)
+            aps.append(float((cum / ranks * good).sum() / good.sum()))
+        if valid:
+            r1s.append(r1 / valid)
+            maps.append(float(np.mean(aps)))
+            valids.append(valid)
+    if not r1s:
+        return None
+    return {
+        "rank1": round(float(np.mean(r1s)), 4),
+        "mAP": round(float(np.mean(maps)), 4),
+        "rank1_std": round(float(np.std(r1s)), 4),
+        "avg_valid_queries": round(float(np.mean(valids)), 1),
+        "trials": len(r1s),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Eval driver (uses the real matcher; reuses vetted metric code)
 # --------------------------------------------------------------------------- #
 
@@ -204,10 +329,19 @@ def evaluate_ir(
     ir_dir: Path,
     images: List[Path],
     labels: np.ndarray,
+    views: Optional[np.ndarray] = None,
+    single_shot_trials: int = 10,
+    single_shot_seed: int = 42,
 ) -> Optional[Dict]:
-    """Embed every held-out crop through the IR and compute rank-1/5 + mAP on a
-    self-as-query gallery (each crop queried against every OTHER crop). Returns
-    None when the IR is missing so a sweep skips it gracefully."""
+    """Embed every held-out crop and score three protocols:
+
+    * ``self_gallery`` — each crop queried against every other (the lenient
+      number; rank-1 saturates because same-view near-duplicate frames count).
+    * ``cross_view`` — Market-1501 with VIEW as the camera: only cross-view
+      matches count (same id+view junked). The honest stricter number.
+    * ``cross_view_single_shot`` — gallery is one crop per (id, view); strictest.
+
+    Returns None when the IR is missing so a sweep skips it gracefully."""
     if not (ir_dir / "model.xml").exists():
         logger.warning("IR not found at %s — skipping.", ir_dir)
         return None
@@ -222,13 +356,21 @@ def evaluate_ir(
     matcher = _build_matcher(ir_dir)
     feats = _extract_features(matcher, images)
     sim = feats @ feats.T
-    return {
+    out: Dict = {
         "ir_dir": str(ir_dir),
         "n_images": int(feats.shape[0]),
-        "rank1": round(_rank_k(sim, labels, 1), 4),
-        "rank5": round(_rank_k(sim, labels, 5), 4),
-        "mAP": round(_mean_average_precision(sim, labels), 4),
+        "self_gallery": {
+            "rank1": round(_rank_k(sim, labels, 1), 4),
+            "rank5": round(_rank_k(sim, labels, 5), 4),
+            "mAP": round(_mean_average_precision(sim, labels), 4),
+        },
     }
+    if views is not None:
+        out["cross_view"] = _evaluate_cross_view(sim, labels, views)
+        out["cross_view_single_shot"] = _evaluate_single_shot_cross_view(
+            feats, labels, views, single_shot_trials, single_shot_seed
+        )
+    return out
 
 
 def run(
@@ -239,6 +381,7 @@ def run(
     ir_dirs: List[Path],
     report_path: Path,
     min_images: int = MIN_IMAGES_PER_IDENTITY,
+    single_shot_trials: int = 10,
 ) -> Dict:
     train_ids = set(explicit_train_ids or set())
     if train_report is not None:
@@ -257,13 +400,24 @@ def run(
     assert_identity_disjoint(set(part.held_out), train_ids)
 
     images, labels, id_names = build_index(part.held_out)
+    views = np.array([parse_view(p.name) for p in images], dtype=np.int64)
+    view_hist = {
+        name: int((views == code).sum()) for name, code in VIEW_CODES.items()
+    }
     logger.info(
         "Identity-disjoint eval: %d held-out identities, %d images "
-        "(dropped %d identities).",
-        len(id_names), len(images), len(part.dropped),
+        "(dropped %d identities). views=%s",
+        len(id_names), len(images), len(part.dropped), view_hist,
     )
 
-    results = [r for r in (evaluate_ir(ir, images, labels) for ir in ir_dirs) if r]
+    results = [
+        r
+        for r in (
+            evaluate_ir(ir, images, labels, views, single_shot_trials)
+            for ir in ir_dirs
+        )
+        if r
+    ]
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -275,7 +429,17 @@ def run(
         "dropped_identities": part.dropped,
         "min_images_per_identity": min_images,
         "n_eval_images": len(images),
+        "view_histogram": view_hist,
+        "single_shot_trials": single_shot_trials,
         "disjointness_verified": True,  # assert_identity_disjoint passed above
+        "protocols": {
+            "self_gallery": "each crop vs every other (lenient; rank-1 saturates)",
+            "cross_view": "Market-1501, VIEW as camera; only cross-view matches "
+                          "count (same id+view junked)",
+            "cross_view_single_shot": "gallery = 1 crop per (id, view); strictest",
+        },
+        "view_note": "views are a floor/gate filename-prefix PROXY for camera — "
+                     "the crops carry no camera id.",
         "per_ir": results,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -294,17 +458,38 @@ def _print_summary(report: Dict) -> None:
         f"| eval images: {report['n_eval_images']}  "
         f"| training identities excluded: {report['train_identity_count']}"
     )
-    print(f"disjointness verified: {report['disjointness_verified']}")
+    print(f"disjointness verified: {report['disjointness_verified']}  "
+          f"| views (camera proxy): {report.get('view_histogram')}")
     print("-" * 70)
     if not report["per_ir"]:
         print("No IR evaluated (missing model.xml). Split is ready; add an IR.")
-    else:
-        print(f"{'IR':40} {'rank1':>7} {'rank5':>7} {'mAP':>7}")
-        for r in report["per_ir"]:
-            print(
-                f"{Path(r['ir_dir']).name:40.40} "
-                f"{r['rank1']:>7.4f} {r['rank5']:>7.4f} {r['mAP']:>7.4f}"
-            )
+        print("=" * 70)
+        return
+
+    def _row(label: str, block: Optional[Dict]) -> None:
+        if not block:
+            print(f"  {label:26} (no valid queries)")
+            return
+        r1 = block.get("rank1")
+        r5 = block.get("rank5")
+        mp = block.get("mAP")
+        extra = ""
+        if "valid_queries" in block:
+            extra = f"  [{block['valid_queries']} valid q]"
+        elif "avg_valid_queries" in block:
+            extra = (f"  [~{block['avg_valid_queries']:.0f} q x "
+                     f"{block['trials']} trials, r1σ={block.get('rank1_std')}]")
+        r5s = f"{r5:>7.4f}" if isinstance(r5, float) else f"{'—':>7}"
+        print(f"  {label:26} rank1={r1:>7.4f} rank5={r5s} mAP={mp:>7.4f}{extra}")
+
+    for r in report["per_ir"]:
+        print(f"{Path(r['ir_dir']).name}  (n={r['n_images']})")
+        _row("self-gallery (lenient)", r.get("self_gallery"))
+        _row("cross-view (Market)", r.get("cross_view"))
+        _row("cross-view single-shot", r.get("cross_view_single_shot"))
+        print()
+    print("mAP is the metric to trust; cross-view removes same-camera "
+          "near-duplicates. Views are a floor/gate proxy (no camera id in crops).")
     print("=" * 70)
 
 
@@ -328,6 +513,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="OpenVINO IR dir to evaluate (repeatable).")
     p.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
     p.add_argument("--min-images", type=int, default=MIN_IMAGES_PER_IDENTITY)
+    p.add_argument("--single-shot-trials", type=int, default=10,
+                   help="Random gallery draws for the cross-view single-shot "
+                        "protocol (averaged for stability).")
     p.add_argument("--no-train-report", action="store_true",
                    help="Ignore --train-report; use only --train-id values.")
     p.add_argument("--verbose", action="store_true")
@@ -362,6 +550,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             ir_dirs=args.ir_dir or [DEFAULT_IR],
             report_path=args.report_path,
             min_images=args.min_images,
+            single_shot_trials=args.single_shot_trials,
         )
     except ContaminationError as exc:
         logger.error("REFUSING TO REPORT A CONTAMINATED EVAL: %s", exc)

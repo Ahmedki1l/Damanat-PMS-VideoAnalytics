@@ -10,12 +10,17 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
+
 from tools.eval_identity_disjoint import (
     ContaminationError,
+    _evaluate_cross_view,
+    _evaluate_single_shot_cross_view,
     assert_identity_disjoint,
     build_index,
     load_train_identities_from_splits,
     normalize_identity,
+    parse_view,
     partition_identities,
     scan_identities,
 )
@@ -98,6 +103,53 @@ class TestScanAndIndex(unittest.TestCase):
         self.assertEqual(len(labels), 5)
         # Labels index into names and are grouped per identity.
         self.assertEqual({names[l] for l in labels}, {"CAR-A", "CAR-B"})
+
+
+class TestParseView(unittest.TestCase):
+    def test_prefix_maps_to_view(self):
+        self.assertEqual(parse_view("floor_000.jpg"), 0)
+        self.assertEqual(parse_view("gate_12ab.jpg"), 1)
+        self.assertEqual(parse_view("crop_20260707_abc.jpg"), 2)  # other
+
+
+class TestCrossViewProtocols(unittest.TestCase):
+    """Two identities, two views each, separable embeddings. Cross-view credit
+    only counts a match when query and gallery differ in view."""
+
+    def _separable(self):
+        # id0 -> [1,0], id1 -> [0,1]; two crops per (id, view) so single-shot
+        # has a query set after one crop per (id,view) is drawn into the gallery.
+        feats = np.array(
+            [[1.0, 0.0]] * 4 + [[0.0, 1.0]] * 4, dtype=np.float32
+        )
+        pids = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+        views = np.array([0, 0, 1, 1, 0, 0, 1, 1])  # floor,floor,gate,gate ...
+        return feats, pids, views
+
+    def test_cross_view_separable_is_perfect(self):
+        feats, pids, views = self._separable()
+        res = _evaluate_cross_view(feats @ feats.T, pids, views)
+        self.assertEqual(res["rank1"], 1.0)
+        self.assertEqual(res["mAP"], 1.0)
+        self.assertEqual(res["valid_queries"], 8)  # every crop has a cross-view mate
+
+    def test_cross_view_skips_single_view_identity(self):
+        # id1 has only the floor view -> its crops have no cross-view mate and
+        # are not counted as valid queries.
+        feats = np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]], dtype=np.float32)
+        pids = np.array([0, 0, 1])
+        views = np.array([0, 1, 0])  # id0 floor+gate, id1 floor only
+        res = _evaluate_cross_view(feats @ feats.T, pids, views)
+        self.assertEqual(res["valid_queries"], 2)  # only id0's two crops
+
+    def test_single_shot_cross_view_separable_is_perfect(self):
+        feats, pids, views = self._separable()
+        res = _evaluate_single_shot_cross_view(
+            feats, pids, views, n_trials=3, base_seed=0
+        )
+        self.assertEqual(res["rank1"], 1.0)
+        self.assertEqual(res["mAP"], 1.0)
+        self.assertGreaterEqual(res["trials"], 1)
 
 
 if __name__ == "__main__":

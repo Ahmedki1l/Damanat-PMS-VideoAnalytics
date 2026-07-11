@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-11T09:19:29+00:00",
+  "generated_at": "2026-07-11T09:32:53+00:00",
   "source_root": "C:\\Users\\moham\\Desktop\\New folder (2)\\Find tunning\\cropped images",
   "train_identity_count": 61,
   "source_identity_count": 141,
@@ -151,21 +151,63 @@
   },
   "min_images_per_identity": 2,
   "n_eval_images": 2061,
+  "view_histogram": {
+    "floor": 1054,
+    "gate": 831,
+    "other": 176
+  },
+  "single_shot_trials": 10,
   "disjointness_verified": true,
+  "protocols": {
+    "self_gallery": "each crop vs every other (lenient; rank-1 saturates)",
+    "cross_view": "Market-1501, VIEW as camera; only cross-view matches count (same id+view junked)",
+    "cross_view_single_shot": "gallery = 1 crop per (id, view); strictest"
+  },
+  "view_note": "views are a floor/gate filename-prefix PROXY for camera \u2014 the crops carry no camera id.",
   "per_ir": [
     {
       "ir_dir": "models\\PS_carMatching",
       "n_images": 2061,
-      "rank1": 0.9762,
-      "rank5": 0.9874,
-      "mAP": 0.711
+      "self_gallery": {
+        "rank1": 0.9762,
+        "rank5": 0.9874,
+        "mAP": 0.711
+      },
+      "cross_view": {
+        "rank1": 0.7355,
+        "rank5": 0.8339,
+        "mAP": 0.564,
+        "valid_queries": 2011
+      },
+      "cross_view_single_shot": {
+        "rank1": 0.5809,
+        "mAP": 0.6318,
+        "rank1_std": 0.0242,
+        "avg_valid_queries": 1964.0,
+        "trials": 10
+      }
     },
     {
       "ir_dir": "models\\osnet_openvino_int8_256x128",
       "n_images": 2061,
-      "rank1": 0.9578,
-      "rank5": 0.9772,
-      "mAP": 0.2972
+      "self_gallery": {
+        "rank1": 0.9578,
+        "rank5": 0.9772,
+        "mAP": 0.2972
+      },
+      "cross_view": {
+        "rank1": 0.4933,
+        "rank5": 0.5261,
+        "mAP": 0.135,
+        "valid_queries": 2011
+      },
+      "cross_view_single_shot": {
+        "rank1": 0.1726,
+        "mAP": 0.1886,
+        "rank1_std": 0.0319,
+        "avg_valid_queries": 1964.0,
+        "trials": 10
+      }
     }
   ]
 }
