@@ -236,6 +236,71 @@ class ParkingEngineRuntimeMixin:
     # without VA seeing the corresponding ANPR exit event.
     _EXIT_JANITOR_INTERVAL_S = 30.0
 
+    # How often a worker re-checks the DB for cars that entered AFTER it booted.
+    # Must stay well under the gate->slot drive time (minutes) so the entrant's
+    # session is in the ReID pool before it reaches whichever camera watches the
+    # slot it parks in. See _session_sync_tick.
+    _SESSION_SYNC_INTERVAL_S = 10.0
+
+    def _open_session_rows(self):
+        """``(plate_number, floor)`` for every car currently inside, or None on error.
+
+        Deliberately unfiltered by camera: a worker must learn about cars that
+        entered through a gate it does not own (see _session_sync_tick).
+        """
+        try:
+            from sqlalchemy import text as _text
+
+            session = self.db_manager.SessionLocal()
+            try:
+                # Runs on the main-loop thread, so it must never block the
+                # pipeline. LOCK_TIMEOUT makes a lock-blocked read raise after
+                # 3s instead of hanging; NOLOCK avoids taking shared locks at
+                # all. A stale read is fine — we re-poll (see _exit_janitor_tick).
+                session.execute(_text("SET LOCK_TIMEOUT 3000"))
+                return session.execute(
+                    _text(
+                        "SELECT plate_number, floor FROM dbo.parking_sessions WITH (NOLOCK) "
+                        "WHERE status = 'open'"
+                    )
+                ).fetchall()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning("[gallery] open-session query failed: %r", exc)
+            return None
+
+    def _hydrate_open_sessions(self, rows) -> int:
+        """``build_session_from_gallery`` for each open plate not yet hydrated here.
+
+        Returns how many NEW sessions were built. Plates whose gallery has no
+        matchable reference yet (an entrant with only the ``gate_only`` shot)
+        are deliberately NOT marked as seen, so a later tick picks them up once
+        CAM-03 adds the first matchable crop.
+        """
+        hydrated = getattr(self, "_hydrated_plates", None)
+        if hydrated is None:
+            hydrated = self._hydrated_plates = set()
+
+        added, still_open = 0, set()
+        for row in rows:
+            plate = row[0]
+            floor = row[1] if len(row) > 1 else None
+            if not plate:
+                continue
+            still_open.add(plate)
+            if plate in hydrated:
+                continue
+            try:
+                if self.vehicle_registry.build_session_from_gallery(plate, floor=floor):
+                    hydrated.add(plate)
+                    added += 1
+            except Exception as exc:
+                logger.warning("[gallery] restore failed for plate=%s: %r", plate, exc)
+        # Forget plates whose session has closed, so a re-entry re-hydrates.
+        hydrated &= still_open
+        return added
+
     def _restore_vehicle_galleries(self) -> None:
         """Reload the persisted per-plate gallery for every car still inside the
         facility (open ``parking_sessions``) so ReID can re-identify it after a
@@ -246,40 +311,48 @@ class ParkingEngineRuntimeMixin:
             return
         if getattr(self.vehicle_registry, "gallery_store", None) is None:
             return
-        try:
-            from sqlalchemy import text as _text
-
-            session = self.db_manager.SessionLocal()
-            try:
-                # Startup restore probe — fail fast rather than hang the boot if
-                # another connection holds a lock on parking_sessions (NOLOCK +
-                # short LOCK_TIMEOUT; see _exit_janitor_tick for rationale).
-                session.execute(_text("SET LOCK_TIMEOUT 3000"))
-                rows = session.execute(
-                    _text(
-                        "SELECT plate_number, floor FROM dbo.parking_sessions WITH (NOLOCK) "
-                        "WHERE status = 'open'"
-                    )
-                ).fetchall()
-            finally:
-                session.close()
-        except Exception as exc:
-            logger.warning("[gallery] restore query failed: %r", exc)
+        rows = self._open_session_rows()
+        if rows is None:
             return
-
-        restored = 0
-        for row in rows:
-            plate = row[0]
-            floor = row[1] if len(row) > 1 else None
-            if not plate:
-                continue
-            try:
-                if self.vehicle_registry.build_session_from_gallery(plate, floor=floor):
-                    restored += 1
-            except Exception as exc:
-                logger.warning("[gallery] restore failed for plate=%s: %r", plate, exc)
+        restored = self._hydrate_open_sessions(rows)
         if restored:
             print(f"[INFO] Restored {restored} vehicle gallery(ies) from disk (cars still inside).")
+
+    def _session_sync_tick(self) -> None:
+        """Pick up cars that entered AFTER this worker booted.
+
+        Only the ``--api`` group runs the ANPR webhook, so only THAT process
+        learns a new entrant's plate and builds its session. Every other group
+        owns the slot cameras the car actually parks on, and was running global
+        ReID against a session pool frozen at its own startup: the car parks,
+        matches nothing, is given an anonymous ``plate=None`` session, and the
+        slot binds to None — rendering as "(pending)" forever. (It fails
+        silently because ``is_plate_inside(None)`` returns True.)
+
+        supervisor.py's contract is that identity crosses the process boundary
+        through the DB + the on-disk gallery. ``_restore_vehicle_galleries`` is
+        the read side of that contract — it was just wired to a one-shot boot
+        call. This runs it on a timer, so every worker sees an entrant within
+        ``_SESSION_SYNC_INTERVAL_S``, long before the car reaches its slot.
+        """
+        if not self.db_manager or not self.vehicle_registry:
+            return
+        if getattr(self.vehicle_registry, "gallery_store", None) is None:
+            return
+
+        now_ts = time.time()
+        last = getattr(self, "_session_sync_last_run_at", 0.0)
+        if now_ts - last < self._SESSION_SYNC_INTERVAL_S:
+            return
+        self._session_sync_last_run_at = now_ts
+
+        rows = self._open_session_rows()
+        if rows is None:
+            return
+        added = self._hydrate_open_sessions(rows)
+        if added:
+            print(f"[INFO] Session sync: picked up {added} car(s) that entered "
+                  f"after this worker started.")
 
     def _exit_janitor_tick(self) -> None:
         """Once per `_EXIT_JANITOR_INTERVAL_S`, find plates VA still has in

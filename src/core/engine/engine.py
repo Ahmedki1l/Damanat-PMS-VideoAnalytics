@@ -254,6 +254,11 @@ class ParkingEngine(
                 # row has been closed by PMS-AI without VA observing the
                 # ANPR exit event. Catches missed CAM-EXIT triggers.
                 self._exit_janitor_tick()
+                # The inverse sweep (gated to once per ~10s): pull in cars that
+                # ENTERED after this worker booted. Only the --api group gets the
+                # ANPR webhook, so without this a car parking on any other
+                # group's camera never matches and binds to plate=None.
+                self._session_sync_tick()
                 self.last_processed_at = datetime.now()
 
                 pipeline = self.pipelines.get(cam_id)
