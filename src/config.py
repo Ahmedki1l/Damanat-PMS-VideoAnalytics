@@ -104,6 +104,14 @@ class DetectorPreprocessingConfig:
     grid_size: tuple = (8, 8)
     gamma_correction: bool = True
     dark_threshold: int = 65
+    # Run CLAHE at the detector's input size instead of the full frame. The IR is
+    # statically shaped (320x320), so a 1280x720 frame gets letterboxed down to
+    # 320x180 inside Ultralytics anyway — normalising beforehand enhances ~16x
+    # more pixels than the model ever sees. Resizing first makes the whole
+    # BGR<->LAB round trip cheap, and the detector's input is unchanged apart
+    # from CLAHE being computed on the downscaled pixels.
+    # Set false to go back to full-frame CLAHE if detection recall regresses.
+    detector_scale: bool = True
 
 
 @dataclass
@@ -573,6 +581,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             )
             config.preprocessing.detector.dark_threshold = d_pp.get(
                 "dark_threshold", config.preprocessing.detector.dark_threshold
+            )
+            config.preprocessing.detector.detector_scale = d_pp.get(
+                "detector_scale", config.preprocessing.detector.detector_scale
             )
         if "reid" in pp:
             r_pp = pp["reid"]

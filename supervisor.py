@@ -76,21 +76,64 @@ def _available_cores() -> int:
     return os.cpu_count() or 1
 
 
-def _thread_slice(cam_count: int, total_cams: int, total_cores: int) -> int:
-    """Cores handed to a group, proportional to its camera share, at least 1.
-    Partitions the CPU so parallel workers don't each spin up all-core pools
-    and thrash (BLAS/OpenMP/OpenVINO all read these env vars)."""
-    return max(1, (total_cores * cam_count) // total_cams)
+def _core_slices(groups: list[dict], total_cores: int) -> list[list[int]]:
+    """Carve the CPU into one DISJOINT core range per group, sized by camera share.
+
+    Every group gets at least 1 core and the slices together cover all cores
+    (largest-remainder apportionment, ties broken toward the busier group), so
+    no core sits idle and no core is claimed twice.
+
+    Why ranges and not just a thread count: OMP_NUM_THREADS only reaches
+    numpy/BLAS/torch. OpenVINO (TBB) and OpenCV ignore it and size their pools
+    to the whole machine, so all 5 groups were each spinning an all-core pool.
+    Both libraries DO respect the CPU affinity mask, so handing each group a
+    disjoint slice is what actually caps them. See src/cpu_affinity.py.
+    """
+    # Fewer cores than groups: there is nothing to partition, so don't pretend to.
+    # Every group sees the whole CPU (i.e. affinity becomes a no-op) rather than
+    # us handing out overlapping "slices" that would just mislead the logs.
+    if total_cores < len(groups):
+        return [list(range(total_cores)) for _ in groups]
+
+    total_cams = sum(_cam_count(g) for g in groups) or 1
+    exact = [total_cores * _cam_count(g) / total_cams for g in groups]
+    sizes = [max(1, int(e)) for e in exact]
+
+    # Hand the remaining cores to whoever was shortchanged most by the floor
+    # (most cameras wins a tie). Measure the shortfall against what each group
+    # was ACTUALLY granted, not against floor(exact) — otherwise a tiny group
+    # rounded up to its 1-core minimum still looks starved and outbids a group
+    # three times its size.
+    leftover = total_cores - sum(sizes)
+    order = sorted(
+        range(len(groups)),
+        key=lambda i: (exact[i] - sizes[i], _cam_count(groups[i])),
+        reverse=True,
+    )
+    for i in range(max(0, leftover)):
+        sizes[order[i % len(order)]] += 1
+
+    slices, next_core = [], 0
+    for size in sizes:
+        slices.append(list(range(next_core, min(next_core + size, total_cores))))
+        next_core += size
+    return slices
 
 
-def _child_env(threads: int) -> dict:
-    """Copy of the parent env with the native-thread caps pinned for one group."""
+def _child_env(cores: list[int]) -> dict:
+    """Copy of the parent env carrying one group's CPU slice.
+
+    VA_CPU_LIST is applied by main.py before it imports cv2/torch/openvino; the
+    *_NUM_THREADS vars still cap the OpenMP/BLAS pools (NMS, ByteTrack, numpy)
+    which read them at first use rather than from the affinity mask.
+    """
     env = os.environ.copy()
+    env["VA_CPU_LIST"] = ",".join(str(c) for c in cores)
     for var in (
         "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
         "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
     ):
-        env[var] = str(threads)
+        env[var] = str(len(cores))
     return env
 
 
@@ -166,9 +209,9 @@ def run(reset_plates: bool = False, foreground: bool = False,
 
     PID_FILE.unlink(missing_ok=True)
 
-    for g in GROUPS:
-        cam_count = _cam_count(g)
-        threads = _thread_slice(cam_count, total_cams, total_cores)
+    slices = _core_slices(GROUPS, total_cores)
+
+    for g, cores in zip(GROUPS, slices):
         cli = [sys.executable, "main.py", "--cameras", g["cams"]]
         if g.get("api"):
             cli += ["--api", "--port", str(port)]
@@ -176,13 +219,14 @@ def run(reset_plates: bool = False, foreground: bool = False,
         out_path = LOG_DIR / f"va_{g['name']}.out.log"
         err_path = LOG_DIR / f"va_{g['name']}.err.log"
         label = f"{g['name']} (+API :{port})" if g.get("api") else g["name"]
+        span = f"{cores[0]}-{cores[-1]}" if len(cores) > 1 else str(cores[0])
         print(f"[supervisor] starting group '{label}' "
-              f"({threads} threads/{total_cores} cores) -> {g['cams']}")
+              f"(CPUs {span} = {len(cores)}/{total_cores}) -> {g['cams']}")
 
         out_fh = out_path.open("w", encoding="utf-8")
         err_fh = err_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
-            cli, cwd=str(ROOT), env=_child_env(threads),
+            cli, cwd=str(ROOT), env=_child_env(cores),
             stdout=out_fh, stderr=err_fh, **popen_kwargs,
         )
         children.append((g["name"], proc))

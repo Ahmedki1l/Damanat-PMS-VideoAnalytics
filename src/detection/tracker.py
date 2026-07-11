@@ -13,8 +13,10 @@ Why not a standalone tracker?
 """
 
 import inspect
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Tuple
 
+import cv2
 import torch
 import numpy as np
 from ultralytics import YOLO
@@ -24,7 +26,7 @@ from ultralytics.utils.checks import check_yaml
 
 from src.config import DetectorConfig, TrackerConfig, DetectorPreprocessingConfig
 from src.detection.detector import Detection
-from src.preprocessing import luminance_normalize, auto_gamma
+from src.preprocessing import luminance_normalize_auto
 from src import perf_trace
 
 # Ultralytics tracker classes by their `tracker_type` config value.
@@ -67,6 +69,7 @@ class TrackedDetector:
 
         print(f"[INFO] Loading YOLO model from '{detector_config.model_path}'...")
         self.model = YOLO(detector_config.model_path, task="detect")
+        self.imgsz = self._resolve_imgsz()
 
         # Resolve device: "auto" picks CUDA if available, else CPU
         if detector_config.device == "auto":
@@ -75,30 +78,72 @@ class TrackedDetector:
             self.device = detector_config.device
 
         pp_status = "ON" if self.preprocessing_config.enabled else "OFF"
-        print(f"[INFO] Model loaded. Tracker: {tracker_config.type} | Device: {self.device} | Preprocessing: {pp_status}")
+        print(f"[INFO] Model loaded. Tracker: {tracker_config.type} | Device: {self.device} "
+              f"| imgsz: {self.imgsz} | Preprocessing: {pp_status}")
 
-    def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
+    def _resolve_imgsz(self) -> int:
+        """The size the model ACTUALLY runs at, not the one config.yaml asks for.
+
+        An OpenVINO export is statically shaped — models/yolo11m_320_int8_* is
+        locked to 320x320 — and Ultralytics silently overrides the requested
+        imgsz from the export's metadata.yaml. config.yaml's `imgsz: 640` is
+        therefore dead config; trusting it would make us letterbox to the wrong
+        size. Read the real value from the export, and fall back to config only
+        for a plain .pt weight file with no metadata.
+        """
+        meta = Path(self.detector_config.model_path) / "metadata.yaml"
+        if meta.is_file():
+            try:
+                size = YAML.load(str(meta)).get("imgsz")
+                if isinstance(size, (list, tuple)) and size:
+                    return int(max(size))
+                if isinstance(size, int):
+                    return int(size)
+            except (OSError, ValueError, TypeError):
+                pass
+        return int(self.detector_config.imgsz)
+
+    def _preprocess_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, float, float]:
         """
         Apply luminance-safe preprocessing if enabled.
 
         Only modifies the L channel in LAB space — hue and saturation
         are preserved so downstream color matching stays stable.
+
+        When ``detector_scale`` is on, the frame is first resized to the model's
+        input size, so CLAHE runs on the ~16x smaller image the detector will
+        actually see rather than the full 1280x720 frame. Ultralytics would have
+        performed that same downscale itself a moment later, so the detector's
+        input is unchanged in size — only the order of resize-vs-CLAHE differs.
+
+        Returns:
+            (inference_frame, scale_x, scale_y) — the scale factors map a box in
+            inference_frame's coordinates back onto the original frame. They are
+            1.0 when no resize happened.
         """
         pp = self.preprocessing_config
         if not pp.enabled:
-            return frame
+            return frame, 1.0, 1.0
 
-        # Optional gamma correction for dark frames
-        gamma = None
-        if pp.gamma_correction:
-            gamma = auto_gamma(frame, dark_threshold=pp.dark_threshold)
+        work = frame
+        scale_x = scale_y = 1.0
 
-        return luminance_normalize(
-            frame,
+        if pp.detector_scale:
+            h, w = frame.shape[:2]
+            ratio = min(1.0, self.imgsz / max(h, w))   # never upscale
+            if ratio < 1.0:
+                new_w, new_h = max(1, round(w * ratio)), max(1, round(h * ratio))
+                work = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                scale_x, scale_y = w / new_w, h / new_h
+
+        normalized = luminance_normalize_auto(
+            work,
             clip_limit=pp.clip_limit,
             grid_size=pp.grid_size,
-            gamma=gamma,
+            gamma_correction=pp.gamma_correction,
+            dark_threshold=pp.dark_threshold,
         )
+        return normalized, scale_x, scale_y
 
     def _new_tracker(self):
         """Build a fresh tracker instance the way Ultralytics' track() does.
@@ -154,7 +199,7 @@ class TrackedDetector:
         """
         # Preprocess for better detection in hard lighting
         with perf_trace.stage("clahe"):
-            inference_frame = self._preprocess_frame(frame)
+            inference_frame, scale_x, scale_y = self._preprocess_frame(frame)
 
         # Build tracker config filename — Ultralytics expects e.g. "bytetrack.yaml"
         tracker_cfg = f"{self.tracker_config.type}.yaml"
@@ -171,7 +216,7 @@ class TrackedDetector:
                 inference_frame,
                 conf=self.detector_config.confidence,
                 classes=self.detector_config.classes,
-                imgsz=self.detector_config.imgsz,
+                imgsz=self.imgsz,
                 device=self.device,
                 persist=True,               # Maintain tracker state across frames
                 tracker=tracker_cfg,         # e.g., "bytetrack.yaml"
@@ -188,10 +233,21 @@ class TrackedDetector:
         ):
             self._camera_trackers[camera_id] = predictor.trackers[0]
 
-        return self._parse_results(results)
+        return self._parse_results(results, scale_x, scale_y)
 
-    def _parse_results(self, results) -> List[Detection]:
-        """Parse YOLO tracking results into Detection objects."""
+    def _parse_results(
+        self,
+        results,
+        scale_x: float = 1.0,
+        scale_y: float = 1.0,
+    ) -> List[Detection]:
+        """Parse YOLO tracking results into Detection objects.
+
+        Ultralytics returns boxes in the coordinates of whatever image it was
+        handed. When _preprocess_frame resized the frame, those are the resized
+        image's coordinates — so scale them back onto the original frame, which
+        is what every downstream consumer (ROI, slots, zones, crops) expects.
+        """
         detections = []
 
         if not results or len(results) == 0:
@@ -206,7 +262,8 @@ class TrackedDetector:
 
         for i in range(len(boxes)):
             xyxy = boxes.xyxy[i].cpu().numpy()
-            x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
+            x1, y1 = float(xyxy[0]) * scale_x, float(xyxy[1]) * scale_y
+            x2, y2 = float(xyxy[2]) * scale_x, float(xyxy[3]) * scale_y
 
             class_id = int(boxes.cls[i].cpu().numpy())
             confidence = float(boxes.conf[i].cpu().numpy())

@@ -33,6 +33,15 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+# Pin to the CPU slice the supervisor handed us — MUST happen before cv2/torch/
+# openvino are imported, because TBB and OpenCV size their thread pools from the
+# affinity mask exactly once, at import/first-use. See src/cpu_affinity.py.
+from src.cpu_affinity import apply_from_env as _apply_cpu_affinity
+
+_PINNED_CPUS = _apply_cpu_affinity()
+if _PINNED_CPUS:
+    print(f"[INFO] pinned to {len(_PINNED_CPUS)} CPUs: {_PINNED_CPUS}")
+
 from src.config import load_config
 from src.core.engine import ParkingEngine
 from src.database import init_db
