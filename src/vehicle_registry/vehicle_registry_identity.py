@@ -583,7 +583,11 @@ class VehicleRegistryIdentityMixin:
         identity_floor = float(
             getattr(self._matching_config, "gallery_min_identity_similarity", 0.0)
         )
-        established = store.load_vectors(plate)  # excludes gate_only refs
+        # load_vectors returns (vectors, model_tag, source_cameras) — compare
+        # against the VECTORS, not the tuple. Iterating the tuple fed the whole
+        # vectors list (and the tag/cameras) into compute_similarity, raising and
+        # breaking every seed once the floor is active (config.yaml sets 0.35).
+        established, _, _ = store.load_vectors(plate)  # excludes gate_only refs
         if identity_floor > 0.0 and established:
             id_sim = max(
                 self.reid_matcher.compute_similarity(feature, ev) for ev in established

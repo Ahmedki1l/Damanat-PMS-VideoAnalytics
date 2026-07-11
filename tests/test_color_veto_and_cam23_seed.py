@@ -465,5 +465,83 @@ class TestReattachLearnGate(unittest.TestCase):
         )
 
 
+class TestSeedPathIdentityFloor(unittest.TestCase):
+    """The CAM-23 Park_Entry seed shares the D2 identity floor
+    (``gallery_min_identity_similarity``). That knob defaults to 0.0 (INERT) in
+    code but production ``config.yaml`` sets 0.35 — so the active behaviour is
+    only ever exercised off the YAML value, never the default. These pin the
+    active-floor behaviour so it cannot silently regress to the no-op, and guard
+    the ``store.load_vectors()`` return-shape: it is a
+    ``(vectors, tag, cameras)`` tuple, and the seed must compare against the
+    vectors, not iterate the tuple."""
+
+    def _registry(self, floor):
+        cfg = _gallery_config()
+        cfg.gallery_min_identity_similarity = floor
+        return make_test_registry(matching_config=cfg)
+
+    def _establish_dark_gallery(self, reg, plate):
+        """Seed one durable ground-truth (dark) ref for ``plate`` so later seeds
+        have an established identity to be measured against."""
+        dark = make_color_crop(DARK)
+        dark_vec = reg.reid_matcher.extract_feature(dark)
+        reg.gallery_store.save_ref(
+            plate, dark, dark_vec, quality=999.0, camera_id="ANPR", gate_only=False
+        )
+        return dark_vec
+
+    def _candidate_with_crop(self, reg, crop, track_id=7):
+        cand = reg.open_park_entry_candidate("CAM-23", track_id)
+        reg.update_park_entry_candidate_snapshot(
+            cand.candidate_id, crop, quality_score=5.0
+        )
+        return cand.candidate_id
+
+    def test_foreign_seed_rejected_at_active_floor(self):
+        reg = self._registry(0.35)
+        dark_vec = self._establish_dark_gallery(reg, "SEED-D")
+        white = make_color_crop(WHITE)
+        white_vec = reg.reid_matcher.extract_feature(white)
+        reg.reid_matcher.pin_similarity(white_vec, dark_vec, 0.10)  # < 0.35 floor
+        cand_id = self._candidate_with_crop(reg, white)
+        self.assertFalse(
+            reg.seed_gallery_from_park_entry(cand_id, "SEED-D"),
+            "a foreign crop below the identity floor must not seed the gallery",
+        )
+        vecs, _, _ = reg.gallery_store.load_vectors("SEED-D")
+        self.assertEqual(len(vecs), 1, "gallery keeps only the established dark ref")
+
+    def test_same_car_seed_admitted_at_active_floor(self):
+        reg = self._registry(0.35)
+        dark_vec = self._establish_dark_gallery(reg, "SEED-S")
+        crop = make_color_crop((40, 40, 40))  # compatible dark shade
+        crop_vec = reg.reid_matcher.extract_feature(crop)
+        reg.reid_matcher.pin_similarity(crop_vec, dark_vec, 0.9)  # > 0.35 floor
+        cand_id = self._candidate_with_crop(reg, crop)
+        self.assertTrue(
+            reg.seed_gallery_from_park_entry(cand_id, "SEED-S"),
+            "a same-car top view above the floor is a legitimate seed",
+        )
+        vecs, _, cams = reg.gallery_store.load_vectors("SEED-S")
+        self.assertEqual(len(vecs), 2, "the CAM-23 top view joins the dark ref")
+        self.assertIn("CAM-23", cams)
+
+    def test_inert_default_floor_admits_foreign_seed(self):
+        # The trap this suite exists to lock down: at the 0.0 default the guard is
+        # a no-op, so even a foreign crop seeds. Documents the config-dependence —
+        # production MUST carry gallery_min_identity_similarity: 0.35 for the
+        # seed-path D2 guard to do anything.
+        reg = self._registry(0.0)
+        dark_vec = self._establish_dark_gallery(reg, "SEED-Z")
+        white = make_color_crop(WHITE)
+        white_vec = reg.reid_matcher.extract_feature(white)
+        reg.reid_matcher.pin_similarity(white_vec, dark_vec, 0.10)
+        cand_id = self._candidate_with_crop(reg, white)
+        self.assertTrue(
+            reg.seed_gallery_from_park_entry(cand_id, "SEED-Z"),
+            "at the inert 0.0 default the seed guard is a no-op (documented trap)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
