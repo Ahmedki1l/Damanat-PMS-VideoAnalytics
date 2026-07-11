@@ -230,7 +230,36 @@ Examples:
         "--port", type=int, default=8000,
         help="API server port (default: 8000).",
     )
+    parser.add_argument(
+        "--supervise", action="store_true",
+        help="Launch + supervise ALL per-group worker processes from this one "
+             "entry point (Python equivalent of run_all.ps1). Spawns one "
+             "'main.py --cameras <group>' process per group in supervisor.py's "
+             "GROUPS table; exactly one group owns --api. This flag does NOT run "
+             "an engine itself — it only orchestrates the workers.",
+    )
+    parser.add_argument(
+        "--foreground", action="store_true",
+        help="With --supervise: mirror every child group's log to stdout "
+             "(use as the Docker PID 1). Ignored without --supervise.",
+    )
     args = parser.parse_args()
+
+    # Supervisor mode short-circuit: fan out to the per-group worker processes
+    # and block, WITHOUT building an engine in this parent. Placed above
+    # load_config/init_db so the orchestrating parent skips config load, DB init,
+    # pipeline build and camera opening — the real per-worker startup happens in
+    # the spawned 'main.py --cameras <group>' children. (For the very lightest
+    # parent, run `python supervisor.py` directly, which avoids main.py's
+    # module-level torch import entirely.) --reset-plates is honoured as the
+    # one-shot global wipe before any worker boots.
+    if args.supervise:
+        import supervisor
+        sys.exit(supervisor.run(
+            reset_plates=args.reset_plates,
+            foreground=args.foreground,
+            port=args.port,
+        ))
 
     # --- Load configuration ---
     print("=" * 60)

@@ -1,147 +1,49 @@
 #Requires -Version 5.1
 <#
-  run_all.ps1 - launch the Video Analytics pipeline as parallel per-process
-  camera groups. This is the supported scaling lever (it replaces the reverted
-  in-process threading). Each process is ONE serial inference worker, so
-  fps/camera scales as that budget is split over fewer cameras. Keep <= 6
-  cameras per group to approach ~5 fps/camera on a high-core box.
+  run_all.ps1 - thin wrapper around the Python supervisor.
 
-  TOPOLOGY RULES (read before editing $Groups)
-    * EXACTLY ONE group runs --api. That process receives the ANPR webhooks
-      and binds plates in its OWN in-memory registry, so it MUST own the
-      entrance / Park_Entry camera. Set Api=$true on that group only.
-    * All groups share the same database and the on-disk gallery, so slot
-      status, parking sessions and per-plate gallery folders are visible
-      across every process.
-    * Cameras in DIFFERENT groups do NOT share live in-memory track state;
-      cross-process identity flows only through the DB + gallery. Keep cameras
-      that must hand identity off live (typically the same floor) in the SAME
-      group.
+  The multi-process launch is now owned by supervisor.py (invoked as
+  `python main.py --supervise`). The camera GROUPS table, per-group core
+  slicing, PID file, log redirection and teardown all live there - this script
+  only resolves the venv python and forwards flags, so there is ONE source of
+  truth for the topology (edit $GROUPS in supervisor.py, not here).
+
+  This blocks and supervises in the foreground: the supervisor stays up until
+  a worker dies or you press Ctrl+C, at which point it tears every group down.
 
   USAGE
-    .\run_all.ps1              # start all groups
-    .\run_all.ps1 -ResetPlates # wipe ALL plate identities once, then start
-    Get-Content -Wait .\logs\va_b1-gate.out.log     # follow a group's log
-    .\stop_all.ps1             # stop everything started by this script
+    .\run_all.ps1               # start + supervise all groups (Ctrl+C stops all)
+    .\run_all.ps1 -ResetPlates  # wipe ALL plate identities once, then start
+    .\run_all.ps1 -Foreground   # also mirror each group's log to this console
+    Get-Content -Wait .\logs\va_b1-gate.out.log   # follow a group's log
+    .\stop_all.ps1              # stop groups by PID file (if run detached)
 #>
 param(
     # One-shot: wipe ALL slot plate identities + per-car gallery folders ONCE,
-    # BEFORE launching the groups (runs main.py --reset-plates-only and waits).
-    # Global and destructive; VA-local (does not notify PMS-AI). Occupancy rows
-    # are left untouched. Omit for a normal start.
-    [switch]$ResetPlates
+    # before launching the groups (forwarded to the supervisor's --reset-plates,
+    # which runs main.py --reset-plates-only and waits). Global and destructive;
+    # VA-local (does not notify PMS-AI). Occupancy rows are left untouched.
+    [switch]$ResetPlates,
+    # Mirror every group's log file to this console (in addition to logs/*.log).
+    [switch]$Foreground
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 
-# Prefer the venv's WINDOWLESS python (pythonw.exe): it has no console, so
-# neither it nor the child processes it spawns pop up console windows - that is
-# what was opening "tons of PowerShell/console windows". stdout/stderr are
-# redirected to log files below, so losing the console costs nothing. Fall back
-# to python.exe, then to whatever 'python' resolves to.
-$Python = Join-Path $Root '.venv\Scripts\pythonw.exe'
-if (-not (Test-Path $Python)) { $Python = Join-Path $Root '.venv\Scripts\python.exe' }
+# Console python (the supervisor spawns the windowless workers itself via
+# CREATE_NO_WINDOW, so no pythonw juggling is needed here). Fall back to PATH.
+$Python = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path $Python)) { $Python = 'python' }
 
-# Console python (has stdout) for the one-shot -ResetPlates step, so its report
-# ("[RESET] Cleared N slot(s)...") is visible. pythonw.exe would swallow it.
-$PythonExe = Join-Path $Root '.venv\Scripts\python.exe'
-if (-not (Test-Path $PythonExe)) { $PythonExe = 'python' }
+$cliArgs = @('main.py', '--supervise')
+if ($ResetPlates) { $cliArgs += '--reset-plates' }
+if ($Foreground)  { $cliArgs += '--foreground' }
 
-# Total logical cores, used to hand each group a slice of the CPU thread budget
-# so the parallel processes PARTITION the cores instead of each grabbing all of
-# them (5 processes x all cores = oversubscription = every inference slower).
-$TotalCores = [int][Environment]::ProcessorCount
-
-$LogDir = Join-Path $Root 'logs'
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-
-# ---------------------------------------------------------------------------
-# EDIT THESE to match your DB camera roster.
-#   Name : short label used for log filenames
-#   Cams : comma-separated camera IDs passed to --cameras
-#   Api  : $true on EXACTLY ONE group - the one that owns the entrance camera
-#
-# Roster below = the 26 enabled non-ANPR cameras from the DB (CAM-00..CAM-25).
-# ANPR-Entry / ANPR-Exit are read by the external ANPR server, not here.
-#
-# CAM-23 is the B1 Park_Entry gate, so its group is the --api host: ANPR
-# webhooks bind the plate in that process's in-memory registry. Each group is
-# <= 6 cameras (one serial inference worker per process). Floors are kept
-# together; cross-process identity flows via the shared DB + gallery.
-# ---------------------------------------------------------------------------
-$Groups = @(
-    @{ Name = 'b1-gate';  Cams = 'CAM-23,CAM-03,CAM-04,CAM-05,CAM-06,CAM-07'; Api = $true  }
-    @{ Name = 'b1-areas'; Cams = 'CAM-08,CAM-20,CAM-21,CAM-22,CAM-24';        Api = $false }
-    @{ Name = 'b2-1';     Cams = 'CAM-09,CAM-10,CAM-11,CAM-12,CAM-13,CAM-14'; Api = $false }
-    @{ Name = 'b2-2';     Cams = 'CAM-15,CAM-16,CAM-17,CAM-18,CAM-19,CAM-25'; Api = $false }
-    @{ Name = 'ground';   Cams = 'CAM-00,CAM-01,CAM-02';                      Api = $false }
-)
-$ApiPort = 8000
-# ---------------------------------------------------------------------------
-
-# Sanity: exactly one API host. NOTE the @(...) wrap - without it, a single
-# match returns the lone hashtable and .Count reads its KEY count (3), not the
-# collection size. @() forces an array so .Count is the number of API groups.
-$apiCount = @($Groups | Where-Object { $_.Api }).Count
-if ($apiCount -ne 1) {
-    throw "Exactly one group must have Api=`$true (found $apiCount). Fix `$Groups."
+Push-Location $Root
+try {
+    & $Python @cliArgs
+    exit $LASTEXITCODE
+} finally {
+    Pop-Location
 }
-
-# One-shot plate reset (opt-in via -ResetPlates). Runs ONCE here - NOT inside
-# the per-group loop - because it is a GLOBAL wipe; running it per process would
-# race 5 wipes at startup. Clears then exits (main.py --reset-plates-only), so
-# the groups below start from a clean plate slate. Occupancy rows are untouched.
-if ($ResetPlates) {
-    Write-Host "[run_all] -ResetPlates: wiping ALL slot plate identities + per-car galleries (one-shot)..."
-    Push-Location $Root
-    try {
-        & $PythonExe 'main.py' --reset-plates-only
-        if ($LASTEXITCODE -ne 0) { throw "reset-plates-only failed (exit code $LASTEXITCODE)." }
-    } finally {
-        Pop-Location
-    }
-    Write-Host "[run_all] reset complete.`n"
-}
-
-$pidFile = Join-Path $Root 'run_all.pids'
-Remove-Item $pidFile -ErrorAction SilentlyContinue
-$started = @()
-
-# Total cameras across all groups - used to slice the CPU thread budget
-# proportionally to each group's camera count.
-$totalCams = ($Groups | ForEach-Object { ($_.Cams -split ',').Count } | Measure-Object -Sum).Sum
-
-foreach ($g in $Groups) {
-    $cliArgs = @('main.py', '--cameras', $g.Cams)
-    if ($g.Api) { $cliArgs += @('--api', '--port', "$ApiPort") }
-
-    # Give this group a slice of the cores proportional to its camera count so
-    # the parallel processes don't each spin up all-core thread pools and thrash
-    # (BLAS/OpenMP/OpenVINO all read these). At least 1.
-    $camCount = ($g.Cams -split ',').Count
-    $threads = [Math]::Max(1, [int][Math]::Floor($TotalCores * $camCount / $totalCams))
-    $env:OMP_NUM_THREADS      = "$threads"
-    $env:OPENBLAS_NUM_THREADS = "$threads"
-    $env:MKL_NUM_THREADS      = "$threads"
-    $env:NUMEXPR_NUM_THREADS  = "$threads"
-    $env:VECLIB_MAXIMUM_THREADS = "$threads"
-
-    $out = Join-Path $LogDir ("va_{0}.out.log" -f $g.Name)
-    $err = Join-Path $LogDir ("va_{0}.err.log" -f $g.Name)
-    $label = if ($g.Api) { "$($g.Name) (+API :$ApiPort)" } else { $g.Name }
-
-    Write-Host "[run_all] starting group '$label' ($threads threads/$TotalCores cores) -> $($g.Cams)"
-    $p = Start-Process -FilePath $Python -ArgumentList $cliArgs -WorkingDirectory $Root `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
-    $p.Id | Add-Content -Path $pidFile
-    $started += [pscustomobject]@{ Group = $g.Name; PID = $p.Id; Cameras = $g.Cams; Log = $out }
-}
-
-Write-Host ''
-$started | Format-Table -AutoSize
-Write-Host "[run_all] PIDs written to $pidFile"
-Write-Host "[run_all] follow a log:  Get-Content -Wait '$LogDir\va_b1-gate.out.log'"
-Write-Host "[run_all] stop all:      .\stop_all.ps1"

@@ -2,20 +2,28 @@
 # Dockerfile.multiprocess - PROPOSAL
 #
 # Adapts the existing single-process Dockerfile to run the PER-PROCESS camera
-# groups (run_all.sh --foreground) instead of one `python main.py --api`. This
-# is the scaling lever: 5 processes = 5 concurrent inference workers pinned to
-# disjoint cores (taskset), vs one serial worker sharing ~2 inferences/sec over
-# all 26 cameras.
+# groups via the Python supervisor (`main.py --supervise --foreground`) instead
+# of one `python main.py --api`. This is the scaling lever: 5 processes = 5 concurrent
+# inference workers, vs one serial worker sharing ~2 inferences/sec over all 26
+# cameras.
+#
+# The supervisor is one PID-1 parent that spawns/supervises the 5 group
+# processes, mirrors their logs to stdout (docker logs), and forwards SIGTERM on
+# `docker stop`. Cores are partitioned SOFTLY via per-group *_NUM_THREADS caps
+# (BLAS/OpenMP/OpenVINO), sized from the cores this container is actually allowed
+# (sched_getaffinity) — NOT hard taskset pinning, so no util-linux is needed.
 #
 # To adopt:   mv Dockerfile.multiprocess Dockerfile
 #
 # Diffs vs the current Dockerfile:
-#   * runtime stage installs `util-linux` (provides taskset) + `procps`.
-#   * ENTRYPOINT keeps the geometry seed, then launches run_all.sh --foreground
-#     (one PID-1 process that supervises the 5 groups) instead of main.py --api.
-#   * Pass extra launcher flags at run time via RUN_ALL_ARGS (e.g. --reset-plates).
+#   * runtime stage installs `procps` (ps/kill niceties for the supervisor).
+#   * ENTRYPOINT launches `main.py --supervise --foreground` (the PID-1
+#     supervisor) instead of `main.py --api`.
+#   * Pass extra launcher flags at run time via RUN_ALL_ARGS — the supervisor
+#     accepts --reset-plates and --port (e.g. RUN_ALL_ARGS="--reset-plates").
 #
-# RUN IT (must expose all 16 cores so taskset's 0-15 pins are valid):
+# RUN IT (constrain the container's cores; the supervisor reads the cpuset mask
+# and slices the thread budget to match, so no host-core assumptions):
 #   docker run --cpuset-cpus=0-15 -p 8000:8000 \
 #     -e RUN_ALL_ARGS="" <image>
 #   # ANPR server must POST to http://<host>:8000/api/anpr/event
@@ -75,8 +83,9 @@ WORKDIR /app
 #   curl/gnupg   - MS repo key + health checks
 #   unixodbc     - pyodbc runtime
 #   libgl1 etc.  - opencv-python-headless shared libs
-#   util-linux   - taskset (REQUIRED by run_all.sh core-pinning)
 #   procps       - ps/kill niceties for the foreground supervisor
+# (No util-linux/taskset: the supervisor partitions cores softly via
+#  *_NUM_THREADS, not hard CPU pinning.)
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
@@ -84,7 +93,6 @@ RUN apt-get update && apt-get install -y \
     libxcb1 \
     libgl1 \
     libglib2.0-0 \
-    util-linux \
     procps \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
@@ -95,9 +103,10 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Bring the prebuilt venv over; put it first on PATH so run_all.sh's fallback
-# (`command -v python3`) resolves to it (the baked /app/.venv is excluded via
-# .dockerignore and would not exist anyway).
+# Bring the prebuilt venv over; put it first on PATH so `python` resolves to it
+# (the baked /app/.venv is excluded via .dockerignore and would not exist
+# anyway). The supervisor spawns workers with sys.executable, so children
+# inherit this same interpreter.
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
@@ -107,10 +116,9 @@ COPY . .
 # POSTs to :8000. Publish it and open the host firewall.
 EXPOSE 8000
 
-# On start: seed the drawn zoning geometry into EMPTY tables (first-run only,
-# --if-empty never clobbers live occupancy), then hand off to the multi-process
-# launcher as PID 1. run_all.sh --foreground supervises the 5 groups, mirrors
-# their logs to stdout (docker logs), and forwards SIGTERM on `docker stop`.
-# Extra launcher flags via RUN_ALL_ARGS, e.g. -e RUN_ALL_ARGS="--reset-plates".
-#   Toggle seed with SEED_GEOMETRY_ON_START=false; GEOMETRY_FILE=/path/dump.json
-ENTRYPOINT ["sh", "-c", "if [ \"${SEED_GEOMETRY_ON_START:-true}\" = true ] && [ -f \"${GEOMETRY_FILE:-geometry.json}\" ]; then echo '[entrypoint] seeding geometry into empty tables...'; python tools/sync_geometry.py seed --in \"${GEOMETRY_FILE:-geometry.json}\" --if-empty || echo '[entrypoint] geometry seed skipped (continuing)'; fi; exec bash run_all.sh --foreground ${RUN_ALL_ARGS:-}"]
+# Hand off to the Python supervisor as PID 1. `main.py --supervise --foreground`
+# spawns/supervises the 5 groups, mirrors their logs to stdout (docker logs),
+# and forwards SIGTERM on `docker stop`. Extra launcher flags via RUN_ALL_ARGS,
+# e.g. -e RUN_ALL_ARGS="--reset-plates". (sh -c wraps it only so RUN_ALL_ARGS
+# expands; exec makes python the actual PID 1 that receives docker stop.)
+ENTRYPOINT ["sh", "-c", "exec python main.py --supervise --foreground ${RUN_ALL_ARGS:-}"]
