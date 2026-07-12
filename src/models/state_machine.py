@@ -14,10 +14,26 @@ Debounce prevents flicker from:
   - Vehicles passing by a slot without parking.
 """
 
+import logging
+import time
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+# Occupancy-latency instrumentation. Every line is tagged [SLOTLAT] so the whole
+# distribution can be pulled out of a running system with a single grep:
+#
+#   grep -h '\[SLOTLAT\]' logs/va_*.out.log
+#
+# CONFIRM lines carry the frames and the WALL-CLOCK seconds a flip actually took;
+# RESET lines are the flicker events that make a flip take longer than its nominal
+# debounce (the counters demand CONSECUTIVE frames, so one contrary frame throws the
+# accumulated count away). Comparing CONFIRM elapsed_s against the nominal
+# frames/fps tells you whether slow flips are the debounce itself or flicker.
+_SLOTLAT = "[SLOTLAT]"
 
 
 class SlotState(Enum):
@@ -133,6 +149,17 @@ class SlotStateMachine:
         self._enter_counter: int = 0
         self._leave_counter: int = 0
 
+        # [SLOTLAT] instrumentation only — never read by the state logic.
+        # _*_started_at: monotonic stamp of the frame that opened the current
+        # ENTERING/LEAVING run, so a CONFIRM can report the true wall-clock cost.
+        # _*_resets: how many times flicker threw the run away since the last
+        # confirmed flip — the number that separates "the debounce is long" from
+        # "detection is unstable".
+        self._enter_started_at: Optional[float] = None
+        self._leave_started_at: Optional[float] = None
+        self._enter_resets: int = 0
+        self._leave_resets: int = 0
+
     @property
     def is_occupied(self) -> bool:
         """True if the slot is confirmed occupied."""
@@ -225,6 +252,7 @@ class SlotStateMachine:
                 self.state = SlotState.ENTERING
                 self.assigned_track_id = track_id
                 self._enter_counter = 1
+                self._enter_started_at = time.monotonic()
                 self.last_update_time = now
                 events.append(SlotEvent(
                     event_type="vehicle_entering",
@@ -244,7 +272,15 @@ class SlotStateMachine:
                 if self._enter_counter >= self.confirm_enter_frames:
                     # Confirmed: vehicle is parked
                     self.state = SlotState.OCCUPIED
+                    self._log_confirm(
+                        "OCCUPIED",
+                        need=self.confirm_enter_frames,
+                        started_at=self._enter_started_at,
+                        resets=self._enter_resets,
+                    )
                     self._enter_counter = 0
+                    self._enter_started_at = None
+                    self._enter_resets = 0
                     events.append(SlotEvent(
                         event_type="vehicle_parked",
                         slot_id=self.slot_id,
@@ -253,9 +289,18 @@ class SlotStateMachine:
                     ))
             else:
                 # Vehicle disappeared before confirmation — revert
+                self._enter_resets += 1
+                self._log_reset(
+                    "ENTERING->VACANT",
+                    had=self._enter_counter,
+                    need=self.confirm_enter_frames,
+                    started_at=self._enter_started_at,
+                    resets=self._enter_resets,
+                )
                 self.state = SlotState.VACANT
                 self.assigned_track_id = None
                 self._enter_counter = 0
+                self._enter_started_at = None
                 self.clear_identity()
                 self.last_update_time = now
 
@@ -269,6 +314,7 @@ class SlotStateMachine:
                 # Vehicle not detected — start leaving
                 self.state = SlotState.LEAVING
                 self._leave_counter = 1
+                self._leave_started_at = time.monotonic()
                 self.last_update_time = now
                 events.append(SlotEvent(
                     event_type="vehicle_leaving",
@@ -287,8 +333,16 @@ class SlotStateMachine:
                     # Confirmed: slot is now vacant
                     old_track = self.assigned_track_id
                     self.state = SlotState.VACANT
+                    self._log_confirm(
+                        "VACANT",
+                        need=self.confirm_leave_frames,
+                        started_at=self._leave_started_at,
+                        resets=self._leave_resets,
+                    )
                     self.assigned_track_id = None
                     self._leave_counter = 0
+                    self._leave_started_at = None
+                    self._leave_resets = 0
                     self.clear_identity()
                     events.append(SlotEvent(
                         event_type="slot_vacant",
@@ -298,9 +352,61 @@ class SlotStateMachine:
                     ))
             else:
                 # Vehicle re-detected — cancel leaving
+                self._leave_resets += 1
+                self._log_reset(
+                    "LEAVING->OCCUPIED",
+                    had=self._leave_counter,
+                    need=self.confirm_leave_frames,
+                    started_at=self._leave_started_at,
+                    resets=self._leave_resets,
+                )
                 self.state = SlotState.OCCUPIED
                 self.assigned_track_id = track_id
                 self._leave_counter = 0
+                self._leave_started_at = None
                 self.last_update_time = now
 
         return events
+
+    # ---- [SLOTLAT] instrumentation -------------------------------------------------
+    # Measurement only: these never mutate state and never raise into the frame loop.
+
+    def _log_confirm(
+        self,
+        to_state: str,
+        *,
+        need: int,
+        started_at: Optional[float],
+        resets: int,
+    ) -> None:
+        """A flip completed. Report what it actually cost in frames, seconds and resets.
+
+        ``elapsed_s`` well above ``need / effective_fps`` means the debounce was NOT the
+        bottleneck — the run kept getting thrown away. ``resets`` says how often.
+        """
+        elapsed = (
+            time.monotonic() - started_at if started_at is not None else float("nan")
+        )
+        logger.info(
+            "%s CONFIRM slot=%s -> %s after %d frames in %.2fs (resets=%d)",
+            _SLOTLAT, self.slot_id, to_state, need, elapsed, resets,
+        )
+
+    def _log_reset(
+        self,
+        transition: str,
+        *,
+        had: int,
+        need: int,
+        started_at: Optional[float],
+        resets: int,
+    ) -> None:
+        """Flicker threw the debounce run away. This is the unbounded-tail event."""
+        elapsed = (
+            time.monotonic() - started_at if started_at is not None else float("nan")
+        )
+        logger.info(
+            "%s RESET   slot=%s %s at %d/%d frames after %.2fs "
+            "(reset #%d for this flip; counters need CONSECUTIVE frames)",
+            _SLOTLAT, self.slot_id, transition, had, need, elapsed, resets,
+        )
