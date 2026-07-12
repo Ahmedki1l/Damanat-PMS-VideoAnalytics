@@ -119,6 +119,27 @@ def load_train_identities_from_splits(splits_json: Path) -> Set[str]:
     return ids
 
 
+def load_train_identities_from_checkpoint(ckpt: Path) -> Set[str]:
+    """Training identities straight from the deployed checkpoint's ``id_names``.
+
+    This is the AUTHORITATIVE list, and it is the one to prefer. The other two
+    loaders read a split *report* — a record of what some training run intended.
+    ``id_names`` is what the weights actually saw, carried inside the same file
+    that is deployed, so it cannot drift away from the model the way a sidecar
+    JSON can. ``models/PS_carMatching.pt`` carries 61 of them.
+    """
+    import torch  # local: the rest of this tool runs on OpenVINO alone.
+
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    names = blob.get("id_names") if isinstance(blob, dict) else None
+    if not names:
+        raise ValueError(
+            f"{ckpt} has no non-empty 'id_names' — cannot determine the "
+            "identities this model was trained on."
+        )
+    return set(names)
+
+
 def scan_identities(source_root: Path) -> Dict[str, List[Path]]:
     """Map each identity subfolder to its list of .jpg crops (sorted)."""
     if not source_root.exists():
