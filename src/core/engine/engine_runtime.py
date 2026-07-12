@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -270,6 +271,77 @@ class ParkingEngineRuntimeMixin:
             logger.warning("[gallery] open-session query failed: %r", exc)
             return None
 
+    def _recently_entered_from_gallery(self):
+        """``(plate, floor, entered_at)`` for cars whose ON-DISK gallery shows a fresh
+        ANPR gate shot — i.e. cars VA itself just watched enter.
+
+        supervisor.py's contract is that identity crosses the process boundary through
+        the DB **and the on-disk gallery**. Until now the sync used only the DB half:
+        ``_open_session_rows`` selects ``parking_sessions WHERE status='open'``, a table
+        PMS-AI owns. On 2026-07-11 PMS-AI stopped inserting rows altogether (its last
+        row was a *closed* one from 17:00, while it kept POSTing ANPR events happily) —
+        so the gate worker knew DJS-7842, and the worker owning the camera it actually
+        parked on had never heard of it. The car was invisible where it mattered.
+
+        The gallery does not have that problem: the gate seeds ``gallery/<plate>/`` with
+        the ANPR shot the moment the car is read, and every worker can see it. So VA can
+        answer "who just drove in" from its OWN evidence, with no dependency on PMS-AI
+        writing anything.
+
+        The ANPR ref's timestamp IS the gate-read time, which also lets a non-gate worker
+        populate ``_last_anpr_entry_at`` — without it the car is never "in flight" there
+        and the elimination cannot fire.
+        """
+        registry = self.vehicle_registry
+        store = getattr(registry, "gallery_store", None)
+        if store is None:
+            return []
+        root = getattr(store, "_root", None)
+        if not root or not os.path.isdir(root):
+            return []
+
+        gt_cams = {
+            str(c).upper()
+            for c in getattr(self.config.matching, "ground_truth_cameras", ()) or ()
+            if "ANPR" in str(c).upper()
+        } or {"ANPR"}
+        window = float(
+            getattr(self.config.matching, "slot_acquire_inflight_seconds", 300.0) or 300.0
+        )
+        now = datetime.now()
+        out = []
+        try:
+            for entry in os.scandir(root):
+                if not entry.is_dir():
+                    continue
+                meta_path = os.path.join(entry.path, "meta.json")
+                if not os.path.isfile(meta_path):
+                    continue
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                except Exception:
+                    continue
+                plate = meta.get("plate")
+                if not plate:
+                    continue
+                stamps = [
+                    r.get("ts")
+                    for r in meta.get("refs", []) or []
+                    if str(r.get("camera", "")).upper() in gt_cams and r.get("ts")
+                ]
+                if not stamps:
+                    continue
+                try:
+                    entered_at = datetime.fromisoformat(max(stamps))
+                except Exception:
+                    continue
+                if (now - entered_at).total_seconds() <= window:
+                    out.append((plate, None, entered_at))
+        except Exception as exc:
+            logger.debug("[gallery] recent-entry scan failed: %r", exc)
+        return out
+
     def _hydrate_open_sessions(self, rows) -> int:
         """``build_session_from_gallery`` for each open plate not yet hydrated here.
 
@@ -348,6 +420,21 @@ class ParkingEngineRuntimeMixin:
 
         rows = self._open_session_rows()
         if rows is None:
+            rows = []
+
+        # VA's OWN evidence, independent of PMS-AI ever writing a row. Also carries the
+        # gate-read time, which this worker needs in _last_anpr_entry_at before the car
+        # can count as "in flight" for slot acquisition.
+        known = {r[0] for r in rows if r and r[0]}
+        for plate, floor, entered_at in self._recently_entered_from_gallery():
+            prior = self.vehicle_registry.last_anpr_entry_at(plate)
+            if prior is None or entered_at > prior:
+                self.vehicle_registry._last_anpr_entry_at[plate] = entered_at
+            if plate not in known:
+                rows.append((plate, floor))
+                known.add(plate)
+
+        if not rows:
             return
         added = self._hydrate_open_sessions(rows)
         if added:
@@ -418,9 +505,11 @@ class ParkingEngineRuntimeMixin:
                 # with no rows aren't in the result — those are fine, they
                 # haven't entered yet. `expanding=True` lets SQLAlchemy
                 # turn the IN binding into a parameterized list at execute time.
+                # entry_time comes back too: it is what tells us whether this
+                # 'closed' row is STALE. See the staleness check below.
                 stmt = _text(
-                    "SELECT plate_number, status FROM ("
-                    "  SELECT plate_number, status, "
+                    "SELECT plate_number, status, entry_time FROM ("
+                    "  SELECT plate_number, status, entry_time, "
                     "         ROW_NUMBER() OVER (PARTITION BY plate_number ORDER BY entry_time DESC) AS rn "
                     "  FROM dbo.parking_sessions WITH (NOLOCK) "
                     "  WHERE plate_number IN :plates"
@@ -433,16 +522,48 @@ class ParkingEngineRuntimeMixin:
             logger.warning("[exit_janitor] DB probe failed: %r", exc)
             return
 
-        closed = [r[0] for r in rows if r[1] == "closed"]
+        closed = [(r[0], r[2]) for r in rows if r[1] == "closed"]
         if not closed:
             return
 
         purged_at = datetime.now()
-        for plate in closed:
+        for plate, row_entry_time in closed:
             try:
-                # Skip a plate VA itself just saw re-enter: the DB row is still
-                # the old 'closed' one because PMS-AI has not inserted the new
-                # open row yet. Pure in-memory check — no extra DB round-trip.
+                # Is this 'closed' row STALE — i.e. does it pre-date the last time VA
+                # itself watched this car drive through the gate?
+                #
+                # The old check was TIME-based ("did it re-enter in the last 60s?") and
+                # it silently deleted live cars. On 2026-07-11 DJS-7842 re-entered at
+                # 17:49:06, was still driving to its slot 77s later, and the janitor
+                # purged its identity — killing the plate bind, the gallery capture and
+                # every downstream fix. Worse, PMS-AI had stopped inserting rows
+                # entirely: the newest row was a 'closed' one from 17:00, so NO grace
+                # value could ever have saved the car. A timer cannot express this.
+                #
+                # Ordering can. If VA's own ANPR saw this plate enter AFTER the row's
+                # entry_time, the row describes an OLDER visit and says nothing about
+                # the car now inside. VA's gate reads are authoritative for "is it in";
+                # the DB is authoritative only for a visit it actually recorded. This
+                # tolerates PMS-AI lag of any length — including forever — while still
+                # purging a car that genuinely left after its most recent entry.
+                va_entry_at = None
+                getter = getattr(self.vehicle_registry, "last_anpr_entry_at", None)
+                if getter is not None:
+                    va_entry_at = getter(plate)
+                if (
+                    va_entry_at is not None
+                    and row_entry_time is not None
+                    and va_entry_at > row_entry_time
+                ):
+                    logger.info(
+                        "[exit_janitor] skip purge plate=%s: STALE closed row "
+                        "(row entry=%s, but VA saw this car enter the gate at %s) — "
+                        "PMS-AI has not opened the new row yet",
+                        plate, row_entry_time, va_entry_at,
+                    )
+                    continue
+                # Belt-and-braces: the original in-memory grace still applies for the
+                # case where the DB has no usable entry_time at all.
                 if getattr(self.vehicle_registry, "has_recent_reentry", None) and \
                         self.vehicle_registry.has_recent_reentry(plate):
                     logger.debug(
@@ -962,6 +1083,76 @@ class ParkingEngineRuntimeMixin:
     # genuinely-unreadable plate doesn't OCR every frame forever.
     _LOCK_MAX_OCR_ATTEMPTS = 4
 
+    # How many OCR reads we are willing to spend identifying one car in one slot.
+    # PaddleOCR is ~200ms and runs on the frame loop, so an unbounded retry would stall
+    # every other camera in this worker. The budget covers the whole manoeuvre: a car
+    # takes several seconds to turn into a slot, and we only need ONE frame in which the
+    # plate faces the camera.
+    _OCR_ID_MAX_ATTEMPTS = 12
+    _OCR_ID_MIN_INTERVAL_S = 0.7
+
+    def _try_ocr_identify(self, cam_id, frame, slot, state_machine, detection) -> None:
+        """Read the plate off a car that has just PARKED, bind it, lock it, and learn it.
+
+        Armed ONLY by a VACANT -> OCCUPIED transition (see ``_arm_ocr_for_slot``), so a
+        car already sitting in a slot is not re-read on every frame forever. Once the
+        plate is READ:
+
+          * it is LOCKED to the slot and stays until the car leaves;
+          * the car's PARKED POSE is written to its gallery. That reference is the thing
+            the system has never had — every existing reference comes from the gate, and
+            gate-vs-parked is the cross-view case where appearance scores WRONG (0.583 for
+            the right car, 0.634 for a different one). We could not capture it before
+            because capturing it needs to know who the car IS, and appearance could not
+            say. OCR breaks that circle: the identity is read, so it is safe to learn from.
+        """
+        if not getattr(self, "_ocr_armed", {}).get(slot.id):
+            return  # only fires on a fresh park (armed by vehicle_parked)
+
+        attempts = self._ocr_id_attempts.get(slot.id, 0)
+        if attempts >= self._OCR_ID_MAX_ATTEMPTS:
+            return
+        now_ts = time.time()
+        if now_ts - self._ocr_id_last_at.get(slot.id, 0.0) < self._OCR_ID_MIN_INTERVAL_S:
+            return
+
+        crop = self._bbox_crop(frame, detection)
+        if crop is None or crop.size == 0:
+            return
+
+        self._ocr_id_attempts[slot.id] = attempts + 1
+        self._ocr_id_last_at[slot.id] = now_ts
+
+        plate = self.vehicle_registry.try_ocr_identify_slot(slot.id, crop)
+        if not plate:
+            return
+
+        # READ, not inferred — so bind it, lock it, and stop reading this slot.
+        conf = 1.0
+        state_machine.bind_identity(
+            plate, self._build_slot_snapshot_url(slot.id), confidence=conf, lock=True
+        )
+        self.vehicle_registry.bind_plate_to_slot(slot.id, plate, cam_id, floor=None)
+        if self.db_manager:
+            self._persist_slot_plate_binding(slot.id, plate, conf, True, cam_id)
+        self._ocr_armed[slot.id] = False
+        logger.info(
+            "[ocr-id] slot=%s BOUND + LOCKED plate=%s on attempt %d/%d (cam=%s) — "
+            "held until the car leaves",
+            slot.id, plate, attempts + 1, self._OCR_ID_MAX_ATTEMPTS, cam_id,
+        )
+
+        # ...and teach the gallery this car's parked pose, now that we KNOW who it is.
+        self.vehicle_registry.save_parked_reference(plate, crop, cam_id)
+
+    def _arm_ocr_for_slot(self, slot_id: str) -> None:
+        """A car just parked here: give it a fresh OCR budget."""
+        if not hasattr(self, "_ocr_id_attempts"):
+            self._ocr_id_attempts, self._ocr_id_last_at, self._ocr_armed = {}, {}, {}
+        self._ocr_id_attempts[slot_id] = 0
+        self._ocr_id_last_at[slot_id] = 0.0
+        self._ocr_armed[slot_id] = True
+
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
         all_events = []
         # Per-slot forced-OCR attempt counter (bounded dead-zone pass, §3b).
@@ -1000,6 +1191,9 @@ class ParkingEngineRuntimeMixin:
                 event.zone_name = slot.zone_name
 
                 if event.event_type == "vehicle_parked":
+                    # VACANT -> OCCUPIED: this is the moment, and the ONLY moment, that
+                    # arms the OCR read for this slot.
+                    self._arm_ocr_for_slot(slot.id)
                     snapshot_filename = self._save_slot_snapshot(
                         frame,
                         slot,
@@ -1061,6 +1255,12 @@ class ParkingEngineRuntimeMixin:
                     # unlink_slot also drops any plate-lock on the slot.
                     plate = self.vehicle_registry.unlink_slot(slot.id)
                     self._forced_ocr_attempts.pop(slot.id, None)
+                    # Car left: release the OCR lock on this slot. The next car that
+                    # parks here re-arms it via vehicle_parked.
+                    if hasattr(self, "_ocr_id_attempts"):
+                        self._ocr_id_attempts.pop(slot.id, None)
+                        self._ocr_id_last_at.pop(slot.id, None)
+                        self._ocr_armed.pop(slot.id, None)
                     # Car left — the restored plate is no longer valid for this
                     # slot; drop restart-stickiness so a new car is resolved fresh.
                     if getattr(self, "_restored_plate_slots", None):
@@ -1071,6 +1271,26 @@ class ParkingEngineRuntimeMixin:
                         self._persist_slot_plate_binding(
                             slot.id, None, 0.0, False, cam_id
                         )
+
+            # OCR IDENTIFICATION — the only mechanism that can fill current_plate
+            # correctly. Runs while the car is STILL MANOEUVRING (ENTERING) as well as
+            # once parked, because many slots never see a plate in the final pose: CAM-21
+            # frames B1_CRO in pure side profile, so a parked car there reads ''. But a
+            # car that ends up side-on TURNED INTO the slot, and during that turn its
+            # plate swings past the camera. Those are the only frames where the plate
+            # exists, and OCR-ing only the settled pose throws them away.
+            # OCR IDENTIFICATION — armed by the VACANT -> OCCUPIED transition only, so a
+            # car already parked is not re-read forever. Reads the plate off the car,
+            # locks it to the slot until the car leaves, and learns the parked pose.
+            if (
+                self.vehicle_registry
+                and vehicle_in_slot
+                and plate_matching_enabled
+                and detection is not None
+                and state_machine.state == SlotState.OCCUPIED
+                and not state_machine.plate_number
+            ):
+                self._try_ocr_identify(cam_id, frame, slot, state_machine, detection)
 
             if (
                 self.vehicle_registry

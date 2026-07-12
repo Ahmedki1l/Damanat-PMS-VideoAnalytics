@@ -18,6 +18,7 @@
   "gallery_min_sharpness": 40.0,
   "gallery_min_view_quality": 0.9,
   "gallery_neighbour_clearance_enforce": false,
+  "gallery_require_slot_authority": true,
   "gallery_persist_enabled": false,
   "gallery_retention_days": 5.0,
   "global_cross_camera": 0.43,
@@ -62,5 +63,11 @@
   "use_openvino_reid": true,
   "voting_enabled": false,
   "voting_min_agree": 3,
-  "voting_window_frames": 5
+  "voting_window_frames": 5,
+  "slot_acquire_by_elimination": true,
+  "slot_acquire_min_similarity": 0.5,
+  "slot_acquire_inflight_seconds": 300.0,
+  "slot_plate_requires_ocr": false,
+  "slot_acquire_by_ocr_transit": true,
+  "ocr_transit_window_seconds": 120.0
 }

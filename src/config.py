@@ -232,6 +232,54 @@ class MatchingConfig:
     # (log-only): the clearance is computed and logged to collect its
     # distribution BEFORE it is allowed to gate anything.
     gallery_neighbour_clearance_enforce: bool = False
+    # Slot authority: a camera may only add a gallery reference for a car that is
+    # inside a slot IT hosts. Owning a car was previously the only camera check on
+    # the teach path, so an aisle camera that won the ownership contest could write
+    # references for a car parked in a DIFFERENT camera's slot â€” which is how four
+    # crops of a black Ford entered grey-Hyundai DJS-7842's gallery from CAM-07
+    # (whose own slot is 4% of a frame whose ROI is 74%). Set False to restore the
+    # old any-owner-may-teach behaviour.
+    gallery_require_slot_authority: bool = True
+    # --- Slot acquisition by elimination -------------------------------------
+    # Appearance alone CANNOT bridge the gate->slot viewpoint gap. A car's first view
+    # from its slot camera is a small oblique crop (~136px tall) matched against its
+    # front-gate photos: measured 0.583 for RDJ-9640 against its OWN references, below
+    # the 0.62 bar. So the car fails to recognise itself on arrival, mints an anonymous
+    # session, and parks as plate=(none) forever. Lowering the bar does NOT fix it â€”
+    # from that viewpoint a DIFFERENT car scored 0.634, i.e. the ranking is inverted,
+    # so a looser bar binds the WRONG plate.
+    #
+    # Geography and timing can identify the car where appearance cannot. Within the
+    # AREA-SCOPED candidate pool, if exactly ONE plated car is still "in flight"
+    # (entered recently, not yet linked to any slot), it is the only car this can be.
+    # Appearance is then only required not to CONTRADICT â€” hence a floor, well clear of
+    # the negative-pair distribution (p10 0.27 / p50 0.39), rather than a decision bar.
+    #
+    # Four independent constraints must agree before a plate is bound this way:
+    # right area, still in transit, uniquely the only candidate, appearance not objecting.
+    # ONLY A READ PLATE MAY REACH parking_slots.current_plate.
+    # The ReID slot-binding path (try_link_to_slot) binds on APPEARANCE, and appearance
+    # at the slot is INVERTED: measured 2026-07-11, a car scored 0.583 against its OWN
+    # gate references while a DIFFERENT car scored 0.634. That path stamped RDJ-9640 onto
+    # B1_CRO (which held DJS-7842) and tore RDJ-9640's plate off its real slot in the
+    # same move. OCR reads the characters off the car instead, and binds only what
+    # exactly one car inside can explain — so current_plate is CORRECT or NULL, never
+    # wrong. Set False to restore the old appearance-based binding.
+    # Default False so the library's legacy behaviour is unchanged; production opts IN
+    # via config.yaml. (Flipping the dataclass default silently rewires every caller and
+    # broke 13 tests that legitimately exercise the ReID slot-binding path.)
+    slot_plate_requires_ocr: bool = False
+    # THE TRANSIT HOP. Every car entering this facility passes CAM-20, which reads plates
+    # reliably. A camera that CANNOT read one (CAM-21 is mounted side-on to its aisle and
+    # has produced zero reads, parked or moving) adopts the identity of the single car
+    # that was READ moments ago and has not parked yet — then captures the SIDE-VIEW
+    # reference the gallery has never had. From that car's second visit, ReID matches
+    # side-vs-side (~0.9) and this hop is never needed again.
+    slot_acquire_by_ocr_transit: bool = True
+    ocr_transit_window_seconds: float = 120.0
+    slot_acquire_by_elimination: bool = True
+    slot_acquire_min_similarity: float = 0.50   # appearance must not CONTRADICT
+    slot_acquire_inflight_seconds: float = 300.0  # gate -> slot transit window
     gallery_min_sharpness: float = 40.0       # reject blurry crops (sharpness_score)
     gallery_dedup_cosine: float = 0.97        # skip near-duplicate refs
     gallery_accumulate_interval_s: float = 3.0  # throttle per (plate, camera)
@@ -701,6 +749,30 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
                 "gallery_neighbour_clearance_enforce",
                 cm.gallery_neighbour_clearance_enforce,
             )
+        )
+        cm.gallery_require_slot_authority = bool(
+            m.get(
+                "gallery_require_slot_authority",
+                cm.gallery_require_slot_authority,
+            )
+        )
+        cm.slot_plate_requires_ocr = bool(
+            m.get("slot_plate_requires_ocr", cm.slot_plate_requires_ocr)
+        )
+        cm.slot_acquire_by_ocr_transit = bool(
+            m.get("slot_acquire_by_ocr_transit", cm.slot_acquire_by_ocr_transit)
+        )
+        cm.ocr_transit_window_seconds = float(
+            m.get("ocr_transit_window_seconds", cm.ocr_transit_window_seconds)
+        )
+        cm.slot_acquire_by_elimination = bool(
+            m.get("slot_acquire_by_elimination", cm.slot_acquire_by_elimination)
+        )
+        cm.slot_acquire_min_similarity = float(
+            m.get("slot_acquire_min_similarity", cm.slot_acquire_min_similarity)
+        )
+        cm.slot_acquire_inflight_seconds = float(
+            m.get("slot_acquire_inflight_seconds", cm.slot_acquire_inflight_seconds)
         )
         cm.gallery_min_sharpness = m.get(
             "gallery_min_sharpness", cm.gallery_min_sharpness

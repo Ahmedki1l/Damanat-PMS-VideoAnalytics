@@ -7,6 +7,7 @@ from typing import List, Optional
 import numpy as np
 
 from src.matching.match_decision import Decision
+from src.matching.plate_ocr_match import confirm_plate
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,33 @@ GLOBAL_MATCH_RANK = 5
 # in the ownership contest (see _resolve_owner_camera). view_quality is 1.0
 # when the bbox is fully inside the frame, lower when clipped by an edge.
 _FULL_VIEW_MIN = 0.9
+
+# A gallery reference must be ONE WHOLE CAR. A box far wider than a car is not a
+# car: it is two of them merged by the detector, or a car plus the one beside it.
+# Mirrors the engine's _VQ_MAX_ASPECT.
+#
+# The engine applies that cap while computing view_quality, so accumulate_reference
+# inherits it. But the two AUTHORITATIVE paths — _seed_gallery (the gate shot) and
+# save_parked_reference (the OCR-verified parked pose) — call store.save_ref DIRECTLY
+# with a hardcoded quality (998/999/1.0) and so were never geometry-checked at all.
+# On 2026-07-12 that let a 1527x519 CAM-03 box (aspect 2.94) into EEB-80's gallery
+# twice, and a 722x258 one (aspect 2.80) into DJS-7842's. "Authoritative identity"
+# says the crop belongs to THIS PLATE; it says nothing about the crop being a car.
+_REF_MAX_ASPECT = 2.2
+_REF_MIN_SIDE_PX = 24
+
+
+def is_plausible_car_crop(crop_bgr) -> bool:
+    """Is this crop shaped like a single car? Geometry only — no appearance."""
+    if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
+        return False
+    try:
+        h, w = crop_bgr.shape[:2]
+    except Exception:
+        return False
+    if h < _REF_MIN_SIDE_PX or w < _REF_MIN_SIDE_PX:
+        return False
+    return (w / float(h)) <= _REF_MAX_ASPECT
 
 
 class VehicleRegistryIdentityMixin:
@@ -166,6 +194,21 @@ class VehicleRegistryIdentityMixin:
         override a stale 'closed' DB read) and by the engine exit-janitor (to
         skip purging a plate that just genuinely re-entered)."""
         return self._has_fresh_reentry(plate, self._clock())
+
+    def last_anpr_entry_at(self, plate: Optional[str]) -> Optional[datetime]:
+        """When VA's OWN ANPR last watched this plate drive in through the gate.
+
+        This is VA's authoritative answer to "is the car inside", independent of the
+        shared parking_sessions table (which PMS-AI owns and can lag on, or — as on
+        2026-07-11 — simply stop writing to). The exit-janitor compares it against the
+        entry_time of the 'closed' row it is about to act on: if VA saw the car enter
+        AFTER that row began, the row describes an older visit and must not be used to
+        delete the car currently inside. Unlike the time-boxed re-entry grace, this
+        holds for a lag of any length.
+        """
+        if not plate:
+            return None
+        return self._last_anpr_entry_at.get(plate)
 
     @staticmethod
     def _dedupe_valid_images(images: List[np.ndarray]) -> List[np.ndarray]:
@@ -506,6 +549,13 @@ class VehicleRegistryIdentityMixin:
                     identity_floor,
                 )
                 return
+        if not is_plausible_car_crop(image):
+            logger.warning(
+                "[gallery] Skipped mis-shaped seed for plate %s: %s is not one car.",
+                plate,
+                "x".join(str(d) for d in image.shape[1::-1]),
+            )
+            return
         try:
             store.save_ref(
                 plate,
@@ -794,10 +844,15 @@ class VehicleRegistryIdentityMixin:
         FIFO rule:
         the first pending ANPR entry is provisionally bound to the first Park_Entry candidate.
 
-        D1 fix: A candidate is bind-eligible only if it entered the zone recently
-        (within PENDING_ANPR_BIND_TTL_SECONDS). This prevents a lingering car from
-        grabbing the next car's plate. Uses entered_at (never refreshed) not last_seen_at
-        (refreshed every frame).
+        D3 linger guard: a candidate may only take a plate that was read at-or-after
+        it entered the zone (within PARK_ENTRY_LINGER_GRACE_SECONDS). A car already
+        sitting in the zone when the read arrived did not trigger that read, so
+        binding it would steal the plate of the car that did. The comparison is
+        `entered_at` vs the EVENT's timestamp — not the candidate's absolute age,
+        which is what wrongly force-expired legitimately-dwelling cars in b3ef313.
+
+        Older pending events are still offered to this candidate, so a lingerer whose
+        OWN read merely arrived late can still bind its own plate.
         """
         now = timestamp or self._clock()
 
@@ -818,6 +873,21 @@ class VehicleRegistryIdentityMixin:
                 age = (now - pending.timestamp).total_seconds()
                 if age > self.PENDING_ANPR_EXPIRY_SECONDS:
                     pending.status = "expired"
+                    continue
+                # D3: was this candidate ALREADY in the zone when the plate was read?
+                # If so it cannot be the car that was read — skip this event (but keep
+                # looking, in case an OLDER pending event is genuinely this car's own).
+                lingered = (
+                    pending.timestamp - candidate.entered_at
+                ).total_seconds()
+                if lingered > self.PARK_ENTRY_LINGER_GRACE_SECONDS:
+                    logger.info(
+                        "[PARK_ENTRY] candidate %s was in-zone %.1fs before event %s "
+                        "(plate=%s) was read (grace=%ss) — lingerer, not eligible for "
+                        "this plate",
+                        candidate_id, lingered, event_id, pending.plate,
+                        self.PARK_ENTRY_LINGER_GRACE_SECONDS,
+                    )
                     continue
                 # Only FIFO-bind a FRESH pending plate to a plateless live-track
                 # candidate. An older-but-not-yet-expired plate is stale residue
@@ -2623,8 +2693,18 @@ class VehicleRegistryIdentityMixin:
         best_sid = None
         best_score = -1.0
         runner_up_score = -1.0
+        # Track WHICH session is the runner-up, not just its score. A near-tie is
+        # usually not two different cars — it is ONE car competing with itself: the
+        # slot worker builds an anonymous (plate=None) session from its own
+        # viewpoint, which then out-scores the car's real plated session (whose refs
+        # are all gate views, so they only match cross-view at ~0.70). Without the
+        # ids and plates in the log, that is indistinguishable from a genuine
+        # two-car ambiguity, and the two call for opposite fixes.
+        runner_up_sid = None
+        session_plate = {}
         decision = self.match_decision
         for session, score in top_candidates:
+            session_plate[session.session_id] = session.plate
             cross_camera = bool(
                 session.plate
                 and session.last_seen_camera
@@ -2648,26 +2728,182 @@ class VehicleRegistryIdentityMixin:
             if verdict.verdict == "confirm" and score > best_score:
                 if best_sid is not None:
                     # The demoted previous winner becomes a runner-up.
-                    runner_up_score = max(runner_up_score, best_score)
+                    if best_score > runner_up_score:
+                        runner_up_score = best_score
+                        runner_up_sid = best_sid
                 best_score = score
                 best_sid = session.session_id
-            else:
-                runner_up_score = max(runner_up_score, score)
+            elif score > runner_up_score:
+                runner_up_score = score
+                runner_up_sid = session.session_id
+
+        # ---- Slot acquisition by elimination --------------------------------
+        # A car arriving at its slot cannot recognise ITSELF: its first view there is a
+        # small oblique crop scoring ~0.58 against its own front-gate photos (below the
+        # bar), so it either matches nothing (and mints an anonymous session) or matches
+        # a nameless copy of itself. Either way the plate never reaches the slot, and no
+        # threshold fixes it — from that viewpoint the ranking is INVERTED, so a looser
+        # bar binds the WRONG plate.
+        #
+        # Geography and timing decide what appearance cannot. Inside the AREA-SCOPED
+        # pool, if exactly ONE plated car is still in flight (entered recently, not yet
+        # parked), it is the only car this can be. Appearance is then only asked not to
+        # object. Requires area scoping to be active — without the spatial constraint
+        # this would be a bare guess, so an un-zoned camera never takes this path.
+        cfg_m = self._matching_config
+        if bool(getattr(cfg_m, "slot_acquire_by_elimination", True)):
+            best_plate_now = session_plate.get(best_sid) if best_sid else None
+            # Only step in when appearance has FAILED to name the car: either nothing
+            # confirmed, or the winner is an anonymous (nameless) session.
+            if best_sid is None or best_plate_now is None:
+                floor = float(
+                    getattr(cfg_m, "slot_acquire_min_similarity", 0.50) or 0.50
+                )
+                inflight = self._inflight_plated_candidates(query_vector, now)
+                if len(inflight) == 1 and inflight[0][1] >= floor:
+                    claim_session, claim_score = inflight[0]
+                    claim_sid = claim_session.session_id
+
+                    # Is the car we are LOOKING AT plausibly the car that arrived?
+                    #
+                    # "Only one car in flight" says WHICH plate is unaccounted for. It
+                    # says nothing about whether THIS car is that car. On 2026-07-11
+                    # that gap bound DJS-7842 to a Nissan Sunny that had been parked in
+                    # B25 for hours and merely never been identified: the B2 worker saw
+                    # an anonymous car, could not name it, found exactly one car in
+                    # flight, and claimed it. A wrong bind is worse than no bind.
+                    #
+                    # A car already being tracked BEFORE the plate was read at the gate
+                    # cannot be the car that was read. Same reasoning as the D3 gate
+                    # linger guard, one level up.
+                    gate_read_at = self._last_anpr_entry_at.get(claim_session.plate)
+                    incumbent = (
+                        self._sessions.get(best_sid) if best_sid is not None else None
+                    )
+                    seen_before_gate = (
+                        incumbent is not None
+                        and gate_read_at is not None
+                        and incumbent.first_seen_at is not None
+                        and incumbent.first_seen_at < gate_read_at
+                    )
+                    if seen_before_gate:
+                        logger.info(
+                            "[GLOBAL] cam=%s elimination REFUSED for %s: this car was "
+                            "already being tracked at %s, BEFORE the gate read at %s — "
+                            "it was here first, so it cannot be the arriving car",
+                            camera_id, claim_session.plate,
+                            incumbent.first_seen_at, gate_read_at,
+                        )
+                        return None
+                    # If a nameless copy of this car already won, fold it in so it
+                    # cannot keep out-scoring the real identity on later frames.
+                    if best_sid is not None and best_plate_now is None:
+                        self._absorb_anonymous_session(best_sid, claim_sid)
+                    logger.info(
+                        "[GLOBAL] cam=%s ACQUIRED %s by elimination "
+                        "(reid=%.3f >= floor %.2f; the ONLY car in flight) — "
+                        "appearance could not name it, the gate and the clock did",
+                        camera_id, claim_session.plate, claim_score, floor,
+                    )
+                    best_sid = claim_sid
+                    best_score = max(best_score, claim_score)
+                    runner_up_score = -1.0  # decided by elimination, not by margin
+                elif len(inflight) > 1:
+                    logger.info(
+                        "[GLOBAL] cam=%s elimination declined: %d cars in flight "
+                        "(%s) — ambiguous, refusing to guess",
+                        camera_id, len(inflight),
+                        ",".join(s.plate for s, _ in inflight),
+                    )
+                elif len(inflight) == 1:
+                    logger.info(
+                        "[GLOBAL] cam=%s elimination declined: only car in flight is "
+                        "%s but reid=%.3f < floor %.2f — appearance CONTRADICTS",
+                        camera_id, inflight[0][0].plate, inflight[0][1], floor,
+                    )
+                else:
+                    # NOTHING in flight. Never leave this silent: it is the case that
+                    # stranded DJS-7842 at CAM-04 on 2026-07-11 — CAM-06 had acquired it
+                    # 25s earlier, yet by the time it reached its slot the in-flight pool
+                    # was empty and the elimination was skipped without a word. Say
+                    # exactly WHY each plated car was ruled out, or the next failure is
+                    # another guessing game.
+                    reasons = []
+                    for sess in list(self._sessions.values()):
+                        if not sess.plate:
+                            continue
+                        if getattr(sess, "linked_slot", None):
+                            reasons.append(
+                                "%s: already linked to slot %s"
+                                % (sess.plate, sess.linked_slot)
+                            )
+                        elif sess.status not in ("confirmed", "parked"):
+                            reasons.append("%s: status=%s" % (sess.plate, sess.status))
+                        elif self._last_anpr_entry_at.get(sess.plate) is None:
+                            reasons.append("%s: no ANPR gate read on record" % sess.plate)
+                        else:
+                            age = (
+                                now - self._last_anpr_entry_at[sess.plate]
+                            ).total_seconds()
+                            reasons.append(
+                                "%s: gate read %.0fs ago (window %.0fs)"
+                                % (sess.plate, age, float(
+                                    getattr(cfg_m, "slot_acquire_inflight_seconds", 300.0)
+                                ))
+                            )
+                    logger.info(
+                        "[GLOBAL] cam=%s elimination SKIPPED: no car in flight. "
+                        "Plated sessions ruled out -> [%s]",
+                        camera_id, "; ".join(reasons) or "no plated sessions at all",
+                    )
 
         if best_sid is not None and runner_up_score >= 0.0:
             margin = float(
                 getattr(self._matching_config, "global_match_margin", 0.05) or 0.0
             )
             if margin > 0.0 and (best_score - runner_up_score) < margin:
-                logger.info(
-                    "[GLOBAL] cam=%s abstain: ambiguous match "
-                    "(best=%.3f runner_up=%.3f margin=%.2f)",
-                    camera_id,
-                    best_score,
-                    runner_up_score,
-                    margin,
-                )
-                return None
+                best_plate = session_plate.get(best_sid)
+                runner_plate = session_plate.get(runner_up_sid)
+                # Exactly one side carries a plate ⇒ this is not two different cars,
+                # it is ONE car competing with itself: its own anonymous session
+                # (built from this camera's viewpoint, so it scores higher) against
+                # its real plated session (gate views only, so it scores lower).
+                # Abstaining here is what strands the car with plate=(none).
+                self_competition = (best_plate is None) != (runner_plate is None)
+                resolved = False
+                if self_competition:
+                    plated_sid = best_sid if best_plate else runner_up_sid
+                    anon_sid = runner_up_sid if best_plate else best_sid
+                    if self._absorb_anonymous_session(anon_sid, plated_sid):
+                        logger.info(
+                            "[GLOBAL] cam=%s self-competition resolved: %s(%.3f) and "
+                            "%s(%.3f) were the SAME car -> bound to plate %s",
+                            camera_id,
+                            best_sid, best_score,
+                            runner_up_sid, runner_up_score,
+                            session_plate.get(plated_sid),
+                        )
+                        # Fall through to the normal success path below with the
+                        # surviving (plated) session, rather than re-implementing it.
+                        best_sid = plated_sid
+                        best_score = max(best_score, runner_up_score)
+                        resolved = True
+
+                if not resolved:
+                    logger.info(
+                        "[GLOBAL] cam=%s abstain: ambiguous match "
+                        "(best=%.3f %s plate=%s | runner_up=%.3f %s plate=%s | "
+                        "margin=%.2f)",
+                        camera_id,
+                        best_score,
+                        best_sid,
+                        best_plate or "NONE(anonymous)",
+                        runner_up_score,
+                        runner_up_sid,
+                        runner_plate or "NONE(anonymous)",
+                        margin,
+                    )
+                    return None
 
         if best_sid:
             with self._lock:
@@ -2751,6 +2987,135 @@ class VehicleRegistryIdentityMixin:
                 # gallery index so the next FAISS search reflects the new
                 # vector. No-op when the feature flag is False.
                 self._gallery_index_upsert(session)
+
+    def _inflight_plated_candidates(self, query_vector, now):
+        """Every plated car that is still IN FLIGHT, scored against this query.
+
+        In flight = has a plate, is NOT yet linked to a slot, and its ANPR GATE READ
+        was recent.
+
+        Deliberately searches ALL sessions, not the area-scoped candidate pool. A car
+        in transit is BY DEFINITION leaving the area it was last seen in: DJS-7842
+        entered at CAM-03 (area B1-A) and parked at CAM-04 (area B1-C), and the
+        adjacency graph makes B1-C a neighbour of B1-B and RAMP-UP but NOT of B1-A —
+        so the area pool excluded the car from its own destination and it was never
+        even scored. Area scoping is right for narrowing ordinary appearance matches;
+        it is wrong for a car whose whole state is "moving between areas".
+
+        The safety here is not spatial, it is the conjunction below:
+
+        Two exclusions carry the safety of this whole path:
+
+        * **Already parked.** A car sitting in a slot is accounted for — it cannot also
+          be the car arriving at a different one. This is what stops a long-parked car
+          from stealing the acquisition, and it matters because from a slot camera's
+          viewpoint a parked car can OUT-SCORE the real arrival (measured: DJS-7842
+          0.634 vs RDJ-9640's own 0.583 on RDJ-9640's own crop).
+
+        * **Anchored on the ANPR gate read**, never on the session's own timestamps.
+          ``_restore_vehicle_galleries`` rebuilds a session with ``first_seen_at=now``,
+          so after a restart EVERY car already inside would look freshly-entered and
+          claim to be in flight. Anchoring on ``_last_anpr_entry_at`` (stamped only by
+          a real gate read) means a restored car is NOT in flight until it actually
+          drives through the gate again. No gate read on record ⇒ not in flight; the
+          fail-safe direction is to decline.
+        """
+        cfg = self._matching_config
+        window = float(
+            getattr(cfg, "slot_acquire_inflight_seconds", 300.0) or 300.0
+        )
+        out = []
+        for session in list(self._sessions.values()):
+            if not session.plate:
+                continue
+            if session.status not in ("confirmed", "parked"):
+                continue
+            if getattr(session, "linked_slot", None):
+                continue  # already parked somewhere — accounted for
+            entered_at = self._last_anpr_entry_at.get(session.plate)
+            if entered_at is None:
+                continue  # no gate read on record — cannot claim to be arriving
+            if (now - entered_at).total_seconds() > window:
+                continue  # entered too long ago to still be driving to a slot
+            score = (
+                self._best_weighted_score(query_vector, session)
+                if query_vector is not None
+                else -1.0
+            )
+            out.append((session, score))
+        return out
+
+    def _absorb_anonymous_session(self, anon_sid: str, plated_sid: str) -> bool:
+        """Fold a car's own ANONYMOUS session into its real PLATED one.
+
+        A car entering the garage is plated at the gate (CAM-03), but the worker that
+        owns the slot cameras also builds its own anonymous (plate=None) session for
+        the same car from ITS viewpoint. Those two sessions then compete:
+
+            anonymous  ~0.73  (slot viewpoint vs slot viewpoint — near-identical)
+            plated     ~0.70  (gate views vs slot viewpoint — cross-view)
+
+        The nameless copy WINS, and because the two land inside global_match_margin
+        the matcher abstains — so the car parks with plate=(none) forever. It is not
+        two cars being confused; it is one car competing with itself, and the side
+        that carries the identity is the side that loses.
+
+        The asymmetry is also the cure: the anonymous session's vectors ARE the
+        parked-pose views the plated session lacks. Absorbing them makes the plated
+        session match strongly from the slot cameras from here on, which is what
+        closes the cross-view gap that no threshold could.
+
+        Returns True when the merge happened. ``self._lock`` is an RLock, so this is
+        safe whether or not the caller already holds it.
+        """
+        with self._lock:
+            anon = self._sessions.get(anon_sid)
+            plated = self._sessions.get(plated_sid)
+            # Only ever collapse a nameless session INTO a named one — never the
+            # reverse, and never merge two plated sessions: that would be a real
+            # identity swap, the exact failure this whole guard exists to prevent.
+            if anon is None or plated is None or anon.plate or not plated.plate:
+                return False
+
+            cap = int(
+                getattr(self._matching_config, "gallery_max_refs_per_car", 20) or 20
+            )
+            carried = 0
+            for vec in [anon.feature_vector, *(anon.reference_feature_vectors or [])]:
+                if vec is None:
+                    continue
+                if len(plated.reference_feature_vectors) >= cap:
+                    break
+                plated.reference_feature_vectors.append(vec)
+                carried += 1
+            self._sync_reference_cameras(plated)
+
+            # Carry the live observers across, so the track keeps its owner and the
+            # slot camera does not immediately mint a FRESH anonymous session for the
+            # same car on the very next frame (which would re-create the competition).
+            for obs_cam, obs_tid in list(anon.observing_tracks.items()):
+                plated.observing_tracks[obs_cam] = obs_tid
+                plated.observing_scores[obs_cam] = anon.observing_scores.get(
+                    obs_cam, 0.0
+                )
+
+            # Repoint every track that was bound to the nameless session.
+            for key, sid in list(self._track_session_map.items()):
+                if sid == anon_sid:
+                    self._track_session_map[key] = plated_sid
+
+            plated.last_seen_at = self._clock()
+            anon.status = "merged"
+            self._sessions.pop(anon_sid, None)
+            self._gallery_index_remove(anon_sid)
+            self._gallery_index_upsert(plated)
+
+            logger.info(
+                "[GLOBAL] merged anonymous session %s into plated %s (plate=%s): "
+                "carried %d slot-viewpoint vector(s) the plated session was missing",
+                anon_sid, plated_sid, plated.plate, carried,
+            )
+            return True
 
     def refresh_track_binding(
         self,
@@ -3042,6 +3407,36 @@ class VehicleRegistryIdentityMixin:
         if track_id is None:
             return None
         if is_reid_disabled_floor(floor):
+            return None
+
+        # ONLY A READ PLATE MAY REACH current_plate.
+        #
+        # This path binds a plate to a slot on APPEARANCE, and appearance at the slot is
+        # not merely weak — it is INVERTED. Measured 2026-07-11: a car scored 0.583
+        # against its OWN gate references while a DIFFERENT car scored 0.634. That
+        # afternoon this path stamped RDJ-9640 onto B1_CRO, which held DJS-7842, and
+        # dragged RDJ-9640's plate off its real slot (B10_CTO) in the same move.
+        #
+        # The OCR path (try_ocr_identify_track / try_ocr_identify_slot) READS the
+        # characters off the car and binds only what exactly one car inside can explain.
+        # Where OCR can see a plate, current_plate is right; where it cannot, the slot
+        # stays NULL. A visible gap is fine. A stranger's plate in a customer's slot is
+        # not — it propagates silently into billing and occupancy.
+        #
+        # So a session may only take a slot once its identity was READ. Set
+        # slot_plate_requires_ocr=False to restore the old appearance-based behaviour.
+        # NOTE the guard is UNCONDITIONAL, not "unless the car was OCR-confirmed".
+        #
+        # The first version checked `session.ocr_confirmed`, which is a property of the
+        # CAR ("was this car ever read?"), not of THIS binding ("was it read at THIS
+        # slot?"). On 2026-07-12 that let NDD-4141 — legitimately read at CAM-20 and so
+        # flagged confirmed — be bound by APPEARANCE to a SECOND slot, B1_CRO, on CAM-21,
+        # a camera that has never read a plate in its life. Same for HER-9235 across B2
+        # and B6_Reserved. A car cannot be in two slots.
+        #
+        # Only the OCR path (bind_plate_to_slot, called after try_ocr_identify_slot
+        # actually READ the characters off the car in THAT slot) may write current_plate.
+        if bool(getattr(self._matching_config, "slot_plate_requires_ocr", True)):
             return None
 
         evicted_slots_to_clear = []
@@ -3406,6 +3801,338 @@ class VehicleRegistryIdentityMixin:
         with self._lock:
             session = self._parked.get(slot_id)
             return bool(session.ocr_confirmed) if session is not None else False
+
+    def plates_inside(self) -> List[str]:
+        """Every plate VA believes is currently inside the facility.
+
+        VA's OWN view (plated sessions in memory), not PMS-AI's parking_sessions table —
+        on 2026-07-11 that table stopped receiving rows entirely while cars kept driving
+        in.
+
+        NOTE this is the FALLBACK candidate set, used only when ReID cannot shortlist
+        (no query vector). Matching OCR against the whole facility is what poisoned the
+        gallery on 2026-07-12 — see :meth:`reid_shortlist`.
+        """
+        with self._lock:
+            return sorted(
+                {s.plate for s in self._sessions.values() if s.plate}
+            )
+
+    def reid_shortlist(self, crop_bgr, k: int = GLOBAL_MATCH_RANK) -> List[str]:
+        """The top-k plates ReID considers plausible for this crop.
+
+        REID NARROWS, OCR CONFIRMS. This is the candidate set OCR is allowed to pick
+        from, and it is the fix for the 2026-07-12 gallery poisoning.
+
+        OCR previously matched against EVERY car inside — 28 plates. 'EEB-80' carries
+        only the digits '80', and '80' is a substring of nearly any read, so a Range
+        Rover's plate "confirmed" EEB-80 and its photo was filed under a matte-grey
+        Porsche's name. Six cars ended up in EEB-80's gallery.
+
+        Appearance would have vetoed that instantly: a Range Rover is nowhere near a
+        Porsche in ReID space, so EEB-80 would never appear in its top-5. Two independent
+        witnesses must now agree — the car must LOOK like the candidate (ReID) AND its
+        plate must READ as the candidate (OCR). Either alone is demonstrably unsafe:
+        ReID at the slot ranks the wrong car first (0.634 vs 0.583), and OCR alone
+        collides on short plates.
+
+        Note ReID only has to place the right car in the TOP FIVE — not first. That is a
+        far weaker requirement than the one it fails at, and it is what lets this work
+        even before a car has a parked-pose reference.
+        """
+        if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
+            return []
+        try:
+            q = self.reid_matcher.extract_feature(crop_bgr)
+        except Exception:
+            return []
+        if q is None:
+            return []
+        with self._lock:
+            scored = [
+                (self._best_weighted_score(q, s), s.plate)
+                for s in self._sessions.values()
+                if s.plate and s.feature_vector is not None
+            ]
+        scored.sort(reverse=True)
+        return [plate for _score, plate in scored[:k]]
+
+    def try_ocr_identify_slot(self, slot_id: str, crop_bgr) -> Optional[str]:
+        """READ the plate off a parked car and bind it — no prior binding needed.
+
+        This is the only mechanism that can fill ``parking_slots.current_plate``
+        CORRECTLY. The alternatives were measured on 2026-07-11 and both fail:
+
+          * ReID at the slot: a car scored 0.583 against its OWN gate references while a
+            DIFFERENT car scored 0.634. The ranking is INVERTED, so no threshold helps —
+            a looser bar binds the WRONG plate.
+          * Acquisition by elimination: bound DJS-7842 onto a stranger's Nissan Sunny
+            that had merely been parked, unidentified, for hours.
+
+        OCR does not infer, it reads. Bind only when the read confirms exactly one car
+        that VA believes is inside; otherwise leave the slot NULL. ``current_plate`` must
+        be CORRECT or NULL — a visible gap is fine, a stranger's plate is a liability.
+
+        Distinct from :meth:`try_ocr_confirm_slot`, which only CONFIRMS a plate already
+        bound by ReID and cannot identify a car from nothing.
+        """
+        existing = self.get_slot_plate(slot_id)
+        if existing:
+            return existing  # already identified; nothing to do
+
+        ocr = getattr(self._match_decision, "plate_ocr", None)
+        if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
+            return None
+        # OCR is heavy — never hold the registry lock across it, or the frame loop for
+        # every other camera in this worker stalls behind one PaddleOCR read.
+        try:
+            ocr_text, _ocr_conf = ocr.read(crop_bgr)
+        except Exception as exc:
+            logger.debug("[ocr-id] slot=%s read failed: %r", slot_id, exc)
+            return None
+        if not ocr_text:
+            # Never silent. A side-on slot (CAM-21 frames B1_CRO in pure profile) reads
+            # nothing at all in the settled pose — the plate is simply not in the frame.
+            # That is a CAMERA-ANGLE fact, not an OCR failure, and it must be visible in
+            # the log or it looks like the pass never ran.
+            logger.info(
+                "[ocr-id] slot=%s read NOTHING — no plate visible in this view "
+                "(side-on slot? the plate is only in frame while the car TURNS IN)",
+                slot_id,
+            )
+            return None
+
+        # REID NARROWS, OCR CONFIRMS. The candidate set is what the car LOOKS like, not
+        # every plate in the building. This is what stops a Range Rover's read from
+        # confirming a Porsche's plate on a two-digit collision.
+        candidates = self.reid_shortlist(crop_bgr)
+        if not candidates:
+            candidates = self.plates_inside()  # ReID unavailable — degrade, don't guess
+        plate = confirm_plate(ocr_text, candidates)
+        if not plate:
+            logger.info(
+                "[ocr-id] slot=%s read=%r confirms none of ReID's top-%d %s — "
+                "leaving NULL",
+                slot_id, ocr_text, len(candidates), candidates,
+            )
+            return None
+
+        logger.info(
+            "[ocr-id] slot=%s CONFIRMED %s: ReID shortlisted it and OCR read %r off the "
+            "car — two independent witnesses agree",
+            slot_id, plate, ocr_text,
+        )
+        return plate
+
+    def ocr_transit_candidates(self, now=None):
+        """Cars whose plate was READ moments ago and that have not parked yet.
+
+        Every car entering this facility passes CAM-20, and CAM-20 reads plates reliably.
+        So a car's identity is established by OCR *before* it reaches its slot, and a car
+        that was read there but has not yet linked to a slot is definitively IN TRANSIT —
+        seconds away, in the same worker process.
+
+        That is what makes the one remaining hop safe. Contrast the earlier
+        acquisition-by-elimination, which anchored on the ANPR gate read minutes and a
+        whole garage away, and bound DJS-7842 onto a Nissan Sunny that had been parked
+        for hours. Here the identity is READ (not inferred), the window is seconds, and
+        the anchor is a camera metres from the slot.
+        """
+        now = now or self._clock()
+        window = float(
+            getattr(self._matching_config, "ocr_transit_window_seconds", 120.0) or 120.0
+        )
+        out = []
+        with self._lock:
+            for s in self._sessions.values():
+                if not s.plate or not getattr(s, "ocr_confirmed", False):
+                    continue
+                if getattr(s, "linked_slot", None):
+                    continue  # already parked — accounted for, cannot also be arriving
+                seen_at = getattr(s, "ocr_identified_at", None)
+                if seen_at is None:
+                    continue
+                if (now - seen_at).total_seconds() <= window:
+                    out.append((s, seen_at))
+        return out
+
+    def adopt_transit_identity(
+        self, camera_id: str, track_id: int, session_id: str
+    ) -> Optional[str]:
+        """Give an anonymous track the identity of the one car in OCR transit."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or not session.plate:
+                return None
+            self._track_session_map[(camera_id, track_id)] = session_id
+            session.observing_tracks[camera_id] = track_id
+            session.observing_scores[camera_id] = 1.0
+            session.last_seen_at = self._clock()
+            session.last_seen_camera = camera_id
+            return session.plate
+
+    def save_parked_reference(self, plate: str, crop_bgr, camera_id: str) -> bool:
+        """Teach the gallery this car's PARKED POSE, on an OCR-VERIFIED identity.
+
+        This is the reference the system has never been able to get, and the reason it
+        could never recognise a parked car. Every gallery reference until now came from
+        the GATE (ANPR / CAM-23 / CAM-03) — front-on, close, at the barrier. A car in a
+        slot is seen small, oblique, from above. Matching one against the other is the
+        cross-view problem, and it does not merely score low, it scores WRONG: measured
+        2026-07-11, a car scored 0.583 against its own gate references while a DIFFERENT
+        car scored 0.634.
+
+        We could not capture the parked pose before because doing so requires knowing
+        WHO the car is, and appearance could not tell us — the chicken-and-egg that made
+        the whole afternoon circular. OCR breaks it: the plate is READ off the car, so
+        the identity is evidence, not inference, and it is safe to learn from.
+
+        Once this reference is on disk, the same car parking again is a SAME-VIEW match
+        (self-gallery rank-1 0.976 in the identity-disjoint eval) rather than a cross-view
+        one (0.736) — which is what will let a side-on slot like B1_CRO, whose camera can
+        never see a plate, be recognised on the car's second visit.
+
+        Deliberately bypasses the accumulate path's occupied-slot guard: that guard exists
+        to stop a MIS-BOUND car poisoning a gallery, and there is no mis-binding here.
+        """
+        if not plate or crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
+            return False
+        store = getattr(self, "gallery_store", None)
+        if store is None:
+            return False
+        # OCR proves WHOSE car this is. It does not prove the box contains one car —
+        # a detector box spanning this car and its neighbour still reads the plate.
+        if not is_plausible_car_crop(crop_bgr):
+            logger.warning(
+                "[ocr-id] Refused mis-shaped parked-pose ref for %s: %s is not one car.",
+                plate,
+                "x".join(str(d) for d in crop_bgr.shape[1::-1]),
+            )
+            return False
+        try:
+            feature = self.reid_matcher.extract_feature(crop_bgr)
+            if feature is None:
+                return False
+            store.save_ref(
+                plate,
+                crop_bgr,
+                feature,
+                quality=1.0,
+                camera_id=camera_id,
+                gate_only=False,
+            )
+        except Exception as exc:
+            logger.warning("[ocr-id] parked-pose save failed for %s: %r", plate, exc)
+            return False
+
+        with self._lock:
+            session = next(
+                (s for s in self._sessions.values() if s.plate == plate), None
+            )
+            if session is not None and feature is not None:
+                session.reference_feature_vectors.append(feature)
+                self._sync_reference_cameras(session)
+                self._gallery_index_upsert(session)
+
+        logger.info(
+            "[ocr-id] gallery LEARNED the parked pose of %s from %s — next time this "
+            "car parks it can be recognised by appearance, not just by reading it",
+            plate, camera_id,
+        )
+        return True
+
+    def try_ocr_identify_track(
+        self, camera_id: str, track_id: int, crop_bgr
+    ) -> Optional[str]:
+        """READ the plate off a still-moving car and bind its session to this track.
+
+        This is what makes side-on slots solvable. CAM-21 frames B1_CRO in pure profile,
+        so a car parked there NEVER shows a plate — but it drove up the aisle to get
+        there, front or rear toward the camera, and the plate was plainly visible then.
+        Identify the track on the approach and the plate is already known by the time the
+        car parks; the existing slot-linking then carries it into current_plate with no
+        appearance guessing anywhere in the chain.
+
+        Same contract as everywhere else: bind only what was READ, and only when exactly
+        one car inside can explain the read. Otherwise leave it anonymous.
+        """
+        ocr = getattr(self._match_decision, "plate_ocr", None)
+        if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
+            return None
+        try:
+            ocr_text, _conf = ocr.read(crop_bgr)  # heavy — never under the lock
+        except Exception:
+            return None
+        if not ocr_text:
+            return None
+
+        # ReID narrows, OCR confirms — same two-witness rule as the slot path.
+        candidates = self.reid_shortlist(crop_bgr) or self.plates_inside()
+        plate = confirm_plate(ocr_text, candidates)
+        if not plate:
+            return None
+
+        with self._lock:
+            session = next(
+                (s for s in self._sessions.values() if s.plate == plate), None
+            )
+            if session is None:
+                return None
+            self._track_session_map[(camera_id, track_id)] = session.session_id
+            session.observing_tracks[camera_id] = track_id
+            session.observing_scores[camera_id] = 1.0  # read, not inferred
+            session.last_seen_at = self._clock()
+            session.last_seen_camera = camera_id
+            session.ocr_confirmed = True
+            # Anchors the transit hop: this car's plate was READ at this moment, so
+            # until it parks it is definitively in transit toward a slot.
+            session.ocr_identified_at = self._clock()
+        logger.info(
+            "[ocr-id] track (%s, %s) read=%r -> %s (bound by evidence)",
+            camera_id, track_id, ocr_text, plate,
+        )
+        return plate
+
+    def bind_plate_to_slot(
+        self,
+        slot_id: str,
+        plate: str,
+        camera_id: str,
+        floor: Optional[str] = None,
+    ) -> bool:
+        """Park the session carrying ``plate`` into ``slot_id``.
+
+        Used by the OCR identification path, where the plate was READ off the car rather
+        than inferred, so the binding is evidence-backed and can be trusted.
+        """
+        if not slot_id or not plate:
+            return False
+        with self._lock:
+            session = next(
+                (s for s in self._sessions.values() if s.plate == plate), None
+            )
+            if session is None:
+                return False
+
+            # If this car was parked somewhere else, release that slot first —
+            # a car cannot occupy two slots, and a stale link would keep the old
+            # slot showing this plate forever.
+            for other_slot, parked in list(self._parked.items()):
+                if other_slot != slot_id and parked is session:
+                    self._parked.pop(other_slot, None)
+                    self._locked_slots.discard(other_slot)
+
+            session.status = "parked"
+            session.linked_slot = slot_id
+            session.linked_camera = camera_id
+            if floor:
+                session.linked_floor = floor
+            session.linked_at = self._clock()
+            session.ocr_confirmed = True  # it was READ, not guessed
+            self._parked[slot_id] = session
+            self._locked_slots.add(slot_id)
+            self._gallery_index_upsert(session)
+            return True
 
     def try_ocr_confirm_slot(self, slot_id: str, crop_bgr) -> bool:
         """Forced-OCR dead-zone pass (§3b): read the plate off the parked car

@@ -53,6 +53,21 @@ class VehicleRegistry(
     # must stop being bindable quickly so the NEXT car cannot inherit it. The event
     # itself still lives the full expiry for re-entry grace / specific-event binds.
     PENDING_ANPR_BIND_TTL_SECONDS = 10
+    # D3 linger guard. The ANPR read happens at the gate, UPSTREAM of the CAM-23
+    # Park_Entry polygon, so the car that triggered a read reaches the zone AFTER
+    # it. A candidate that was ALREADY sitting in the zone when the plate was read
+    # therefore cannot be the car that was read — it is a lingerer (it entered
+    # without an ANPR read of its own, or its read was missed), and FIFO-binding it
+    # hands it the ARRIVING car's plate.
+    #
+    # This is a check on the candidate's entry time RELATIVE TO THE READ, not on
+    # its absolute age: a car may legitimately dwell in the zone for minutes at the
+    # barrier, and an absolute age cap is exactly what force-expired dwelling cars
+    # and had to be reverted (b3ef313). Both clocks are the registry's own
+    # (`_clock()`), so there is no integrator skew to absorb — but `event.timestamp`
+    # is when the event was RECEIVED, not when the plate was physically read, so
+    # this grace must comfortably exceed the ANPR integrator's POST latency.
+    PARK_ENTRY_LINGER_GRACE_SECONDS = 5
     # Re-entry DB-grace: a car can exit (parking_sessions -> closed) and RE-ENTER
     # before PMS-AI inserts the new open row. During that window the freshest DB
     # row is still the exit's closed row, so is_plate_inside would wrongly report

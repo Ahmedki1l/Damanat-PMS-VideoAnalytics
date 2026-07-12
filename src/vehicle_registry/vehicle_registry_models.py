@@ -173,6 +173,9 @@ class VehicleSession:
     # "ReID >= lock_confidence OR ocr_confirmed" freeze condition, and does not
     # rely on the synthetic Decision built for the voter (which carries no OCR).
     ocr_confirmed: bool = False
+    # When this car's plate was READ (OCR), not inferred. Anchors the transit hop: until
+    # the car parks, it is definitively on its way to a slot.
+    ocr_identified_at: Optional[datetime] = None
 
     @property
     def display_id(self) -> str:
