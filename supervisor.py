@@ -48,6 +48,11 @@ API_PORT = 8000
 #   cams : comma-separated camera IDs passed to --cameras
 #   api  : True on EXACTLY ONE group — the one owning the entrance camera
 # ---------------------------------------------------------------------------
+# These 5 groups are the STATIC FALLBACK only. The live topology is now built
+# per-AREA from the DB `cameras.area` column at startup (see resolve_groups /
+# _groups_from_db). This list is used verbatim only if that DB read fails or the
+# ANPR/entrance camera can't be located — so a bad DB never leaves the demo worse
+# than today. Force this fallback with env VA_STATIC_GROUPS=1.
 GROUPS = [
     {"name": "b1-gate",  "cams": "CAM-23,CAM-03,CAM-04,CAM-05,CAM-06,CAM-07", "api": True},
     {"name": "b1-areas", "cams": "CAM-08,CAM-20,CAM-21,CAM-22,CAM-24",        "api": False},
@@ -55,6 +60,89 @@ GROUPS = [
     {"name": "b2-2",     "cams": "CAM-15,CAM-16,CAM-17,CAM-18,CAM-19,CAM-25", "api": False},
     {"name": "ground",   "cams": "CAM-00,CAM-01,CAM-02",                      "api": False},
 ]
+
+# The camera that receives the ANPR webhooks / owns the entrance. Its group is the
+# one (and only one) that runs --api. Override with env VA_API_CAMERA.
+API_CAMERA = os.environ.get("VA_API_CAMERA", "CAM-23").strip().upper()
+# ---------------------------------------------------------------------------
+
+
+def _groups_from_db() -> list[dict]:
+    """Build one supervisor group per parking AREA from the DB `cameras.area`
+    column — the same roster main.py loads (ANPR cams already excluded).
+
+    WHY PER-AREA: per-camera fps is 1/(cams_in_group x ~50ms) and only one
+    inference runs at a time per group, so a few big groups leave cores idle.
+    One group per aisle (B1-A/B/C, B2-A/B/C, ...) gives ~3-4 cams/group =~ 2x the
+    concurrent inferences (fills the idle cores) while keeping each aisle's
+    cameras in ONE process, so live identity handoff WITHIN an aisle is preserved.
+
+    Raises on any problem (no cameras, entrance cam missing) so the caller can
+    fall back to the static GROUPS. Never returns a topology with != 1 api group.
+    """
+    from collections import OrderedDict
+
+    from src.config import load_config
+    from src.database import init_db
+    from src.services.config_service import (
+        ensure_areas_initialized,
+        load_cameras_from_db,
+        sync_areas_from_db,
+    )
+
+    config = load_config(str(ROOT / "config.yaml"))
+    db = init_db(config.database.url)
+    db.create_tables()
+    session = db.SessionLocal()
+    try:
+        # Areas first so a camera's `area` resolves against the synced table,
+        # then the DB-first camera roster (mirrors main.py's startup order).
+        ensure_areas_initialized(session, config)
+        sync_areas_from_db(session, config)
+        load_cameras_from_db(session, config)
+    finally:
+        session.close()
+
+    if not config.cameras:
+        raise RuntimeError("no cameras returned from DB")
+
+    # Bucket by area; un-zoned cameras (e.g. Ground) fall back to their floor so
+    # they stay grouped together instead of scattering into one 'unzoned' blob.
+    buckets: "OrderedDict[str, list[str]]" = OrderedDict()
+    for cam in config.cameras:
+        key = (cam.area or "").strip() or (cam.floor or "").strip() or "unzoned"
+        buckets.setdefault(key, []).append(cam.id)
+
+    groups = [
+        {"name": key.lower().replace(" ", "-"), "cams": ",".join(cams), "api": False}
+        for key, cams in sorted(buckets.items())
+    ]
+
+    # Exactly one --api group: whichever area owns the entrance/ANPR camera.
+    for g in groups:
+        if API_CAMERA in [c.strip().upper() for c in g["cams"].split(",")]:
+            g["api"] = True
+            break
+    else:
+        raise RuntimeError(f"entrance/ANPR camera {API_CAMERA} not in any area group")
+
+    return groups
+
+
+def resolve_groups() -> list[dict]:
+    """The live group topology: per-area from the DB, or the static GROUPS if the
+    DB read fails (or VA_STATIC_GROUPS is set). Logs which one is used."""
+    if os.environ.get("VA_STATIC_GROUPS", "").strip().lower() in ("1", "true", "yes", "on"):
+        print("[supervisor] VA_STATIC_GROUPS set — using the static fallback GROUPS.")
+        return GROUPS
+    try:
+        groups = _groups_from_db()
+        print(f"[supervisor] topology from DB cameras.area: {len(groups)} area group(s).")
+        return groups
+    except Exception as exc:  # noqa: BLE001 — never let grouping block startup
+        print(f"[supervisor] DB area-grouping failed ({exc!r}); "
+              f"falling back to static GROUPS.")
+        return GROUPS
 # ---------------------------------------------------------------------------
 
 
@@ -181,8 +269,12 @@ def run(reset_plates: bool = False, foreground: bool = False,
     signal (Ctrl+C / SIGTERM) or an unexpected child exit tears the fleet down.
     Callable directly (this is what ``main.py --supervise`` invokes) so it does
     not parse argv itself. Returns a process exit code."""
+    # Per-area topology from the DB (or the static fallback). Resolve ONCE here so
+    # the sanity check, core-slicing and the spawn loop all see the same groups.
+    groups = resolve_groups()
+
     # Sanity: exactly one API host owns the entrance camera + ANPR webhooks.
-    api_groups = [g for g in GROUPS if g.get("api")]
+    api_groups = [g for g in groups if g.get("api")]
     if len(api_groups) != 1:
         raise SystemExit(
             f"Exactly one group must have api=True (found {len(api_groups)}). Fix GROUPS."
@@ -193,7 +285,7 @@ def run(reset_plates: bool = False, foreground: bool = False,
         _reset_plates()
 
     total_cores = _available_cores()
-    total_cams = sum(_cam_count(g) for g in GROUPS)
+    total_cams = sum(_cam_count(g) for g in groups)
 
     # On Windows: NEW_PROCESS_GROUP so a stray CTRL_C to us isn't broadcast to
     # the children (we tear them down explicitly), and NO_WINDOW so each worker
@@ -216,9 +308,9 @@ def run(reset_plates: bool = False, foreground: bool = False,
 
     PID_FILE.unlink(missing_ok=True)
 
-    slices = _core_slices(GROUPS, total_cores)
+    slices = _core_slices(groups, total_cores)
 
-    for g, cores in zip(GROUPS, slices):
+    for g, cores in zip(groups, slices):
         cli = [sys.executable, "main.py", "--cameras", g["cams"]]
         if g.get("api"):
             cli += ["--api", "--port", str(port)]
