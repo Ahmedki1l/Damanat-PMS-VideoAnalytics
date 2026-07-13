@@ -301,13 +301,19 @@ class TestReidSoloFallback:
                                           is_reserved=True) is None  # reserved: 0.20, fails
 
     def test_a_solo_bind_never_claims_to_be_ocr_confirmed(self, registry):
-        """It is inference, not evidence: it must not set ocr_confirmed, must not lock the
-        slot, and so must not let save_parked_reference learn from it."""
+        """It is inference, not evidence: it must not set ocr_confirmed, so
+        save_parked_reference will not learn from it and the lock gate will not fire.
+
+        It DOES still claim the slot (_locked_slots) — that is what mutual exclusion
+        reads, and conflating "claimed" with "frozen against OCR" is what once put
+        ERS-7949 in B17 and B19 at the same time. Correctability lives on the state
+        machine lock and parking_slots.plate_locked, not here.
+        """
         reg = self._reg(registry)
         s = _add(reg, "GUESSED", [(GATE_CAM, _vec(1, 0, 0))])
         assert reg.bind_plate_to_slot("B1_CRO", "GUESSED", SLOT_CAM, source="reid_solo")
-        assert s.ocr_confirmed is False
-        assert "B1_CRO" not in reg._locked_slots
+        assert s.ocr_confirmed is False, "a guess must never masquerade as a read"
+        assert "B1_CRO" in reg._locked_slots, "but it DOES claim the slot"
 
         s2 = _add(reg, "READ", [(GATE_CAM, _vec(0, 1, 0))])
         assert reg.bind_plate_to_slot("B14", "READ", SLOT_CAM, source="ocr")
@@ -323,3 +329,59 @@ class TestReidSoloFallback:
         monkeypatch.setattr(reg.reid_matcher, "extract_feature", lambda _c: q)
         assert reg.try_reid_identify_slot("B1_CRO", np.ones((8, 8, 3), np.uint8),
                                           SLOT_CAM) is None
+
+
+class TestOneCarOneSlot:
+    """The production contract. It broke once, in exactly the way below: solo binds were
+    kept OUT of _locked_slots on the reasoning that "only a READ plate should freeze the
+    slot" — but _locked_slots is what mutual exclusion READS, so a solo-bound car became
+    invisible to it and ERS-7949 ended up in B17 and B19 at the same time.
+
+    A slot CLAIMS a car whatever named it. "Correctable by OCR" is a different property
+    and lives elsewhere (state machine lock / parking_slots.plate_locked)."""
+
+    def test_a_solo_bound_car_cannot_be_claimed_by_a_second_slot(self, registry):
+        reg = registry
+        reg._matching_config.slot_reid_solo_enabled = True
+        q = _vec(1, 0, 0)
+        s = _add(reg, "ERS-7949", [(GATE_CAM, _vec(1, 0, 0))])
+        _add(reg, "OTHER", [(GATE_CAM, _vec(0.2, 0.98, 0))])
+
+        # B19 takes it by appearance alone — NOT locked, but it IS claimed.
+        assert reg.bind_plate_to_slot("B19", "ERS-7949", SLOT_CAM, source="reid_solo")
+        assert "B19" in reg._locked_slots, (
+            "a solo bind must still CLAIM the slot, or mutual exclusion cannot see it"
+        )
+
+        # B17, on the same camera, must no longer be offered that car.
+        kept, rejected = reg.reid_rank(q, slot_id="B17", slot_camera=SLOT_CAM, k=5)
+        assert "ERS-7949" not in [c.plate for c in kept]
+        assert ("ERS-7949", "LOCKED_ELSEWHERE_LOCAL") in [
+            (r.plate, r.reason) for r in rejected
+        ]
+
+    def test_the_slot_holding_it_can_still_re_confirm_its_own_car(self, registry):
+        reg = registry
+        _add(reg, "ERS-7949", [(GATE_CAM, _vec(1, 0, 0))])
+        reg.bind_plate_to_slot("B19", "ERS-7949", SLOT_CAM, source="reid_solo")
+        kept, _ = reg.reid_rank(_vec(1, 0, 0), slot_id="B19", slot_camera=SLOT_CAM, k=5)
+        assert [c.plate for c in kept] == ["ERS-7949"]
+
+    def test_relocating_releases_the_old_slot_for_the_db_too(self, registry):
+        """Releasing only in memory left parking_slots holding the old row, so the same
+        car was reported in two places by /api/slots."""
+        reg = registry
+        _add(reg, "ERS-7949", [(GATE_CAM, _vec(1, 0, 0))])
+        reg.bind_plate_to_slot("B19", "ERS-7949", SLOT_CAM, source="reid_solo")
+        reg.bind_plate_to_slot("B17", "ERS-7949", SLOT_CAM, source="ocr")
+
+        assert "B19" not in reg._locked_slots
+        assert reg.take_released_slots() == ["B19"]
+        assert reg.take_released_slots() == []      # drained once
+
+    def test_a_solo_bind_is_still_correctable_by_ocr(self, registry):
+        """Claiming the slot must NOT make it look OCR-confirmed."""
+        reg = registry
+        s = _add(reg, "GUESSED", [(GATE_CAM, _vec(1, 0, 0))])
+        reg.bind_plate_to_slot("B14", "GUESSED", SLOT_CAM, source="reid_solo")
+        assert s.ocr_confirmed is False

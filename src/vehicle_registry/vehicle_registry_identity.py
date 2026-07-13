@@ -4007,6 +4007,15 @@ class VehicleRegistryIdentityMixin:
 
         return False, "", {}
 
+    def take_released_slots(self) -> List[str]:
+        """Slots a relocating car vacated, drained once. The engine nulls their DB rows —
+        without this, parking_slots keeps the old row and the same car is reported in two
+        places."""
+        with self._lock:
+            released = sorted(getattr(self, "_released_slots", set()) or set())
+            self._released_slots = set()
+        return released
+
     def _is_plate_locked_elsewhere(self, plate: str, slot_id: Optional[str]) -> bool:
         if not getattr(
             self._matching_config, "exclude_plates_locked_elsewhere", True
@@ -4695,10 +4704,17 @@ class VehicleRegistryIdentityMixin:
             # If this car was parked somewhere else, release that slot first —
             # a car cannot occupy two slots, and a stale link would keep the old
             # slot showing this plate forever.
+            #
+            # Releasing it in MEMORY is not enough: parking_slots keeps the old row, and
+            # /api/slots then reports the same car in two places. Record the release so
+            # the engine can null the DB row on its next sync tick.
             for other_slot, parked in list(self._parked.items()):
                 if other_slot != slot_id and parked is session:
                     self._parked.pop(other_slot, None)
                     self._locked_slots.discard(other_slot)
+                    if not hasattr(self, "_released_slots"):
+                        self._released_slots = set()
+                    self._released_slots.add(other_slot)
 
             session.status = "parked"
             session.linked_slot = slot_id
@@ -4710,10 +4726,17 @@ class VehicleRegistryIdentityMixin:
             if read:
                 session.ocr_confirmed = True  # it was READ, not guessed
             self._parked[slot_id] = session
-            # Only a READ plate freezes the slot. A solo (appearance) bind stays
-            # correctable — it is a best guess, and OCR must be able to overrule it.
-            if read:
-                self._locked_slots.add(slot_id)
+
+            # A slot CLAIMS a car whatever named it — that is what mutual exclusion reads,
+            # and one car still cannot be in two slots. Leaving solo binds out of
+            # _locked_slots (on the reasoning that only a READ plate should "freeze")
+            # conflated two different ideas and broke the contract: ERS-7949 ended up bound
+            # to B17 AND B19 at once, because B17 could not see that B19 already held it.
+            #
+            # "Correctable by OCR" is a SEPARATE property, and it lives on the state
+            # machine (bind_identity(lock=...)) and on parking_slots.plate_locked — not
+            # here. A solo bind is still correctable; it is just no longer invisible.
+            self._locked_slots.add(slot_id)
             self._gallery_index_upsert(session)
             return True
 

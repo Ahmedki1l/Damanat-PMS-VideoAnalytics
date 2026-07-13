@@ -422,6 +422,12 @@ class ParkingEngineRuntimeMixin:
         # car already parked on a camera we don't own is excluded as a candidate here.
         self._refresh_external_plate_locks()
 
+        # A car that relocated released its previous slot in memory; null that slot's DB
+        # row too, or /api/slots reports the same car in two places.
+        for slot_id in self.vehicle_registry.take_released_slots():
+            if self.db_manager:
+                self._persist_slot_plate_binding(slot_id, None, 0.0, False, "")
+
         rows = self._open_session_rows()
         if rows is None:
             rows = []
