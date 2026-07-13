@@ -1,46 +1,3 @@
-# =============================================================================
-# Dockerfile.multiprocess - PROPOSAL
-#
-# Adapts the existing single-process Dockerfile to run the PER-PROCESS camera
-# groups via the Python supervisor (`main.py --supervise --foreground`) instead
-# of one `python main.py --api`. This is the scaling lever: 5 processes = 5 concurrent
-# inference workers, vs one serial worker sharing ~2 inferences/sec over all 26
-# cameras.
-#
-# The supervisor is one PID-1 parent that spawns/supervises the 5 group
-# processes, mirrors their logs to stdout (docker logs), and forwards SIGTERM on
-# `docker stop`. Cores are partitioned SOFTLY via per-group *_NUM_THREADS caps
-# (BLAS/OpenMP/OpenVINO), sized from the cores this container is actually allowed
-# (sched_getaffinity) — NOT hard taskset pinning, so no util-linux is needed.
-#
-# To adopt:   mv Dockerfile.multiprocess Dockerfile
-#
-# Diffs vs the current Dockerfile:
-#   * runtime stage installs `procps` (ps/kill niceties for the supervisor).
-#   * ENTRYPOINT launches `main.py --supervise --foreground` (the PID-1
-#     supervisor) instead of `main.py --api`.
-#   * Pass extra launcher flags at run time via RUN_ALL_ARGS — the supervisor
-#     accepts --reset-plates and --port (e.g. RUN_ALL_ARGS="--reset-plates").
-#
-# RUN IT (constrain the container's cores; the supervisor reads the cpuset mask
-# and slices the thread budget to match, so no host-core assumptions):
-#   docker run --cpuset-cpus=0-15 -p 8000:8000 \
-#     -e RUN_ALL_ARGS="" <image>
-#   # ANPR server must POST to http://<host>:8000/api/anpr/event
-#
-# PERF LOGGING (docker logs, prefixed per group e.g. `[group2] [PERF] ...`):
-#   the effective-FPS summary prints on its own; add per-stage timings with
-#   docker run -e PERF_TRACE=1 -e PERF_TRACE_EVERY=50 ... <image>
-#
-# !! ODBC DRIVER MISMATCH TO RESOLVE !!
-#   This installs msodbcsql18, but config.yaml's DATABASE_URL says
-#   "ODBC Driver 17 for SQL Server". The driver name in the connection string
-#   MUST match the installed package or pyodbc fails at connect. Either:
-#     (a) change config.yaml to "ODBC Driver 18 for SQL Server" (keep
-#         TrustServerCertificate=yes - Driver 18 defaults to Encrypt=yes), or
-#     (b) swap msodbcsql18 -> msodbcsql17 below.
-# =============================================================================
-
 # =========================
 # Stage 1: Builder
 # =========================
@@ -48,7 +5,7 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Build deps (unixodbc-dev for pyodbc, git for any VCS installs).
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
@@ -56,23 +13,31 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# Create virtual environment
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# Upgrade pip tools
 RUN pip install --upgrade pip setuptools wheel
 
-# Install in dependency order (numpy<2 first, then the heavy native wheels) so
-# layers cache well and pip does not resolve to a GPU torch build.
+# Install core dependencies FIRST (important ترتيب)
 RUN pip install --no-cache-dir "numpy<2.0.0"
 RUN pip install --no-cache-dir Cython scipy
 RUN pip install --no-cache-dir opencv-python-headless
+
+# Install PyTorch CPU
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
+# Copy requirements
 COPY requirements.txt .
 
-# Stable torchreid (legacy ReID fallback only; production ReID is OpenVINO).
+# 🔥 IMPORTANT: استخدم نسخة stable بدل Git
 RUN pip install --no-cache-dir torchreid==0.2.5
+
+# Install build-heavy dependencies separately to cache layers
 RUN pip install --no-cache-dir "lap>=0.5.12" "openvino>=2024.0.0"
+
+# Install remaining requirements
 RUN pip install --no-cache-dir -r requirements.txt
 
 
@@ -83,13 +48,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Runtime deps:
-#   curl/gnupg   - MS repo key + health checks
-#   unixodbc     - pyodbc runtime
-#   libgl1 etc.  - opencv-python-headless shared libs
-#   procps       - ps/kill niceties for the foreground supervisor
-# (No util-linux/taskset: the supervisor partitions cores softly via
-#  *_NUM_THREADS, not hard CPU pinning.)
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
@@ -97,28 +56,22 @@ RUN apt-get update && apt-get install -y \
     libxcb1 \
     libgl1 \
     libglib2.0-0 \
-    procps \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
     > /etc/apt/sources.list.d/mssql-release.list \
     && apt-get update \
-    && ACCEPT_EULA=Y apt-get install -y msodbcsql18 \
+    && ACCEPT_EULA=Y apt-get install -y msodbcsql17 msodbcsql18 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Bring the prebuilt venv over; put it first on PATH so `python` resolves to it
-# (the baked /app/.venv is excluded via .dockerignore and would not exist
-# anyway). The supervisor spawns workers with sys.executable, so children
-# inherit this same interpreter.
+# Copy virtual environment
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Line-buffer stdout. Every worker's stdout is a FILE (supervisor.py redirects
-# it, then tails it back to PID 1), and Python block-buffers 8KB to a non-tty —
-# so without this the `[INFO] effective FPS/camera` and `[PERF]` lines sit in the
-# buffer for minutes and `docker logs` looks dead. The supervisor copies its env
-# to the children, so setting it here covers all 5 groups.
+# Line-buffer stdout: docker hands the process a pipe, not a tty, and Python
+# block-buffers 8KB to a pipe — so without this the `[INFO] effective FPS/camera`
+# and `[PERF]` lines only reach `docker logs` in delayed bursts.
 ENV PYTHONUNBUFFERED=1
 
 # Per-stage timing (roi/clahe/infer/zones/assign/slot + the decode meter) is
@@ -127,15 +80,14 @@ ENV PYTHONUNBUFFERED=1
 # The effective-FPS summary is always on and needs nothing.
 ENV PERF_TRACE=0
 
+# Copy app code
 COPY . .
 
-# The API host group listens here; the external ANPR/ramp/Park_Entry server
-# POSTs to :8000. Publish it and open the host firewall.
 EXPOSE 8000
 
-# Hand off to the Python supervisor as PID 1. `main.py --supervise --foreground`
-# spawns/supervises the 5 groups, mirrors their logs to stdout (docker logs),
-# and forwards SIGTERM on `docker stop`. Extra launcher flags via RUN_ALL_ARGS,
-# e.g. -e RUN_ALL_ARGS="--reset-plates". (sh -c wraps it only so RUN_ALL_ARGS
-# expands; exec makes python the actual PID 1 that receives docker stop.)
-ENTRYPOINT ["sh", "-c", "exec python main.py --supervise --foreground ${RUN_ALL_ARGS:-}"]
+# Same geometry seed as the single-process image; the only difference is the
+# final exec — the Python supervisor (`--supervise --foreground`) runs as PID 1
+# and spawns/supervises the 5 camera groups instead of one `main.py --api`. It
+# mirrors each group's logs to stdout and forwards SIGTERM on `docker stop`.
+# Extra launcher flags via RUN_ALL_ARGS, e.g. -e RUN_ALL_ARGS="--reset-plates".
+ENTRYPOINT ["sh", "-c", "if [ \"${SEED_GEOMETRY_ON_START:-true}\" = true ] && [ -f \"${GEOMETRY_FILE:-geometry.json}\" ]; then echo '[entrypoint] seeding geometry into empty tables...'; python tools/sync_geometry.py seed --in \"${GEOMETRY_FILE:-geometry.json}\" --if-empty || echo '[entrypoint] geometry seed skipped (continuing)'; fi; exec python main.py --supervise --foreground ${RUN_ALL_ARGS:-}"]
