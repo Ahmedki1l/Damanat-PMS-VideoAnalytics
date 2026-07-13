@@ -263,7 +263,7 @@ class MatchingConfig:
     # gate references while a DIFFERENT car scored 0.634. That path stamped RDJ-9640 onto
     # B1_CRO (which held DJS-7842) and tore RDJ-9640's plate off its real slot in the
     # same move. OCR reads the characters off the car instead, and binds only what
-    # exactly one car inside can explain � so current_plate is CORRECT or NULL, never
+    # exactly one car inside can explain � so current_plate is CORRECT or NULL, never
     # wrong. Set False to restore the old appearance-based binding.
     # Default False so the library's legacy behaviour is unchanged; production opts IN
     # via config.yaml. (Flipping the dataclass default silently rewires every caller and
@@ -272,7 +272,7 @@ class MatchingConfig:
     # THE TRANSIT HOP. Every car entering this facility passes CAM-20, which reads plates
     # reliably. A camera that CANNOT read one (CAM-21 is mounted side-on to its aisle and
     # has produced zero reads, parked or moving) adopts the identity of the single car
-    # that was READ moments ago and has not parked yet � then captures the SIDE-VIEW
+    # that was READ moments ago and has not parked yet � then captures the SIDE-VIEW
     # reference the gallery has never had. From that car's second visit, ReID matches
     # side-vs-side (~0.9) and this hop is never needed again.
     slot_acquire_by_ocr_transit: bool = True
@@ -322,6 +322,51 @@ class MatchingConfig:
     # secondary (conservative default). Set weight = 1.0 for uniform/legacy.
     ground_truth_cameras: tuple = ("ANPR", "ANPR-Entry", "ANPR-Exit", "CAM-23", "CAM-03")
     secondary_camera_weight: float = 0.6
+
+    # ...with ONE exception, on the slot path. When identifying a car parked in a slot,
+    # a reference captured by THAT SAME slot camera is not an oblique guess — it is the
+    # car photographed in the very pose we are looking at, taught by an earlier
+    # OCR-confirmed park (save_parked_reference). At 0.6 a car's own parked pose (cosine
+    # ~0.9 -> 0.54) loses to a DIFFERENT car's full-weight gate photo, so the car cannot
+    # be recognised even on a return visit.
+    #
+    # But it must NOT go to 1.0 either. The boost is symmetric — it lifts every
+    # candidate's same-camera refs, including the regulars who park at this camera daily
+    # — and same-view similarity between DIFFERENT cars (~0.66) exceeds cross-view
+    # similarity for the SAME car (~0.55). At full weight those regulars outrank a car
+    # that has never parked here. Suppressing that is what the 0.6 discount was FOR.
+    #
+    # Swept on the live 34-car gallery, 2026-07-13 (263 real parked-pose queries), with
+    # the query crop withheld. WARM = the car has parked at this camera before;
+    # COLD = it never has:
+    #     weight   WARM rank-1   COLD rank-1
+    #     0.60         98.5%        87.8%    <- old behaviour (no special case)
+    #     0.70        100.0%        87.8%
+    #     0.80        100.0%        87.8%    <- chosen: full warm gain, zero cold cost
+    #     0.90        100.0%        87.5%
+    #     1.00        100.0%        87.5%    <- naive "full weight"; costs cold for nothing
+    # 0.80 sits mid-plateau, so neither bound is near a cliff. Re-derive on any ReID
+    # model swap — PS_matcher V2's cosine scale is not V1's.
+    # Slot path only; the gate/global path keeps the plain 0.6, where it is load-bearing.
+    slot_camera_ref_weight: float = 0.80
+
+    # A candidate VA has never photographed cannot be matched — it can only collide.
+    # VA hydrates a session for every open parking_sessions row, and the ANPR gate
+    # misreads: 2026-07-13, 18 of 51 "cars inside" had no gallery folder because they
+    # are mis-OCR'd spellings of real plates (BJA-7842 / DJA-7842 next to the real
+    # DJS-7842). confirm_plate() matches on the DIGIT RUN and abstains on ambiguity, so
+    # those phantoms turn a perfect read of DJS-7842 into a 3-way tie -> slot stays NULL.
+    # Require appearance evidence (a gallery reference) before a plate may be an OCR
+    # candidate. The ReID path is already immune — a phantom has no vector, so it is
+    # never scored — this closes the plates_inside() fallback.
+    candidates_require_appearance_evidence: bool = True
+
+    # A car cannot occupy two slots. Drop candidates already locked into a DIFFERENT
+    # slot before the shortlist is truncated, so rank-6 promotes into the top-5 — the
+    # gate can only ADD the right car to the candidate set, never remove it. Measured
+    # 2026-07-13: this alone accounts for ~9 of the 34 cold rank-1 errors (TRS-9117 in
+    # B5 kept losing to HSR-8327, which was already locked into B26).
+    exclude_plates_locked_elsewhere: bool = True
 
     # Legacy multi-feature fallback path (image_matcher.VehicleImageMatcher).
     legacy_color_fallback: float = 0.35
@@ -797,6 +842,16 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             cm.ground_truth_cameras = tuple(m.get("ground_truth_cameras") or ())
         cm.secondary_camera_weight = m.get(
             "secondary_camera_weight", cm.secondary_camera_weight
+        )
+        cm.slot_camera_ref_weight = m.get(
+            "slot_camera_ref_weight", cm.slot_camera_ref_weight
+        )
+        cm.exclude_plates_locked_elsewhere = m.get(
+            "exclude_plates_locked_elsewhere", cm.exclude_plates_locked_elsewhere
+        )
+        cm.candidates_require_appearance_evidence = m.get(
+            "candidates_require_appearance_evidence",
+            cm.candidates_require_appearance_evidence,
         )
 
         # HSV tolerances

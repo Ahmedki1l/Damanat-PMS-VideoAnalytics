@@ -152,6 +152,13 @@ class VehicleRegistry(
         # refused by the relocate / stale-release / theft paths in
         # try_link_to_slot until it is explicitly unlocked (slot goes VACANT).
         self._locked_slots: set[str] = set()
+        # Plate locks held by OTHER worker processes. The supervisor runs several
+        # engines, each with its own registry, so a car locked into a slot on a camera
+        # this worker doesn't own is invisible here — yet it is exactly the candidate
+        # that must be excluded (a car cannot be in two slots). parking_slots is the
+        # shared truth; this mirror is refreshed on the existing session-sync tick.
+        # plate -> {slot_id, camera_id, locked_at}
+        self._external_plate_locks: Dict[str, Dict[str, Any]] = {}
         self._history: List[VehicleSession] = []
 
         # Zoning: area_id → {session_id} for the bounded (per-area) candidate
@@ -293,6 +300,23 @@ class VehicleRegistry(
         consults the index when the feature flag is True.
         """
         return self._gallery_index
+
+    # --- Cross-worker plate locks --------------------------------------- #
+    def set_external_plate_locks(self, locks: Dict[str, Dict[str, Any]]) -> None:
+        """Replace this worker's view of the plate locks held across the whole system.
+
+        Read from ``parking_slots`` (the shared truth) on the session-sync tick, so a car
+        locked into a slot by ANOTHER worker process still gets excluded as a candidate
+        here. Whole-map replace rather than merge: a slot that has gone vacant must
+        disappear, and a stale lock is worse than a missing one — it would keep vetoing
+        the right car.
+        """
+        with self._lock:
+            self._external_plate_locks = dict(locks or {})
+
+    def get_external_plate_locks(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return dict(self._external_plate_locks)
 
     # --- Zoning: per-area session index -------------------------------- #
     def set_session_area(self, session: VehicleSession, area_id: str) -> None:

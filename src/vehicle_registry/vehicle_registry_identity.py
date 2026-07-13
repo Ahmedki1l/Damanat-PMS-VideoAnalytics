@@ -1,8 +1,9 @@
 import logging
 import os
 import uuid
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -11,6 +12,44 @@ from src.matching.plate_ocr_match import confirm_plate
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RankedCandidate:
+    """One car ReID thinks the query crop might be, with the evidence behind it.
+
+    ``score`` is what the ranking sorts on. ``same_view_score`` is the part that comes
+    from a reference taught by the SAME camera that is now looking at the car — a car
+    that has parked here before. It is broken out because a warm match is much stronger
+    evidence than a cold one (measured: warm rank-1 100%, cold 87.8%), and the decision
+    layer and the ranker both need to tell them apart.
+    """
+
+    plate: str
+    session_id: str
+    score: float
+    same_view_score: float
+    cross_view_score: float
+    warm: bool
+    rank: int
+    session: Any = None  # live VehicleSession; never serialised
+
+
+@dataclass(frozen=True)
+class RejectedCandidate:
+    """A candidate a deterministic rule threw out, and why.
+
+    Kept rather than silently dropped: the reason code is what makes a decision
+    auditable, and the rejects are what let us MEASURE whether a rule earns its keep
+    instead of assuming it does.
+    """
+
+    plate: str
+    session_id: str
+    raw_rank: int
+    score: float
+    reason: str
+    detail: Dict[str, Any] = field(default_factory=dict)
 
 # Legacy module-level flag retained for backward compatibility — Phase 2
 # cleanup drops ``REID_USE_LAB_CLAHE`` and ``REID_USE_MULTISHOT`` from this
@@ -2416,6 +2455,66 @@ class VehicleRegistryIdentityMixin:
                 best = score
         return best
 
+    def _slot_pose_score(self, query_vector, session, slot_camera: str):
+        """Score a PARKED-CAR query against a session's gallery, for the slot path.
+
+        Identical to :meth:`_best_weighted_score` except that a reference captured by
+        ``slot_camera`` itself is weighted by ``slot_camera_ref_weight`` (0.80) rather
+        than the ordinary ``secondary_camera_weight`` (0.60). Such a reference is the car
+        photographed in the exact pose we are now looking at, taught by an earlier
+        OCR-confirmed park (``save_parked_reference``), and at 0.60 a car's own parked
+        pose loses to a different car's full-weight gate photo — so it can never be
+        recognised on a return visit.
+
+        The uplift stops short of full weight on purpose: it applies to EVERY candidate,
+        so it also lifts the regulars who park at this camera daily, and a same-view match
+        between two *different* cars outscores a cross-view match on the *same* car. See
+        the swept table on ``MatchingConfig.slot_camera_ref_weight`` — 1.0 buys nothing
+        over 0.80 on warm and costs accuracy on cold.
+
+        Returns ``(score, same_view, cross_view)``:
+          * ``same_view``  — best RAW (unweighted) similarity over refs from
+            ``slot_camera``; 0.0 if this car has never parked here. Non-zero = "warm".
+          * ``cross_view`` — the ordinary weighted score over everything else.
+          * ``score``      — what the ranking sorts on.
+
+        The parts are returned separately because they are not interchangeable evidence:
+        a warm match is far stronger than a cold one (rank-1 100% vs 88%), and both the
+        decision gate and the ranker need to tell them apart.
+        """
+        if query_vector is None:
+            return 0.0, 0.0, 0.0
+
+        same_w = float(
+            getattr(self._matching_config, "slot_camera_ref_weight", 0.80) or 0.80
+        )
+
+        same_view = 0.0     # raw, unweighted — the evidence, not the vote
+        cross_view = 0.0    # weighted
+        best = 0.0          # what we rank on
+
+        primary = getattr(session, "feature_vector", None)
+        if primary is not None:
+            cross_view = self.reid_matcher.compute_similarity(query_vector, primary)
+            best = cross_view
+
+        refs = getattr(session, "reference_feature_vectors", None) or []
+        cams = getattr(session, "reference_source_cameras", None) or []
+        for i, ref in enumerate(refs):
+            if ref is None:
+                continue
+            cam = cams[i] if i < len(cams) else ""
+            sim = self.reid_matcher.compute_similarity(query_vector, ref)
+            if slot_camera and cam == slot_camera:
+                same_view = max(same_view, sim)
+                best = max(best, sim * same_w)
+            else:
+                weighted = sim * self._reference_weight(cam)
+                cross_view = max(cross_view, weighted)
+                best = max(best, weighted)
+
+        return best, same_view, cross_view
+
     @staticmethod
     def _temporally_eligible(session, anchor: Optional[datetime]) -> bool:
         """Temporal entry gate shared by both identity-match forks.
@@ -3802,23 +3901,218 @@ class VehicleRegistryIdentityMixin:
             session = self._parked.get(slot_id)
             return bool(session.ocr_confirmed) if session is not None else False
 
-    def plates_inside(self) -> List[str]:
+    @staticmethod
+    def _has_appearance_evidence(session) -> bool:
+        """Has VA ever actually SEEN this car — does it hold any image of it?
+
+        A session hydrated from PMS-AI's ``parking_sessions`` carries a plate and nothing
+        else. When that plate is an ANPR misread it names a car that does not exist, and
+        VA has no photo of it because there is nothing to photograph.
+        """
+        if getattr(session, "feature_vector", None) is not None:
+            return True
+        return bool(getattr(session, "reference_feature_vectors", None))
+
+    def plates_inside(self, require_appearance: Optional[bool] = None) -> List[str]:
         """Every plate VA believes is currently inside the facility.
 
         VA's OWN view (plated sessions in memory), not PMS-AI's parking_sessions table —
         on 2026-07-11 that table stopped receiving rows entirely while cars kept driving
         in.
 
-        NOTE this is the FALLBACK candidate set, used only when ReID cannot shortlist
-        (no query vector). Matching OCR against the whole facility is what poisoned the
-        gallery on 2026-07-12 — see :meth:`reid_shortlist`.
+        **Phantom plates are excluded.** VA hydrates a session for every open
+        ``parking_sessions`` row, and the ANPR gate misreads: measured 2026-07-13, 18 of
+        51 "cars inside" had no gallery folder because they are not cars — they are
+        mis-OCR'd spellings of real ones (``BJA-7842``/``DJA-7842`` alongside the real
+        ``DJS-7842``). They cannot be matched, because there is no photo of a car that
+        does not exist; all they can do is collide. ``confirm_plate`` matches on the DIGIT
+        RUN and abstains when a read fits more than one candidate, so those two phantoms
+        turn a *perfect* read of ``DJS-7842`` into a three-way tie and the slot stays
+        NULL. A candidate VA has never seen can only ever subtract.
+
+        NOTE this is the FALLBACK candidate set, used only when ReID cannot shortlist (no
+        query vector). Matching OCR against the whole facility is what poisoned the
+        gallery on 2026-07-12 — see :meth:`reid_shortlist`. The ReID path is already
+        immune (a phantom has no vector, so it is never scored); this closes the fallback.
         """
+        if require_appearance is None:
+            require_appearance = bool(
+                getattr(
+                    self._matching_config,
+                    "candidates_require_appearance_evidence",
+                    True,
+                )
+            )
         with self._lock:
             return sorted(
-                {s.plate for s in self._sessions.values() if s.plate}
+                {
+                    s.plate
+                    for s in self._sessions.values()
+                    if s.plate
+                    and (not require_appearance or self._has_appearance_evidence(s))
+                }
             )
 
-    def reid_shortlist(self, crop_bgr, k: int = GLOBAL_MATCH_RANK) -> List[str]:
+    def _is_locked_elsewhere(self, session, slot_id: Optional[str]):
+        """Is this car already parked-and-locked in a DIFFERENT slot?
+
+        A car cannot occupy two slots, so such a session is not the car we are looking
+        at — no matter how much it resembles it. This is the cheapest and most reliable
+        non-appearance signal available, and it kills a whole class of look-alike error:
+        measured 2026-07-13, TRS-9117 in B5 (CAM-08) was consistently outranked by
+        HSR-8327, which was already locked into B26 on another camera.
+
+        Two sources, because a slot on another camera may be owned by another worker
+        process (the supervisor runs several) and this registry cannot see its sessions:
+          * LOCAL  — ``self._locked_slots`` / ``self._parked``, this worker's own binds.
+          * DB     — ``_external_plate_locks``, refreshed from ``parking_slots`` on the
+            existing session-sync tick.
+
+        Returns ``(locked, reason, detail)``; ``locked`` False means keep the candidate.
+        """
+        plate = getattr(session, "plate", None)
+        if not plate:
+            return False, "", {}
+        return self._locked_elsewhere_reason(
+            plate, slot_id, linked_slot=getattr(session, "linked_slot", None)
+        )
+
+    def _locked_elsewhere_reason(
+        self, plate: str, slot_id: Optional[str], linked_slot: Optional[str] = None
+    ):
+        """The rule itself, keyed by plate so both the ReID path and the
+        ``plates_inside`` fallback can share it. Returns ``(locked, reason, detail)``."""
+        if not plate:
+            return False, "", {}
+
+        if linked_slot and linked_slot != slot_id and linked_slot in self._locked_slots:
+            return True, "LOCKED_ELSEWHERE_LOCAL", {"locked_slot": linked_slot}
+
+        lock = (getattr(self, "_external_plate_locks", None) or {}).get(plate)
+        if lock and lock.get("slot_id") and lock.get("slot_id") != slot_id:
+            # ...unless the car has since left and driven back in. The lock is then a
+            # ghost of the previous visit, and the car really is parking again, in a new
+            # slot. Deliberately NOT a TTL: a car parked overnight holds a 12-hour-old
+            # lock that is perfectly valid, and a TTL would silently un-exclude it.
+            locked_at = lock.get("locked_at")
+            if locked_at is not None:
+                entered_at = self.last_anpr_entry_at(plate)
+                if entered_at is not None and entered_at > locked_at:
+                    return False, "", {}
+            return True, "LOCKED_ELSEWHERE_DB", {
+                "locked_slot": lock.get("slot_id"),
+                "locked_camera": lock.get("camera_id"),
+                "locked_at": locked_at,
+            }
+
+        return False, "", {}
+
+    def _is_plate_locked_elsewhere(self, plate: str, slot_id: Optional[str]) -> bool:
+        if not getattr(
+            self._matching_config, "exclude_plates_locked_elsewhere", True
+        ):
+            return False
+        locked, _reason, _detail = self._locked_elsewhere_reason(plate, slot_id)
+        return locked
+
+    def reid_rank(
+        self,
+        query_vector,
+        *,
+        slot_id: Optional[str] = None,
+        slot_camera: Optional[str] = None,
+        k: int = GLOBAL_MATCH_RANK,
+        apply_mutual_exclusion: bool = True,
+    ):
+        """Rank every plausible car for a query vector, WITH its scores.
+
+        This is :meth:`reid_shortlist` with the reasoning left in. The shortlist throws
+        the scores away and returns bare plates, which is why nothing downstream could
+        ever say *how sure* it was, and why no training data existed: the losing
+        candidates — the hard negatives — vanished at the return statement.
+
+        Two things happen here that the plain scan did not do:
+
+        * **Scoring is slot-aware.** With ``slot_camera``, a reference taught by that same
+          camera scores at full weight (see :meth:`_slot_pose_score`) instead of taking
+          the secondary-camera discount meant for oblique guesses.
+
+        * **Rejects come out before the top-k slice**, not after. That ordering matters:
+          dropping a locked-elsewhere car PROMOTES rank-6 into the shortlist, so the gate
+          can only ever ADD the right car to the candidate set. It cannot turn a correct
+          bind into a wrong one.
+
+        Returns ``(kept, rejected)``. ``kept`` is the top-k surviving
+        :class:`RankedCandidate`, best first, re-ranked 1..k. ``rejected`` carries the
+        reason each excluded candidate was dropped, for the decision log.
+        """
+        if query_vector is None:
+            return [], []
+
+        use_pose = bool(slot_camera)
+
+        scored: List[RankedCandidate] = []
+        with self._lock:
+            for s in self._sessions.values():
+                if not s.plate or s.feature_vector is None:
+                    continue
+                if use_pose:
+                    score, same_view, cross_view = self._slot_pose_score(
+                        query_vector, s, slot_camera
+                    )
+                else:
+                    score = self._best_weighted_score(query_vector, s)
+                    same_view, cross_view = 0.0, score
+                scored.append(
+                    RankedCandidate(
+                        plate=s.plate,
+                        session_id=s.session_id,
+                        score=float(score),
+                        same_view_score=float(same_view),
+                        cross_view_score=float(cross_view),
+                        warm=bool(same_view > 0.0),
+                        rank=0,
+                        session=s,
+                    )
+                )
+
+            scored.sort(key=lambda c: c.score, reverse=True)
+
+            kept: List[RankedCandidate] = []
+            rejected: List[RejectedCandidate] = []
+            for raw_rank, cand in enumerate(scored, start=1):
+                if apply_mutual_exclusion and getattr(
+                    self._matching_config, "exclude_plates_locked_elsewhere", True
+                ):
+                    locked, reason, detail = self._is_locked_elsewhere(
+                        cand.session, slot_id
+                    )
+                    if locked:
+                        rejected.append(
+                            RejectedCandidate(
+                                plate=cand.plate,
+                                session_id=cand.session_id,
+                                raw_rank=raw_rank,
+                                score=cand.score,
+                                reason=reason,
+                                detail=detail,
+                            )
+                        )
+                        continue
+                kept.append(replace(cand, rank=len(kept) + 1))
+                if len(kept) >= k:
+                    break
+
+        return kept, rejected
+
+    def reid_shortlist(
+        self,
+        crop_bgr,
+        k: int = GLOBAL_MATCH_RANK,
+        *,
+        slot_id: Optional[str] = None,
+        slot_camera: Optional[str] = None,
+    ) -> List[str]:
         """The top-k plates ReID considers plausible for this crop.
 
         REID NARROWS, OCR CONFIRMS. This is the candidate set OCR is allowed to pick
@@ -3832,13 +4126,15 @@ class VehicleRegistryIdentityMixin:
         Appearance would have vetoed that instantly: a Range Rover is nowhere near a
         Porsche in ReID space, so EEB-80 would never appear in its top-5. Two independent
         witnesses must now agree — the car must LOOK like the candidate (ReID) AND its
-        plate must READ as the candidate (OCR). Either alone is demonstrably unsafe:
-        ReID at the slot ranks the wrong car first (0.634 vs 0.583), and OCR alone
-        collides on short plates.
+        plate must READ as the candidate (OCR). Either alone is demonstrably unsafe, and
+        OCR alone collides on short plates.
 
-        Note ReID only has to place the right car in the TOP FIVE — not first. That is a
-        far weaker requirement than the one it fails at, and it is what lets this work
-        even before a car has a parked-pose reference.
+        Note ReID only has to place the right car in the TOP FIVE, not first — and it
+        does: measured 2026-07-13 on the live gallery, recall@5 is 97.7% cold even
+        though rank-1 is only 87.8%. That gap is exactly why the shortlist is the
+        contract here, and why a bare top-1 is not trusted on its own.
+
+        Thin wrapper over :meth:`reid_rank` — use that directly when you need the scores.
         """
         if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
             return []
@@ -3846,35 +4142,33 @@ class VehicleRegistryIdentityMixin:
             q = self.reid_matcher.extract_feature(crop_bgr)
         except Exception:
             return []
-        if q is None:
-            return []
-        with self._lock:
-            scored = [
-                (self._best_weighted_score(q, s), s.plate)
-                for s in self._sessions.values()
-                if s.plate and s.feature_vector is not None
-            ]
-        scored.sort(reverse=True)
-        return [plate for _score, plate in scored[:k]]
+        kept, _rejected = self.reid_rank(
+            q, slot_id=slot_id, slot_camera=slot_camera, k=k
+        )
+        return [c.plate for c in kept]
 
-    def try_ocr_identify_slot(self, slot_id: str, crop_bgr) -> Optional[str]:
+    def try_ocr_identify_slot(
+        self, slot_id: str, crop_bgr, camera_id: Optional[str] = None
+    ) -> Optional[str]:
         """READ the plate off a parked car and bind it — no prior binding needed.
 
-        This is the only mechanism that can fill ``parking_slots.current_plate``
-        CORRECTLY. The alternatives were measured on 2026-07-11 and both fail:
+        REID NARROWS, OCR CONFIRMS: appearance proposes a shortlist, and the plate read
+        off the car picks exactly one of them. Two independent witnesses must agree.
+        Neither is trusted alone — OCR alone collides on short plates (a Range Rover's
+        read "confirmed" EEB-80 and poisoned a Porsche's gallery on 2026-07-12), and a
+        bare ReID top-1 is right only 87.8% of the time cold.
 
-          * ReID at the slot: a car scored 0.583 against its OWN gate references while a
-            DIFFERENT car scored 0.634. The ranking is INVERTED, so no threshold helps —
-            a looser bar binds the WRONG plate.
-          * Acquisition by elimination: bound DJS-7842 onto a stranger's Nissan Sunny
-            that had merely been parked, unidentified, for hours.
+        Bind only when the read confirms exactly one shortlisted car; otherwise leave the
+        slot NULL. ``current_plate`` must be CORRECT or NULL — a visible gap is fine, a
+        stranger's plate is a liability.
 
-        OCR does not infer, it reads. Bind only when the read confirms exactly one car
-        that VA believes is inside; otherwise leave the slot NULL. ``current_plate`` must
-        be CORRECT or NULL — a visible gap is fine, a stranger's plate is a liability.
+        ``camera_id`` is the camera looking at the slot. Passing it lets the ranking
+        recognise a reference this same camera taught on an earlier park (the car's own
+        parked pose) and score it at full weight instead of discounting it as an oblique
+        secondary view — worth +1.5pt of rank-1 on cars that have parked here before.
 
         Distinct from :meth:`try_ocr_confirm_slot`, which only CONFIRMS a plate already
-        bound by ReID and cannot identify a car from nothing.
+        bound and cannot identify a car from nothing.
         """
         existing = self.get_slot_plate(slot_id)
         if existing:
@@ -3905,9 +4199,18 @@ class VehicleRegistryIdentityMixin:
         # REID NARROWS, OCR CONFIRMS. The candidate set is what the car LOOKS like, not
         # every plate in the building. This is what stops a Range Rover's read from
         # confirming a Porsche's plate on a two-digit collision.
-        candidates = self.reid_shortlist(crop_bgr)
+        candidates = self.reid_shortlist(
+            crop_bgr, slot_id=slot_id, slot_camera=camera_id
+        )
         if not candidates:
-            candidates = self.plates_inside()  # ReID unavailable — degrade, don't guess
+            # ReID unavailable — degrade, don't guess. Still drop cars parked elsewhere:
+            # this fallback matched against EVERY plate inside and is the path that let
+            # the 2026-07-12 poisoning through.
+            candidates = [
+                p
+                for p in self.plates_inside()
+                if not self._is_plate_locked_elsewhere(p, slot_id)
+            ]
         plate = confirm_plate(ocr_text, candidates)
         if not plate:
             logger.info(
@@ -4032,6 +4335,11 @@ class VehicleRegistryIdentityMixin:
             if session is not None and feature is not None:
                 session.reference_feature_vectors.append(feature)
                 self._sync_reference_cameras(session)
+                # _sync_reference_cameras only PADS with "", so the ref would score as
+                # an unknown (secondary) camera until a restart reloaded it from disk —
+                # where save_ref did record camera_id. The slot-pose scorer keys off this
+                # tag to recognise a same-view reference, so it must be set here.
+                session.reference_source_cameras[-1] = camera_id or ""
                 self._gallery_index_upsert(session)
 
         logger.info(

@@ -418,6 +418,10 @@ class ParkingEngineRuntimeMixin:
             return
         self._session_sync_last_run_at = now_ts
 
+        # Refresh this worker's view of the plate locks held by every OTHER worker, so a
+        # car already parked on a camera we don't own is excluded as a candidate here.
+        self._refresh_external_plate_locks()
+
         rows = self._open_session_rows()
         if rows is None:
             rows = []
@@ -440,6 +444,37 @@ class ParkingEngineRuntimeMixin:
         if added:
             print(f"[INFO] Session sync: picked up {added} car(s) that entered "
                   f"after this worker started.")
+
+    def _refresh_external_plate_locks(self) -> None:
+        """Mirror ``parking_slots``' plate locks into the registry.
+
+        One small query on the tick that already opens a DB session, so this costs no
+        new polling and no new connection. Best-effort: on failure we keep the previous
+        map rather than clearing it — a momentarily stale lock is a far smaller problem
+        than suddenly un-excluding every parked car at once.
+        """
+        if not self.db_manager or not self.vehicle_registry:
+            return
+        session = self.db_manager.SessionLocal()
+        try:
+            from src.repositories import ParkingSlotRepository
+
+            locks = {}
+            for row in ParkingSlotRepository.get_plate_locks(session):
+                plate = (row.current_plate or "").strip()
+                if not plate:
+                    continue
+                locks[plate] = {
+                    "slot_id": row.slot_id,
+                    "camera_id": row.camera_id or "",
+                    "locked": bool(row.plate_locked),
+                    "locked_at": row.plate_locked_at,
+                }
+            self.vehicle_registry.set_external_plate_locks(locks)
+        except Exception as exc:
+            logger.debug("[plate-lock] external lock refresh failed: %r", exc)
+        finally:
+            session.close()
 
     def _exit_janitor_tick(self) -> None:
         """Once per `_EXIT_JANITOR_INTERVAL_S`, find plates VA still has in
@@ -966,6 +1001,12 @@ class ParkingEngineRuntimeMixin:
                         "slot_name": db_slot.slot_name or db_slot.slot_id,
                         "camera_id": db_slot.camera_id or "",
                     }
+                elif not db_slot.is_available:
+                    # Occupied, but we never learned who it is. Only vehicle_parked arms
+                    # the identity pass, and that transition already happened — before this
+                    # worker booted. Without arming here the slot stays anonymous until the
+                    # car leaves and someone else parks, which for a long-stay car is all day.
+                    self._arm_ocr_for_slot(db_slot.slot_id)
         except Exception as exc:
             print(f"[ERROR] Failed to load initial slot states from DB: {exc}")
         finally:
@@ -1123,7 +1164,7 @@ class ParkingEngineRuntimeMixin:
         self._ocr_id_attempts[slot.id] = attempts + 1
         self._ocr_id_last_at[slot.id] = now_ts
 
-        plate = self.vehicle_registry.try_ocr_identify_slot(slot.id, crop)
+        plate = self.vehicle_registry.try_ocr_identify_slot(slot.id, crop, cam_id)
         if not plate:
             return
 
