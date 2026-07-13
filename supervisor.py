@@ -150,10 +150,17 @@ def _reset_plates() -> None:
     print("[supervisor] reset complete.\n")
 
 
-def _tail_to_stdout(path: Path, label: str, stop: threading.Event) -> None:
-    """Mirror a child log file to this process's stdout, prefixed with the
-    group label — so `--foreground` (Docker PID 1) surfaces every group's
-    output in one stream. Best-effort; polls for the file to appear."""
+def _tail(path: Path, label: str, stop: threading.Event, stream=None) -> None:
+    """Mirror a child log file to this process's stdout (or stderr), prefixed
+    with the group label — so `--foreground` (Docker PID 1) surfaces every
+    group's output in one stream. Best-effort; polls for the file to appear.
+
+    Each group is tailed twice: its .out.log to our stdout, its .err.log to our
+    stderr. Tailing only stdout would silently swallow every worker traceback —
+    a group that dies on import would just vanish from `docker logs`, leaving
+    the fleet looking healthy minus one camera group.
+    """
+    out = stream if stream is not None else sys.stdout
     while not stop.is_set() and not path.exists():
         time.sleep(0.2)
     if not path.exists():
@@ -162,8 +169,8 @@ def _tail_to_stdout(path: Path, label: str, stop: threading.Event) -> None:
         while not stop.is_set():
             line = fh.readline()
             if line:
-                sys.stdout.write(f"[{label}] {line}")
-                sys.stdout.flush()
+                out.write(f"[{label}] {line}")
+                out.flush()
             else:
                 time.sleep(0.25)
 
@@ -234,12 +241,20 @@ def run(reset_plates: bool = False, foreground: bool = False,
             pf.write(f"{proc.pid}\n")
 
         if foreground:
-            t = threading.Thread(
-                target=_tail_to_stdout, args=(out_path, g["name"], stop_tail),
-                daemon=True,
-            )
-            t.start()
-            tail_threads.append(t)
+            # Two tails per group: stdout carries the [PERF]/effective-FPS lines,
+            # stderr carries the tracebacks. Both must reach PID 1 or `docker
+            # logs` shows a half-story.
+            for tail_path, tail_label, tail_stream in (
+                (out_path, g["name"], sys.stdout),
+                (err_path, f"{g['name']}:err", sys.stderr),
+            ):
+                t = threading.Thread(
+                    target=_tail,
+                    args=(tail_path, tail_label, stop_tail, tail_stream),
+                    daemon=True,
+                )
+                t.start()
+                tail_threads.append(t)
 
     print(f"\n[supervisor] {len(children)} groups up. PIDs -> {PID_FILE}")
     print(f"[supervisor] follow a log:  Get-Content -Wait '{LOG_DIR / 'va_b1-gate.out.log'}'")
