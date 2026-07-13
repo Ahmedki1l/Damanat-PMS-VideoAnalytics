@@ -76,6 +76,17 @@ class DetectorConfig:
     imgsz: int = 480
     device: str = "auto"  # "auto", "cpu", or "cuda"
 
+    # OpenVINO CPU pool. NOT DB-owned — these two are YAML-only (see
+    # config_service.sync_app_config_from_db, which never touches them).
+    #
+    # Ultralytics hardcodes PERFORMANCE_HINT=LATENCY, and on CPU that hint caps
+    # the pool at 8 threads no matter how many cores exist — which is why a
+    # 15-core box shows ~8 busy cores and looks half-idle. 0 / "" keeps that
+    # default. See src/ov_tuning.py for the measured cost/benefit before raising
+    # it: widening is worth ~1.2x and REGRESSES past ~16 threads.
+    ov_num_threads: int = 0          # 0 = leave OpenVINO's default
+    ov_performance_hint: str = ""    # "" = leave LATENCY; or THROUGHPUT
+
 
 @dataclass
 class TrackerConfig:
@@ -759,6 +770,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.detector.classes = d.get("classes", config.detector.classes)
         config.detector.imgsz = d.get("imgsz", config.detector.imgsz)
         config.detector.device = d.get("device", config.detector.device)
+        config.detector.ov_num_threads = int(
+            d.get("ov_num_threads", config.detector.ov_num_threads) or 0
+        )
+        config.detector.ov_performance_hint = str(
+            d.get("ov_performance_hint", config.detector.ov_performance_hint) or ""
+        )
 
     # --- Tracker ---
     if "tracker" in raw:
