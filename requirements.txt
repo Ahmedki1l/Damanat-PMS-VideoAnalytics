@@ -51,25 +51,27 @@ openvino-telemetry>=2023.2.1
 onnx>=1.16.0
 nncf>=2.10.0
 
-# Plate-OCR cross-check (Wave 1 / WS-D) — DISABLED for client deployment.
+# Plate-OCR cross-check (Wave 1 / WS-D). Enabled: OCR is the only modality
+# that can name a PARKED car (ReID cannot), so current_plate depends on it.
 #
-# config.example.yaml sets matching.plate_ocr_model: "" which routes to
-# NoopPlateOCR. The cascade ensemble rule (>=2 of {ReID, color, type})
-# still works without the OCR modality.
+# Requires matching.plate_ocr_model non-empty in config.yaml ("auto" routes to
+# the PaddleX cache; a directory pins an explicit PaddleOCR home).
 #
-# To re-enable:
-#   1. Uncomment the two lines below.
-#   2. In config.yaml, set matching.plate_ocr_model: "paddleocr-mobile".
-#   3. pip install paddleocr paddlepaddle (~500 MB combined install).
-# The mobile det+rec weights (~12-20 MB) auto-download to
-# ~/.paddlex/official_models/ on first PlateOCR.read() call.
+# Versions are pinned to the set validated on the dev machine — paddleocr 3.x
+# changed the constructor signature and the model-name flags, so a float here
+# silently changes which weights load.
 #
-# Notes for re-enablement:
-#   - Models: PP-OCRv5_mobile_det (~5 MB), en_PP-OCRv5_mobile_rec (~8 MB).
+# The det/rec/angle weights (~20 MB) are NOT downloaded at runtime: the
+# Dockerfile warms $PADDLE_PDX_CACHE_HOME at build time so the pod needs no
+# internet egress and no writable $HOME. Outside Docker they land in
+# ~/.paddlex/official_models/ on the first PlateOCR.read() call.
+#   - Models: PP-OCRv5_mobile_det, en_PP-OCRv5_mobile_rec,
+#     PP-LCNet_x1_0_textline_ori (pulled by use_angle_cls=True).
 #   - On Windows + paddlepaddle 3.x, oneDNN can trip a NotImpl at predict
 #     time; the plugin sets FLAGS_use_mkldnn=0 by default to avoid it.
-# paddleocr>=2.7.0
-# paddlepaddle>=2.6.0
+paddleocr==3.5.0
+paddlepaddle==3.3.1
+paddlex==3.5.2
 
 # Phase 3 / T3.2 — FAISS-CPU gallery index. Optional at runtime: when
 # absent the GalleryIndex falls back to a pure-numpy brute-force search

@@ -56,6 +56,7 @@ RUN apt-get update && apt-get install -y \
     libxcb1 \
     libgl1 \
     libglib2.0-0 \
+    libgomp1 \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
@@ -68,6 +69,22 @@ RUN apt-get update && apt-get install -y \
 # Copy virtual environment
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+
+# Plate-OCR weights, baked. PaddleOCR otherwise downloads det/rec/angle (~20MB)
+# into $HOME/.paddlex on the FIRST read() — which in a pod means an internet
+# egress the cluster may not allow, into a $HOME that may not be writable (see
+# the Ultralytics '/root/.config not writable' warning). Both failure modes hit
+# mid-run, long after the pod looks healthy, and land in a blanket `except` in
+# vehicle_registry.py that silently degrades to NoopPlateOCR — i.e. plates just
+# stop binding, with no crash to point at.
+#
+# So: point PaddleX's cache at a fixed dir and populate it at BUILD time. The
+# warm-up must construct PaddleOCR with the same model names + angle flag that
+# PaddlePlateOCR._ensure_engine() uses, or it would cache the wrong weights.
+# The supervisor copies its env to all 5 groups, so one ENV covers every worker.
+ENV PADDLE_PDX_CACHE_HOME=/opt/paddlex
+RUN python -c 'import numpy as np; from paddleocr import PaddleOCR; PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=True, enable_mkldnn=False, device="cpu", text_detection_model_name="PP-OCRv5_mobile_det", text_recognition_model_name="en_PP-OCRv5_mobile_rec").predict(np.zeros((320, 320, 3), dtype=np.uint8))' \
+    && ls /opt/paddlex/official_models
 
 # Line-buffer stdout: docker hands the process a pipe, not a tty, and Python
 # block-buffers 8KB to a pipe — so without this the `[INFO] effective FPS/camera`
