@@ -4147,8 +4147,136 @@ class VehicleRegistryIdentityMixin:
         )
         return [c.plate for c in kept]
 
+    def _candidate_attrs(self, plate: str):
+        """(colour, type) for a candidate, as ``((label, conf), (label, conf))``.
+
+        Cached per plate: the classifiers are OpenVINO inferences (~15ms each) and a
+        car's colour does not change between frames. Computed once from a gallery crop,
+        then free forever. Returns ``((None,0.0),(None,0.0))`` when unavailable.
+        """
+        cache = getattr(self, "_attr_cache", None)
+        if cache is None:
+            cache = self._attr_cache = {}
+        if plate in cache:
+            return cache[plate]
+
+        blank = ((None, 0.0), (None, 0.0))
+        store = getattr(self, "gallery_store", None)
+        if store is None:
+            cache[plate] = blank
+            return blank
+        try:
+            crops = store.load_crops(plate) or []
+            if not crops:
+                cache[plate] = blank
+                return blank
+            col = self._match_decision._color_classifier.predict(crops[0])
+            typ = self._match_decision._type_classifier.predict(crops[0])
+            cache[plate] = (col, typ)
+        except Exception:
+            cache[plate] = blank
+        return cache[plate]
+
+    def _log_slot_decision(
+        self, *, slot_id, camera_id, crop_bgr, kept, rejected,
+        ocr_text, ocr_conf, bound_plate, ctx,
+    ) -> None:
+        """Record this decision — the candidates, their features, and the answer.
+
+        ``bound_plate`` is the LABEL when OCR confirmed one; the other candidates are
+        hard negatives (cars ReID genuinely believed at this instant). This is the only
+        place the tie-breaking signals — locked_elsewhere, the OCR read, crop quality —
+        are captured, and they cannot be reconstructed after the fact. Best-effort:
+        logging must never break identification.
+        """
+        log = getattr(self, "decision_log", None)
+        if log is None or not getattr(log, "enabled", False) or not kept:
+            return
+        try:
+            from src.matching.decision_log import build_record
+            from src.matching.slot_rank_features import (
+                FEATURE_NAMES, CandidateSignals, QuerySignals, build_features,
+            )
+            from src.reid_matcher.reid_burst import sharpness_score
+
+            ctx = ctx or {}
+            h, w = crop_bgr.shape[:2]
+            qcol, qtyp = (
+                self._match_decision._color_classifier.predict(crop_bgr),
+                self._match_decision._type_classifier.predict(crop_bgr),
+            )
+            query = QuerySignals(
+                crop_sharpness=float(sharpness_score(crop_bgr)),
+                crop_area=float(h * w),
+                crop_aspect=float(w / max(h, 1)),
+                active_candidates=len(kept),
+            )
+            sigs = []
+            for c in kept:
+                sess = c.session
+                cams = list(getattr(sess, "reference_source_cameras", None) or [])
+                ccol, ctyp_ = self._candidate_attrs(c.plate)
+                locked, _r, _d = self._locked_elsewhere_reason(
+                    c.plate, slot_id, getattr(sess, "linked_slot", None)
+                )
+                sigs.append(
+                    CandidateSignals(
+                        plate=c.plate,
+                        reid_score=c.score,
+                        same_view_score=c.same_view_score,
+                        cross_view_score=c.cross_view_score,
+                        warm=c.warm,
+                        rank=c.rank,
+                        n_refs=len(cams),
+                        n_same_view_refs=sum(1 for x in cams if x == camera_id),
+                        best_ref_is_gate=not c.warm,
+                        color_match=(qcol[0] == ccol[0]) if (qcol[0] and ccol[0]) else None,
+                        color_conf_query=float(qcol[1] or 0.0),
+                        color_conf_cand=float(ccol[1] or 0.0),
+                        type_match=(qtyp[0] == ctyp_[0]) if (qtyp[0] and ctyp_[0]) else None,
+                        type_conf_query=float(qtyp[1] or 0.0),
+                        locked_elsewhere=bool(locked),
+                    )
+                )
+            feats = build_features(sigs, query)
+            if bound_plate:
+                decision = "BIND"
+            elif not ocr_text:
+                decision = "ABSTAIN_NO_READ"
+            else:
+                decision = "ABSTAIN_READ_MATCHES_NOBODY"
+            log.emit(
+                build_record(
+                    slot_id=slot_id,
+                    camera_id=camera_id or "",
+                    floor=ctx.get("floor"),
+                    area=ctx.get("area"),
+                    is_reserved=bool(ctx.get("is_reserved")),
+                    reserved_for=ctx.get("reserved_for"),
+                    attempt=int(ctx.get("attempt", 0)),
+                    max_attempts=int(ctx.get("max_attempts", 0)),
+                    query=query,
+                    candidates=sigs,
+                    feature_matrix=feats,
+                    feature_names=FEATURE_NAMES,
+                    rejected=rejected,
+                    ocr_text=ocr_text,
+                    ocr_conf=ocr_conf,
+                    decision=decision,
+                    bound_plate=bound_plate,
+                    label_source="ocr" if bound_plate else None,
+                )
+            )
+        except Exception as exc:
+            logger.debug("[decision-log] emit failed for slot=%s: %r", slot_id, exc)
+
     def try_ocr_identify_slot(
-        self, slot_id: str, crop_bgr, camera_id: Optional[str] = None
+        self,
+        slot_id: str,
+        crop_bgr,
+        camera_id: Optional[str] = None,
+        *,
+        decision_ctx: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """READ the plate off a parked car and bind it — no prior binding needed.
 
@@ -4177,13 +4305,70 @@ class VehicleRegistryIdentityMixin:
         ocr = getattr(self._match_decision, "plate_ocr", None)
         if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
             return None
+
+        # RANK FIRST, then read. The order matters: a blank OCR read used to return here
+        # immediately, so the candidate list — the hard negatives a ranker needs — was
+        # thrown away on exactly the 2,269 attempts we most want to understand. Scoring
+        # costs one embedding (~15ms) against OCR's ~80-470ms, so it is nearly free.
+        kept: List[RankedCandidate] = []
+        rejected: List[RejectedCandidate] = []
+        try:
+            qvec = self.reid_matcher.extract_feature(crop_bgr)
+        except Exception:
+            qvec = None
+        if qvec is not None:
+            kept, rejected = self.reid_rank(
+                qvec, slot_id=slot_id, slot_camera=camera_id, k=GLOBAL_MATCH_RANK
+            )
+
+        candidates = [c.plate for c in kept]
+        if not candidates:
+            # ReID unavailable — degrade, don't guess. Still drop cars parked elsewhere:
+            # this fallback matched against EVERY plate inside and is the path that let
+            # the 2026-07-12 poisoning through.
+            candidates = [
+                p
+                for p in self.plates_inside()
+                if not self._is_plate_locked_elsewhere(p, slot_id)
+            ]
+
         # OCR is heavy — never hold the registry lock across it, or the frame loop for
         # every other camera in this worker stalls behind one PaddleOCR read.
+        #
+        # The enlarged-retry pass rescues a distant plate (B13: '' -> '9990BHD'), but on
+        # a slot whose plate is simply not in frame it costs ~670ms and finds nothing. So
+        # spend it on the FIRST few attempts only: if the plate were visible at all, an
+        # early frame would have caught it. Beyond that we are paying to re-confirm a
+        # camera-angle fact, 12 times a park, on the frame loop.
+        attempt = int((decision_ctx or {}).get("attempt", 1))
+        retry_budget = int(
+            getattr(self._matching_config, "ocr_upscale_retry_max_attempts", 4)
+        )
         try:
-            ocr_text, _ocr_conf = ocr.read(crop_bgr)
+            ocr_text, ocr_conf = ocr.read(
+                crop_bgr, allow_retry=(attempt <= retry_budget)
+            )
+        except TypeError:
+            # A PlateOCR implementation without the retry knob (e.g. NoopPlateOCR).
+            ocr_text, ocr_conf = ocr.read(crop_bgr)
         except Exception as exc:
             logger.debug("[ocr-id] slot=%s read failed: %r", slot_id, exc)
-            return None
+            ocr_text, ocr_conf = "", 0.0
+
+        plate = confirm_plate(ocr_text, candidates) if ocr_text else None
+
+        self._log_slot_decision(
+            slot_id=slot_id,
+            camera_id=camera_id,
+            crop_bgr=crop_bgr,
+            kept=kept,
+            rejected=rejected,
+            ocr_text=ocr_text,
+            ocr_conf=ocr_conf,
+            bound_plate=plate,
+            ctx=decision_ctx,
+        )
+
         if not ocr_text:
             # Never silent. A side-on slot (CAM-21 frames B1_CRO in pure profile) reads
             # nothing at all in the settled pose — the plate is simply not in the frame.
@@ -4196,22 +4381,6 @@ class VehicleRegistryIdentityMixin:
             )
             return None
 
-        # REID NARROWS, OCR CONFIRMS. The candidate set is what the car LOOKS like, not
-        # every plate in the building. This is what stops a Range Rover's read from
-        # confirming a Porsche's plate on a two-digit collision.
-        candidates = self.reid_shortlist(
-            crop_bgr, slot_id=slot_id, slot_camera=camera_id
-        )
-        if not candidates:
-            # ReID unavailable — degrade, don't guess. Still drop cars parked elsewhere:
-            # this fallback matched against EVERY plate inside and is the path that let
-            # the 2026-07-12 poisoning through.
-            candidates = [
-                p
-                for p in self.plates_inside()
-                if not self._is_plate_locked_elsewhere(p, slot_id)
-            ]
-        plate = confirm_plate(ocr_text, candidates)
         if not plate:
             logger.info(
                 "[ocr-id] slot=%s read=%r confirms none of ReID's top-%d %s — "

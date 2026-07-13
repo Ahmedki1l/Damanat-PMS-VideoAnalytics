@@ -152,6 +152,21 @@ class VehicleRegistry(
         # refused by the relocate / stale-release / theft paths in
         # try_link_to_slot until it is explicitly unlocked (slot goes VACANT).
         self._locked_slots: set[str] = set()
+        # Training-data harvest: one JSONL record per slot-identity decision. Per-process
+        # file (the supervisor runs several workers; a shared handle interleaves and
+        # corrupts — see zoning_trace.log). Writes happen on a daemon thread, so the
+        # frame loop never waits on disk.
+        # NOTE: self._matching_config is not assigned until later in __init__, so read
+        # from the constructor argument, not the attribute.
+        from src.matching.decision_log import DecisionLog
+
+        _mc = matching_config or MatchingConfig()
+        self.decision_log = DecisionLog(
+            directory=getattr(_mc, "decision_log_dir", "logs/decisions"),
+            worker=os.environ.get("VA_GROUP", "") or f"pid{os.getpid()}",
+            max_queue=int(getattr(_mc, "decision_log_queue_max", 2000)),
+            enabled=bool(getattr(_mc, "decision_log_enabled", True)),
+        )
         # Plate locks held by OTHER worker processes. The supervisor runs several
         # engines, each with its own registry, so a car locked into a slot on a camera
         # this worker doesn't own is invisible here — yet it is exactly the candidate

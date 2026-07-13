@@ -1164,7 +1164,24 @@ class ParkingEngineRuntimeMixin:
         self._ocr_id_attempts[slot.id] = attempts + 1
         self._ocr_id_last_at[slot.id] = now_ts
 
-        plate = self.vehicle_registry.try_ocr_identify_slot(slot.id, crop, cam_id)
+        # Context the registry cannot see: which slot this is, whether it is reserved,
+        # which area the camera watches, and how far into the attempt budget we are.
+        # These land in the decision log and become ranker features / analysis keys.
+        reserved_map = getattr(self, "_reserved_for_map", None) or {}
+        special = getattr(self, "_special_slots", None) or set()
+        pipelines = getattr(self, "pipelines", None) or {}
+        area_registry = getattr(self, "area_registry", None)
+        decision_ctx = {
+            "floor": getattr(pipelines.get(cam_id), "floor", None),
+            "area": area_registry.area_for_camera(cam_id) if area_registry else None,
+            "is_reserved": slot.id in reserved_map or slot.id in special,
+            "reserved_for": reserved_map.get(slot.id),
+            "attempt": attempts + 1,
+            "max_attempts": self._OCR_ID_MAX_ATTEMPTS,
+        }
+        plate = self.vehicle_registry.try_ocr_identify_slot(
+            slot.id, crop, cam_id, decision_ctx=decision_ctx
+        )
         if not plate:
             return
 

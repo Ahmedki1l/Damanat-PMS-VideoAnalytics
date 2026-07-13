@@ -350,6 +350,28 @@ class MatchingConfig:
     # Slot path only; the gate/global path keeps the plain 0.6, where it is load-bearing.
     slot_camera_ref_weight: float = 0.80
 
+    # How many of the 12 identify attempts may pay for OCR's enlarged retry pass.
+    # The retry rescues a plate that is present but too small for the text detector to
+    # find (slot B13, CAM-24: '' -> '9990BHD' -> BHD-9990, a C-level slot dark for 60
+    # attempts). On a slot whose plate is genuinely out of frame it instead surfaces
+    # spurious text regions, runs the recogniser on them, discards them, and costs ~670ms
+    # — on the frame loop, 12 times a park. If the plate were visible at all an early
+    # frame would have caught it, so spend the budget there.
+    ocr_upscale_retry_max_attempts: int = 4
+
+    # Decision log — one JSONL record per slot-identity attempt: the ranked candidates,
+    # their full feature vectors, the gate rejects, the OCR read, and which candidate the
+    # read confirmed (THE LABEL). Every bind yields 1 positive + up to k-1 hard negatives.
+    #
+    # This exists because a ranker trained offline on the gallery alone does NOT beat
+    # plain ReID (measured 2026-07-13: cold rank-1 74.9% -> 71.1%, and the trainer refused
+    # to ship it). The features that actually break ties — locked_elsewhere, the OCR read,
+    # crop quality at that instant — only exist at decision time and cannot be
+    # reconstructed later. So they are recorded as they happen.
+    decision_log_enabled: bool = True
+    decision_log_dir: str = "logs/decisions"
+    decision_log_queue_max: int = 2000
+
     # A candidate VA has never photographed cannot be matched — it can only collide.
     # VA hydrates a session for every open parking_sessions row, and the ANPR gate
     # misreads: 2026-07-13, 18 of 51 "cars inside" had no gallery folder because they
@@ -852,6 +874,14 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.candidates_require_appearance_evidence = m.get(
             "candidates_require_appearance_evidence",
             cm.candidates_require_appearance_evidence,
+        )
+        cm.ocr_upscale_retry_max_attempts = m.get(
+            "ocr_upscale_retry_max_attempts", cm.ocr_upscale_retry_max_attempts
+        )
+        cm.decision_log_enabled = m.get("decision_log_enabled", cm.decision_log_enabled)
+        cm.decision_log_dir = m.get("decision_log_dir", cm.decision_log_dir)
+        cm.decision_log_queue_max = m.get(
+            "decision_log_queue_max", cm.decision_log_queue_max
         )
 
         # HSV tolerances
