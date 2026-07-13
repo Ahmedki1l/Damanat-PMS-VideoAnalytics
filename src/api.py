@@ -141,6 +141,15 @@ class StatsResponse(BaseModel):
 
 # --- App Factory ---
 
+def _first(*values):
+    """First value that isn't None or empty — used to prefer a slot's live
+    in-process metadata over the DB row, and the DB row over nothing."""
+    for value in values:
+        if value:
+            return value
+    return None
+
+
 def create_app(
     vehicle_registry: Optional[VehicleRegistry] = None,
     get_slot_statuses=None,
@@ -370,15 +379,26 @@ def create_app(
             # Crop to the entering car: the CAM-03 frame is a wide fisheye view
             # with the car in a corner (+ parked cars in the background), so
             # embedding the full frame is the dominant cause of low ReID scores.
-            # Store a tight crop instead; fall back to the full frame if the
-            # detector isn't wired or finds nothing.
+            # Store a tight crop instead; DO NOT fall back to full frame — if no
+            # car is detected, skip the snapshot rather than poison the gallery
+            # with a full-frame anchor.
+            cropped = False
             if detect_vehicle_crop is not None:
                 try:
                     _c = detect_vehicle_crop(frame)
                     if _c is not None and getattr(_c, "size", 0) > 0:
                         frame = _c
+                        cropped = True
                 except Exception as _exc:
                     print(f"[API] B-entry vehicle crop failed: {_exc!r}")
+
+            if not cropped:
+                print(
+                    f"[API] B-entry for plate {plate}: no vehicle crop detected "
+                    f"— skipping (avoid full-frame anchor)"
+                )
+                return False
+
             session_id = registry.confirm_b1_entrance_by_plate(plate, frame)
             if session_id:
                 print(
@@ -409,14 +429,26 @@ def create_app(
                 print(f"[API] ramp-entry for plate {plate}: no usable image — skipped")
                 return False
             # Crop to the car before storing as a gallery reference (same reason
-            # as B-entry — a wide frame embeds poorly). Fall back to full frame.
+            # as B-entry — a wide frame embeds poorly). DO NOT fall back to full
+            # frame — if no car is detected, skip the snapshot rather than poison
+            # the gallery with a full-frame anchor.
+            cropped = False
             if detect_vehicle_crop is not None:
                 try:
                     _c = detect_vehicle_crop(frame)
                     if _c is not None and getattr(_c, "size", 0) > 0:
                         frame = _c
+                        cropped = True
                 except Exception as _exc:
                     print(f"[API] ramp-entry vehicle crop failed: {_exc!r}")
+
+            if not cropped:
+                print(
+                    f"[API] ramp-entry for plate {plate}: no vehicle crop detected "
+                    f"— skipping gallery snapshot (avoid full-frame anchor)"
+                )
+                return False
+
             session_id = registry.add_gallery_snapshot_by_plate(
                 plate, frame, source_cam=camera_id or "CAM-23",
             )
@@ -512,11 +544,11 @@ def create_app(
 
                     # Crop the ANPR frame to the car so the held-back reference is
                     # a tight vehicle crop — the frame is a wide gate shot (road,
-                    # buildings, sun) that embeds poorly. Falls back to the full
-                    # frame if the detector isn't wired or finds nothing. This crop
-                    # is stashed as the session's pending_anpr_vector and only
-                    # promoted to a matchable reference after CAM-03 confirmation.
-                    _anpr_ref = frame
+                    # buildings, sun) that embeds poorly. Require successful crop;
+                    # DO NOT fall back to full frame. This crop is stashed as the
+                    # session's pending_anpr_vector and only promoted to a matchable
+                    # reference after CAM-03 confirmation.
+                    _anpr_ref = None
                     if detect_vehicle_crop is not None:
                         try:
                             _car = detect_vehicle_crop(frame)
@@ -524,6 +556,13 @@ def create_app(
                                 _anpr_ref = _car
                         except Exception as _exc:
                             print(f"[API] ANPR vehicle crop failed: {_exc!r}")
+
+                    if _anpr_ref is None:
+                        print(
+                            f"[API] ANPR entry for plate {plate}: no vehicle crop detected "
+                            f"— skipping (avoid full-frame anchor)"
+                        )
+                        return False
 
                     registry.confirm_anpr_session_directly(
                         plate=bound_plate,
@@ -905,38 +944,75 @@ def create_app(
 
     @app.get("/api/slots", response_model=List[SlotStatus])
     async def get_all_slots():
-        """Get status of all parking slots across all cameras."""
-        if get_slot_statuses is None:
-            return []
+        """Get status of all parking slots across all cameras.
 
-        statuses = get_slot_statuses()
+        MULTI-PROCESS: under supervisor.py the API runs inside ONE of five camera
+        groups. ``get_slot_statuses()`` walks ``engine.pipelines`` and
+        ``registry.get_slot_plate()`` reads the in-memory ``_parked`` map, so both
+        only see the cameras THIS worker owns — every slot on another group's
+        camera was silently reported as vacant-and-plateless. The DB is the only
+        view of the whole facility, so the roster comes from ``parking_slots``
+        (the owning worker persists plate/occupancy there), and this worker's live
+        state is overlaid on top for the slots it does own.
+        """
+        statuses = get_slot_statuses() if get_slot_statuses is not None else []
+        live = {s["slot_id"]: s for s in statuses if s.get("slot_id")}
+
         db_slots = {}
         if db_manager:
             _session = db_manager.SessionLocal()
             try:
                 from src.repositories import ParkingSlotRepository
-                db_slots = {s.slot_id: s for s in ParkingSlotRepository.get_all(_session)}
+                db_slots = {
+                    s.slot_id: s
+                    for s in ParkingSlotRepository.get_all(_session)
+                    # parking_slots also stores ROI masks and the Park_Entry /
+                    # B1_Entrence special zones — never surface those as slots.
+                    if getattr(s, "slot_type", "parking") == "parking"
+                }
             finally:
                 _session.close()
+
+        # Every DB slot, plus any live slot not yet persisted (so a slot can
+        # never vanish from the API just because its row is missing).
+        roster = list(db_slots) + [sid for sid in live if sid not in db_slots]
+
         result = []
-        for s in statuses:
-            slot_id = s.get("slot_id", "")
-            plate = registry.get_slot_plate(slot_id)
+        for slot_id in roster:
+            s = live.get(slot_id)
             db_slot = db_slots.get(slot_id)
+
+            if s is not None:
+                # This worker owns the camera: its registry is authoritative,
+                # including "no plate" — do NOT fall back to a stale DB column.
+                plate = registry.get_slot_plate(slot_id)
+                occupied = bool(s.get("occupied", False))
+                state = s.get("state", "UNKNOWN")
+            else:
+                plate = db_slot.current_plate
+                occupied = not bool(db_slot.is_available)
+                state = "OCCUPIED" if occupied else "VACANT"
+
             is_restricted = bool(
                 (db_slot.reservation_type != "GENERAL" or db_slot.is_violation_zone)
-                if db_slot else s.get("is_violation_zone", False)
+                if db_slot is not None
+                else (s or {}).get("is_violation_zone", False)
             )
             result.append(SlotStatus(
                 slot_id=slot_id,
-                slot_name=s.get("slot_name") or s.get("label", slot_id),
-                floor=s.get("floor"),
-                zone_id=s.get("zone_id"),
-                zone_name=s.get("zone_name"),
-                occupied=s.get("occupied", False),
-                state=s.get("state", "UNKNOWN"),
+                slot_name=_first(
+                    (s or {}).get("slot_name"), (s or {}).get("label"),
+                    getattr(db_slot, "slot_name", None), slot_id,
+                ),
+                floor=_first((s or {}).get("floor"), getattr(db_slot, "floor", None)),
+                zone_id=_first((s or {}).get("zone_id"), getattr(db_slot, "zone_id", None)),
+                zone_name=_first((s or {}).get("zone_name"), getattr(db_slot, "zone_name", None)),
+                occupied=occupied,
+                state=state,
                 plate_number=plate,
-                camera_id=s.get("camera_id"),
+                camera_id=_first(
+                    (s or {}).get("camera_id"), getattr(db_slot, "camera_id", None)
+                ),
                 is_restricted=is_restricted,
                 restriction_type=get_slot_restriction_type(db_slot) if db_slot else None,
                 snapshot_url=_build_slot_snapshot_url(slot_id),

@@ -11,6 +11,28 @@ class ParkingSlotRepository:
         return db.query(ParkingSlot).filter(ParkingSlot.slot_id == slot_id).first()
 
     @staticmethod
+    def get_plate_locks(db: Session):
+        """Every slot that currently claims a plate, across ALL cameras and workers.
+
+        The cross-process truth for "this car is already parked somewhere else". Each
+        worker owns only its own cameras' slots, so this is the only way one worker can
+        know that a candidate it is scoring is in fact sitting in a slot on a camera it
+        never sees. A handful of rows (13 today) — cheap enough for the 10s sync tick.
+        """
+        return (
+            db.query(
+                ParkingSlot.slot_id,
+                ParkingSlot.camera_id,
+                ParkingSlot.current_plate,
+                ParkingSlot.plate_locked,
+                ParkingSlot.plate_locked_at,
+            )
+            .filter(ParkingSlot.current_plate.isnot(None))
+            .filter(ParkingSlot.current_plate != "")
+            .all()
+        )
+
+    @staticmethod
     def get_by_camera_and_slot_id(db: Session, camera_id: str, slot_id: str):
         return (
             db.query(ParkingSlot)

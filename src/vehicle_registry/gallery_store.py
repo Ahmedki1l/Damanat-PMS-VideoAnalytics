@@ -259,17 +259,21 @@ class VehicleGalleryStore:
     # ------------------------------------------------------------------ #
     # Load
     # ------------------------------------------------------------------ #
-    def load_vectors(self, plate: str) -> Tuple[List[np.ndarray], Optional[str]]:
-        """Return (vectors, stored_model_tag). Empty list when absent/unreadable.
+    def load_vectors(
+        self, plate: str
+    ) -> Tuple[List[np.ndarray], Optional[str], List[str]]:
+        """Return (vectors, stored_model_tag, source_cameras). Empty when
+        absent/unreadable.
 
         Vectors are returned primary-first (highest quality first) so the caller
-        can use ``vectors[0]`` as the session's primary feature. Gate-only refs
-        are excluded — they exist for the folder/photo guarantee, never for
-        matching (see :meth:`save_ref`).
+        can use ``vectors[0]`` as the session's primary feature. ``source_cameras``
+        is index-aligned with ``vectors`` (the camera that captured each ref, for
+        match-time trust weighting). Gate-only refs are excluded — they exist for
+        the folder/photo guarantee, never for matching (see :meth:`save_ref`).
         """
         meta = self._read_meta(plate)
         if not meta:
-            return [], None
+            return [], None, []
         d = self._plate_dir(plate)
         refs = sorted(
             (r for r in meta.get("refs", []) if not r.get("gate")),
@@ -277,6 +281,7 @@ class VehicleGalleryStore:
             reverse=True,
         )
         vectors: List[np.ndarray] = []
+        cameras: List[str] = []
         for r in refs:
             fn = r.get("vec")
             if not fn:
@@ -285,15 +290,17 @@ class VehicleGalleryStore:
                 vectors.append(np.load(os.path.join(d, fn)).astype(np.float32))
             except (OSError, ValueError):
                 continue
-        return vectors, meta.get("model_tag")
+            cameras.append(r.get("camera", "") or "")
+        return vectors, meta.get("model_tag"), cameras
 
-    def load_crops(self, plate: str) -> List[np.ndarray]:
+    def load_crops(self, plate: str) -> Tuple[List[np.ndarray], List[str]]:
         """Load the reference crop images (highest quality first) for re-embedding
-        when the stored ``model_tag`` no longer matches the running model.
-        Gate-only refs are excluded, mirroring :meth:`load_vectors`."""
+        when the stored ``model_tag`` no longer matches the running model, with an
+        index-aligned list of their source cameras. Gate-only refs are excluded,
+        mirroring :meth:`load_vectors`."""
         meta = self._read_meta(plate)
         if not meta:
-            return []
+            return [], []
         d = self._plate_dir(plate)
         refs = sorted(
             (r for r in meta.get("refs", []) if not r.get("gate")),
@@ -301,6 +308,7 @@ class VehicleGalleryStore:
             reverse=True,
         )
         crops: List[np.ndarray] = []
+        cameras: List[str] = []
         for r in refs:
             fn = r.get("crop")
             if not fn:
@@ -308,7 +316,8 @@ class VehicleGalleryStore:
             img = cv2.imread(os.path.join(d, fn))
             if img is not None and img.size > 0:
                 crops.append(img)
-        return crops
+                cameras.append(r.get("camera", "") or "")
+        return crops, cameras
 
     def ref_count(self, plate: str) -> int:
         meta = self._read_meta(plate)

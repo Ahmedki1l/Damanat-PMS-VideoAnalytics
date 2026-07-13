@@ -101,7 +101,21 @@ class VehicleSession:
     snapshot_path: Optional[str] = None
     reference_snapshot_paths: List[str] = field(default_factory=list)
     reference_feature_vectors: List[np.ndarray] = field(default_factory=list)
-    
+    # Source camera id per entry in reference_feature_vectors (index-aligned).
+    # Drives source-camera trust weighting at match time (see MatchingConfig
+    # .ground_truth_cameras / .secondary_camera_weight). A missing / short entry
+    # is treated as a non-ground-truth (secondary) reference — the conservative
+    # default, so a ref never gets full weight by accident.
+    reference_source_cameras: List[str] = field(default_factory=list)
+
+    # Cached canonical body colour (mean HSV of a centre crop), anchored ONCE
+    # from the first ground-truth camera seen (ANPR front, then CAM-03 / CAM-23).
+    # It is the colour veto anchor: floor-camera reference crops and match-time
+    # queries whose colour is incompatible with this are rejected, so a
+    # different-coloured car passing next to this one cannot poison the gallery
+    # or bind to the session. None until a ground-truth crop sets it (fail-open).
+    ground_truth_hsv: Optional[Tuple[float, float, float]] = None
+
     gate_snapshot_paths: List[str] = field(default_factory=list)
 
     # True while the session's ONLY ReID reference is the wide ANPR gate image
@@ -159,6 +173,9 @@ class VehicleSession:
     # "ReID >= lock_confidence OR ocr_confirmed" freeze condition, and does not
     # rely on the synthetic Decision built for the voter (which carries no OCR).
     ocr_confirmed: bool = False
+    # When this car's plate was READ (OCR), not inferred. Anchors the transit hop: until
+    # the car parks, it is definitively on its way to a slot.
+    ocr_identified_at: Optional[datetime] = None
 
     @property
     def display_id(self) -> str:

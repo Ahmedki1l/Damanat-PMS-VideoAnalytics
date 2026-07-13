@@ -216,10 +216,14 @@ class VehicleRegistryCoreMixin:
         session_id: str,
         image: np.ndarray,
         timestamp: Optional[datetime] = None,
+        source_camera: str = "",
     ) -> Optional[str]:
         """
         Append a new snapshot image to an existing session's reference gallery.
         Also extracts and adds a new ReID feature vector to improve matching accuracy.
+
+        ``source_camera`` tags the added reference so match-time trust weighting
+        knows which camera produced it (ground-truth vs secondary).
         """
         if image is None or image.size == 0:
             return None
@@ -245,7 +249,9 @@ class VehicleRegistryCoreMixin:
                 session.reference_snapshot_paths.append(path)
                 if feature_vector is not None:
                     session.reference_feature_vectors.append(feature_vector)
-                
+                    self._sync_reference_cameras(session)
+                    session.reference_source_cameras[-1] = source_camera or ""
+
                 logger.info(
                     "[REGISTRY] Added extra snapshot to session %s (total=%d)",
                     session_id,
@@ -371,6 +377,13 @@ class VehicleRegistryCoreMixin:
             # (and used for ReID) by confirm_b1_entrance_by_plate in the API
             # layer, which has the decoded frame. Nothing to record here.
             logger.info("[ANPR] B1 confirmation (CAM-03) snapshot: plate=%s", plate)
+        elif direction == "ramp-entry":
+            # The CAM-23 ramp-entry snapshot, pushed via the ANPR API as a
+            # SECONDARY appearance reference (not the primary). It does NOT open a
+            # pending entry — it enriches an existing gate-created session. The image
+            # is attached to the plate's session by add_gallery_snapshot_by_plate in
+            # the API layer, which has the decoded frame. Nothing to record here.
+            logger.info("[ANPR] CAM-23 ramp-entry snapshot: plate=%s", plate)
         else:
             # Be defensive: an unrecognised direction from the ANPR client must
             # not 500 the webhook (which would drop the event). Log and no-op.
@@ -534,6 +547,12 @@ class VehicleRegistryCoreMixin:
             candidates_to_delete = []
             for candidate_id, candidate in self._park_entry_candidates.items():
                 if candidate.status in ("open", "provisional"):
+                    # Liveness clock: keep a candidate alive as long as the car is
+                    # still visible in the zone (last_seen_at is refreshed every
+                    # frame it is in-zone). A parking-entry car legitimately dwells
+                    # (barrier/maneuver/queue) for well over CANDIDATE_EXPIRY_SECONDS,
+                    # so expiring on entered_at would kill the candidate of a car
+                    # still standing in the zone and drop its plate bind.
                     age = (now - candidate.last_seen_at).total_seconds()
                     if age > self.CANDIDATE_EXPIRY_SECONDS:
                         candidate.status = "expired"
@@ -551,8 +570,13 @@ class VehicleRegistryCoreMixin:
                 elif candidate.status in ("confirmed", "dropped", "expired"):
                     candidates_to_delete.append(candidate_id)
 
+            seeded = getattr(self, "_park_entry_gallery_seeded", None)
             for candidate_id in candidates_to_delete:
                 self._park_entry_candidates.pop(candidate_id, None)
+                # Drop the per-visit gallery-seed marker so the set can't grow
+                # without bound (see seed_gallery_from_park_entry).
+                if seeded is not None:
+                    seeded.discard(candidate_id)
 
         # Phase 2 / T2.2 — drop stale per-track vote buffers. Held outside
         # the registry lock so the voter's own RLock is the only contention
@@ -588,6 +612,54 @@ class VehicleRegistryCoreMixin:
             self._park_entry_candidates[candidate.candidate_id] = candidate
 
         return candidate
+
+    def expire_park_entry_candidate(self, candidate_id: str) -> None:
+        """D3: Mark a Park_Entry candidate as expired when it leaves the zone.
+
+        Called by the exit path when a track leaves. Prevents a car that queued,
+        left, and re-entered from re-using an old candidate that may have been
+        sitting in zone for longer than PENDING_ANPR_BIND_TTL_SECONDS.
+        """
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if candidate and candidate.status in ("open", "provisional"):
+                candidate.status = "expired"
+
+    def plate_for_park_entry_candidate(self, candidate_id: str) -> Optional[str]:
+        """Resolve the plate a Park_Entry candidate is bound to, if any.
+
+        After the one-shot ``bind_next_pending_anpr_to_candidate`` fires the
+        candidate goes ``open`` → ``provisional`` and later frames get None from
+        that method — but the binding persists on ``candidate.bound_event_id``.
+        This lets a later frame (with a better crop) still resolve the plate and
+        re-attempt the idempotent CAM-23 top-view seed. Returns None when the
+        candidate is unknown or not yet bound to a pending event."""
+        with self._lock:
+            candidate = self._park_entry_candidates.get(candidate_id)
+            if candidate is None or not candidate.bound_event_id:
+                return None
+            event = self._pending_events.get(candidate.bound_event_id)
+            return event.plate if event is not None else None
+
+    def latest_park_entry_candidate_for_plate(self, plate: str) -> Optional[str]:
+        """Most-recent Park_Entry candidate bound to ``plate`` that still holds a
+        usable crop. Used by the CAM-03 confirmation fallback to seed the CAM-23
+        top view when the in-zone Park_Entry seed never fired this visit."""
+        with self._lock:
+            best = None
+            for cand in self._park_entry_candidates.values():
+                if not cand.bound_event_id:
+                    continue
+                event = self._pending_events.get(cand.bound_event_id)
+                if event is None or event.plate != plate:
+                    continue
+                if cand.snapshot_image is None or getattr(
+                    cand.snapshot_image, "size", 0
+                ) == 0:
+                    continue
+                if best is None or cand.last_seen_at > best.last_seen_at:
+                    best = cand
+            return best.candidate_id if best is not None else None
 
     @staticmethod
     def _clear_candidate_references(candidate: ParkEntryCandidate) -> None:
@@ -637,6 +709,10 @@ class VehicleRegistryCoreMixin:
             if not candidate or quality_score <= candidate.quality_score:
                 if candidate:
                     candidate.last_seen_at = now
+                    logger.debug(
+                        "[PARK_ENTRY] candidate=%s snapshot rejected: new_quality=%.1f <= current=%.1f",
+                        candidate_id, quality_score, candidate.quality_score,
+                    )
                 return
 
         if feature_vector is None:

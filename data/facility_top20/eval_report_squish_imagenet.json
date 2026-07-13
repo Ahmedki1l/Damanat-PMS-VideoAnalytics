@@ -1,0 +1,127 @@
+{
+  "generated_at": "2026-05-15T13:38:00+00:00",
+  "eval_dir": "data\\facility_top20\\eval",
+  "pairs_csv": "data\\facility_top20\\pairs_eval.csv",
+  "n_eval_images": 79,
+  "n_plates": 20,
+  "plate_names": [
+    "AGA-6649",
+    "EEB-80",
+    "ERD-7800",
+    "HBR-4920",
+    "HGD-2926",
+    "HUD-9444",
+    "HVA-77",
+    "LNV-94",
+    "LRS-9439",
+    "NDD-4141",
+    "NJS-7894",
+    "NXR-2727",
+    "RDJ-9640",
+    "RTB-2016",
+    "SDD-6707",
+    "XBD-5588",
+    "XRD-6663",
+    "ZDR-8501",
+    "ZRS-6511",
+    "ZVH-337"
+  ],
+  "threshold": 0.53,
+  "summary": {
+    "baseline_vs_fine_tuned": {
+      "rank1": {
+        "baseline": 0.6709,
+        "fine_tuned": 0.7468,
+        "delta": 0.0759
+      },
+      "rank5": {
+        "baseline": 0.7089,
+        "fine_tuned": 0.8228,
+        "delta": 0.1139
+      },
+      "mAP": {
+        "baseline": 0.5435,
+        "fine_tuned": 0.6809,
+        "delta": 0.1374
+      },
+      "cosine_margin": {
+        "baseline": 0.1355,
+        "fine_tuned": 0.2572,
+        "delta": 0.1217
+      },
+      "embed_ms_per_image": {
+        "baseline": 8.11,
+        "fine_tuned": 8.88,
+        "delta": 0.77
+      }
+    },
+    "pair_roc_auc": {
+      "baseline": 0.7902,
+      "fine_tuned": 0.9174
+    }
+  },
+  "baseline": {
+    "ir_dir": "models\\osnet_unfinetuned_squish_int8_256x128",
+    "n_eval": 79,
+    "embed_time_s": 0.641,
+    "embed_ms_per_image": 8.11,
+    "rank1": 0.6709,
+    "rank5": 0.7089,
+    "mAP": 0.5435,
+    "mean_same_cosine": 0.7186,
+    "mean_diff_cosine": 0.5832,
+    "cosine_margin": 0.1355,
+    "pairs": {
+      "total": 1095,
+      "positives": 95,
+      "negatives": 1000,
+      "skipped_due_to_missing_paths": 0,
+      "roc_auc": 0.7902,
+      "threshold_used": 0.53,
+      "precision_at_threshold": 0.1036,
+      "recall_at_threshold": 0.8842,
+      "tp": 84,
+      "fp": 727,
+      "fn": 11,
+      "tn": 273
+    }
+  },
+  "fine_tuned": {
+    "ir_dir": "models\\osnet_facility_imagenet_int8_256x128",
+    "n_eval": 79,
+    "embed_time_s": 0.701,
+    "embed_ms_per_image": 8.88,
+    "rank1": 0.7468,
+    "rank5": 0.8228,
+    "mAP": 0.6809,
+    "mean_same_cosine": 0.5728,
+    "mean_diff_cosine": 0.3156,
+    "cosine_margin": 0.2572,
+    "pairs": {
+      "total": 1095,
+      "positives": 95,
+      "negatives": 1000,
+      "skipped_due_to_missing_paths": 0,
+      "roc_auc": 0.9174,
+      "threshold_used": 0.53,
+      "precision_at_threshold": 0.6832,
+      "recall_at_threshold": 0.7263,
+      "tp": 69,
+      "fp": 32,
+      "fn": 26,
+      "tn": 968
+    }
+  },
+  "cascade_contribution": null,
+  "acceptance": {
+    "verdict": "pass",
+    "metrics_beaten": 4,
+    "metrics_total": 4,
+    "deltas": {
+      "rank1": 0.0759,
+      "rank5": 0.1139,
+      "mAP": 0.1374,
+      "cosine_margin": 0.1217
+    }
+  }
+}

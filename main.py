@@ -33,6 +33,15 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+# Pin to the CPU slice the supervisor handed us — MUST happen before cv2/torch/
+# openvino are imported, because TBB and OpenCV size their thread pools from the
+# affinity mask exactly once, at import/first-use. See src/cpu_affinity.py.
+from src.cpu_affinity import apply_from_env as _apply_cpu_affinity
+
+_PINNED_CPUS = _apply_cpu_affinity()
+if _PINNED_CPUS:
+    print(f"[INFO] pinned to {len(_PINNED_CPUS)} CPUs: {_PINNED_CPUS}")
+
 from src.config import load_config
 from src.core.engine import ParkingEngine
 from src.database import init_db
@@ -230,7 +239,36 @@ Examples:
         "--port", type=int, default=8000,
         help="API server port (default: 8000).",
     )
+    parser.add_argument(
+        "--supervise", action="store_true",
+        help="Launch + supervise ALL per-group worker processes from this one "
+             "entry point (Python equivalent of run_all.ps1). Spawns one "
+             "'main.py --cameras <group>' process per group in supervisor.py's "
+             "GROUPS table; exactly one group owns --api. This flag does NOT run "
+             "an engine itself — it only orchestrates the workers.",
+    )
+    parser.add_argument(
+        "--foreground", action="store_true",
+        help="With --supervise: mirror every child group's log to stdout "
+             "(use as the Docker PID 1). Ignored without --supervise.",
+    )
     args = parser.parse_args()
+
+    # Supervisor mode short-circuit: fan out to the per-group worker processes
+    # and block, WITHOUT building an engine in this parent. Placed above
+    # load_config/init_db so the orchestrating parent skips config load, DB init,
+    # pipeline build and camera opening — the real per-worker startup happens in
+    # the spawned 'main.py --cameras <group>' children. (For the very lightest
+    # parent, run `python supervisor.py` directly, which avoids main.py's
+    # module-level torch import entirely.) --reset-plates is honoured as the
+    # one-shot global wipe before any worker boots.
+    if args.supervise:
+        import supervisor
+        sys.exit(supervisor.run(
+            reset_plates=args.reset_plates,
+            foreground=args.foreground,
+            port=args.port,
+        ))
 
     # --- Load configuration ---
     print("=" * 60)
@@ -353,36 +391,34 @@ Examples:
     )
 
     # --- Initialize vehicle registry (shared between engine and API) ---
-    registry = None
-    if args.api:
-        from src.vehicle_registry import VehicleRegistry
-        from src.zoning import AreaRegistry
+    from src.vehicle_registry import VehicleRegistry
+    from src.zoning import AreaRegistry
 
-        # Zoning: a read-only camera↔area index built from config. When no areas
-        # are defined it reports enabled=False and the registry stays in legacy
-        # un-zoned mode (area-bounded ReID + per-area ownership are no-ops).
-        area_registry = AreaRegistry(config)
-        registry = VehicleRegistry(
-            image_dir=config.output.snapshot_base_dir,
-            # Without this the registry silently falls back to MatchingConfig()
-            # DEFAULTS — ignoring every YAML-tuned threshold AND leaving
-            # gallery_persist_enabled at its False default, so no per-plate
-            # gallery folder is ever seeded. Pass the loaded matching config so
-            # the tuned Youden thresholds + gallery persistence actually apply.
-            matching_config=config.matching,
-            public_base_url=config.output.public_base_url,
-            snapshot_url_prefix=config.output.snapshot_url_prefix,
-            gateway_path_prefix=config.output.gateway_path_prefix,
-            area_registry=area_registry,
-            # camera_id → floor, so the identity gate can skip ReID/plate
-            # matching on ground-floor cameras by floor rather than a hardcoded
-            # camera-id set.
-            camera_floors={c.id: c.floor for c in config.cameras},
-            # Best-effort DB handle for clearing a stale slot's plate binding
-            # after an ANPR eviction (_clear_slot_db_binding). Same handle the
-            # engine uses below.
-            db_manager=db,
-        )
+    # Zoning: a read-only camera↔area index built from config. When no areas
+    # are defined it reports enabled=False and the registry stays in legacy
+    # un-zoned mode (area-bounded ReID + per-area ownership are no-ops).
+    area_registry = AreaRegistry(config)
+    registry = VehicleRegistry(
+        image_dir=config.output.snapshot_base_dir,
+        # Without this the registry silently falls back to MatchingConfig()
+        # DEFAULTS — ignoring every YAML-tuned threshold AND leaving
+        # gallery_persist_enabled at its False default, so no per-plate
+        # gallery folder is ever seeded. Pass the loaded matching config so
+        # the tuned Youden thresholds + gallery persistence actually apply.
+        matching_config=config.matching,
+        public_base_url=config.output.public_base_url,
+        snapshot_url_prefix=config.output.snapshot_url_prefix,
+        gateway_path_prefix=config.output.gateway_path_prefix,
+        area_registry=area_registry,
+        # camera_id → floor, so the identity gate can skip ReID/plate
+        # matching on ground-floor cameras by floor rather than a hardcoded
+        # camera-id set.
+        camera_floors={c.id: c.floor for c in config.cameras},
+        # Best-effort DB handle for clearing a stale slot's plate binding
+        # after an ANPR eviction (_clear_slot_db_binding). Same handle the
+        # engine uses below.
+        db_manager=db,
+    )
 
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)
 

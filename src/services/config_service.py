@@ -123,7 +123,7 @@ def sync_app_config_from_db(db: Session, app_config: AppConfig):
     for pp in db_config.preprocessing:
         # Check if Enum matches scope
         scope_val = pp.scope.value if hasattr(pp.scope, 'value') else str(pp.scope)
-        
+
         if scope_val == ScopeEnum.DETECTOR.value:
             app_config.preprocessing.detector.enabled = pp.enabled
             app_config.preprocessing.detector.clip_limit = pp.clip_limit
@@ -136,6 +136,14 @@ def sync_app_config_from_db(db: Session, app_config: AppConfig):
             app_config.preprocessing.reid.grid_size = (pp.grid_w, pp.grid_h)
 
     print("[DB] Runtime configuration successfully linked.")
+
+    # Log effective config values for debugging (D8b: show what actually took effect)
+    print(f"[DB] Effective detector config: imgsz={app_config.detector.imgsz}, "
+          f"confidence={app_config.detector.confidence}, model_path={app_config.detector.model_path}")
+    print(f"[DB] Effective state_machine config: confirm_enter_frames={app_config.state_machine.confirm_enter_frames}, "
+          f"confirm_leave_frames={app_config.state_machine.confirm_leave_frames}")
+    print(f"[DB] Effective assigner config: overlap_threshold={app_config.assigner.overlap_threshold}")
+
     return app_config
 
 

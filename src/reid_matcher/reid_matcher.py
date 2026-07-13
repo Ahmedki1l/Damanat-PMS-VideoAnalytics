@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -296,6 +297,11 @@ class VehicleReIDMatcher:
             # shift embeddings off the trained distribution.
             # ReIDPreprocessingConfig only affects the torchreid fallback.
             pp_status = "OFF (model contract: squish, no CLAHE)"
+            logger.info(
+                "[REID] OpenVINO backend: CLAHE is DISABLED. "
+                "preprocessing_config.enabled=%s (this flag only affects torchreid fallback)",
+                self.preprocessing_config.enabled,
+            )
             if self.preprocessing_config.enabled:
                 logger.info(
                     "[REID] Note: ReID preprocessing (CLAHE) is configured ON "
@@ -305,6 +311,11 @@ class VehicleReIDMatcher:
                 )
         else:
             pp_status = "ON" if self.preprocessing_config.enabled else "OFF"
+            logger.info(
+                "[REID] Torchreid backend: CLAHE is %s (preprocessing_config.enabled=%s)",
+                "ENABLED" if self.preprocessing_config.enabled else "DISABLED",
+                self.preprocessing_config.enabled,
+            )
         logger.info(
             "[REID] Active backend: %s (preprocessing=%s, input=%dx%d)",
             self.backend, pp_status,
@@ -317,19 +328,39 @@ class VehicleReIDMatcher:
 
     def _select_backend(self, requested: Optional[str], use_gpu: bool):
         cfg = self._matching_config
+        ov_model_dir_config = getattr(cfg, "reid_openvino_model_dir", None)
+        use_ov_config = getattr(cfg, "use_openvino_reid", True)
+
+        logger.info(
+            "[REID-BACKEND-SELECT] Config: use_openvino_reid=%s, "
+            "reid_openvino_model_dir=%s, requested_backend=%s",
+            use_ov_config, ov_model_dir_config, requested,
+        )
+
         ov_dir = _resolve_model_dir(
-            Path(cfg.reid_openvino_model_dir) if getattr(cfg, "reid_openvino_model_dir", None)
+            Path(ov_model_dir_config) if ov_model_dir_config
             else self.DEFAULT_OV_MODEL_DIR
         )
         ov_xml_exists = _ir_path(ov_dir).exists()
+
+        logger.info(
+            "[REID-BACKEND-SELECT] OpenVINO model dir: %s, exists=%s",
+            ov_dir, ov_xml_exists,
+        )
 
         prefer_ov = (
             requested == "openvino"
             or (
                 requested is None
-                and getattr(cfg, "use_openvino_reid", True)
+                and use_ov_config
                 and ov_xml_exists
             )
+        )
+
+        logger.info(
+            "[REID-BACKEND-SELECT] Prefer OpenVINO: %s (requested=%s, "
+            "config_enabled=%s, xml_exists=%s)",
+            prefer_ov, requested, use_ov_config, ov_xml_exists,
         )
 
         if prefer_ov:
@@ -338,22 +369,29 @@ class VehicleReIDMatcher:
                     OpenVINOReIDBackend,
                 )
                 input_size = tuple(getattr(cfg, "reid_input_size", (192, 96)))
+                logger.info(
+                    "[REID-BACKEND-SELECT] Initializing OpenVINO backend: "
+                    "model_dir=%s, input_size=%s",
+                    ov_dir, input_size,
+                )
                 impl = OpenVINOReIDBackend(
                     model_dir=ov_dir,
                     input_size=input_size,
                     device="CPU",
                 )
+                logger.info("[REID-BACKEND-SELECT] OpenVINO backend loaded successfully")
                 return impl, "openvino"
             except Exception as exc:
                 if requested == "openvino":
                     raise
                 logger.warning(
-                    "[REID] OpenVINO backend unavailable (%r); falling back "
-                    "to torchreid.",
+                    "[REID-BACKEND-SELECT] OpenVINO backend unavailable (%r); "
+                    "falling back to torchreid.",
                     exc,
                 )
 
         # torchreid fallback (legacy)
+        logger.info("[REID-BACKEND-SELECT] Using torchreid fallback backend")
         impl = _TorchreidBackend(
             model_name=self.model_name,
             use_gpu=use_gpu,
@@ -373,7 +411,17 @@ class VehicleReIDMatcher:
         ``float32`` (matches the pre-WS-A behaviour).
         """
         if hasattr(self._backend, "extract"):
-            return _ensure_f32(self._backend.extract(image))
+            t_start = time.time()
+            result = self._backend.extract(image)
+            elapsed_ms = (time.time() - t_start) * 1000
+            logger.debug(
+                "[REID] extract_feature: backend=%s, elapsed=%.1fms, "
+                "result_shape=%s",
+                self.backend,
+                elapsed_ms,
+                result.shape if result is not None else None,
+            )
+            return _ensure_f32(result)
         return None
 
     # Some legacy callers expect ``extract_features`` (plural).
@@ -395,7 +443,18 @@ class VehicleReIDMatcher:
         if not images:
             return []
         if hasattr(self._backend, "extract_batch"):
-            return [_ensure_f32(v) for v in self._backend.extract_batch(images)]
+            t_start = time.time()
+            results = self._backend.extract_batch(images)
+            elapsed_ms = (time.time() - t_start) * 1000
+            logger.debug(
+                "[REID] extract_features_batch: backend=%s, num_images=%d, "
+                "elapsed=%.1fms (%.1fms/img)",
+                self.backend,
+                len(images),
+                elapsed_ms,
+                elapsed_ms / len(images) if images else 0,
+            )
+            return [_ensure_f32(v) for v in results]
         return [self.extract_feature(img) for img in images]
 
     @staticmethod

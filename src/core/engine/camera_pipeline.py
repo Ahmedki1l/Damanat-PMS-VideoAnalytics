@@ -2,7 +2,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon
 
 from src.config import AppConfig
 from src.core.slot_assigner import SlotAssigner
@@ -63,6 +63,27 @@ class CameraPipeline:
             cv2.fillPoly(self._mask, [pts], 255)
 
         return cv2.bitwise_and(frame, frame, mask=self._mask)
+
+    def filter_detections_to_roi(self, detections):
+        """Drop detections whose ground-contact point falls outside the ROI.
+
+        This is the post-detection equivalent of ``apply_roi_mask``: it keeps
+        out-of-area vehicles (e.g. a neighbouring camera's car visible at the
+        frame edge) from reaching the assigner/zoning, WITHOUT blacking out the
+        frame before detection. Masking the frame first paints large black
+        regions that wreck the detector after it letterboxes 1280x720 down to
+        the model's small input (a fully-visible dark car was being missed at
+        int8/320). Detecting on the full frame preserves detection quality; the
+        ROI is then applied here as a cheap membership test on the same
+        bottom-center point ``SlotAssigner`` uses, so the exclusion semantics are
+        unchanged. No-op when the camera has no ROI polygon.
+        """
+        if self.roi_polygon is None:
+            return detections
+        return [
+            d for d in detections
+            if self.roi_polygon.contains(Point(*d.bottom_center))
+        ]
 
     @property
     def slot_count(self) -> int:

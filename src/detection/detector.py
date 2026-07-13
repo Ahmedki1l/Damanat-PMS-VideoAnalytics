@@ -19,7 +19,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from src.config import DetectorConfig, DetectorPreprocessingConfig
-from src.preprocessing import luminance_normalize, auto_gamma
+from src.preprocessing import luminance_normalize_auto
 
 
 @dataclass
@@ -104,15 +104,12 @@ class VehicleDetector:
         if not pp.enabled:
             return frame
 
-        gamma = None
-        if pp.gamma_correction:
-            gamma = auto_gamma(frame, dark_threshold=pp.dark_threshold)
-
-        return luminance_normalize(
+        return luminance_normalize_auto(
             frame,
             clip_limit=pp.clip_limit,
             grid_size=pp.grid_size,
-            gamma=gamma,
+            gamma_correction=pp.gamma_correction,
+            dark_threshold=pp.dark_threshold,
         )
 
     def detect(self, frame: np.ndarray) -> List[Detection]:

@@ -106,13 +106,17 @@ class TestANPRDropped(unittest.TestCase):
 
 
 class TestANPRDelayed(unittest.TestCase):
-    """Two sub-scenarios: ANPR arrives just inside the window vs. just outside.
-    The registry policy at ``vehicle_registry_identity.py:305`` and
-    ``vehicle_registry_core.py:293`` is "drop pending events older than
-    ``PENDING_ANPR_EXPIRY_SECONDS`` (30s)"."""
+    """ANPR arrives late relative to the candidate — how late is still legitimate?
 
-    def test_anpr_delayed_within_window_binds(self) -> None:
-        """ANPR arrives 29s after the candidate — bind still succeeds."""
+    ``event.timestamp`` is when the event was RECEIVED, and the plate is read at the
+    gate UPSTREAM of the zone, so a genuine car's event lands at-or-just-after that car
+    appears in the zone. ``PARK_ENTRY_LINGER_GRACE_SECONDS`` absorbs the integrator's
+    POST latency. Past that, a candidate already sitting in the zone did not trigger the
+    read, and taking the plate would steal it from the car that did (D3).
+    """
+
+    def test_anpr_delayed_within_grace_binds(self) -> None:
+        """ANPR lands shortly after the car appears in the zone (POST latency) — binds."""
         clock = FakeClock()
         registry = make_test_registry(clock=clock)
 
@@ -128,8 +132,8 @@ class TestANPRDelayed(unittest.TestCase):
             registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id)
         )
 
-        # T=29s — ANPR finally arrives, still inside the 30s grace window.
-        clock.advance(29)
+        # The event lands inside the grace — a slow POST for THIS car.
+        clock.advance(registry.PARK_ENTRY_LINGER_GRACE_SECONDS - 1)
         event = registry.register_anpr_event("DELAY-001", "entry")
         plate = registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id)
 
@@ -137,6 +141,35 @@ class TestANPRDelayed(unittest.TestCase):
         self.assertEqual(event.status, "provisional")
         self.assertEqual(candidate.status, "provisional")
         self.assertEqual(candidate.bound_event_id, event.event_id)
+
+    def test_anpr_long_after_candidate_is_refused_as_lingerer(self) -> None:
+        """D3: 29s after a car settled in the zone, a freshly-read plate belongs to the
+        ARRIVING car — not to the one already sitting there.
+
+        This case used to BIND (the steal). It is the same scenario the old
+        ``test_anpr_delayed_within_window_binds`` asserted as correct: nothing stopped it
+        but candidate GC at 30s, and in production ``last_seen_at`` is refreshed every
+        frame a car is visible, so that GC never fires and a lingerer stayed bindable
+        indefinitely.
+        """
+        clock = FakeClock()
+        registry = make_test_registry(clock=clock)
+
+        candidate = registry.open_park_entry_candidate("CAM-03", track_id=2)
+        registry.update_park_entry_candidate_snapshot(
+            candidate.candidate_id,
+            make_color_crop(bgr=(20, 200, 20)),
+            quality_score=5.0,
+        )
+
+        clock.advance(29)
+        registry.register_anpr_event("DELAY-001", "entry")
+
+        self.assertIsNone(
+            registry.bind_next_pending_anpr_to_candidate(candidate.candidate_id),
+            "lingering candidate took a plate read 29s after it entered the zone",
+        )
+        self.assertEqual(candidate.status, "open")
 
     def test_anpr_delayed_past_window_drops(self) -> None:
         """ANPR arrives 45s after the candidate — pending event ages out

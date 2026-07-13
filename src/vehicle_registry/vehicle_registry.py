@@ -53,6 +53,21 @@ class VehicleRegistry(
     # must stop being bindable quickly so the NEXT car cannot inherit it. The event
     # itself still lives the full expiry for re-entry grace / specific-event binds.
     PENDING_ANPR_BIND_TTL_SECONDS = 10
+    # D3 linger guard. The ANPR read happens at the gate, UPSTREAM of the CAM-23
+    # Park_Entry polygon, so the car that triggered a read reaches the zone AFTER
+    # it. A candidate that was ALREADY sitting in the zone when the plate was read
+    # therefore cannot be the car that was read — it is a lingerer (it entered
+    # without an ANPR read of its own, or its read was missed), and FIFO-binding it
+    # hands it the ARRIVING car's plate.
+    #
+    # This is a check on the candidate's entry time RELATIVE TO THE READ, not on
+    # its absolute age: a car may legitimately dwell in the zone for minutes at the
+    # barrier, and an absolute age cap is exactly what force-expired dwelling cars
+    # and had to be reverted (b3ef313). Both clocks are the registry's own
+    # (`_clock()`), so there is no integrator skew to absorb — but `event.timestamp`
+    # is when the event was RECEIVED, not when the plate was physically read, so
+    # this grace must comfortably exceed the ANPR integrator's POST latency.
+    PARK_ENTRY_LINGER_GRACE_SECONDS = 5
     # Re-entry DB-grace: a car can exit (parking_sessions -> closed) and RE-ENTER
     # before PMS-AI inserts the new open row. During that window the freshest DB
     # row is still the exit's closed row, so is_plate_inside would wrongly report
@@ -137,6 +152,28 @@ class VehicleRegistry(
         # refused by the relocate / stale-release / theft paths in
         # try_link_to_slot until it is explicitly unlocked (slot goes VACANT).
         self._locked_slots: set[str] = set()
+        # Training-data harvest: one JSONL record per slot-identity decision. Per-process
+        # file (the supervisor runs several workers; a shared handle interleaves and
+        # corrupts — see zoning_trace.log). Writes happen on a daemon thread, so the
+        # frame loop never waits on disk.
+        # NOTE: self._matching_config is not assigned until later in __init__, so read
+        # from the constructor argument, not the attribute.
+        from src.matching.decision_log import DecisionLog
+
+        _mc = matching_config or MatchingConfig()
+        self.decision_log = DecisionLog(
+            directory=getattr(_mc, "decision_log_dir", "logs/decisions"),
+            worker=os.environ.get("VA_GROUP", "") or f"pid{os.getpid()}",
+            max_queue=int(getattr(_mc, "decision_log_queue_max", 2000)),
+            enabled=bool(getattr(_mc, "decision_log_enabled", True)),
+        )
+        # Plate locks held by OTHER worker processes. The supervisor runs several
+        # engines, each with its own registry, so a car locked into a slot on a camera
+        # this worker doesn't own is invisible here — yet it is exactly the candidate
+        # that must be excluded (a car cannot be in two slots). parking_slots is the
+        # shared truth; this mirror is refreshed on the existing session-sync tick.
+        # plate -> {slot_id, camera_id, locked_at}
+        self._external_plate_locks: Dict[str, Dict[str, Any]] = {}
         self._history: List[VehicleSession] = []
 
         # Zoning: area_id → {session_id} for the bounded (per-area) candidate
@@ -278,6 +315,23 @@ class VehicleRegistry(
         consults the index when the feature flag is True.
         """
         return self._gallery_index
+
+    # --- Cross-worker plate locks --------------------------------------- #
+    def set_external_plate_locks(self, locks: Dict[str, Dict[str, Any]]) -> None:
+        """Replace this worker's view of the plate locks held across the whole system.
+
+        Read from ``parking_slots`` (the shared truth) on the session-sync tick, so a car
+        locked into a slot by ANOTHER worker process still gets excluded as a candidate
+        here. Whole-map replace rather than merge: a slot that has gone vacant must
+        disappear, and a stale lock is worse than a missing one — it would keep vetoing
+        the right car.
+        """
+        with self._lock:
+            self._external_plate_locks = dict(locks or {})
+
+    def get_external_plate_locks(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return dict(self._external_plate_locks)
 
     # --- Zoning: per-area session index -------------------------------- #
     def set_session_area(self, session: VehicleSession, area_id: str) -> None:

@@ -9,8 +9,51 @@ import numpy as np
 from shapely.geometry import Point, box
 
 from src.models.slot import ParkingSlot
+from src.models.state_machine import SlotState
 
 logger = logging.getLogger(__name__)
+
+# Apparent-size ramp for _bbox_view_quality: a car whose on-screen HEIGHT is at
+# or below _VQ_MIN_H px yields a useless upscaled crop for ReID and scores 0 on
+# size; at or above _VQ_GOOD_H px it is well-resolved and scores 1.0. This makes
+# a far camera whose tiny car is fully framed rank BELOW a near camera that sees
+# the car large — for both identity ownership and gallery reference capture.
+#
+# _VQ_GOOD_H was 90px, which made this ramp nearly inert: ANY car >=90px tall
+# scored a PERFECT 1.0 on size and sailed through gallery_min_view_quality (0.9).
+# Measured against the real on-disk gallery, that is far too generous:
+#     genuine close references (CAM-03 / CAM-23 entry shots):  300-537 px tall
+#     far aisle crops that poisoned DJS-7842 (CAM-07/CAM-04):  119-139 px tall
+# Both scored 1.0. 250px sits cleanly between the two populations, so a distant
+# car down an aisle now scores well under the 0.9 gate and can no longer become
+# a gallery reference or win the ownership contest against the camera that
+# actually sees the car up close.
+# These were calibrated against 720p crops. They MUST NOT be absolute pixels: the
+# cameras were switched from 1280x720 to 1920x1080 on 2026-07-11, which makes every car
+# 1.5x taller on screen at the same physical distance — so a fixed 250px gate silently
+# became a 167px-at-720p gate, 50% more permissive, letting back in exactly the mid-size
+# junk it was added to exclude. Expressed as a FRACTION of frame height, the gate means
+# the same thing at any stream resolution.
+_VQ_REF_H = 720.0          # the resolution the numbers below were measured at
+_VQ_MIN_H_720 = 45.0       # below this: a useless upscaled crop
+_VQ_GOOD_H_720 = 250.0     # at/above this: well-resolved (real refs were 300-537px)
+
+
+def _vq_size_thresholds(frame_h: float) -> Tuple[float, float]:
+    """Scale the size ramp to the actual frame height, so the gate is resolution-free."""
+    s = max(1e-6, float(frame_h)) / _VQ_REF_H
+    return _VQ_MIN_H_720 * s, _VQ_GOOD_H_720 * s
+
+# A bbox within this many px of the frame border was CLAMPED by the detector: the car
+# runs off the edge and the box holds only the visible fragment. Such a crop is a piece
+# of a car, and must never become a ReID reference. 2px (not 0) because the detector
+# rounds, so a truly touching box can report 1.0 rather than 0.0.
+_VQ_BORDER_PX = 2.0
+# Widest a whole car may plausibly appear. Facility crops have a MEDIAN w/h of 1.40;
+# CAM-04's junk was 707x222 = 3.2 — a sliver of a car cut off at the top of frame, not
+# a vehicle. Catches badly-merged boxes too, which can be sliver-shaped without ever
+# touching a border.
+_VQ_MAX_ASPECT = 2.2
 
 
 class ParkingEngineTrackingMixin:
@@ -147,6 +190,74 @@ class ParkingEngineTrackingMixin:
         bc_x, bc_y = detection.bottom_center
         return zone_slot.polygon.contains(Point(bc_x, bc_y))
 
+    def _detection_in_occupied_slot(self, cam_id: str, detection) -> bool:
+        """True when this detection sits inside a slot that is ALREADY occupied
+        (or leaving) on this camera.
+
+        A car in an occupied slot is a parked car — it cannot be the newly
+        entered car we are building a reference for — so its crop must not be
+        pulled into a gallery. Uses the slot state from the previous frame's
+        occupancy pass (this runs before ``_update_slot_state`` for the current
+        frame), which is the correct "already occupied" signal. No-op (False)
+        when the camera has no pipeline / slots."""
+        pipeline = self.pipelines.get(cam_id) if hasattr(self, "pipelines") else None
+        if pipeline is None:
+            return False
+        for slot in getattr(pipeline, "slots", []) or []:
+            sm = pipeline.state_machines.get(slot.id)
+            if sm is None or sm.state not in (SlotState.OCCUPIED, SlotState.LEAVING):
+                continue
+            if self._detection_in_zone(detection, slot):
+                return True
+        return False
+
+    def _detection_in_own_slot(self, cam_id: str, detection) -> bool:
+        """True when this detection sits inside a slot THIS camera hosts.
+
+        Slot authority for gallery teaching. A camera may host one or two slots
+        while its frame covers a whole aisle full of OTHER cameras' slots — CAM-07
+        hosts a single slot that is 4% of its frame, yet its ROI is 74% of it. Owning
+        a car (the only camera check on the teach path) was therefore enough licence
+        to write references for a car parked in someone else's slot, and that is how
+        four crops of a black Ford ended up in grey-Hyundai DJS-7842's gallery.
+
+        Note this can only ever ask "is it in MY slot", never "is it in SOMEONE
+        ELSE'S": slot polygons are expressed in each camera's own image coordinates,
+        and the cameras are split across worker processes, so another camera's
+        polygon is neither comparable nor in scope here.
+
+        No-op (False) when the camera has no pipeline / hosts no slots — a slotless
+        transit camera (CAM-03, CAM-05, CAM-23) has no slot authority and so teaches
+        nothing through this path. Its references come from the seed paths instead.
+        """
+        pipeline = self.pipelines.get(cam_id) if hasattr(self, "pipelines") else None
+        if pipeline is None:
+            return False
+        for slot in getattr(pipeline, "slots", []) or []:
+            if self._detection_in_zone(detection, slot):
+                return True
+        return False
+
+    def _slot_authority_required(self) -> bool:
+        cfg = getattr(self, "config", None)
+        matching = getattr(cfg, "matching", None) if cfg is not None else None
+        return bool(getattr(matching, "gallery_require_slot_authority", True))
+
+    def _track_in_entrance_zone(self, cam_id: str, track_id: int) -> bool:
+        """True while ``track_id`` is currently inside a B1_Entrance
+        (``Entrence``) confirmation zone on this camera.
+
+        Reference snapshots must not be captured for a car until it has LEFT the
+        B1_Entrance (CAM-03) zone — while inside, the view is mid-transit /
+        partial, not the clean profile we want. ``_process_confirmation_zone``
+        refreshes ``_tracks_inside_zones`` earlier in the same frame, so this
+        reads the current-frame membership. Cameras without an entrance zone
+        simply have no such key → False (accumulation proceeds normally)."""
+        for (c, zone_id), ids in self._tracks_inside_zones.items():
+            if c == cam_id and "Entrence" in zone_id and track_id in ids:
+                return True
+        return False
+
     def _detection_overlaps_zone(
         self,
         detection,
@@ -268,6 +379,33 @@ class ParkingEngineTrackingMixin:
         if include_exit_view and exit_view and exit_view.get("crop") is not None:
             ordered_views.append(("exit", exit_view["crop"]))
 
+        # Extra rear-side views. The single `exit` frame above is only the last
+        # consistent crop and is often far/small, so the car's BACK is under-
+        # represented by a single frame. Sample additional frames from the
+        # crossing tail (car driving away = rear-facing) so the gallery carries
+        # real rear coverage. Consistency-gated against the entry crop so a
+        # mis-tracked frame (a different car) never enters; evenly spread in time
+        # so the frames are distinct rear viewpoints, not adjacent duplicates.
+        # Bounded by config; the downstream cosine-dedup drops any redundant one.
+        extra_rear = 0
+        if include_exit_view and self.vehicle_registry is not None:
+            cfg = getattr(self.vehicle_registry, "matching_config", None)
+            extra_rear = int(getattr(cfg, "confirmation_extra_rear_views", 0) or 0)
+        if extra_rear > 0:
+            tail = (burst.get("candidates") or [])[len(burst.get("candidates") or []) // 2:]
+            rear_pool = [
+                c for c in tail
+                if c.get("crop") is not None and c["crop"].size > 0
+                and (
+                    entry_crop is None
+                    or self._is_consistent_confirmation_crop(entry_crop, c["crop"])
+                )
+            ]
+            if rear_pool:
+                step = max(1, len(rear_pool) // extra_rear)
+                for c in rear_pool[::step][:extra_rear]:
+                    ordered_views.append(("rear", c["crop"]))
+
         images: List[np.ndarray] = []
         labels: List[str] = []
         for label, crop in ordered_views:
@@ -343,16 +481,84 @@ class ParkingEngineTrackingMixin:
             selected.append(secondary)
         return selected
 
-    def _bbox_view_quality(self, frame: np.ndarray, detection) -> float:
-        """How fully this camera sees the car: 1.0 when the bbox sits entirely
-        inside the frame (with a 1% edge margin), decreasing toward 0.0 as the
-        box is clipped by a frame edge (part of the car out of view).
+    def _neighbour_clearance(self, detection, detections) -> float:
+        """1.0 when this car's box is unobstructed; →0 as other boxes cover it.
 
-        Estimated as the fraction of the detection's *reported* bbox area that
-        falls inside the frame — a box hard against an edge has been clamped by
-        the detector, so its reported extent beyond the border is the missing
-        part of the car. Used only as an ownership tie-breaker (display/
-        attribution), never a detection decision.
+        A car parked shoulder-to-shoulder in a garage has a box that overlaps its
+        neighbour's, so a crop of it contains part of the wrong car and makes a
+        contaminated ReID reference. Returns the fraction of THIS box NOT covered
+        by the single most-overlapping other detection — an asymmetric
+        intersection-over-self, not IoU, so a large neighbour that swallows a
+        small distant box correctly scores that small box as heavily occluded.
+        Fails open (1.0) on any error: clearance only ever WEIGHTS view quality,
+        it is never a detection decision.
+        """
+        try:
+            if not detections or len(detections) < 2:
+                return 1.0
+            ax1, ay1, ax2, ay2 = (float(v) for v in detection.bbox)
+            a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            if a_area <= 0.0:
+                return 1.0
+            self_tid = getattr(detection, "track_id", None)
+            worst = 0.0
+            for other in detections:
+                if other is detection:
+                    continue
+                other_tid = getattr(other, "track_id", None)
+                if other_tid == -1 or (
+                    self_tid is not None and other_tid == self_tid
+                ):
+                    continue
+                bx1, by1, bx2, by2 = (float(v) for v in other.bbox)
+                ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+                iy = max(0.0, min(ay2, by2) - max(ay1, by1))
+                worst = max(worst, (ix * iy) / a_area)
+            return max(0.0, 1.0 - worst)
+        except Exception:
+            return 1.0
+
+    def _clearance_enforced(self) -> bool:
+        """True when D9 neighbour-clearance should MULTIPLY view quality (gating
+        occluded crops out of the gallery). Default False ⇒ log-only. Reads the
+        registry's matching config; absent (bare mixin in a unit test) ⇒ False."""
+        cfg = getattr(getattr(self, "vehicle_registry", None), "matching_config", None)
+        return bool(getattr(cfg, "gallery_neighbour_clearance_enforce", False))
+
+    def _bbox_view_quality(self, frame: np.ndarray, detection, detections=None) -> float:
+        """How well this camera sees the car — the product of two (or three)
+        factors:
+
+        * TRUNCATION: 0.0 when the bbox touches the frame border. The detector
+          reports only the VISIBLE fragment of a car that runs off the edge, so the
+          box is not "slightly clipped" — it is a partial car, and the missing part
+          is invisible to the box geometry. The old `edge` term could not see this:
+          it only ever docked the width of the 1% margin, so a car with a third of
+          its body out of frame (bbox 222x707, y1=0) scored edge = (222-7.2)/222 =
+          0.968 and sailed through the 0.9 gallery gate. That is exactly how CAM-04
+          wrote a 707px-wide sliver into DJS-7842's gallery.
+        * ASPECT: 0.0 when the crop is far too wide to be a whole car. Facility crops
+          have a median w/h of 1.40; a 707x222 box (3.2) is a sliver, not a vehicle.
+          Truncation and aspect catch overlapping-but-different failures — a car cut
+          off at the BOTTOM of frame stays plausibly-shaped, and a badly-merged box
+          can be sliver-shaped without touching any border.
+        * edge fraction: 1.0 when the bbox sits entirely inside the frame (1%
+          edge margin), toward 0.0 as an edge clips it (part of the car out of
+          view). Retained as a soft term for boxes that are near, but not on, a border.
+        * apparent-size factor: ramps 0→1 with the car's on-screen HEIGHT
+          (_VQ_MIN_H → _VQ_GOOD_H). A distant, low-resolution car makes a poor
+          ReID crop regardless of framing, so it must NOT rank as a "full view".
+        * neighbour clearance (D9): 1.0 unobstructed → 0.0 covered by another
+          car's box. Folded in ONLY when ``detections`` is supplied AND
+          gallery_neighbour_clearance_enforce is set; otherwise it is computed
+          and logged (log-only) so its distribution can be studied before it
+          gates. Passing ``detections=None`` (e.g. unit tests) skips it entirely.
+
+        Used as an ownership tie-breaker (display/attribution) AND as the
+        gallery-reference quality gate — so a far camera whose tiny car is fully
+        framed no longer outranks a near camera that sees the car large, and its
+        low-resolution crops are kept out of the gallery. Never a detection
+        decision.
         """
         try:
             h, w = frame.shape[:2]
@@ -360,10 +566,48 @@ class ParkingEngineTrackingMixin:
             bw, bh = x2 - x1, y2 - y1
             if bw <= 0 or bh <= 0:
                 return 0.0
+
+            # Truncated: the box runs off the frame, so this is a fragment of a car.
+            if (
+                x1 <= _VQ_BORDER_PX
+                or y1 <= _VQ_BORDER_PX
+                or x2 >= w - _VQ_BORDER_PX
+                or y2 >= h - _VQ_BORDER_PX
+            ):
+                logger.debug(
+                    "[quality] track=%s TRUNCATED at frame border "
+                    "(bbox=%.0f,%.0f,%.0f,%.0f frame=%dx%d) -> quality 0",
+                    getattr(detection, "track_id", "?"), x1, y1, x2, y2, w, h,
+                )
+                return 0.0
+
+            # Sliver: too wide to be a whole car (median facility aspect is 1.40).
+            if (bw / bh) > _VQ_MAX_ASPECT:
+                logger.debug(
+                    "[quality] track=%s ASPECT %.2f > %.2f (%.0fx%.0f) — a sliver, "
+                    "not a car -> quality 0",
+                    getattr(detection, "track_id", "?"), bw / bh, _VQ_MAX_ASPECT, bw, bh,
+                )
+                return 0.0
+
             mx, my = 0.01 * w, 0.01 * h
             ix = max(0.0, min(x2, w - mx) - max(x1, mx))
             iy = max(0.0, min(y2, h - my) - max(y1, my))
-            return max(0.0, min(1.0, (ix * iy) / (bw * bh)))
+            edge = max(0.0, min(1.0, (ix * iy) / (bw * bh)))
+            vq_min_h, vq_good_h = _vq_size_thresholds(h)
+            size = max(0.0, min(1.0, (bh - vq_min_h) / (vq_good_h - vq_min_h)))
+            base = edge * size
+            if detections is None:
+                return base
+            clearance = self._neighbour_clearance(detection, detections)
+            enforce = self._clearance_enforced()
+            if clearance < 1.0:
+                logger.info(
+                    "[quality] track=%s clearance=%.3f base=%.3f -> %.3f (enforce=%s)",
+                    getattr(detection, "track_id", "?"),
+                    clearance, base, base * clearance, enforce,
+                )
+            return base * clearance if enforce else base
         except Exception:
             return 0.0
 
@@ -487,6 +731,22 @@ class ParkingEngineTrackingMixin:
         """
         Pick the single best entrance car for this frame and ignore nearby cars.
         """
+        ranked = self._rank_zone_detections(frame, detections, zone)
+        return ranked[0] if ranked else None
+
+    def _rank_zone_detections(
+        self,
+        frame: np.ndarray,
+        detections: List,
+        zone: ParkingSlot,
+    ) -> List:
+        """
+        Rank the snapshot-ready in-zone cars best-first (the primary is [0]).
+
+        The Park_Entry bind walks this order and stops at the first car the
+        registry accepts, so a car that CANNOT bind (a D3 lingerer, or one
+        already bound) no longer blocks the car behind it.
+        """
         candidates = []
         for detection in detections:
             if detection.track_id == -1:
@@ -515,11 +775,8 @@ class ParkingEngineTrackingMixin:
             )
             candidates.append((score, detection))
 
-        if not candidates:
-            return None
-
         candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates[0][1]
+        return [detection for _, detection in candidates]
 
     def _process_park_entry_zone(
         self,
@@ -528,50 +785,126 @@ class ParkingEngineTrackingMixin:
         detections: List,
         zone: ParkingSlot,
     ):
-        """Handle CAM_01 logic for Park_Entry."""
-        currently_inside = set()
+        """Handle CAM_01 logic for Park_Entry.
 
-        for detection in detections:
-            if detection.track_id == -1:
-                continue
+        D1: the pending plate goes to the PRIMARY car in the zone, not to whoever
+        the tracker happened to list first.
 
-            if self._detection_in_zone(detection, zone):
-                currently_inside.add(detection.track_id)
+        D3: the bind walks the cars in primary order and stops at the first one the
+        registry accepts. A car that cannot legitimately own the plate — a lingerer
+        that was already sitting in the zone when the plate was read, or one that is
+        already bound — is skipped rather than allowed to steal it. Walking on to the
+        next car also matters: the bind requires status == "open" and only the
+        best-ranked car used to attempt it, so a stationary lingerer (which scores
+        HIGH on overlap/depth/area, and so wins the primary slot) would otherwise
+        block every car behind it from ever binding.
+        """
+        in_zone_detections = [
+            d for d in detections
+            if d.track_id != -1 and self._detection_in_zone(d, zone)
+        ]
+        currently_inside = {d.track_id for d in in_zone_detections}
 
-                candidate_id = self._park_entry_track_to_candidate.get(detection.track_id)
-                if not candidate_id:
-                    candidate = self.vehicle_registry.open_park_entry_candidate(
-                        cam_id,
-                        detection.track_id,
-                    )
-                    candidate_id = candidate.candidate_id
-                    self._park_entry_track_to_candidate[detection.track_id] = candidate_id
-
-                crop = self._crop_detection(frame, detection)
-                if crop is not None:
-                    quality = self._score_snapshot_quality(detection, crop)
-                    self.vehicle_registry.update_park_entry_candidate_snapshot(
-                        candidate_id,
-                        crop,
-                        quality,
-                    )
-
-                bound_plate = self.vehicle_registry.bind_next_pending_anpr_to_candidate(
-                    candidate_id
+        if cam_id == "CAM-23":
+            for detection in detections:
+                if detection.track_id == -1:
+                    continue
+                logger.debug(
+                    "[PARK_ENTRY] Track %d zone-contains: %s (bottom_center=%s)",
+                    detection.track_id,
+                    detection.track_id in currently_inside,
+                    detection.bottom_center,
                 )
-                # A successful bind fires once (the candidate leaves "open"), so
-                # this is the natural moment to create the car's durable per-plate
-                # gallery folder from its first good Park_Entry view — guaranteeing
-                # every entering car gets a folder here, at CAM-23, not the gate.
-                if bound_plate:
-                    self.vehicle_registry.seed_gallery_from_park_entry(
-                        candidate_id, bound_plate
-                    )
+
+        # Pass 1 — every in-zone car gets a candidate and a fresh snapshot.
+        candidate_ids = {}
+        for detection in in_zone_detections:
+            candidate_id = self._park_entry_track_to_candidate.get(detection.track_id)
+            if not candidate_id:
+                candidate = self.vehicle_registry.open_park_entry_candidate(
+                    cam_id,
+                    detection.track_id,
+                )
+                candidate_id = candidate.candidate_id
+                self._park_entry_track_to_candidate[detection.track_id] = candidate_id
+            candidate_ids[detection.track_id] = candidate_id
+
+            crop = self._crop_detection(frame, detection)
+            if crop is not None:
+                quality = self._score_snapshot_quality(detection, crop)
+                self.vehicle_registry.update_park_entry_candidate_snapshot(
+                    candidate_id,
+                    crop,
+                    quality,
+                )
+            elif cam_id == "CAM-23":
+                logger.debug(
+                    "[PARK_ENTRY] Track %d crop is None (bbox=%s)",
+                    detection.track_id, detection.bbox,
+                )
+
+        # Pass 2 — bind at most ONE pending plate, walking the cars in primary order.
+        # Solo fallback (b3ef313): a lone car must still bind when _rank_zone_detections
+        # abstains, because its snapshot-ready test is stricter than _detection_in_zone.
+        # With several cars present only the ranked (snapshot-ready) ones are eligible,
+        # so the order is deterministic and D1's anti-tailgate preference holds.
+        if len(in_zone_detections) == 1:
+            bind_order = [in_zone_detections[0].track_id]
+        else:
+            bind_order = [
+                d.track_id
+                for d in self._rank_zone_detections(frame, detections, zone)
+                if d.track_id in candidate_ids
+            ]
+
+        bound_plates = {}
+        for track_id in bind_order:
+            bound_plate = self.vehicle_registry.bind_next_pending_anpr_to_candidate(
+                candidate_ids[track_id]
+            )
+            if cam_id == "CAM-23":
+                logger.info(
+                    "[PARK_ENTRY] Track %d bind_next_pending_anpr_to_candidate -> plate=%s",
+                    track_id, bound_plate,
+                )
+            if bound_plate:
+                bound_plates[track_id] = bound_plate
+                break
+
+        # Pass 3 — a successful bind fires once (the candidate leaves "open"), so this
+        # is the natural moment to create the car's durable per-plate gallery folder
+        # from its first good Park_Entry view — guaranteeing every entering car gets a
+        # folder here, at CAM-23, not the gate. Retried every frame (Fix 4): even when
+        # THIS frame did not bind (bound earlier, or the pending event was consumed),
+        # the candidate still carries its plate — resolve it and re-attempt the
+        # idempotent seed so a good LATER crop still lands the CAM-23 top view instead
+        # of being lost when the first in-zone frame was poor.
+        for track_id, candidate_id in candidate_ids.items():
+            plate_for_seed = (
+                bound_plates.get(track_id)
+                or self.vehicle_registry.plate_for_park_entry_candidate(candidate_id)
+            )
+            if not plate_for_seed:
+                continue
+            seeded_ok = self.vehicle_registry.seed_gallery_from_park_entry(
+                candidate_id, plate_for_seed
+            )
+            if cam_id == "CAM-23":
+                logger.info(
+                    "[PARK_ENTRY] seed_gallery_from_park_entry candidate=%s plate=%s -> %s",
+                    candidate_id, plate_for_seed, seeded_ok,
+                )
 
         last_track_ids = self._tracks_inside_zones.get((cam_id, zone.id), set())
         left_zone = last_track_ids - currently_inside
         for track_id in left_zone:
             if track_id in self._park_entry_track_to_candidate:
+                # Drop only the track->candidate map entry. Do NOT expire the
+                # candidate here: a one-frame ByteTrack dropout/ID-switch briefly
+                # removes a still-present car from currently_inside, and actively
+                # expiring on that flicker permanently kills a candidate that was
+                # about to bind. The liveness sweep (last_seen_at) retires genuinely
+                # departed candidates.
                 del self._park_entry_track_to_candidate[track_id]
 
         self._tracks_inside_zones[(cam_id, zone.id)] = currently_inside
@@ -610,10 +943,12 @@ class ParkingEngineTrackingMixin:
                     continue
 
                 burst_key = (cam_id, detection.track_id)
-                crop = self._crop_detection(
+                crop = self._crop_detection_to_zone(
                     frame,
                     detection,
+                    zone,
                     padding_ratio=0.12,
+                    mask_outside_zone=True,
                 )
                 if crop is None:
                     continue
@@ -819,6 +1154,132 @@ class ParkingEngineTrackingMixin:
 
         self._tracks_inside_zones[(cam_id, zone.id)] = currently_inside
 
+    # Budget per TRACK. PaddleOCR is ~200ms on the frame loop, so this must stay tight:
+    # a car drives up the aisle for several seconds and we only need ONE frame in which
+    # its plate faces the camera.
+    _OCR_TRACK_MAX_ATTEMPTS = 8
+    _OCR_TRACK_MIN_INTERVAL_S = 1.0
+
+    def _try_ocr_identify_tracks(self, cam_id, frame, detections, now_ts) -> None:
+        """Read the plate off a still-driving car and bind its identity to the track.
+
+        Only for tracks that are ANONYMOUS (no plate yet) on a camera that hosts slots —
+        i.e. a car heading for a parking space on this camera. Bounded per track, and the
+        budget dies with the track.
+        """
+        registry = self.vehicle_registry
+        if registry is None or not getattr(self, "pipelines", None):
+            return
+        pipeline = self.pipelines.get(cam_id)
+        if pipeline is None or not getattr(pipeline, "slots", None):
+            return  # a camera with no slots has no car to identify for a slot
+
+        if not hasattr(self, "_ocr_track_attempts"):
+            self._ocr_track_attempts, self._ocr_track_last_at = {}, {}
+            self._ocr_track_first_seen = {}
+
+        for detection in detections:
+            tid = getattr(detection, "track_id", -1)
+            if tid == -1:
+                continue
+            key = (cam_id, tid)
+            # When did we FIRST see this car? The transit hop needs it: a car already
+            # being tracked before another car's plate was read cannot be that car.
+            self._ocr_track_first_seen.setdefault(key, now_ts)
+            if registry.get_plate_for_track(cam_id, tid):
+                continue  # already identified — nothing to read
+            if self._ocr_track_attempts.get(key, 0) >= self._OCR_TRACK_MAX_ATTEMPTS:
+                continue
+            if now_ts - self._ocr_track_last_at.get(key, 0.0) < self._OCR_TRACK_MIN_INTERVAL_S:
+                continue
+
+            crop = self._crop_detection(frame, detection)
+            if crop is None or crop.size == 0:
+                continue
+
+            self._ocr_track_attempts[key] = self._ocr_track_attempts.get(key, 0) + 1
+            self._ocr_track_last_at[key] = now_ts
+
+            plate = registry.try_ocr_identify_track(cam_id, tid, crop)
+            if plate:
+                logger.info(
+                    "[ocr-id] track (%s, %s) IDENTIFIED as %s while driving — "
+                    "the plate is known BEFORE it parks",
+                    cam_id, tid, plate,
+                )
+                continue
+
+            # THE TRANSIT HOP. This camera cannot read a plate — CAM-21 is mounted
+            # side-on to its aisle and has produced ZERO successful reads, parked or
+            # moving, because a car is in profile the entire time it is in frame. The
+            # information simply is not in the image.
+            #
+            # But every car entering this facility passes CAM-20, which reads plates
+            # reliably. So the car in front of us was READ seconds ago, metres away, and
+            # has not parked yet. Adopt that identity — then capture the SIDE-VIEW
+            # reference, which is the thing ReID has never had. Every gallery reference
+            # today is a front-on gate photo, which is why a side view scores 0.583 for
+            # the right car and 0.634 for a wrong one. One side reference turns that into
+            # a same-view match (~0.9), and from the car's SECOND visit ReID does this on
+            # its own and this hop is never needed again.
+            self._try_adopt_transit_identity(cam_id, tid, key, crop, now_ts, detection)
+
+    def _try_adopt_transit_identity(self, cam_id, tid, key, crop, now_ts, detection) -> None:
+        registry = self.vehicle_registry
+        cfg = getattr(getattr(registry, "_matching_config", None), "__dict__", {})
+        if not cfg.get("slot_acquire_by_ocr_transit", True):
+            return
+
+        first_seen = self._ocr_track_first_seen.get(key)
+        if first_seen is None:
+            return
+
+        # A car sitting in an OCCUPIED slot is PARKED. It cannot be the car that just
+        # drove past CAM-20, no matter how new its track looks.
+        #
+        # This is the hole the "appeared after the read" guard does not close: ByteTrack
+        # loses and re-acquires IDs, so a car that has been parked for hours can suddenly
+        # present a brand-new track whose first_seen is AFTER someone else's plate was
+        # read. Unattended, in a full garage, that would stamp wrong plates across many
+        # slots — the same way acquisition-by-elimination put DJS-7842 on a parked Nissan
+        # Sunny. Ask where the car IS, not just how old its track is.
+        if detection is not None and self._detection_in_occupied_slot(cam_id, detection):
+            return
+
+        transit = registry.ocr_transit_candidates()
+        if len(transit) != 1:
+            if len(transit) > 1:
+                logger.info(
+                    "[ocr-id] cam=%s transit hop declined: %d cars in transit (%s) — "
+                    "ambiguous, refusing to guess",
+                    cam_id, len(transit), ",".join(s.plate for s, _ in transit),
+                )
+            return
+
+        session, identified_at = transit[0]
+        # The car we are looking at must have appeared AFTER the other car was read.
+        # A car already being tracked here beforehand was here first, so it cannot be
+        # the one that just drove past CAM-20. This is the guard that stopped the
+        # Nissan Sunny from being handed someone else's plate.
+        if first_seen < identified_at.timestamp():
+            logger.info(
+                "[ocr-id] cam=%s transit hop REFUSED for %s: this car was already "
+                "being tracked before that plate was read — it was here first",
+                cam_id, session.plate,
+            )
+            return
+
+        plate = registry.adopt_transit_identity(cam_id, tid, session.session_id)
+        if not plate:
+            return
+        logger.info(
+            "[ocr-id] cam=%s track %s ADOPTED %s in transit (read at %s, the only car "
+            "in transit) — this camera cannot read a plate, so the read one is carried",
+            cam_id, tid, plate, identified_at.strftime("%H:%M:%S"),
+        )
+        # The whole point: learn what this car looks like FROM THIS CAMERA.
+        registry.save_parked_reference(plate, crop, cam_id)
+
     def _process_global_tracking(
         self,
         cam_id: str,
@@ -833,6 +1294,19 @@ class ParkingEngineTrackingMixin:
             return
 
         now_ts = time.time()
+
+        # OCR the car WHILE IT IS STILL DRIVING, before it reaches a slot.
+        #
+        # Slot-level OCR cannot solve a side-on slot: CAM-21 frames B1_CRO in pure
+        # profile, so a car parked there shows no plate at all — not when settled, not
+        # even while turning in. The plate is only ever visible on the APPROACH, when the
+        # car is driving up the aisle with its front or rear toward the camera. Those are
+        # the frames we were throwing away by only looking inside slot polygons.
+        #
+        # Identify the track here, and the plate is already known by the time it parks —
+        # the existing slot-linking then carries it into current_plate with no guessing.
+        self._try_ocr_identify_tracks(cam_id, frame, detections, now_ts)
+
         for detection in detections:
             if detection.track_id == -1:
                 continue
@@ -842,7 +1316,7 @@ class ParkingEngineTrackingMixin:
             self.vehicle_registry.record_track_view(
                 cam_id,
                 detection.track_id,
-                self._bbox_view_quality(frame, detection),
+                self._bbox_view_quality(frame, detection, detections),
             )
 
             track_key = (cam_id, detection.track_id)
@@ -879,14 +1353,45 @@ class ParkingEngineTrackingMixin:
                             )
                         # Grow this car's persistent gallery with a fresh full-view
                         # crop (throttled/gated/deduped inside the registry) so its
-                        # ReID profile keeps improving and survives restart.
+                        # ReID profile keeps improving and survives restart. Two
+                        # capture guards, so a reference is only ever taken from
+                        # the genuine moving entrant:
+                        #   * skip a car sitting in an already-occupied slot — it
+                        #     is parked, not the newly entered car (its crop must
+                        #     not enter a gallery);
+                        #   * skip while the car is still inside the B1_Entrance
+                        #     (CAM-03) zone — wait until it has LEFT, so the ref is
+                        #     a clean profile, not a mid-transit partial view.
+                        if self._detection_in_occupied_slot(cam_id, detection):
+                            continue
+                        if self._track_in_entrance_zone(cam_id, detection.track_id):
+                            continue
+                        # Slot authority: only teach a car that is inside a slot THIS
+                        # camera hosts. Owning a car used to be the only camera check
+                        # here, so any aisle camera that won the ownership contest
+                        # could write references for a car parked in another camera's
+                        # slot. Combined with the guard above (skip already-occupied
+                        # slots), what survives is precisely the car currently
+                        # settling into MY not-yet-confirmed slot — which is the
+                        # parked-pose reference the gallery was missing, and the one
+                        # a slot camera needs to re-identify that car later.
+                        if (
+                            self._slot_authority_required()
+                            and not self._detection_in_own_slot(cam_id, detection)
+                        ):
+                            logger.debug(
+                                "[gallery] %s refused reference for plate=%s: car is "
+                                "not in a slot this camera hosts",
+                                cam_id, plate,
+                            )
+                            continue
                         ref_crop = self._crop_detection(frame, detection)
                         if ref_crop is not None:
                             self.vehicle_registry.record_reference_for_track(
                                 cam_id,
                                 detection.track_id,
                                 ref_crop,
-                                self._bbox_view_quality(frame, detection),
+                                self._bbox_view_quality(frame, detection, detections),
                             )
                     continue
 

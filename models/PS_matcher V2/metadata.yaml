@@ -1,0 +1,16 @@
+backbone: osnet_ain_veri
+input_size: [208, 208]   # [height, width] - the runtime reads this and overrides its default
+normalisation:
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  note: the input InstanceNorm cancels any per-channel affine, so these values do not
+    actually matter for this model - but channel order does. Feed RGB (cosine(RGB,BGR)=0.77).
+quantisation: int8
+calibration_image_count: 200
+source_weights_hash: osnet_ain_veri_facility.pth:f98076a5a9579254
+onnx_opset: 14
+fp32_vs_int8_cosine: 0.9871
+export_timestamp: 2026-07-12T22:39:34.832414+00:00
+input_name: images
+output_name: features
+finetuned: true

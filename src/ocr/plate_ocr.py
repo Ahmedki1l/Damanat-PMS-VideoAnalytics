@@ -227,6 +227,15 @@ class PaddlePlateOCR(PlateOCR):
     DEFAULT_PLATE_ROI_LEFT = 0.20     # plate sits centre-horizontally
     DEFAULT_PLATE_ROI_RIGHT = 0.80
 
+    # Retry factor applied ONLY when a read comes back empty. A blank read is not
+    # proof the plate is absent — a car parked far from the camera carries a plate
+    # too few pixels wide for the text DETECTOR to find, even though it is legible.
+    # 1.0 (or 0) disables the retry.
+    DEFAULT_EMPTY_READ_UPSCALE = 2.0
+    # Never enlarge past this many pixels: beyond it the retry costs more time than
+    # the recogniser gains, and a crop that big already had plenty of resolution.
+    DEFAULT_MAX_UPSCALED_PIXELS = 6_000_000
+
     def __init__(
         self,
         lang: str = DEFAULT_LANG,
@@ -245,6 +254,8 @@ class PaddlePlateOCR(PlateOCR):
         plate_roi_bottom: float = DEFAULT_PLATE_ROI_BOTTOM,
         plate_roi_left: float = DEFAULT_PLATE_ROI_LEFT,
         plate_roi_right: float = DEFAULT_PLATE_ROI_RIGHT,
+        empty_read_upscale: float = DEFAULT_EMPTY_READ_UPSCALE,
+        max_upscaled_pixels: int = DEFAULT_MAX_UPSCALED_PIXELS,
     ) -> None:
         # Fail fast at construction so callers know whether the plugin is
         # usable before the first frame arrives. The actual heavy model load
@@ -265,6 +276,8 @@ class PaddlePlateOCR(PlateOCR):
         self._min_crop_h = int(min_crop_h)
         self._min_crop_w = int(min_crop_w)
         self._rec_score_thresh = float(rec_score_thresh)
+        self._empty_read_upscale = float(empty_read_upscale)
+        self._max_upscaled_pixels = int(max_upscaled_pixels)
         # Default to PaddleOCR v5 mobile det/rec; callers can override for
         # an explicit model upgrade or downgrade.
         self._det_model_name = det_model_name or self.DEFAULT_DET_V3
@@ -514,9 +527,17 @@ class PaddlePlateOCR(PlateOCR):
 
     # ----- PlateOCR ABC --------------------------------------------------- #
 
-    def read(self, crop_bgr: np.ndarray) -> Tuple[str, float]:
+    def read(
+        self, crop_bgr: np.ndarray, *, allow_retry: bool = True
+    ) -> Tuple[str, float]:
         """
         Run OCR on a BGR crop and return ``(normalised_text, mean_conf)``.
+
+        ``allow_retry`` gates the enlarged second pass (see below). The enlarged pass is
+        what rescues a distant plate, but on a slot whose plate is genuinely out of frame
+        it finds spurious text regions, runs the recogniser on them, discards the lot,
+        and costs ~670ms for nothing. Callers with an attempt budget should spend the
+        retry on the first few attempts only.
 
         * Normalisation: uppercase, strip non-alphanumerics.
         * Fragments are concatenated in PaddleOCR's natural detection order
@@ -539,6 +560,56 @@ class PaddlePlateOCR(PlateOCR):
             return ("", 0.0)
 
         prepped = self._preprocess(crop_bgr)
+        text, conf = self._infer(prepped)
+        if text:
+            return (text, conf)
+
+        if not allow_retry:
+            # Caller has spent its retry budget for this slot (see
+            # ocr_upscale_retry_max_attempts). A slot whose plate is genuinely not in
+            # frame would otherwise pay the enlarged pass on all 12 attempts.
+            return ("", 0.0)
+
+        # Empty read — retry once on the ENLARGED plate region.
+        #
+        # A blank read is NOT the same as "no plate in frame". The crop is a whole
+        # vehicle, so a car parked far from the camera can carry a plate only ~120px
+        # wide inside a 540px crop, and the text DETECTOR never finds it — even though
+        # the plate is perfectly legible to a human. _preprocess only upsamples crops
+        # below a tiny 32x64 floor, so a large-but-distant crop like that is never
+        # enlarged and reads as ''.
+        #
+        # Measured 2026-07-13 on slot B13 (CAM-24, a C-level slot dark for 60 attempts):
+        #     native 540x562  -> ''          (what production did)
+        #     retry at x2     -> '9990BHD'   -> matches BHD-9990
+        #
+        # Enlarge the ALREADY-PREPROCESSED region, not the raw crop: it is ~3x smaller
+        # (HUD masked, cropped to the plate ROI), so the retry costs 199ms instead of
+        # 759ms on a slot whose plate is genuinely absent — and that is the common case,
+        # paid on every one of the 12 attempts. Same read either way.
+        scale = float(self._empty_read_upscale or 0.0)
+        if scale <= 1.0 or prepped is None or getattr(prepped, "size", 0) == 0:
+            return ("", 0.0)
+        try:
+            import cv2
+
+            h, w = prepped.shape[:2]
+            if h * w * scale * scale > self._max_upscaled_pixels:
+                return ("", 0.0)  # already huge; enlarging further just costs time
+            bigger = cv2.resize(
+                prepped, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC
+            )
+        except Exception:
+            return ("", 0.0)
+        # Feed the enlarged region STRAIGHT to the engine. Running _preprocess again
+        # would re-apply the plate-ROI crop to an image that is already the ROI, cutting
+        # into the plate itself.
+        return self._infer(bigger)
+
+    def _infer(self, prepped: np.ndarray) -> Tuple[str, float]:
+        """OCR an ALREADY-preprocessed image. ``("", 0.0)`` when nothing is read."""
+        if prepped is None or getattr(prepped, "size", 0) == 0:
+            return ("", 0.0)
 
         try:
             if self._api_version == 3:

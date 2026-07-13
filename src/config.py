@@ -104,6 +104,14 @@ class DetectorPreprocessingConfig:
     grid_size: tuple = (8, 8)
     gamma_correction: bool = True
     dark_threshold: int = 65
+    # Run CLAHE at the detector's input size instead of the full frame. The IR is
+    # statically shaped (320x320), so a 1280x720 frame gets letterboxed down to
+    # 320x180 inside Ultralytics anyway — normalising beforehand enhances ~16x
+    # more pixels than the model ever sees. Resizing first makes the whole
+    # BGR<->LAB round trip cheap, and the detector's input is unchanged apart
+    # from CLAHE being computed on the downscaled pixels.
+    # Set false to go back to full-frame CLAHE if detection recall regresses.
+    detector_scale: bool = True
 
 
 @dataclass
@@ -115,7 +123,7 @@ class ReIDPreprocessingConfig:
     trained and calibrated on raw squish-resized crops, and normalising
     luminance at inference would shift embeddings off the trained
     distribution (see VehicleReIDMatcher backend selection logging)."""
-    enabled: bool = True
+    enabled: bool = False
     clip_limit: float = 2.0
     grid_size: tuple = (8, 8)
 
@@ -189,6 +197,17 @@ class MatchingConfig:
     reattach_default: float = 0.52
     reattach_cross_camera: float = 0.43
 
+    # Cameras whose anonymous tracks must NOT donate their appearance into a
+    # confirmed session via reattach. A static parking-slot camera permanently
+    # frames the same parked car; it endlessly mints fresh anonymous tracks that
+    # hunt for any confirmed session scoring above reattach_cross_camera (0.43)
+    # and, on a borderline match, poison that session's gallery with a different
+    # car (the CAM-24 champagne-Lexus-into-a-dark-Hyundai leak). Listed cameras
+    # still detect, track locally, and can be identified by the forward
+    # global-match path — they just cannot ADOPT another car's identity by
+    # reattach. Same spirit as the gate-camera exclusion. Empty ⇒ legacy.
+    reattach_excluded_cameras: tuple = ()
+
     # Abstain-on-ambiguity margin for match_global_session: when the best and
     # second-best candidates score within this distance of each other, the
     # match is ambiguous (visually similar cars) and NO session is returned —
@@ -205,9 +224,252 @@ class MatchingConfig:
     gallery_max_refs_per_car: int = 10        # cap crops/vectors per plate folder
     gallery_retention_days: float = 5.0       # GC folders idle longer than this
     gallery_min_view_quality: float = 0.9     # full-view gate (see _bbox_view_quality)
+    # D9 neighbour-clearance: a car parked shoulder-to-shoulder has a bbox that a
+    # neighbour's box overlaps, so its ReID crop is contaminated with the wrong
+    # car. When enforced, _bbox_view_quality is multiplied by the clearance
+    # (1.0 unobstructed → 0.0 fully covered), so an occluded crop falls below
+    # gallery_min_view_quality and is kept out of the gallery. Default OFF
+    # (log-only): the clearance is computed and logged to collect its
+    # distribution BEFORE it is allowed to gate anything.
+    gallery_neighbour_clearance_enforce: bool = False
+    # Slot authority: a camera may only add a gallery reference for a car that is
+    # inside a slot IT hosts. Owning a car was previously the only camera check on
+    # the teach path, so an aisle camera that won the ownership contest could write
+    # references for a car parked in a DIFFERENT camera's slot — which is how four
+    # crops of a black Ford entered grey-Hyundai DJS-7842's gallery from CAM-07
+    # (whose own slot is 4% of a frame whose ROI is 74%). Set False to restore the
+    # old any-owner-may-teach behaviour.
+    gallery_require_slot_authority: bool = True
+    # --- Slot acquisition by elimination -------------------------------------
+    # Appearance alone CANNOT bridge the gate->slot viewpoint gap. A car's first view
+    # from its slot camera is a small oblique crop (~136px tall) matched against its
+    # front-gate photos: measured 0.583 for RDJ-9640 against its OWN references, below
+    # the 0.62 bar. So the car fails to recognise itself on arrival, mints an anonymous
+    # session, and parks as plate=(none) forever. Lowering the bar does NOT fix it —
+    # from that viewpoint a DIFFERENT car scored 0.634, i.e. the ranking is inverted,
+    # so a looser bar binds the WRONG plate.
+    #
+    # Geography and timing can identify the car where appearance cannot. Within the
+    # AREA-SCOPED candidate pool, if exactly ONE plated car is still "in flight"
+    # (entered recently, not yet linked to any slot), it is the only car this can be.
+    # Appearance is then only required not to CONTRADICT — hence a floor, well clear of
+    # the negative-pair distribution (p10 0.27 / p50 0.39), rather than a decision bar.
+    #
+    # Four independent constraints must agree before a plate is bound this way:
+    # right area, still in transit, uniquely the only candidate, appearance not objecting.
+    # ONLY A READ PLATE MAY REACH parking_slots.current_plate.
+    # The ReID slot-binding path (try_link_to_slot) binds on APPEARANCE, and appearance
+    # at the slot is INVERTED: measured 2026-07-11, a car scored 0.583 against its OWN
+    # gate references while a DIFFERENT car scored 0.634. That path stamped RDJ-9640 onto
+    # B1_CRO (which held DJS-7842) and tore RDJ-9640's plate off its real slot in the
+    # same move. OCR reads the characters off the car instead, and binds only what
+    # exactly one car inside can explain � so current_plate is CORRECT or NULL, never
+    # wrong. Set False to restore the old appearance-based binding.
+    # Default False so the library's legacy behaviour is unchanged; production opts IN
+    # via config.yaml. (Flipping the dataclass default silently rewires every caller and
+    # broke 13 tests that legitimately exercise the ReID slot-binding path.)
+    slot_plate_requires_ocr: bool = False
+    # THE TRANSIT HOP. Every car entering this facility passes CAM-20, which reads plates
+    # reliably. A camera that CANNOT read one (CAM-21 is mounted side-on to its aisle and
+    # has produced zero reads, parked or moving) adopts the identity of the single car
+    # that was READ moments ago and has not parked yet � then captures the SIDE-VIEW
+    # reference the gallery has never had. From that car's second visit, ReID matches
+    # side-vs-side (~0.9) and this hop is never needed again.
+    slot_acquire_by_ocr_transit: bool = True
+    ocr_transit_window_seconds: float = 120.0
+    slot_acquire_by_elimination: bool = True
+    slot_acquire_min_similarity: float = 0.50   # appearance must not CONTRADICT
+    slot_acquire_inflight_seconds: float = 300.0  # gate -> slot transit window
     gallery_min_sharpness: float = 40.0       # reject blurry crops (sharpness_score)
     gallery_dedup_cosine: float = 0.97        # skip near-duplicate refs
     gallery_accumulate_interval_s: float = 3.0  # throttle per (plate, camera)
+    # Feedback-loop guard: a new floor-camera reference must resemble the car's
+    # GROUND-TRUTH references (ANPR/CAM-03/CAM-23 primary + refs), scoring at
+    # least this cosine against the best of them, before it is LEARNED as a
+    # gallery reference. Applies to BOTH the disk-accumulate path and the reattach
+    # append path (association can happen at reattach_cross_camera 0.43, but
+    # LEARNING an appearance requires clearing this higher bar). Legitimate
+    # oblique cross-view crops still pass; a wrong-car crop that slipped past
+    # matching (0.43-0.60) does not. 0.30 proved a formality — a night crop of a
+    # different car clears it — so the floor sits at 0.45. Fail-open when the
+    # session has no ground-truth reference yet.
+    gallery_accumulate_min_gt_similarity: float = 0.45
+    # Minimum reference-crop resolution (pixels, width*height). A distant car
+    # occupies too few pixels to make a useful ReID reference — upscaling it to
+    # the model input is mostly interpolation — and lets a far camera flood a
+    # plate's gallery with tiny crops. Reject crops below this area so only
+    # close, well-resolved views are stored. (A 110x110 car ~= 12k px.)
+    gallery_min_crop_area: float = 12000.0
+
+    # CAM-03 confirmation-timeline size. The confirmation burst captures the car
+    # front-to-rear as it crosses the B-entry zone; the timeline gallery emits
+    # entry (front) + deep (primary) + exit (rear) plus up to this many EXTRA
+    # rear-side frames sampled from the crossing tail, so the car's BACK is
+    # represented by more than a single far exit frame. Capped downstream by
+    # gallery_max_refs_per_car and the cosine-dedup, so redundant frames are
+    # dropped. Set 0 to keep the legacy fixed entry/deep/exit triple.
+    confirmation_extra_rear_views: int = 3
+
+    # Source-camera trust weighting for ReID gallery references. The parking has
+    # three GROUND-TRUTH cameras whose crops are canonical viewpoints — ANPR
+    # (front), CAM-23 (top), CAM-03 (upper-front + back). A reference captured by
+    # one of these scores at full weight; a reference from ANY other camera (an
+    # oblique in-garage side view) has its similarity multiplied by
+    # ``secondary_camera_weight`` (<1), so a secondary crop can only win a match
+    # when it is substantially stronger than every ground-truth view. The session
+    # PRIMARY (feature_vector, always set from a confirmation/seed path) is always
+    # full weight. A reference with no recorded source camera is treated as
+    # secondary (conservative default). Set weight = 1.0 for uniform/legacy.
+    ground_truth_cameras: tuple = ("ANPR", "ANPR-Entry", "ANPR-Exit", "CAM-23", "CAM-03")
+    secondary_camera_weight: float = 0.6
+
+    # ...with ONE exception, on the slot path. When identifying a car parked in a slot,
+    # a reference captured by THAT SAME slot camera is not an oblique guess — it is the
+    # car photographed in the very pose we are looking at, taught by an earlier
+    # OCR-confirmed park (save_parked_reference). At 0.6 a car's own parked pose (cosine
+    # ~0.9 -> 0.54) loses to a DIFFERENT car's full-weight gate photo, so the car cannot
+    # be recognised even on a return visit.
+    #
+    # But it must NOT go to 1.0 either. The boost is symmetric — it lifts every
+    # candidate's same-camera refs, including the regulars who park at this camera daily
+    # — and same-view similarity between DIFFERENT cars (~0.66) exceeds cross-view
+    # similarity for the SAME car (~0.55). At full weight those regulars outrank a car
+    # that has never parked here. Suppressing that is what the 0.6 discount was FOR.
+    #
+    # Swept on the live 34-car gallery, 2026-07-13 (263 real parked-pose queries), with
+    # the query crop withheld. WARM = the car has parked at this camera before;
+    # COLD = it never has:
+    #     weight   WARM rank-1   COLD rank-1
+    #     0.60         98.5%        87.8%    <- old behaviour (no special case)
+    #     0.70        100.0%        87.8%
+    #     0.80        100.0%        87.8%    <- chosen: full warm gain, zero cold cost
+    #     0.90        100.0%        87.5%
+    #     1.00        100.0%        87.5%    <- naive "full weight"; costs cold for nothing
+    # 0.80 sits mid-plateau, so neither bound is near a cliff. Re-derive on any ReID
+    # model swap — PS_matcher V2's cosine scale is not V1's.
+    # Slot path only; the gate/global path keeps the plain 0.6, where it is load-bearing.
+    slot_camera_ref_weight: float = 0.80
+
+    # ---- ReID-solo fallback -------------------------------------------------------
+    # Some slots can NEVER be read. CAM-21 frames B1_CRO in pure side profile: 455
+    # attempts, zero reads. On those, insisting on an OCR witness means the slot stays
+    # NULL forever, so appearance has to stand alone — but only when it is genuinely sure.
+    #
+    # `reid_solo_confirm` (0.90) is NOT reused here: on PS_matcher V2 it accepts 0 of 311
+    # real queries. It was calibrated for the gate/global comparison on a model whose
+    # cosine scale was much wider. Borrowing it would silently disable this path.
+    #
+    # THE TWO GATES GUARD DIFFERENT FAILURES. Both are required.
+    #
+    # MARGIN — guards against confusing two cars we KNOW. Derived from 311 real
+    # parked-pose queries, 2026-07-13:
+    #
+    #                wrong top-1   worst wrong score   worst wrong margin
+    #     WARM            2%             0.714               0.094
+    #     COLD           26%             0.762               0.099
+    #
+    # A wrong car never wins by more than 0.099, so margin >= 0.15 clears it with >= 0.05
+    # headroom in BOTH regimes — the same headroom rule that derived lock_confidence.
+    # Zero false accepts over the whole set.
+    #
+    # SCORE — guards against a car we have NEVER SEEN. This is the one the offline eval
+    # cannot measure, because that eval is CLOSED-SET: the true car is always somewhere in
+    # the gallery, so "the right answer is absent" never happens and the score floor looks
+    # redundant (margin>=0.15 alone: 42 accepted, 0 wrong; adding score>=0.70 changes
+    # nothing). Production is OPEN-SET, and it shows the real failure immediately:
+    #
+    #     B14  best=RDJ-9640  score 0.600  margin 0.356
+    #     B19  best=ERS-7949  score 0.669  margin 0.411
+    #     B22  best=ZRS-6511  score 0.615  margin 0.388
+    #
+    # LOW score with a WIDE margin is the signature of an unknown vehicle: nothing matches
+    # it well, but one gallery car is the nearest of a bad bunch, so it wins by a mile.
+    # Margin alone would confidently stamp a stranger with RDJ-9640's plate. The floor is
+    # what refuses. (Those cars are genuinely absent — 17 registered vehicles have no open
+    # session; B28's is HRS-4772, B25's is AVD-4918, neither ever seen at the gate.)
+    #
+    # WHERE THE FLOOR SITS. Cold cars score lower than warm ones — there is no
+    # parked-pose reference yet, only a gate photo, and that is the cross-view case.
+    # DAY-1 COLD, top-1 score:
+    #     CORRECT  p5=0.614  p10=0.637  p25=0.682  p50=0.737
+    #     WRONG              p50=0.646             max=0.762
+    # The two overlap heavily, so the score is a weak correct/wrong discriminator — the
+    # margin does that job. What the score DOES separate is the open-set case: an unknown
+    # car matches nothing well (B25 scored 0.269, B28 0.327), far below any real match.
+    #
+    # The floor is set by the GAP between a known car and an unknown one, and production
+    # ground truth is what pins it. Two solo answers have been verified against the plate
+    # visible in the frame, and ReID was right BOTH times:
+    #
+    #     B19  ERS-7949  score 0.669-0.721   CORRECT (plate reads 7949 ERS)
+    #     B14  RDJ-9640  score 0.586-0.600   CORRECT (operator-confirmed)
+    #
+    # ...while the cars that are genuinely NOT enrolled score far lower, because nothing
+    # in the gallery resembles them:
+    #
+    #     B25  best 0.218-0.281      B28  best 0.304-0.339
+    #
+    # So known-cold lands at 0.59+, unknown at <=0.34 — a wide, clean gap. 0.50 sits in
+    # the middle of it, with 0.16 of headroom over the worst unknown and 0.086 under the
+    # weakest verified-correct answer.
+    #
+    # Earlier floors of 0.70 (from WARM statistics) and 0.65 were BOTH too high and were
+    # silently discarding correct answers: cold cars have no parked-pose reference yet,
+    # only a gate photo, so their scores sit lower by construction (correct-cold p10 =
+    # 0.637, p5 = 0.614). Do not re-raise this from warm numbers.
+    #
+    # The margin gate remains the guard against confusing two KNOWN cars; the floor is
+    # purely the open-set guard. Both are needed — see the note above.
+    slot_reid_solo_enabled: bool = True
+    slot_reid_solo_after_attempts: int = 8      # give OCR most of its budget first
+    slot_reid_solo_min_score: float = 0.50
+    slot_reid_solo_min_margin: float = 0.15
+    # Reserved slots stay stricter: a wrong plate here raises a false intrusion alert
+    # against an executive, so precision beats coverage. The MARGIN is what is tightened
+    # (0.20 vs 0.15) — that is the guard that actually discriminates. B1_CRO's best guess
+    # scores a respectable 0.677 but wins by only 0.047, and is correctly refused.
+    slot_reid_solo_min_score_reserved: float = 0.60
+    slot_reid_solo_min_margin_reserved: float = 0.20
+
+    # How many of the 12 identify attempts may pay for OCR's enlarged retry pass.
+    # The retry rescues a plate that is present but too small for the text detector to
+    # find (slot B13, CAM-24: '' -> '9990BHD' -> BHD-9990, a C-level slot dark for 60
+    # attempts). On a slot whose plate is genuinely out of frame it instead surfaces
+    # spurious text regions, runs the recogniser on them, discards them, and costs ~670ms
+    # — on the frame loop, 12 times a park. If the plate were visible at all an early
+    # frame would have caught it, so spend the budget there.
+    ocr_upscale_retry_max_attempts: int = 4
+
+    # Decision log — one JSONL record per slot-identity attempt: the ranked candidates,
+    # their full feature vectors, the gate rejects, the OCR read, and which candidate the
+    # read confirmed (THE LABEL). Every bind yields 1 positive + up to k-1 hard negatives.
+    #
+    # This exists because a ranker trained offline on the gallery alone does NOT beat
+    # plain ReID (measured 2026-07-13: cold rank-1 74.9% -> 71.1%, and the trainer refused
+    # to ship it). The features that actually break ties — locked_elsewhere, the OCR read,
+    # crop quality at that instant — only exist at decision time and cannot be
+    # reconstructed later. So they are recorded as they happen.
+    decision_log_enabled: bool = True
+    decision_log_dir: str = "logs/decisions"
+    decision_log_queue_max: int = 2000
+
+    # A candidate VA has never photographed cannot be matched — it can only collide.
+    # VA hydrates a session for every open parking_sessions row, and the ANPR gate
+    # misreads: 2026-07-13, 18 of 51 "cars inside" had no gallery folder because they
+    # are mis-OCR'd spellings of real plates (BJA-7842 / DJA-7842 next to the real
+    # DJS-7842). confirm_plate() matches on the DIGIT RUN and abstains on ambiguity, so
+    # those phantoms turn a perfect read of DJS-7842 into a 3-way tie -> slot stays NULL.
+    # Require appearance evidence (a gallery reference) before a plate may be an OCR
+    # candidate. The ReID path is already immune — a phantom has no vector, so it is
+    # never scored — this closes the plates_inside() fallback.
+    candidates_require_appearance_evidence: bool = True
+
+    # A car cannot occupy two slots. Drop candidates already locked into a DIFFERENT
+    # slot before the shortlist is truncated, so rank-6 promotes into the top-5 — the
+    # gate can only ADD the right car to the candidate set, never remove it. Measured
+    # 2026-07-13: this alone accounts for ~9 of the 34 cold rank-1 errors (TRS-9117 in
+    # B5 kept losing to HSR-8327, which was already locked into B26).
+    exclude_plates_locked_elsewhere: bool = True
 
     # Legacy multi-feature fallback path (image_matcher.VehicleImageMatcher).
     legacy_color_fallback: float = 0.35
@@ -310,14 +572,14 @@ class MatchingConfig:
 
     # --- Fast ReID backend (Phase 1 / WS-A) ---
     # When ``use_openvino_reid`` is on AND an OpenVINO IR for OSNet exists at
-    # ``models/osnet_openvino_int8/model.xml`` the matcher uses the OpenVINO
-    # runtime path (target ≤40 ms/image on CPU). When the file is missing or
-    # the flag is off the matcher falls back to the legacy torchreid path
-    # (~1 s/image on CPU). ``reid_input_size`` is ``(height, width)`` and
-    # must agree with the size baked into the exported IR.
+    # the specified directory, the matcher uses the OpenVINO runtime path
+    # (target ≤40 ms/image on CPU). When the file is missing or the flag is off
+    # the matcher falls back to the legacy torchreid path (~1 s/image on CPU).
+    # ``reid_input_size`` is ``(height, width)`` and must agree with the size
+    # baked into the exported IR.
     use_openvino_reid: bool = True
-    reid_input_size: tuple = (192, 96)
-    reid_openvino_model_dir: str = "models/osnet_openvino_int8"
+    reid_input_size: tuple = (256, 128)
+    reid_openvino_model_dir: str = "models/PS_carMatching"
 
     # --- Phase 3 / T3.2 — FAISS-CPU gallery index ---
     # ``match_global_session`` defaults to the legacy O(n) linear scan
@@ -538,6 +800,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             config.preprocessing.detector.dark_threshold = d_pp.get(
                 "dark_threshold", config.preprocessing.detector.dark_threshold
             )
+            config.preprocessing.detector.detector_scale = d_pp.get(
+                "detector_scale", config.preprocessing.detector.detector_scale
+            )
         if "reid" in pp:
             r_pp = pp["reid"]
             config.preprocessing.reid.enabled = r_pp.get(
@@ -590,6 +855,10 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.reattach_cross_camera = m.get(
             "reattach_cross_camera", cm.reattach_cross_camera
         )
+        if "reattach_excluded_cameras" in m:
+            cm.reattach_excluded_cameras = tuple(
+                m.get("reattach_excluded_cameras") or ()
+            )
         cm.legacy_color_fallback = m.get(
             "legacy_color_fallback", cm.legacy_color_fallback
         )
@@ -623,6 +892,36 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.gallery_min_view_quality = m.get(
             "gallery_min_view_quality", cm.gallery_min_view_quality
         )
+        cm.gallery_neighbour_clearance_enforce = bool(
+            m.get(
+                "gallery_neighbour_clearance_enforce",
+                cm.gallery_neighbour_clearance_enforce,
+            )
+        )
+        cm.gallery_require_slot_authority = bool(
+            m.get(
+                "gallery_require_slot_authority",
+                cm.gallery_require_slot_authority,
+            )
+        )
+        cm.slot_plate_requires_ocr = bool(
+            m.get("slot_plate_requires_ocr", cm.slot_plate_requires_ocr)
+        )
+        cm.slot_acquire_by_ocr_transit = bool(
+            m.get("slot_acquire_by_ocr_transit", cm.slot_acquire_by_ocr_transit)
+        )
+        cm.ocr_transit_window_seconds = float(
+            m.get("ocr_transit_window_seconds", cm.ocr_transit_window_seconds)
+        )
+        cm.slot_acquire_by_elimination = bool(
+            m.get("slot_acquire_by_elimination", cm.slot_acquire_by_elimination)
+        )
+        cm.slot_acquire_min_similarity = float(
+            m.get("slot_acquire_min_similarity", cm.slot_acquire_min_similarity)
+        )
+        cm.slot_acquire_inflight_seconds = float(
+            m.get("slot_acquire_inflight_seconds", cm.slot_acquire_inflight_seconds)
+        )
         cm.gallery_min_sharpness = m.get(
             "gallery_min_sharpness", cm.gallery_min_sharpness
         )
@@ -631,6 +930,57 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         cm.gallery_accumulate_interval_s = m.get(
             "gallery_accumulate_interval_s", cm.gallery_accumulate_interval_s
+        )
+        cm.gallery_accumulate_min_gt_similarity = m.get(
+            "gallery_accumulate_min_gt_similarity",
+            cm.gallery_accumulate_min_gt_similarity,
+        )
+        cm.gallery_min_crop_area = m.get(
+            "gallery_min_crop_area", cm.gallery_min_crop_area
+        )
+        cm.confirmation_extra_rear_views = m.get(
+            "confirmation_extra_rear_views", cm.confirmation_extra_rear_views
+        )
+        if "ground_truth_cameras" in m:
+            cm.ground_truth_cameras = tuple(m.get("ground_truth_cameras") or ())
+        cm.secondary_camera_weight = m.get(
+            "secondary_camera_weight", cm.secondary_camera_weight
+        )
+        cm.slot_camera_ref_weight = m.get(
+            "slot_camera_ref_weight", cm.slot_camera_ref_weight
+        )
+        cm.exclude_plates_locked_elsewhere = m.get(
+            "exclude_plates_locked_elsewhere", cm.exclude_plates_locked_elsewhere
+        )
+        cm.candidates_require_appearance_evidence = m.get(
+            "candidates_require_appearance_evidence",
+            cm.candidates_require_appearance_evidence,
+        )
+        cm.ocr_upscale_retry_max_attempts = m.get(
+            "ocr_upscale_retry_max_attempts", cm.ocr_upscale_retry_max_attempts
+        )
+        cm.slot_reid_solo_enabled = m.get(
+            "slot_reid_solo_enabled", cm.slot_reid_solo_enabled
+        )
+        cm.slot_reid_solo_after_attempts = m.get(
+            "slot_reid_solo_after_attempts", cm.slot_reid_solo_after_attempts
+        )
+        cm.slot_reid_solo_min_score = m.get(
+            "slot_reid_solo_min_score", cm.slot_reid_solo_min_score
+        )
+        cm.slot_reid_solo_min_margin = m.get(
+            "slot_reid_solo_min_margin", cm.slot_reid_solo_min_margin
+        )
+        cm.slot_reid_solo_min_score_reserved = m.get(
+            "slot_reid_solo_min_score_reserved", cm.slot_reid_solo_min_score_reserved
+        )
+        cm.slot_reid_solo_min_margin_reserved = m.get(
+            "slot_reid_solo_min_margin_reserved", cm.slot_reid_solo_min_margin_reserved
+        )
+        cm.decision_log_enabled = m.get("decision_log_enabled", cm.decision_log_enabled)
+        cm.decision_log_dir = m.get("decision_log_dir", cm.decision_log_dir)
+        cm.decision_log_queue_max = m.get(
+            "decision_log_queue_max", cm.decision_log_queue_max
         )
 
         # HSV tolerances
