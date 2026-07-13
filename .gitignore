@@ -47,6 +47,17 @@ events.jsonl
 # Vehicle images (generated at runtime)
 vehicle_images/
 vehicle_images_p3/
+scratchpad/
+
+# data/ is local by default — datasets, snapshots, unmatched-prediction dumps.
+# The one exception is the facility_top20 JSON reports: the bench numbers stay
+# reviewable in git (see the facility_top20 block below). Git will not descend into
+# an excluded directory, so the parent has to be re-included before the files inside
+# it can be — hence the four lines rather than a single negation.
+data/*
+!data/facility_top20/
+data/facility_top20/*
+!data/facility_top20/*.json
 
 # Per-test runtime snapshots (created by VehicleRegistry tests)
 tests/test_images/*.jpg
@@ -86,6 +97,20 @@ data/eval_verification/
 
 # Intermediate ONNX from the facility fine-tune re-export — regenerable.
 models/osnet_facility_int8_256x128/model.onnx
+models/osnet_facility_carla_int8_256x128/model.onnx
+models/PS_matcher V2/model.onnx
+
+# Ablation baselines behind the D15 eval reports (carla-fp32, imagenet-pretrained,
+# unfinetuned-squish). The eval JSONs under data/facility_top20/ keep the numbers
+# reviewable in git; the weights themselves are re-exportable from the training tooling
+# and only the shipped IR is worth tracking.
+models/osnet_facility_carla_fp32_256x128/
+models/osnet_facility_imagenet_int8_256x128/
+models/osnet_unfinetuned_squish_int8_256x128/
+
+# Point-in-time model copies taken before a swap (local safety nets, not artifacts —
+# the previous model is always recoverable from git history).
+models/*_backup*/
 
 # Test videos
 *.mp4
