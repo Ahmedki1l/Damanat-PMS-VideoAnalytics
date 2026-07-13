@@ -64,6 +64,21 @@ GROUPS = [
 # The camera that receives the ANPR webhooks / owns the entrance. Its group is the
 # one (and only one) that runs --api. Override with env VA_API_CAMERA.
 API_CAMERA = os.environ.get("VA_API_CAMERA", "CAM-23").strip().upper()
+
+# Entry/gate cameras forced together into the single --api group, pulled OUT of
+# their DB area buckets. WHY: the ANPR handler pulls LIVE frames from CAM-23 (ramp
+# top) AND CAM-03 (B1 entrance line-crossing) through a PROCESS-LOCAL buffer
+# (main.py get_camera_frame -> engine.cam_manager), so if those two aren't in the
+# same process as the API server, entrance plate->identity seeding silently fails.
+# ONLY those two need co-location — CAM-05/06/07 are the B1<->B2 RAMP cameras
+# (boot log: CAM-05 RAMP-UP<->B1-C, CAM-07 B1-C<->RAMP-DN), so they stay in their
+# own area groups. Override with env VA_GATE_CAMERAS (comma-separated); set it
+# empty to disable the gate group and fall back to a pure per-area split.
+GATE_CAMERAS = [
+    c.strip().upper()
+    for c in os.environ.get("VA_GATE_CAMERAS", "CAM-23,CAM-03").split(",")
+    if c.strip()
+]
 # ---------------------------------------------------------------------------
 
 
@@ -106,10 +121,18 @@ def _groups_from_db() -> list[dict]:
     if not config.cameras:
         raise RuntimeError("no cameras returned from DB")
 
-    # Bucket by area; un-zoned cameras (e.g. Ground) fall back to their floor so
-    # they stay grouped together instead of scattering into one 'unzoned' blob.
+    # Resolve the gate roster against the actual cameras, preserving GATE_CAMERAS
+    # order (a gate camera that isn't enabled/loaded is simply skipped).
+    by_upper = {cam.id.strip().upper(): cam.id for cam in config.cameras}
+    gate_ids = [by_upper[g] for g in GATE_CAMERAS if g in by_upper]
+    gate_set = set(gate_ids)
+
+    # Bucket the REMAINING cameras by area; un-zoned cameras (e.g. Ground) fall
+    # back to their floor so they stay grouped instead of scattering into one blob.
     buckets: "OrderedDict[str, list[str]]" = OrderedDict()
     for cam in config.cameras:
+        if cam.id in gate_set:
+            continue
         key = (cam.area or "").strip() or (cam.floor or "").strip() or "unzoned"
         buckets.setdefault(key, []).append(cam.id)
 
@@ -118,13 +141,24 @@ def _groups_from_db() -> list[dict]:
         for key, cams in sorted(buckets.items())
     ]
 
-    # Exactly one --api group: whichever area owns the entrance/ANPR camera.
-    for g in groups:
-        if API_CAMERA in [c.strip().upper() for c in g["cams"].split(",")]:
-            g["api"] = True
-            break
+    if gate_ids:
+        # The gate group is THE --api group by construction; put it first.
+        if API_CAMERA not in {g.upper() for g in gate_ids}:
+            raise RuntimeError(
+                f"api camera {API_CAMERA} not in gate set {gate_ids}"
+            )
+        groups.insert(0, {"name": "gate", "cams": ",".join(gate_ids), "api": True})
     else:
-        raise RuntimeError(f"entrance/ANPR camera {API_CAMERA} not in any area group")
+        # No gate cameras present — fall back to tagging whichever area owns the
+        # entrance/ANPR camera as --api (pure per-area split).
+        for g in groups:
+            if API_CAMERA in [c.strip().upper() for c in g["cams"].split(",")]:
+                g["api"] = True
+                break
+        else:
+            raise RuntimeError(
+                f"entrance/ANPR camera {API_CAMERA} not in any area group"
+            )
 
     return groups
 
