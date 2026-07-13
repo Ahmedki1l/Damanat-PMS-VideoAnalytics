@@ -28,6 +28,10 @@
 #     -e RUN_ALL_ARGS="" <image>
 #   # ANPR server must POST to http://<host>:8000/api/anpr/event
 #
+# PERF LOGGING (docker logs, prefixed per group e.g. `[group2] [PERF] ...`):
+#   the effective-FPS summary prints on its own; add per-stage timings with
+#   docker run -e PERF_TRACE=1 -e PERF_TRACE_EVERY=50 ... <image>
+#
 # !! ODBC DRIVER MISMATCH TO RESOLVE !!
 #   This installs msodbcsql18, but config.yaml's DATABASE_URL says
 #   "ODBC Driver 17 for SQL Server". The driver name in the connection string
@@ -109,6 +113,19 @@ RUN apt-get update && apt-get install -y \
 # inherit this same interpreter.
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+
+# Line-buffer stdout. Every worker's stdout is a FILE (supervisor.py redirects
+# it, then tails it back to PID 1), and Python block-buffers 8KB to a non-tty —
+# so without this the `[INFO] effective FPS/camera` and `[PERF]` lines sit in the
+# buffer for minutes and `docker logs` looks dead. The supervisor copies its env
+# to the children, so setting it here covers all 5 groups.
+ENV PYTHONUNBUFFERED=1
+
+# Per-stage timing (roi/clahe/infer/zones/assign/slot + the decode meter) is
+# opt-in — flip it on at run time, no rebuild:
+#   docker run -e PERF_TRACE=1 -e PERF_TRACE_EVERY=50 ...
+# The effective-FPS summary is always on and needs nothing.
+ENV PERF_TRACE=0
 
 COPY . .
 
