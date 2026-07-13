@@ -1,5 +1,9 @@
 {
+<<<<<<< Updated upstream
   "generated_at": "2026-05-15T07:19:32+00:00",
+=======
+  "generated_at": "2026-07-13T12:34:49+00:00",
+>>>>>>> Stashed changes
   "eval_dir": "data\\facility_top20\\eval",
   "pairs_csv": "data\\facility_top20\\pairs_eval.csv",
   "n_eval_images": 79,
@@ -50,9 +54,15 @@
         "delta": 0.0637
       },
       "embed_ms_per_image": {
+<<<<<<< Updated upstream
         "baseline": 17.26,
         "fine_tuned": 16.84,
         "delta": -0.42
+=======
+        "baseline": 8.71,
+        "fine_tuned": 8.54,
+        "delta": -0.17
+>>>>>>> Stashed changes
       }
     },
     "pair_roc_auc": {
@@ -63,6 +73,7 @@
   "baseline": {
     "ir_dir": "models\\osnet_openvino_int8_256x128",
     "n_eval": 79,
+<<<<<<< Updated upstream
     "embed_time_s": 1.363,
     "embed_ms_per_image": 17.26,
     "rank1": 0.6582,
@@ -71,6 +82,16 @@
     "mean_same_cosine": 0.729,
     "mean_diff_cosine": 0.6185,
     "cosine_margin": 0.1105,
+=======
+    "embed_time_s": 0.688,
+    "embed_ms_per_image": 8.71,
+    "rank1": 0.6835,
+    "rank5": 0.7089,
+    "mAP": 0.5477,
+    "mean_same_cosine": 0.7196,
+    "mean_diff_cosine": 0.585,
+    "cosine_margin": 0.1346,
+>>>>>>> Stashed changes
     "pairs": {
       "total": 1095,
       "positives": 95,
@@ -89,6 +110,7 @@
   "fine_tuned": {
     "ir_dir": "models\\osnet_facility_int8_256x128",
     "n_eval": 79,
+<<<<<<< Updated upstream
     "embed_time_s": 1.33,
     "embed_ms_per_image": 16.84,
     "rank1": 0.6835,
@@ -97,6 +119,16 @@
     "mean_same_cosine": 0.626,
     "mean_diff_cosine": 0.4519,
     "cosine_margin": 0.1742,
+=======
+    "embed_time_s": 0.675,
+    "embed_ms_per_image": 8.54,
+    "rank1": 0.7595,
+    "rank5": 0.8228,
+    "mAP": 0.6842,
+    "mean_same_cosine": 0.5751,
+    "mean_diff_cosine": 0.3163,
+    "cosine_margin": 0.2588,
+>>>>>>> Stashed changes
     "pairs": {
       "total": 1095,
       "positives": 95,

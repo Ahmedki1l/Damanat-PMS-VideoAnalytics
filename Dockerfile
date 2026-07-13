@@ -69,6 +69,17 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# Line-buffer stdout: docker hands the process a pipe, not a tty, and Python
+# block-buffers 8KB to a pipe — so without this the `[INFO] effective FPS/camera`
+# and `[PERF]` lines only reach `docker logs` in delayed bursts.
+ENV PYTHONUNBUFFERED=1
+
+# Per-stage timing (roi/clahe/infer/zones/assign/slot + the decode meter) is
+# opt-in — flip it on at run time, no rebuild:
+#   docker run -e PERF_TRACE=1 -e PERF_TRACE_EVERY=50 ...
+# The effective-FPS summary is always on and needs nothing.
+ENV PERF_TRACE=0
+
 # Copy app code
 COPY . .
 
