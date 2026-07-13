@@ -230,6 +230,20 @@ detector:
   classes: [2, 5, 7]                            # 2=car, 5=bus, 7=truck (SUVs/vans often classified as truck)
   imgsz: 640
 
+  # OpenVINO CPU pool. Ultralytics hardcodes PERFORMANCE_HINT=LATENCY, which on CPU
+  # caps the pool at 8 threads however many cores the box has — so a 15-core machine
+  # shows only ~8 busy cores. That is a default, not saturation. 0 / "" keeps it.
+  #
+  # Raising it is worth less than it looks (yolo11m_320_int8, end to end):
+  #     ov_num_threads: 0 -> 15.2 ms/frame | 15 -> 10.2 ms/frame (1.49x) | 24 -> SLOWER than 8
+  # One 320px int8 inference cannot fill a wide pool. The 2.5x lever is CONCURRENCY
+  # (the 5 supervisor process groups), not thread width. See src/ov_tuning.py.
+  #
+  # Leave at 0 under the supervisor: each group is already pinned to a disjoint core
+  # slice, and a global override would oversubscribe all 5 groups at once.
+  ov_num_threads: 0                             # 0 = OpenVINO default (8). Try ~n_cores on a single-process box.
+  ov_performance_hint: ""                       # "" = leave LATENCY. THROUGHPUT needs async/batching this loop does not do.
+
 # --- Tracker Settings ---
 tracker:
   type: "bytetrack"
