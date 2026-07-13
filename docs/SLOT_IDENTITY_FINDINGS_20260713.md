@@ -99,40 +99,57 @@ candidates, no real car dropped, and `B27` bound `DJS-7842` on the next restart.
 
 ---
 
-## 6. THE ROOT CAUSE: camera stream drops delete plates.
+## 6. THE ROOT CAUSE: a per-frame clear destroyed every binding it could not re-derive.
 
-This is the finding that matters most, and it is not in the matching layer.
+> **CORRECTION.** This section originally blamed camera stream drops. **That was wrong**,
+> and the retraction is below the real cause. I include the mistake because the reasoning
+> that produced it is seductive and someone will reproduce it.
 
-In the 8 minutes after a restart the system made **17 correct bindings** — including 5 of
-the 9 C-level slots — but only **12 survived**. `B24` was bound **four separate times**
-with the same plate.
+`_resolve_locked_plate` (`engine_runtime.py`) runs on **every frame** of an occupied slot
+and used to WIPE any plate it could not re-derive on that frame. But the thing it asks —
+`try_link_to_slot` — returns `None` on **every** frame: it is disabled on its third
+statement by `slot_plate_requires_ocr: true`.
 
-Vacancy events, grouped by camera:
+So the resolver destroyed bindings the instant they were made. OCR binds survived only by
+accident: they lock, and a locked slot takes an early return before reaching that branch.
+Every *provisional* binding — appearance-only binds, restart-restored plates — was erased
+on the next frame. B19 was bound to ERS-7949 and destroyed **three times in six seconds**.
 
-```
-CAM-15   3 vacancy events across 3 slots   <- ALL its slots, simultaneously
-CAM-17   3 vacancy events across 3 slots   <- ALL its slots, simultaneously
-CAM-24   3 vacancy events across 3 slots   <- ALL its slots, simultaneously
-CAM-22   2 vacancy events across 2 slots   <- ALL its slots, simultaneously
-```
+**Measured, before vs after removing the clear (same cameras, same day):**
 
-Cars do not leave in synchronised groups. Every slot on a camera empties **at the same
-instant**, coincident with the **15 `CAM-N — reconnecting...`** warnings logged in those
-same 8 minutes. B7_CHRO and B8_CSBDO (both CAM-22) were erased together at 13:18:18.
+| | before | after |
+|---|---|---|
+| B26 re-bound | **36x** | 3x |
+| B11 re-bound | **36x** | 3x |
+| B18 re-bound | **33x** | 3x |
+| vacancy events | many | **0** |
+| reconnects | happening | **still happening** |
 
-The chain:
+**THE INVARIANT (operator's rule, now enforced): a plate dies ONLY when the slot goes
+VACANT.** Absence of a re-derivation is not evidence that the car left. The slot is still
+OCCUPIED — that is the only fact the resolver actually has.
 
-> **stream drops → no frames → no detections → `vehicle_present=False` →
-> `confirm_leave_frames` (15) elapses → slot goes VACANT → `unlink_slot()` →
-> `current_plate` wiped, lock released**
+### Retraction: camera drops do NOT delete plates
 
-**The slot state machine treats absence of evidence as evidence of absence.** A network
-blip deletes an identity that OCR and ReID established correctly.
+The original claim was: stream drops → no frames → no detections → `vehicle_present=False`
+→ `confirm_leave_frames` elapses → VACANT → `unlink_slot()` → plate wiped.
 
-**Consequence for planning:** there is no point teaching ReID to fill the OCR-blind slots
-(Matching V2 Phase 1) while a reconnect empties them 90 seconds later. Fix the vacancy
-gating first: a slot must not count down to VACANT while its camera is not delivering
-frames. The plate lock should survive a reconnect exactly as it already survives a restart.
+**That chain cannot happen.** `RTSPCamera.read()` (`src/camera_manager.py`) returns
+`self._latest_frame`, which is **never cleared on failure**. During a reconnect the grabber
+keeps serving the LAST GOOD FRAME, `next_frame()` never skips the camera, the car is still
+visible, and the slot never vacates. Confirmed empirically: reconnects continued at the
+same rate after the fix, with **zero** vacancies and zero plate loss.
+
+What I misread: "17 binds, only 12 survived" and "B24 bound four times" are fully explained
+by the per-frame clear. And "every slot on a camera vacates in the same instant" was wrong
+— the vacancies were spread across 2-3 *different* cameras, and the ground floor (G3/G8)
+flaps for unrelated reasons.
+
+### A real camera bug remains — but it is the OPPOSITE failure
+
+A dead stream serves its last frame **forever**, so a car that leaves during an outage
+stays "parked" indefinitely, and the engine keeps running the detector on a frozen image.
+That is stale occupancy, not plate loss. **Unfixed.**
 
 ---
 
