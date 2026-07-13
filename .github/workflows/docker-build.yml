@@ -8,8 +8,15 @@ on:
       - published
 
 env:
-  # Dockerfile path
+  # Build context
   DOCKERFILE_PATH: "."
+  # Which Dockerfile to build. A bare `docker build .` reads ./Dockerfile, which
+  # is the SINGLE-process image (main.py --api): one process, one inference at a
+  # time, so the detector's OpenVINO pool caps at ~8 threads and the rest of the
+  # box sits idle. Dockerfile.multiprocess runs the supervisor instead (5 camera
+  # groups, each pinned to its own core slice = 5 concurrent inferences), which
+  # is the ~2x lever. The two files are identical apart from the ENTRYPOINT.
+  DOCKERFILE: "Dockerfile.multiprocess"
   # Docker image name
   IMAGE_NAME: "damanat-pms-video-analytics"
   # Image tag starting number (will increment by 1 per push)
@@ -50,7 +57,7 @@ jobs:
       - name: Build Docker image
         id: build_image
         run: |
-          docker build -t ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }} ${{ env.DOCKERFILE_PATH }}
+          docker build -f ${{ env.DOCKERFILE }} -t ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }} ${{ env.DOCKERFILE_PATH }}
 
       - name: Notify build success
         if: always() && steps.build_image.outcome == 'success'
