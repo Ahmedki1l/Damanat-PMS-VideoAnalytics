@@ -4147,6 +4147,95 @@ class VehicleRegistryIdentityMixin:
         )
         return [c.plate for c in kept]
 
+    def try_reid_identify_slot(
+        self,
+        slot_id: str,
+        crop_bgr,
+        camera_id: Optional[str] = None,
+        *,
+        is_reserved: bool = False,
+        decision_ctx: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Identify a parked car by APPEARANCE ALONE, when OCR cannot read its plate.
+
+        The fallback for a slot that has no readable plate, ever. CAM-21 frames B1_CRO in
+        pure side profile and has logged 455 attempts with zero reads; demanding an OCR
+        witness there means the slot is NULL forever. So appearance stands alone — but
+        only when it is genuinely certain, and it abstains loudly otherwise.
+
+        The bar is the MARGIN, not the score. Measured on 311 real parked-pose queries: a
+        wrong car's top-1 score reaches 0.762, above any score floor worth having, but a
+        wrong car NEVER wins by more than 0.099. Requiring a 0.15 margin clears that with
+        0.05 headroom in both the warm and cold regimes, for zero false accepts.
+
+        It will refuse a car it has never seen, and that is the point: an unknown vehicle
+        scores ~0.6 against everything with a near-zero margin (B22: top-1 0.598, margin
+        0.025), and binding it would stamp a random known plate onto a stranger.
+        ``current_plate`` is CORRECT or NULL.
+
+        Returns the plate, or None. Does NOT teach the gallery — a solo bind is not
+        evidence, and a wrong one would poison the very references it learned from.
+        """
+        cfg = self._matching_config
+        if not getattr(cfg, "slot_reid_solo_enabled", False):
+            return None
+        if self.get_slot_plate(slot_id):
+            return None
+        if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
+            return None
+
+        min_score = float(
+            cfg.slot_reid_solo_min_score_reserved if is_reserved
+            else cfg.slot_reid_solo_min_score
+        )
+        min_margin = float(
+            cfg.slot_reid_solo_min_margin_reserved if is_reserved
+            else cfg.slot_reid_solo_min_margin
+        )
+
+        try:
+            qvec = self.reid_matcher.extract_feature(crop_bgr)
+        except Exception:
+            return None
+        if qvec is None:
+            return None
+
+        kept, rejected = self.reid_rank(
+            qvec, slot_id=slot_id, slot_camera=camera_id, k=GLOBAL_MATCH_RANK
+        )
+        if not kept:
+            return None
+
+        top = kept[0]
+        margin = top.score - (kept[1].score if len(kept) > 1 else 0.0)
+        accept = top.score >= min_score and margin >= min_margin
+
+        self._log_slot_decision(
+            slot_id=slot_id, camera_id=camera_id, crop_bgr=crop_bgr,
+            kept=kept, rejected=rejected, ocr_text="", ocr_conf=0.0,
+            bound_plate=top.plate if accept else None,
+            ctx={**(decision_ctx or {}), "path": "reid_solo"},
+        )
+
+        if not accept:
+            logger.info(
+                "[reid-solo] slot=%s ABSTAIN — best is %s at %.3f (margin %.3f); needs "
+                "score>=%.2f margin>=%.2f%s. A low score AND a flat margin means no car "
+                "in the gallery looks like this one — binding it would stamp a stranger "
+                "with a known plate.",
+                slot_id, top.plate, top.score, margin, min_score, min_margin,
+                " [RESERVED — stricter]" if is_reserved else "",
+            )
+            return None
+
+        logger.info(
+            "[reid-solo] slot=%s ACCEPT %s — appearance alone: score %.3f, clear of the "
+            "runner-up by %.3f (a wrong car never wins by more than 0.099). OCR cannot "
+            "read this slot, so there is no second witness to wait for.",
+            slot_id, top.plate, top.score, margin,
+        )
+        return top.plate
+
     def _candidate_attrs(self, plate: str):
         """(colour, type) for a candidate, as ``((label, conf), (label, conf))``.
 
@@ -4239,8 +4328,11 @@ class VehicleRegistryIdentityMixin:
                     )
                 )
             feats = build_features(sigs, query)
+            solo = (ctx.get("path") == "reid_solo")
             if bound_plate:
-                decision = "BIND"
+                decision = "BIND_REID_SOLO" if solo else "BIND"
+            elif solo:
+                decision = "ABSTAIN_REID_NOT_CONFIDENT"
             elif not ocr_text:
                 decision = "ABSTAIN_NO_READ"
             else:
@@ -4576,11 +4668,20 @@ class VehicleRegistryIdentityMixin:
         plate: str,
         camera_id: str,
         floor: Optional[str] = None,
+        *,
+        source: str = "ocr",
     ) -> bool:
         """Park the session carrying ``plate`` into ``slot_id``.
 
-        Used by the OCR identification path, where the plate was READ off the car rather
-        than inferred, so the binding is evidence-backed and can be trusted.
+        ``source="ocr"`` means the plate was READ off the car — evidence, so the session
+        is marked ``ocr_confirmed`` and downstream may trust it (the lock gate fires, and
+        the parked pose may be taught to the gallery).
+
+        ``source="reid_solo"`` means it was INFERRED from appearance because no plate is
+        readable at this slot. That must never masquerade as a read: ``ocr_confirmed``
+        stays False, so the lock gate does not fire and ``save_parked_reference`` will not
+        learn from it. A wrong solo bind would otherwise poison the very gallery it was
+        inferred from.
         """
         if not slot_id or not plate:
             return False
@@ -4605,9 +4706,14 @@ class VehicleRegistryIdentityMixin:
             if floor:
                 session.linked_floor = floor
             session.linked_at = self._clock()
-            session.ocr_confirmed = True  # it was READ, not guessed
+            read = source == "ocr"
+            if read:
+                session.ocr_confirmed = True  # it was READ, not guessed
             self._parked[slot_id] = session
-            self._locked_slots.add(slot_id)
+            # Only a READ plate freezes the slot. A solo (appearance) bind stays
+            # correctable — it is a best guess, and OCR must be able to overrule it.
+            if read:
+                self._locked_slots.add(slot_id)
             self._gallery_index_upsert(session)
             return True
 

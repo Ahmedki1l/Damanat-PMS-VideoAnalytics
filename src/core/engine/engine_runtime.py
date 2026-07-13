@@ -1183,6 +1183,43 @@ class ParkingEngineRuntimeMixin:
             slot.id, crop, cam_id, decision_ctx=decision_ctx
         )
         if not plate:
+            # OCR could not name the car. On a slot whose plate is never in frame — CAM-21
+            # sees B1_CRO in pure profile, 455 attempts and zero reads — waiting for a
+            # second witness that can never arrive just leaves the slot NULL forever. So
+            # once OCR has had most of its budget, let appearance decide ALONE, and only
+            # when it is genuinely certain (see try_reid_identify_slot: the bar is the
+            # margin over the runner-up, not the raw score).
+            mc = self.vehicle_registry.matching_config
+            after = int(getattr(mc, "slot_reid_solo_after_attempts", 8))
+            if not getattr(mc, "slot_reid_solo_enabled", False) or attempts + 1 < after:
+                return
+            plate = self.vehicle_registry.try_reid_identify_slot(
+                slot.id, crop, cam_id,
+                is_reserved=bool(decision_ctx["is_reserved"]),
+                decision_ctx=decision_ctx,
+            )
+            if not plate:
+                return
+
+            # Appearance-only: bind it PROVISIONALLY. Not locked, so a later OCR read can
+            # still overrule it, and deliberately NOT taught to the gallery — a solo bind
+            # is inference, not evidence, and a wrong one would poison the references it
+            # was inferred from.
+            conf = float(getattr(mc, "slot_reid_solo_min_score", 0.70))
+            state_machine.bind_identity(
+                plate, self._build_slot_snapshot_url(slot.id), confidence=conf, lock=False
+            )
+            self.vehicle_registry.bind_plate_to_slot(
+                slot.id, plate, cam_id, floor=None, source="reid_solo"
+            )
+            if self.db_manager:
+                self._persist_slot_plate_binding(slot.id, plate, conf, False, cam_id)
+            logger.info(
+                "[reid-solo] slot=%s BOUND plate=%s (cam=%s) on attempt %d/%d — "
+                "appearance only, NOT locked and NOT taught to the gallery; OCR may still "
+                "overrule it",
+                slot.id, plate, cam_id, attempts + 1, self._OCR_ID_MAX_ATTEMPTS,
+            )
             return
 
         # READ, not inferred — so bind it, lock it, and stop reading this slot.

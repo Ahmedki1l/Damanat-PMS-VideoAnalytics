@@ -30,6 +30,9 @@ def registry():
     cfg.ground_truth_cameras = (GATE_CAM,)
     cfg.secondary_camera_weight = 0.6
     cfg.slot_camera_ref_weight = 0.8
+    # Never write synthetic fixtures into the real training data. The decision log is a
+    # training corpus, and TRUE-CAR / TWIN-A rows would teach the ranker nonsense.
+    cfg.decision_log_enabled = False
     return VehicleRegistry(matching_config=cfg)
 
 
@@ -233,3 +236,90 @@ class TestPhantomPlateFilter:
         registry._matching_config.candidates_require_appearance_evidence = False
         self._phantom_scenario(registry)
         assert len(registry.plates_inside()) == 3
+
+
+class TestReidSoloFallback:
+    """When OCR can never read a slot's plate, appearance decides alone — but only when
+    it is genuinely certain. The bar is the MARGIN over the runner-up, not the score:
+    measured on 311 real queries a wrong car reaches 0.762 (above any usable score floor)
+    but never wins by more than 0.099."""
+
+    def _reg(self, registry):
+        registry._matching_config.slot_reid_solo_enabled = True
+        registry._matching_config.slot_reid_solo_min_score = 0.70
+        registry._matching_config.slot_reid_solo_min_margin = 0.15
+        registry._matching_config.slot_reid_solo_min_score_reserved = 0.75
+        registry._matching_config.slot_reid_solo_min_margin_reserved = 0.20
+        registry._matching_config.decision_log_enabled = False
+        return registry
+
+    def test_binds_when_appearance_is_decisive(self, registry, monkeypatch):
+        reg = self._reg(registry)
+        q = _vec(1, 0, 0)
+        _add(reg, "TRUE-CAR", [(GATE_CAM, _vec(0.98, 0.20, 0))])   # ~0.98
+        _add(reg, "OTHER", [(GATE_CAM, _vec(0.70, 0.71, 0))])      # ~0.70 -> margin ~0.28
+        monkeypatch.setattr(reg.reid_matcher, "extract_feature", lambda _c: q)
+        assert reg.try_reid_identify_slot("B1_CRO", np.ones((8, 8, 3), np.uint8),
+                                          SLOT_CAM) == "TRUE-CAR"
+
+    def test_abstains_on_a_car_it_has_never_seen(self, registry, monkeypatch):
+        """The real B22/B1_CRO case. An unknown vehicle scores ~0.6 against EVERYTHING
+        with a flat margin. Binding it would stamp a stranger with a known plate."""
+        reg = self._reg(registry)
+        q = _vec(1, 0, 0)
+        _add(reg, "STRANGER-A", [(GATE_CAM, _vec(0.66, 0.75, 0))])   # 0.66
+        _add(reg, "STRANGER-B", [(GATE_CAM, _vec(0.65, 0.76, 0))])   # 0.65 -> margin ~0.01
+        monkeypatch.setattr(reg.reid_matcher, "extract_feature", lambda _c: q)
+        assert reg.try_reid_identify_slot("B22", np.ones((8, 8, 3), np.uint8),
+                                          SLOT_CAM) is None
+
+    def test_high_score_but_flat_margin_is_refused(self, registry, monkeypatch):
+        """Score alone is NOT a guard — a wrong car reaches 0.762 in cold. Two cars that
+        both look like the query is exactly when we must not guess."""
+        reg = self._reg(registry)
+        q = _vec(1, 0, 0)
+        _add(reg, "TWIN-A", [(GATE_CAM, _vec(0.99, 0.10, 0))])   # ~0.99, well over the floor
+        _add(reg, "TWIN-B", [(GATE_CAM, _vec(0.98, 0.17, 0))])   # ~0.98 -> margin ~0.01
+        monkeypatch.setattr(reg.reid_matcher, "extract_feature", lambda _c: q)
+        assert reg.try_reid_identify_slot("B14", np.ones((8, 8, 3), np.uint8),
+                                          SLOT_CAM) is None
+
+    def test_reserved_slots_are_held_to_a_stricter_bar(self, registry, monkeypatch):
+        """A wrong plate on a C-level slot raises a false intrusion alert against an
+        executive, so reserved slots demand a wider margin than general ones."""
+        reg = self._reg(registry)
+        q = _vec(1, 0, 0)
+        _add(reg, "TRUE-CAR", [(GATE_CAM, _vec(0.90, 0.44, 0))])   # ~0.90
+        _add(reg, "OTHER", [(GATE_CAM, _vec(0.79, 0.61, 0))])      # ~0.79 -> margin ~0.11
+        monkeypatch.setattr(reg.reid_matcher, "extract_feature", lambda _c: q)
+        crop = np.ones((8, 8, 3), np.uint8)
+        # margin 0.11 clears neither bar (general needs 0.15) — widen it and retest.
+        _add(reg, "PADDING", [(GATE_CAM, _vec(0.10, 0.99, 0))])
+        reg._matching_config.slot_reid_solo_min_margin = 0.10       # general: passes
+        assert reg.try_reid_identify_slot("B14", crop, SLOT_CAM) == "TRUE-CAR"
+        assert reg.try_reid_identify_slot("B13", crop, SLOT_CAM,
+                                          is_reserved=True) is None  # reserved: 0.20, fails
+
+    def test_a_solo_bind_never_claims_to_be_ocr_confirmed(self, registry):
+        """It is inference, not evidence: it must not set ocr_confirmed, must not lock the
+        slot, and so must not let save_parked_reference learn from it."""
+        reg = self._reg(registry)
+        s = _add(reg, "GUESSED", [(GATE_CAM, _vec(1, 0, 0))])
+        assert reg.bind_plate_to_slot("B1_CRO", "GUESSED", SLOT_CAM, source="reid_solo")
+        assert s.ocr_confirmed is False
+        assert "B1_CRO" not in reg._locked_slots
+
+        s2 = _add(reg, "READ", [(GATE_CAM, _vec(0, 1, 0))])
+        assert reg.bind_plate_to_slot("B14", "READ", SLOT_CAM, source="ocr")
+        assert s2.ocr_confirmed is True
+        assert "B14" in reg._locked_slots
+
+    def test_disabled_by_config(self, registry, monkeypatch):
+        reg = self._reg(registry)
+        reg._matching_config.slot_reid_solo_enabled = False
+        q = _vec(1, 0, 0)
+        _add(reg, "TRUE-CAR", [(GATE_CAM, _vec(1, 0, 0))])
+        _add(reg, "OTHER", [(GATE_CAM, _vec(0.1, 0.99, 0))])
+        monkeypatch.setattr(reg.reid_matcher, "extract_feature", lambda _c: q)
+        assert reg.try_reid_identify_slot("B1_CRO", np.ones((8, 8, 3), np.uint8),
+                                          SLOT_CAM) is None

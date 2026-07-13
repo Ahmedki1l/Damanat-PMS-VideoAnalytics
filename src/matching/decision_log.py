@@ -63,7 +63,11 @@ class DecisionLog:
         max_queue: int = 2000,
         enabled: bool = True,
     ) -> None:
-        self.enabled = bool(enabled)
+        # This file is a TRAINING CORPUS, not a debug log. A unit test's synthetic
+        # fixtures (TRUE-CAR, TWIN-A, STRANGER-A) would teach the ranker nonsense, and
+        # they did exactly that once. Refuse to write under pytest, whatever the caller
+        # passed — a test that wants to exercise the writer can construct it explicitly.
+        self.enabled = bool(enabled) and "PYTEST_CURRENT_TEST" not in os.environ
         self._dir = directory
         self._worker = worker or f"pid{os.getpid()}"
         self._q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=max_queue)

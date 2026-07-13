@@ -350,6 +350,69 @@ class MatchingConfig:
     # Slot path only; the gate/global path keeps the plain 0.6, where it is load-bearing.
     slot_camera_ref_weight: float = 0.80
 
+    # ---- ReID-solo fallback -------------------------------------------------------
+    # Some slots can NEVER be read. CAM-21 frames B1_CRO in pure side profile: 455
+    # attempts, zero reads. On those, insisting on an OCR witness means the slot stays
+    # NULL forever, so appearance has to stand alone — but only when it is genuinely sure.
+    #
+    # `reid_solo_confirm` (0.90) is NOT reused here: on PS_matcher V2 it accepts 0 of 311
+    # real queries. It was calibrated for the gate/global comparison on a model whose
+    # cosine scale was much wider. Borrowing it would silently disable this path.
+    #
+    # THE TWO GATES GUARD DIFFERENT FAILURES. Both are required.
+    #
+    # MARGIN — guards against confusing two cars we KNOW. Derived from 311 real
+    # parked-pose queries, 2026-07-13:
+    #
+    #                wrong top-1   worst wrong score   worst wrong margin
+    #     WARM            2%             0.714               0.094
+    #     COLD           26%             0.762               0.099
+    #
+    # A wrong car never wins by more than 0.099, so margin >= 0.15 clears it with >= 0.05
+    # headroom in BOTH regimes — the same headroom rule that derived lock_confidence.
+    # Zero false accepts over the whole set.
+    #
+    # SCORE — guards against a car we have NEVER SEEN. This is the one the offline eval
+    # cannot measure, because that eval is CLOSED-SET: the true car is always somewhere in
+    # the gallery, so "the right answer is absent" never happens and the score floor looks
+    # redundant (margin>=0.15 alone: 42 accepted, 0 wrong; adding score>=0.70 changes
+    # nothing). Production is OPEN-SET, and it shows the real failure immediately:
+    #
+    #     B14  best=RDJ-9640  score 0.600  margin 0.356
+    #     B19  best=ERS-7949  score 0.669  margin 0.411
+    #     B22  best=ZRS-6511  score 0.615  margin 0.388
+    #
+    # LOW score with a WIDE margin is the signature of an unknown vehicle: nothing matches
+    # it well, but one gallery car is the nearest of a bad bunch, so it wins by a mile.
+    # Margin alone would confidently stamp a stranger with RDJ-9640's plate. The floor is
+    # what refuses. (Those cars are genuinely absent — 17 registered vehicles have no open
+    # session; B28's is HRS-4772, B25's is AVD-4918, neither ever seen at the gate.)
+    #
+    # WHERE THE FLOOR SITS. Cold cars score lower than warm ones — there is no
+    # parked-pose reference yet, only a gate photo, and that is the cross-view case.
+    # DAY-1 COLD, top-1 score:
+    #     CORRECT  p5=0.614  p10=0.637  p25=0.682  p50=0.737
+    #     WRONG              p50=0.646             max=0.762
+    # The two overlap heavily, so the score is a weak correct/wrong discriminator — the
+    # margin does that job. What the score DOES separate is the open-set case: an unknown
+    # car matches nothing well (B25 scored 0.269, B28 0.327), far below any real match.
+    #
+    # 0.65 sits just above the correct-cold p10. Verified against production: slot B19's
+    # plate reads ERS-7949 and ReID ranked ERS-7949 first at score 0.669 / margin 0.411 —
+    # correct, and the old 0.70 floor was REFUSING it (0.70 rejects 31% of correct cold
+    # answers). 0.65 admits B19 and still refuses B14 (0.600) and B22 (0.615), whose
+    # plates are not visible from any camera and whose identity therefore cannot be
+    # verified. Do not lower it further to "fix" those two: an unverifiable bind on a
+    # side-on slot is exactly how a stranger gets stamped with a known plate.
+    slot_reid_solo_enabled: bool = True
+    slot_reid_solo_after_attempts: int = 8      # give OCR most of its budget first
+    slot_reid_solo_min_score: float = 0.65
+    slot_reid_solo_min_margin: float = 0.15
+    # Reserved slots stay stricter: a wrong plate here raises a false intrusion alert
+    # against an executive, so precision beats coverage.
+    slot_reid_solo_min_score_reserved: float = 0.72
+    slot_reid_solo_min_margin_reserved: float = 0.20
+
     # How many of the 12 identify attempts may pay for OCR's enlarged retry pass.
     # The retry rescues a plate that is present but too small for the text detector to
     # find (slot B13, CAM-24: '' -> '9990BHD' -> BHD-9990, a C-level slot dark for 60
@@ -877,6 +940,24 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         cm.ocr_upscale_retry_max_attempts = m.get(
             "ocr_upscale_retry_max_attempts", cm.ocr_upscale_retry_max_attempts
+        )
+        cm.slot_reid_solo_enabled = m.get(
+            "slot_reid_solo_enabled", cm.slot_reid_solo_enabled
+        )
+        cm.slot_reid_solo_after_attempts = m.get(
+            "slot_reid_solo_after_attempts", cm.slot_reid_solo_after_attempts
+        )
+        cm.slot_reid_solo_min_score = m.get(
+            "slot_reid_solo_min_score", cm.slot_reid_solo_min_score
+        )
+        cm.slot_reid_solo_min_margin = m.get(
+            "slot_reid_solo_min_margin", cm.slot_reid_solo_min_margin
+        )
+        cm.slot_reid_solo_min_score_reserved = m.get(
+            "slot_reid_solo_min_score_reserved", cm.slot_reid_solo_min_score_reserved
+        )
+        cm.slot_reid_solo_min_margin_reserved = m.get(
+            "slot_reid_solo_min_margin_reserved", cm.slot_reid_solo_min_margin_reserved
         )
         cm.decision_log_enabled = m.get("decision_log_enabled", cm.decision_log_enabled)
         cm.decision_log_dir = m.get("decision_log_dir", cm.decision_log_dir)
