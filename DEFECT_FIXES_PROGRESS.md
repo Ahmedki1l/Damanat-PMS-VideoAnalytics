@@ -86,37 +86,66 @@
 
 ---
 
-## POINT 3: D3 — Candidate Expiry Timeout Fix ✅ DONE
+## POINT 3: D3 — Lingering car steals the next car's plate ✅ DONE (2nd attempt)
 
-### What Changed
+> **The first attempt was reverted and this section used to describe it as shipped.**
+> It claimed an `entered_at` expiry sweep, an `expire_park_entry_candidate()` call on
+> zone exit, and an `entered_at` bind TTL. All three were rolled back in `b3ef313`
+> ("un-break Park_Entry binding damaged by D1/D2/D3 over-reach") because they keyed on
+> the candidate's **absolute age** and so force-expired cars that were legitimately
+> dwelling at the barrier — they never bound at all. For a while afterwards the code
+> carried a docstring asserting an `entered_at` check that did not exist, and
+> `expire_park_entry_candidate()` sat unreferenced. Both are now corrected.
 
-**1. vehicle_registry_core.py:541 — Expiry sweep now uses entered_at**
+### The rule that actually shipped
+
+A candidate may only bind a plate that was **read at-or-after it entered the zone**.
+The ANPR read happens at the gate, upstream of the CAM-23 polygon, so the car that
+triggered a read reaches the zone *after* it. A car already sitting in the zone when
+the read landed cannot be the car that was read.
+
+**1. `vehicle_registry.py` — `PARK_ENTRY_LINGER_GRACE_SECONDS = 5`**
+Relative, not absolute. A car may dwell in the zone for minutes; only its entry time
+*versus the read* matters. The grace absorbs ANPR POST latency, because
+`event.timestamp` is when the event was **received**, not when the plate was read.
+
+**2. `vehicle_registry_identity.py` — `bind_next_pending_anpr_to_candidate()`**
 ```python
-age = (now - candidate.entered_at).total_seconds() if candidate.entered_at else 0
-if age > self.CANDIDATE_EXPIRY_SECONDS:  # 30s
-    candidate.status = "expired"
+lingered = (pending.timestamp - candidate.entered_at).total_seconds()
+if lingered > self.PARK_ENTRY_LINGER_GRACE_SECONDS:
+    continue   # not this car's plate — but keep looking for an OLDER event
 ```
-- Replaces `last_seen_at` (refreshed every frame)
-- Now a stationary car expires after 30s, not never
+`continue`, not `return`: a car whose own read merely arrived late can still bind its
+own (older) pending event.
 
-**2. vehicle_registry_core.py:606 — New expire_park_entry_candidate() method**
-- Called when a track leaves the zone
-- Marks candidate as "expired" immediately
-- Prevents re-use if car queues, leaves, re-enters
-
-**3. engine_tracking.py:695 — Exit path now calls expire**
-```python
-self.vehicle_registry.expire_park_entry_candidate(candidate_id)
-```
-- Aggressive cleanup when track leaves zone
-- Prevents lingering candidates from grabbing next plate
+**3. `engine_tracking.py` — `_process_park_entry_zone()` binds by walking the ranked cars**
+The guard alone was not enough. The bind requires `status == "open"` and only the
+single best-ranked car ever attempted it — and a stationary lingerer scores **high** on
+overlap/depth/area, so it wins the primary slot. It would therefore either take the
+arriving car's plate or, once refused, **block every car behind it from ever binding**.
+The bind now walks `_rank_zone_detections()` best-first and stops at the first car the
+registry accepts, so an ineligible car is skipped instead of blocking the gate. The
+solo-car fallback from `b3ef313` is preserved.
 
 ### Interaction with D1
 
-D1 + D3 = complete anti-swap defense:
-- D1: Only primary car can bind
-- D3: Only recently-entered candidates can bind (TTL enforced)
-- Together: eliminates FIFO cross-binding vulnerability
+- D1: among *eligible* cars, the plate goes to the primary — not to whoever the tracker listed first.
+- D3: a lingerer is not eligible, and cannot block the car that is.
+
+### Tests
+
+`tests/test_park_entry_linger_d3.py` (7). The three D3 cases fail without the guard
+(reproducing the steal: *"lingering primary stole the arriving car's plate"*); the rest
+are regression guards for the `b3ef313` revert — a dwelling car still binds its own
+plate, a solo car still binds when the ranking abstains, and a late ANPR POST inside the
+grace still binds.
+
+### Still open
+
+`expire_park_entry_candidate()` (`vehicle_registry_core.py`) remains **dead code** and is
+still labelled D3. It is not part of this fix — calling it on zone exit is precisely what
+`b3ef313` had to revert (a one-frame ByteTrack dropout would kill a candidate about to
+bind). Delete it or relabel it; do not wire it back up.
 
 ---
 
@@ -160,11 +189,18 @@ Combined: Wrong plate cannot become permanent
 
 ## Status Summary
 
+> **Verify against the code before trusting a ✅ here.** This file marked D3 done for a
+> month while the tree contained no such fix (see POINT 3). A row is evidence of intent,
+> not of a shipped change.
+
 | Defect | Severity | Status |
 |--------|----------|--------|
-| **D8b** | High | ✅ DONE |
-| **D1** | Critical | ✅ DONE |
-| **D3** | Critical | ✅ DONE |
-| **D2** | Critical | ✅ DONE |
-| D15+D14 | Medium | 📋 NEXT |
-| D9 | Medium | 📋 QUEUED |
+| **D8b** | High | ✅ DONE (effective-config logging uses `print`, not `logger`) |
+| **D1** | Critical | ✅ DONE (`_select_primary_zone_detection`, + solo fallback from `b3ef313`) |
+| **D3** | Critical | ✅ DONE (2nd attempt — linger guard + ranked bind walk; 1st attempt was reverted) |
+| **D2** | Critical | ✅ DONE (seed + reattach + CAM-03 paths) |
+| D15 | Medium | ✅ DONE (`tools/eval_identity_disjoint.py`; honest cross-view rank-1 0.736 / mAP 0.564) |
+| D9 | Medium | ✅ DONE, log-only (`gallery_neighbour_clearance_enforce: false` — collect the histogram, then gate) |
+| D14 | Medium | ❌ NOT DONE (`bench_yolo.py` measures throughput only; no small-car recall benchmark) |
+| D5 | Low | ❌ NOT DONE (`b1_cross_camera` is still dead config — `decide_b1` takes a `cross_camera` flag and never reads it) |
+| D6 | Medium | ⚠️ PARTIAL (imgsz now resolved from the export's `metadata.yaml`; still 320, no `detector_overrides`, no 512 IR) |
