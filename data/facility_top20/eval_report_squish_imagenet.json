@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-12T16:45:07+00:00",
+  "generated_at": "2026-05-15T13:38:00+00:00",
   "eval_dir": "data\\facility_top20\\eval",
   "pairs_csv": "data\\facility_top20\\pairs_eval.csv",
   "n_eval_images": 79,
@@ -30,9 +30,9 @@
   "summary": {
     "baseline_vs_fine_tuned": {
       "rank1": {
-        "baseline": 0.6835,
-        "fine_tuned": 0.7595,
-        "delta": 0.076
+        "baseline": 0.6709,
+        "fine_tuned": 0.7468,
+        "delta": 0.0759
       },
       "rank5": {
         "baseline": 0.7089,
@@ -40,76 +40,76 @@
         "delta": 0.1139
       },
       "mAP": {
-        "baseline": 0.5477,
-        "fine_tuned": 0.6842,
-        "delta": 0.1365
+        "baseline": 0.5435,
+        "fine_tuned": 0.6809,
+        "delta": 0.1374
       },
       "cosine_margin": {
-        "baseline": 0.1346,
-        "fine_tuned": 0.2588,
-        "delta": 0.1242
+        "baseline": 0.1355,
+        "fine_tuned": 0.2572,
+        "delta": 0.1217
       },
       "embed_ms_per_image": {
-        "baseline": 14.83,
-        "fine_tuned": 8.32,
-        "delta": -6.51
+        "baseline": 8.11,
+        "fine_tuned": 8.88,
+        "delta": 0.77
       }
     },
     "pair_roc_auc": {
-      "baseline": 0.7917,
-      "fine_tuned": 0.9181
+      "baseline": 0.7902,
+      "fine_tuned": 0.9174
     }
   },
   "baseline": {
-    "ir_dir": "models\\osnet_openvino_int8_256x128",
+    "ir_dir": "models\\osnet_unfinetuned_squish_int8_256x128",
     "n_eval": 79,
-    "embed_time_s": 1.171,
-    "embed_ms_per_image": 14.83,
-    "rank1": 0.6835,
+    "embed_time_s": 0.641,
+    "embed_ms_per_image": 8.11,
+    "rank1": 0.6709,
     "rank5": 0.7089,
-    "mAP": 0.5477,
-    "mean_same_cosine": 0.7196,
-    "mean_diff_cosine": 0.585,
-    "cosine_margin": 0.1346,
+    "mAP": 0.5435,
+    "mean_same_cosine": 0.7186,
+    "mean_diff_cosine": 0.5832,
+    "cosine_margin": 0.1355,
     "pairs": {
       "total": 1095,
       "positives": 95,
       "negatives": 1000,
       "skipped_due_to_missing_paths": 0,
-      "roc_auc": 0.7917,
+      "roc_auc": 0.7902,
       "threshold_used": 0.53,
-      "precision_at_threshold": 0.1039,
-      "recall_at_threshold": 0.9053,
-      "tp": 86,
-      "fp": 742,
-      "fn": 9,
-      "tn": 258
+      "precision_at_threshold": 0.1036,
+      "recall_at_threshold": 0.8842,
+      "tp": 84,
+      "fp": 727,
+      "fn": 11,
+      "tn": 273
     }
   },
   "fine_tuned": {
-    "ir_dir": "models\\osnet_facility_int8_256x128",
+    "ir_dir": "models\\osnet_facility_imagenet_int8_256x128",
     "n_eval": 79,
-    "embed_time_s": 0.657,
-    "embed_ms_per_image": 8.32,
-    "rank1": 0.7595,
+    "embed_time_s": 0.701,
+    "embed_ms_per_image": 8.88,
+    "rank1": 0.7468,
     "rank5": 0.8228,
-    "mAP": 0.6842,
-    "mean_same_cosine": 0.5751,
-    "mean_diff_cosine": 0.3163,
-    "cosine_margin": 0.2588,
+    "mAP": 0.6809,
+    "mean_same_cosine": 0.5728,
+    "mean_diff_cosine": 0.3156,
+    "cosine_margin": 0.2572,
     "pairs": {
       "total": 1095,
       "positives": 95,
       "negatives": 1000,
       "skipped_due_to_missing_paths": 0,
-      "roc_auc": 0.9181,
+      "roc_auc": 0.9174,
       "threshold_used": 0.53,
-      "precision_at_threshold": 0.6569,
-      "recall_at_threshold": 0.7053,
-      "tp": 67,
-      "fp": 35,
-      "fn": 28,
-      "tn": 965
+      "precision_at_threshold": 0.6832,
+      "recall_at_threshold": 0.7263,
+      "tp": 69,
+      "fp": 32,
+      "fn": 26,
+      "tn": 968
     }
   },
   "cascade_contribution": null,
@@ -118,10 +118,10 @@
     "metrics_beaten": 4,
     "metrics_total": 4,
     "deltas": {
-      "rank1": 0.076,
+      "rank1": 0.0759,
       "rank5": 0.1139,
-      "mAP": 0.1365,
-      "cosine_margin": 0.1242
+      "mAP": 0.1374,
+      "cosine_margin": 0.1217
     }
   }
 }

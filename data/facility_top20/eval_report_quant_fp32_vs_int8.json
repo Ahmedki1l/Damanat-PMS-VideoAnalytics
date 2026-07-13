@@ -1,0 +1,127 @@
+{
+  "generated_at": "2026-07-06T22:37:47+00:00",
+  "eval_dir": "data\\facility_top20\\eval",
+  "pairs_csv": "data\\facility_top20\\pairs_eval.csv",
+  "n_eval_images": 79,
+  "n_plates": 20,
+  "plate_names": [
+    "AGA-6649",
+    "EEB-80",
+    "ERD-7800",
+    "HBR-4920",
+    "HGD-2926",
+    "HUD-9444",
+    "HVA-77",
+    "LNV-94",
+    "LRS-9439",
+    "NDD-4141",
+    "NJS-7894",
+    "NXR-2727",
+    "RDJ-9640",
+    "RTB-2016",
+    "SDD-6707",
+    "XBD-5588",
+    "XRD-6663",
+    "ZDR-8501",
+    "ZRS-6511",
+    "ZVH-337"
+  ],
+  "threshold": 0.53,
+  "summary": {
+    "baseline_vs_fine_tuned": {
+      "rank1": {
+        "baseline": 0.7722,
+        "fine_tuned": 0.7595,
+        "delta": -0.0127
+      },
+      "rank5": {
+        "baseline": 0.8481,
+        "fine_tuned": 0.8481,
+        "delta": 0.0
+      },
+      "mAP": {
+        "baseline": 0.7067,
+        "fine_tuned": 0.7154,
+        "delta": 0.0087
+      },
+      "cosine_margin": {
+        "baseline": 0.2811,
+        "fine_tuned": 0.2792,
+        "delta": -0.0019
+      },
+      "embed_ms_per_image": {
+        "baseline": 13.38,
+        "fine_tuned": 8.54,
+        "delta": -4.84
+      }
+    },
+    "pair_roc_auc": {
+      "baseline": 0.9269,
+      "fine_tuned": 0.928
+    }
+  },
+  "baseline": {
+    "ir_dir": "models\\osnet_facility_carla_fp32_256x128",
+    "n_eval": 79,
+    "embed_time_s": 1.057,
+    "embed_ms_per_image": 13.38,
+    "rank1": 0.7722,
+    "rank5": 0.8481,
+    "mAP": 0.7067,
+    "mean_same_cosine": 0.6699,
+    "mean_diff_cosine": 0.3888,
+    "cosine_margin": 0.2811,
+    "pairs": {
+      "total": 1095,
+      "positives": 95,
+      "negatives": 1000,
+      "skipped_due_to_missing_paths": 0,
+      "roc_auc": 0.9269,
+      "threshold_used": 0.53,
+      "precision_at_threshold": 0.4011,
+      "recall_at_threshold": 0.7895,
+      "tp": 75,
+      "fp": 112,
+      "fn": 20,
+      "tn": 888
+    }
+  },
+  "fine_tuned": {
+    "ir_dir": "models\\osnet_facility_carla_int8_256x128",
+    "n_eval": 79,
+    "embed_time_s": 0.675,
+    "embed_ms_per_image": 8.54,
+    "rank1": 0.7595,
+    "rank5": 0.8481,
+    "mAP": 0.7154,
+    "mean_same_cosine": 0.6686,
+    "mean_diff_cosine": 0.3894,
+    "cosine_margin": 0.2792,
+    "pairs": {
+      "total": 1095,
+      "positives": 95,
+      "negatives": 1000,
+      "skipped_due_to_missing_paths": 0,
+      "roc_auc": 0.928,
+      "threshold_used": 0.53,
+      "precision_at_threshold": 0.4051,
+      "recall_at_threshold": 0.8316,
+      "tp": 79,
+      "fp": 116,
+      "fn": 16,
+      "tn": 884
+    }
+  },
+  "cascade_contribution": null,
+  "acceptance": {
+    "verdict": "fail",
+    "metrics_beaten": 1,
+    "metrics_total": 4,
+    "deltas": {
+      "rank1": -0.0127,
+      "rank5": 0.0,
+      "mAP": 0.0087,
+      "cosine_margin": -0.0019
+    }
+  }
+}
