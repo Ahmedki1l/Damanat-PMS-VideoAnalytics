@@ -397,20 +397,38 @@ class MatchingConfig:
     # margin does that job. What the score DOES separate is the open-set case: an unknown
     # car matches nothing well (B25 scored 0.269, B28 0.327), far below any real match.
     #
-    # 0.65 sits just above the correct-cold p10. Verified against production: slot B19's
-    # plate reads ERS-7949 and ReID ranked ERS-7949 first at score 0.669 / margin 0.411 —
-    # correct, and the old 0.70 floor was REFUSING it (0.70 rejects 31% of correct cold
-    # answers). 0.65 admits B19 and still refuses B14 (0.600) and B22 (0.615), whose
-    # plates are not visible from any camera and whose identity therefore cannot be
-    # verified. Do not lower it further to "fix" those two: an unverifiable bind on a
-    # side-on slot is exactly how a stranger gets stamped with a known plate.
+    # The floor is set by the GAP between a known car and an unknown one, and production
+    # ground truth is what pins it. Two solo answers have been verified against the plate
+    # visible in the frame, and ReID was right BOTH times:
+    #
+    #     B19  ERS-7949  score 0.669-0.721   CORRECT (plate reads 7949 ERS)
+    #     B14  RDJ-9640  score 0.586-0.600   CORRECT (operator-confirmed)
+    #
+    # ...while the cars that are genuinely NOT enrolled score far lower, because nothing
+    # in the gallery resembles them:
+    #
+    #     B25  best 0.218-0.281      B28  best 0.304-0.339
+    #
+    # So known-cold lands at 0.59+, unknown at <=0.34 — a wide, clean gap. 0.50 sits in
+    # the middle of it, with 0.16 of headroom over the worst unknown and 0.086 under the
+    # weakest verified-correct answer.
+    #
+    # Earlier floors of 0.70 (from WARM statistics) and 0.65 were BOTH too high and were
+    # silently discarding correct answers: cold cars have no parked-pose reference yet,
+    # only a gate photo, so their scores sit lower by construction (correct-cold p10 =
+    # 0.637, p5 = 0.614). Do not re-raise this from warm numbers.
+    #
+    # The margin gate remains the guard against confusing two KNOWN cars; the floor is
+    # purely the open-set guard. Both are needed — see the note above.
     slot_reid_solo_enabled: bool = True
     slot_reid_solo_after_attempts: int = 8      # give OCR most of its budget first
-    slot_reid_solo_min_score: float = 0.65
+    slot_reid_solo_min_score: float = 0.50
     slot_reid_solo_min_margin: float = 0.15
     # Reserved slots stay stricter: a wrong plate here raises a false intrusion alert
-    # against an executive, so precision beats coverage.
-    slot_reid_solo_min_score_reserved: float = 0.72
+    # against an executive, so precision beats coverage. The MARGIN is what is tightened
+    # (0.20 vs 0.15) — that is the guard that actually discriminates. B1_CRO's best guess
+    # scores a respectable 0.677 but wins by only 0.047, and is correctly refused.
+    slot_reid_solo_min_score_reserved: float = 0.60
     slot_reid_solo_min_margin_reserved: float = 0.20
 
     # How many of the 12 identify attempts may pay for OCR's enlarged retry pass.

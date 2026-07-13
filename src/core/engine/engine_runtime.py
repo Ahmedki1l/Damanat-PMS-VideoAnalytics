@@ -1459,27 +1459,21 @@ class ParkingEngineRuntimeMixin:
         )
 
         if not plate:
-            # Restart stickiness: a plate restored from persistence has no
-            # gallery/track backing yet, so try_link_to_slot returns None on the
-            # first frames. Keep the restored plate on the still-occupied slot
-            # rather than dropping it — the whole point of persistence. It stays
-            # correctable (OCR/ReID can still upgrade it below once the car is
-            # re-identified) and is cleared only when the slot goes VACANT.
-            if previous_plate and slot.id in getattr(self, "_restored_plate_slots", ()):
-                return
-            # Registry says no plate (moved/unlinked, or the voter is still
-            # deferring). Only clear a PROVISIONAL binding — a locked one already
-            # returned above — to avoid ghost labels in the UI / API.
-            if previous_plate:
-                state_machine.bind_identity(
-                    None, self._build_slot_snapshot_url(slot.id)
-                )
-                registry.unlink_slot(slot.id)
-                self._forced_ocr_attempts.pop(slot.id, None)
-                if self.db_manager:
-                    self._persist_slot_plate_binding(
-                        slot.id, None, 0.0, False, cam_id
-                    )
+            # A BOUND PLATE IS CLEARED ONLY WHEN THE SLOT CHANGES STATE — never here.
+            #
+            # This resolver runs on every frame of an occupied slot, and it used to wipe
+            # any binding the registry could not re-derive on that particular frame. That
+            # was catastrophic once try_link_to_slot went dead behind
+            # slot_plate_requires_ocr: it returns None on EVERY frame now, so every
+            # provisional binding was erased the instant after it was made. B19 was bound
+            # to ERS-7949 and destroyed three times in six seconds. The same mechanism
+            # quietly undid appearance-only binds and restart-restored plates alike.
+            #
+            # The car has not moved — the slot is still OCCUPIED, which is the only thing
+            # this function actually knows. Absence of a re-derivation is not evidence the
+            # car left. The slot going VACANT is, and that path (slot_vacant -> unlink_slot)
+            # already clears the plate and releases the lock. That is the single place a
+            # binding dies.
             return
 
         # A live track re-derived a plate for this slot — it is now backed by
