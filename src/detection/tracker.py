@@ -26,6 +26,7 @@ from ultralytics.utils.checks import check_yaml
 
 from src.config import DetectorConfig, TrackerConfig, DetectorPreprocessingConfig
 from src.detection.detector import Detection
+from src.ov_tuning import apply_openvino_overrides
 from src.preprocessing import luminance_normalize_auto
 from src import perf_trace
 
@@ -68,6 +69,13 @@ class TrackedDetector:
         self._camera_trackers: Dict[str, object] = {}
 
         print(f"[INFO] Loading YOLO model from '{detector_config.model_path}'...")
+        # Ultralytics hardcodes PERFORMANCE_HINT=LATENCY, which caps the CPU pool
+        # at 8 threads however many cores exist. Must patch before YOLO() compiles
+        # the model — OpenVINO sizes the pool once and never re-reads it.
+        apply_openvino_overrides(
+            num_threads=getattr(detector_config, "ov_num_threads", 0),
+            performance_hint=getattr(detector_config, "ov_performance_hint", ""),
+        )
         self.model = YOLO(detector_config.model_path, task="detect")
         self.imgsz = self._resolve_imgsz()
 
