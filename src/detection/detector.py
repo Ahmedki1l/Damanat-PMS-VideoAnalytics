@@ -55,7 +55,7 @@ class Detection:
         """
         x1, y1, x2, y2 = self.bbox
         cx = (x1 + x2) / 2.0
-        cy = y2
+        cy = ( y1 + y2) / 1.5
         return (cx, cy)
 
     @property
