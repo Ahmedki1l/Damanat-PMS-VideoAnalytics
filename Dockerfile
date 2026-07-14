@@ -81,6 +81,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 # So: point PaddleX's cache at a fixed dir and populate it at BUILD time. The
 # warm-up must construct PaddleOCR with the same model names + angle flag that
 # PaddlePlateOCR._ensure_engine() uses, or it would cache the wrong weights.
+# The supervisor copies its env to all 5 groups, so one ENV covers every worker.
 ENV PADDLE_PDX_CACHE_HOME=/opt/paddlex
 RUN python -c 'import numpy as np; from paddleocr import PaddleOCR; PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=True, enable_mkldnn=False, device="cpu", text_detection_model_name="PP-OCRv5_mobile_det", text_recognition_model_name="en_PP-OCRv5_mobile_rec").predict(np.zeros((320, 320, 3), dtype=np.uint8))' \
     && ls /opt/paddlex/official_models
@@ -101,10 +102,9 @@ COPY . .
 
 EXPOSE 8000
 
-# On start: seed the drawn zoning geometry (areas/slots/boundaries) into any
-# EMPTY tables, then launch the API. `--if-empty` makes this a first-run seed —
-# a restart/redeploy against a populated DB skips it and never clobbers live
-# occupancy. Disable with SEED_GEOMETRY_ON_START=false; point at another dump
-# with GEOMETRY_FILE=/path/to/dump.json. main.py still creates tables + seeds
-# parking_areas from config.yaml, so the seed is additive (slots + boundaries).
-ENTRYPOINT ["sh", "-c", "if [ \"${SEED_GEOMETRY_ON_START:-true}\" = true ] && [ -f \"${GEOMETRY_FILE:-geometry.json}\" ]; then echo '[entrypoint] seeding geometry into empty tables...'; python tools/sync_geometry.py seed --in \"${GEOMETRY_FILE:-geometry.json}\" --if-empty || echo '[entrypoint] geometry seed skipped (continuing)'; fi; exec python main.py --api"]
+# Same geometry seed as the single-process image; the only difference is the
+# final exec — the Python supervisor (`--supervise --foreground`) runs as PID 1
+# and spawns/supervises the 5 camera groups instead of one `main.py --api`. It
+# mirrors each group's logs to stdout and forwards SIGTERM on `docker stop`.
+# Extra launcher flags via RUN_ALL_ARGS, e.g. -e RUN_ALL_ARGS="--reset-plates".
+ENTRYPOINT ["sh", "-c", "if [ \"${SEED_GEOMETRY_ON_START:-true}\" = true ] && [ -f \"${GEOMETRY_FILE:-geometry.json}\" ]; then echo '[entrypoint] seeding geometry into empty tables...'; python tools/sync_geometry.py seed --in \"${GEOMETRY_FILE:-geometry.json}\" --if-empty || echo '[entrypoint] geometry seed skipped (continuing)'; fi; exec python main.py --supervise --foreground ${RUN_ALL_ARGS:-}"]
