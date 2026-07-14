@@ -91,8 +91,13 @@ class PlateOCR(ABC):
     """
 
     @abstractmethod
-    def read(self, crop_bgr: np.ndarray) -> Tuple[str, float]:
-        """Return ``(text, confidence)`` where text is normalised alphanumerics."""
+    def read(self, crop_bgr: np.ndarray, **kwargs) -> Tuple[str, float]:
+        """Return ``(text, confidence)`` where text is normalised alphanumerics.
+
+        Implementations accept optional keyword flags (``allow_retry``,
+        ``apply_plate_roi``); the base contract ignores any it does not use, so
+        callers can pass them uniformly without probing the concrete type.
+        """
 
 
 # --------------------------------------------------------------------------- #
@@ -234,5 +239,5 @@ class NoopTypeClassifier(TypeClassifier):
 class NoopPlateOCR(PlateOCR):
     """Returns ``("", 0.0)`` — Phase 0 has no OCR cross-check."""
 
-    def read(self, crop_bgr: np.ndarray) -> Tuple[str, float]:
+    def read(self, crop_bgr: np.ndarray, **kwargs) -> Tuple[str, float]:
         return ("", 0.0)

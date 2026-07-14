@@ -419,8 +419,16 @@ class PaddlePlateOCR(PlateOCR):
             return crop_bgr
         return crop_bgr[y0:y1, x0:x1]
 
-    def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
-        """Mask HUD bands, crop the geometric plate ROI, then upsample tiny crops."""
+    def _preprocess(self, crop_bgr: np.ndarray, apply_roi: bool = True) -> np.ndarray:
+        """Mask HUD bands, crop the geometric plate ROI, then upsample tiny crops.
+
+        ``apply_roi=False`` skips the bottom-centre plate-ROI crop. That crop
+        assumes a head-on GATE view where the plate sits at 50-95% of the box
+        height; on a ceiling-mounted SLOT camera looking DOWN, the plate sits at
+        the very bottom of the box and the 50-95% band lands on the grille (BMW
+        kidney / Lexus spindle slats read as garbage). Slot reads pass False and
+        let PaddleOCR's own text detector localise the plate in the full car crop.
+        """
         if crop_bgr is None or crop_bgr.size == 0:
             return crop_bgr
 
@@ -430,8 +438,10 @@ class PaddlePlateOCR(PlateOCR):
 
         # 2. Geometric plate-ROI crop. Drops windshield stickers, branding,
         #    wide chassis background — leaves the bottom-centre region where
-        #    license plates live on head-on / angled vehicle bboxes.
-        crop_bgr = self._extract_plate_roi(crop_bgr)
+        #    license plates live on head-on / angled vehicle bboxes. Skipped for
+        #    slot cameras, whose downward geometry puts the plate below this band.
+        if apply_roi:
+            crop_bgr = self._extract_plate_roi(crop_bgr)
 
         h, w = crop_bgr.shape[:2]
         if h >= self._min_crop_h and w >= self._min_crop_w:
@@ -528,7 +538,11 @@ class PaddlePlateOCR(PlateOCR):
     # ----- PlateOCR ABC --------------------------------------------------- #
 
     def read(
-        self, crop_bgr: np.ndarray, *, allow_retry: bool = True
+        self,
+        crop_bgr: np.ndarray,
+        *,
+        allow_retry: bool = True,
+        apply_plate_roi: bool = True,
     ) -> Tuple[str, float]:
         """
         Run OCR on a BGR crop and return ``(normalised_text, mean_conf)``.
@@ -559,7 +573,7 @@ class PaddlePlateOCR(PlateOCR):
             logger.warning("[PaddlePlateOCR] engine init failed: %r", exc)
             return ("", 0.0)
 
-        prepped = self._preprocess(crop_bgr)
+        prepped = self._preprocess(crop_bgr, apply_roi=apply_plate_roi)
         text, conf = self._infer(prepped)
         if text:
             return (text, conf)

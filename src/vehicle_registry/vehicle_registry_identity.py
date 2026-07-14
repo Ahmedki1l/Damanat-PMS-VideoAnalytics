@@ -2761,7 +2761,9 @@ class VehicleRegistryIdentityMixin:
             ocr = getattr(self._match_decision, "plate_ocr", None)
             if ocr is not None and hasattr(ocr, "read"):
                 try:
-                    ocr_text, ocr_conf = ocr.read(query_crop)
+                    # Oblique slot/aisle view: plate is at the bottom of the box,
+                    # not in the gate's bottom-centre ROI — read the full crop.
+                    ocr_text, ocr_conf = ocr.read(query_crop, apply_plate_roi=False)
                 except Exception:
                     ocr_text, ocr_conf = "", 0.0
                 if ocr_text and float(ocr_conf or 0.0) >= RANK5_OCR_MIN_CONF:
@@ -4447,7 +4449,11 @@ class VehicleRegistryIdentityMixin:
         )
         try:
             ocr_text, ocr_conf = ocr.read(
-                crop_bgr, allow_retry=(attempt <= retry_budget)
+                crop_bgr,
+                allow_retry=(attempt <= retry_budget),
+                # Slot camera looks DOWN: the plate is at the bottom of the box,
+                # not in the gate's bottom-centre band, so read the full car crop.
+                apply_plate_roi=False,
             )
         except TypeError:
             # A PlateOCR implementation without the retry knob (e.g. NoopPlateOCR).
@@ -4638,7 +4644,8 @@ class VehicleRegistryIdentityMixin:
         if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
             return None
         try:
-            ocr_text, _conf = ocr.read(crop_bgr)  # heavy — never under the lock
+            # Slot camera: read the full car crop, not the gate's bottom-centre ROI.
+            ocr_text, _conf = ocr.read(crop_bgr, apply_plate_roi=False)  # heavy — never under the lock
         except Exception:
             return None
         if not ocr_text:
@@ -4762,7 +4769,8 @@ class VehicleRegistryIdentityMixin:
         if ocr is None or not hasattr(ocr, "read"):
             return False
         try:
-            ocr_text, ocr_conf = ocr.read(crop_bgr)
+            # Slot camera: read the full car crop, not the gate's bottom-centre ROI.
+            ocr_text, ocr_conf = ocr.read(crop_bgr, apply_plate_roi=False)
         except Exception:
             return False
         if not ocr_text:
