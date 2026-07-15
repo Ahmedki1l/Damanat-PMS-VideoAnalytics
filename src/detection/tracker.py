@@ -241,13 +241,14 @@ class TrackedDetector:
         ):
             self._camera_trackers[camera_id] = predictor.trackers[0]
 
-        return self._parse_results(results, scale_x, scale_y)
+        return self._parse_results(results, scale_x, scale_y, frame.shape)
 
     def _parse_results(
         self,
         results,
         scale_x: float = 1.0,
         scale_y: float = 1.0,
+        frame_shape: tuple = None,
     ) -> List[Detection]:
         """Parse YOLO tracking results into Detection objects.
 
@@ -268,10 +269,24 @@ class TrackedDetector:
 
         boxes = result.boxes
 
+        # Whole-frame box guard (see DetectorConfig.max_box_area_ratio). Measured
+        # against the ORIGINAL frame, so it is unaffected by _preprocess_frame's
+        # resize — the coords below are already scaled back.
+        max_area_ratio = getattr(self.detector_config, "max_box_area_ratio", 0.0) or 0.0
+        frame_area = (
+            float(frame_shape[0] * frame_shape[1])
+            if max_area_ratio > 0.0 and frame_shape is not None
+            else 0.0
+        )
+
         for i in range(len(boxes)):
             xyxy = boxes.xyxy[i].cpu().numpy()
             x1, y1 = float(xyxy[0]) * scale_x, float(xyxy[1]) * scale_y
             x2, y2 = float(xyxy[2]) * scale_x, float(xyxy[3]) * scale_y
+
+            if frame_area > 0.0:
+                if ((x2 - x1) * (y2 - y1)) / frame_area > max_area_ratio:
+                    continue
 
             class_id = int(boxes.cls[i].cpu().numpy())
             confidence = float(boxes.conf[i].cpu().numpy())

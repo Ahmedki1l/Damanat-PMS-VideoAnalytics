@@ -12,6 +12,12 @@ from typing import Dict, List, Optional
 import yaml
 
 
+def norm_camera_id(value: str) -> str:
+    """Normalize a camera id for cross-source matching (DB ``Cam_03`` vs YAML
+    ``CAM-03``). Mirrors the normalization in services/config_service.py."""
+    return (value or "").upper().replace("-", "").replace("_", "")
+
+
 @dataclass
 class AreaEntry:
     """
@@ -67,6 +73,53 @@ class ProcessingConfig:
     per_camera_tracker: bool = True
 
 
+# Fields a detector.camera_overrides entry is allowed to set. Deliberately
+# excludes device / ov_* : those are properties of the HOST, not the camera, and
+# OpenVINO sizes its thread pool once per process — letting one camera reset them
+# would silently retune every other camera in the same group. "preprocessing" is
+# a nested dict validated against PREPROCESSING_OVERRIDE_KEYS.
+DETECTOR_OVERRIDE_KEYS = frozenset(
+    {"model_path", "confidence", "imgsz", "classes", "max_box_area_ratio",
+     "preprocessing"}
+)
+
+# Fields a camera override's nested "preprocessing" block may set — the CLAHE
+# knobs on DetectorPreprocessingConfig.
+PREPROCESSING_OVERRIDE_KEYS = frozenset(
+    {"enabled", "clip_limit", "grid_size", "gamma_correction", "dark_threshold",
+     "detector_scale"}
+)
+
+
+def _parse_detector_overrides(raw: Dict) -> Dict[str, Dict]:
+    """Parse+validate detector.camera_overrides. Unknown keys raise rather than
+    being dropped: a typo here fails open (camera keeps the broken global model)
+    and the symptom — no detections — is exactly what the override was added to
+    fix, so it would be near-impossible to spot in the field."""
+    parsed: Dict[str, Dict] = {}
+    for cam_id, fields in (raw or {}).items():
+        fields = dict(fields or {})
+        unknown = set(fields) - DETECTOR_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(
+                f"detector.camera_overrides['{cam_id}']: unknown key(s) "
+                f"{sorted(unknown)}. Allowed: {sorted(DETECTOR_OVERRIDE_KEYS)}"
+            )
+        pp = fields.get("preprocessing")
+        if pp is not None:
+            pp_unknown = set(pp or {}) - PREPROCESSING_OVERRIDE_KEYS
+            if pp_unknown:
+                raise ValueError(
+                    f"detector.camera_overrides['{cam_id}'].preprocessing: unknown "
+                    f"key(s) {sorted(pp_unknown)}. Allowed: "
+                    f"{sorted(PREPROCESSING_OVERRIDE_KEYS)}"
+                )
+            fields["preprocessing"] = dict(pp or {})
+        if fields:
+            parsed[norm_camera_id(cam_id)] = fields
+    return parsed
+
+
 @dataclass
 class DetectorConfig:
     """YOLO detector settings."""
@@ -75,6 +128,21 @@ class DetectorConfig:
     classes: List[int] = field(default_factory=lambda: [2])  # 2 = car
     imgsz: int = 480
     device: str = "auto"  # "auto", "cpu", or "cuda"
+
+    # Drop any box covering more than this fraction of the frame. 0.0 = off.
+    # Large models occasionally emit a whole-frame "car"/"bus"; the slot
+    # assigner's primary path is bottom-center point-in-polygon, so such a box
+    # can land in a slot and pin it OCCUPIED. Real vehicles here are <10% of
+    # frame even on the fisheye, so this only ever fires on the bogus box.
+    max_box_area_ratio: float = 0.0
+
+    # YAML-ONLY per-camera overrides, keyed by normalized camera id (see
+    # norm_camera_id). NOT DB-owned: sync_app_config_from_db rewrites
+    # model_path/confidence/imgsz from the Config table on every sync, so a
+    # per-camera value stored there would be clobbered — it lives in YAML alone,
+    # same as ov_num_threads above. Each entry may set any of
+    # DETECTOR_OVERRIDE_KEYS; unset keys inherit the global (DB) value.
+    camera_overrides: Dict[str, Dict] = field(default_factory=dict)
 
     # OpenVINO CPU pool. NOT DB-owned — these two are YAML-only (see
     # config_service.sync_app_config_from_db, which never touches them).
@@ -799,6 +867,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         config.detector.ov_performance_hint = str(
             d.get("ov_performance_hint", config.detector.ov_performance_hint) or ""
+        )
+        config.detector.max_box_area_ratio = float(
+            d.get("max_box_area_ratio", config.detector.max_box_area_ratio) or 0.0
+        )
+        config.detector.camera_overrides = _parse_detector_overrides(
+            d.get("camera_overrides") or {}
         )
 
     # The supervisor's per-group thread cap. When each group is pinned to a

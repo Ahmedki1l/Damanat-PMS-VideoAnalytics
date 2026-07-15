@@ -1,6 +1,17 @@
 # YOLO model weights (download via setup_model.py)
 *.pt
 
+# EXCEPTION — CAM-00 (10.1.13.95) is a near-nadir fisheye roof camera. The
+# global int8 IR detects ZERO vehicles on it (measured 2026-07-15, even at
+# conf=0.05), so this checkpoint is load-bearing, not a convenience: without it
+# CAM-00's slots can never flip. It cannot be fetched by setup_model.py at the
+# needed revision, and Dockerfile's `COPY . .` excludes .git — so a CI build
+# from a clean clone must find this file in-tree or CAM-00 silently runs blind.
+# Exporting it to OpenVINO IR (the usual convention here) was tried and REJECTED:
+# fp16 IR loses the detection outright and runs 2.7x slower; fp32 IR is ~101 MB,
+# over GitHub's hard file limit. See detector.camera_overrides in config.yaml.
+!models/yolo11l.pt
+
 # WS-B color classifier — training intermediates and generated synthetic
 # dataset live under models/color_classifier_openvino/. The IR (model.xml /
 # model.bin / labels.json / README.md) is what we ship; everything else is

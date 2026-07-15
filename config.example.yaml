@@ -230,6 +230,36 @@ detector:
   classes: [2, 5, 7]                            # 2=car, 5=bus, 7=truck (SUVs/vans often classified as truck)
   imgsz: 640
 
+  # --- Per-camera detector overrides (optional) -------------------------------
+  # For cameras whose VIEW breaks the global detector. NOT DB-owned: the Config
+  # table rewrites model_path/confidence/imgsz on every sync, so a per-camera
+  # value stored there would be clobbered — YAML is the only home. Unset keys
+  # inherit the live global value. Each DISTINCT override costs one extra model
+  # load in whichever supervisor group owns the camera, so add sparingly.
+  #
+  # Allowed keys: model_path, confidence, imgsz, classes, max_box_area_ratio,
+  # and a nested `preprocessing` block (CLAHE knobs). A typo RAISES at load
+  # rather than being ignored — a silently-dropped override looks exactly like
+  # the bug it was added to fix (no detections).
+  #
+  # Real example (the deployment's CAM-00 is a near-nadir fisheye ROOF camera;
+  # the global int8 IR detects ZERO vehicles on it even at conf=0.05, while
+  # scoring 0.93 on the oblique cameras beside it):
+  #
+  # camera_overrides:
+  #   CAM-00:
+  #     model_path: "models/yolo11l.pt"   # int8/yolo11m collapse on fisheye
+  #     max_box_area_ratio: 0.5           # drop yolo11l's whole-frame "bus"
+  #     preprocessing:
+  #       enabled: false                  # CLAHE erases dark cars on a SUNLIT view
+
+  # Drop any detection covering more than this fraction of the frame. 0.0 = off.
+  # Guards against a model emitting a whole-frame "car"/"bus": the slot assigner
+  # matches on bottom-center point-in-polygon, so such a box can pin a slot
+  # OCCUPIED forever. Set per-camera above rather than globally unless every
+  # camera needs it.
+  max_box_area_ratio: 0.0
+
   # OpenVINO CPU pool. Ultralytics hardcodes PERFORMANCE_HINT=LATENCY, which on CPU
   # caps the pool at 8 threads however many cores the box has — so a 15-core machine
   # shows only ~8 busy cores. That is a default, not saturation. 0 / "" keeps it.

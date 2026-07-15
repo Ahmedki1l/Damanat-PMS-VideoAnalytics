@@ -7,6 +7,7 @@ on lifecycle and control flow.
 
 import os
 import time
+from dataclasses import replace
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -15,7 +16,7 @@ import logging
 import numpy as np
 
 from src.camera_manager import CameraManager
-from src.config import AppConfig
+from src.config import AppConfig, norm_camera_id
 from src.core.engine.camera_pipeline import CameraPipeline
 from src.core.engine.engine_runtime import ParkingEngineRuntimeMixin
 from src.core.engine.engine_tracking import ParkingEngineTrackingMixin
@@ -56,6 +57,9 @@ class ParkingEngine(
         # stable per-camera track IDs — round-robin frames from different
         # cameras no longer corrupt each other's tracker state.
         self._shared_detector: Optional[TrackedDetector] = self._build_tracked_detector()
+        # Extra models for cameras in detector.camera_overrides, keyed by the
+        # override's settings so cameras sharing one override share one load.
+        self._override_detectors: Dict[tuple, TrackedDetector] = {}
         print("[INFO] Shared detection model + per-camera tracker state (decoupled).")
         self.event_bus = EventBus(log_file=config.output.log_file)
 
@@ -121,13 +125,41 @@ class ParkingEngine(
         )
 
     def _detector_for(self, camera_id: str) -> TrackedDetector:
-        """Return the shared detector. Per-camera ByteTrack state is isolated
-        inside TrackedDetector (keyed by camera_id passed to detect_and_track),
-        so a single shared model serves every camera without mixing track IDs.
+        """Return the detector serving this camera.
+
+        Normally the shared one: per-camera ByteTrack state is isolated inside
+        TrackedDetector (keyed by camera_id passed to detect_and_track), so a
+        single shared model serves every camera without mixing track IDs.
+
+        A camera listed in detector.camera_overrides gets its own model instead
+        (see config.DetectorConfig.camera_overrides). Overridden detectors are
+        cached by their *settings*, not by camera_id, so N cameras sharing one
+        override still cost a single model load.
         """
-        if self._shared_detector is None:
-            self._shared_detector = self._build_tracked_detector()
-        return self._shared_detector
+        override = self.config.detector.camera_overrides.get(norm_camera_id(camera_id))
+        if not override:
+            if self._shared_detector is None:
+                self._shared_detector = self._build_tracked_detector()
+            return self._shared_detector
+
+        key = tuple(sorted((k, str(v)) for k, v in override.items()))
+        detector = self._override_detectors.get(key)
+        if detector is None:
+            print(f"[INFO] {camera_id}: detector override {dict(override)}")
+            fields = dict(override)
+            pp_override = fields.pop("preprocessing", None)
+            preprocessing = self.config.preprocessing.detector
+            if pp_override:
+                preprocessing = replace(preprocessing, **pp_override)
+            detector = TrackedDetector(
+                detector_config=replace(
+                    self.config.detector, camera_overrides={}, **fields
+                ),
+                tracker_config=self.config.tracker,
+                preprocessing_config=preprocessing,
+            )
+            self._override_detectors[key] = detector
+        return detector
 
     @property
     def detector(self) -> TrackedDetector:
