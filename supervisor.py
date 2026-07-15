@@ -236,7 +236,27 @@ def _quota_cores() -> Optional[float]:
     return None
 
 
-def _cpu_budget() -> tuple[int, bool]:
+# Threads per CPU-second of quota, when the quota (not a cpuset) is the limit.
+# A QUOTA IS NOT A THREAD COUNT. It caps CPU-seconds burned per second; it says
+# nothing about how many threads should exist. These workers are not CPU-bound end
+# to end — they block on RTSP/HEVC decode, the DB and disk — so sizing the pools to
+# the quota leaves the quota itself UNUSED, and the kernel cannot spend what no
+# runnable thread is asking for.
+#
+# Measured 2026-07-15, the hard way: apportioning exactly `quota` threads (14 across
+# 8 groups) gave gate and ground ONE thread each, dropping them from 1.8/1.6 fps to
+# 0.40/0.20 — worse than the bug it replaced — while the pod drew only 8.8 of its
+# 14 cores. Single-threaded HEVC decode was the floor. Mild oversubscription is the
+# correct posture under a quota: CFS throttles the burn, and a thread blocked on
+# decode costs nothing while it waits.
+_QUOTA_THREAD_OVERSUBSCRIBE = 1.5
+
+# Never choke a group below this, whatever the arithmetic says. One thread cannot
+# decode a 1080p HEVC stream and run inference on it.
+_MIN_THREADS_PER_GROUP = 2
+
+
+def _cpu_budget(n_groups: int = 1) -> tuple[int, bool]:
     """(threads to apportion, whether pinning is safe).
 
     PIN ONLY WHAT WE EXCLUSIVELY OWN. A cpuset (docker --cpuset-cpus / taskset)
@@ -246,21 +266,25 @@ def _cpu_budget() -> tuple[int, bool]:
     worse than not pinning: it cannot add throughput, and it forfeits the
     kernel's ability to route around a core a neighbouring pod is hogging.
 
-    So the presence of a quota — at ANY value — is what decides this, not
+    So the presence of a quota — at ANY value — is what decides PINNING, not
     whether the quota is smaller than the mask. Raising the pod's CPU limit
     above the mask does NOT make pinning safe again: the cores were never ours.
     That is exactly the trap this hit in production — the limit was raised, the
     pod stayed at ~11.9 cores, because affinity (not quota) was the real cap.
+
+    THREAD COUNT IS A SEPARATE QUESTION. See _QUOTA_THREAD_OVERSUBSCRIBE: the
+    quota caps the burn, so pools are sized for concurrency (to keep the quota
+    busy across I/O waits), bounded by the mask — there is no point spinning more
+    threads than the node has cores.
     """
     mask = _affinity_cores()
     quota = _quota_cores()
     if quota is None:
         # No quota: the mask IS our exclusive budget (cpuset, or a whole box).
         return mask, True
-    # Quota-limited: we may burn `quota` CPU-seconds/sec, but only ever across
-    # cores we share. Never pin. Apportion min(quota, mask) — more threads than
-    # either would just oversubscribe.
-    return max(1, min(int(quota), mask)), False
+    want = int(_QUOTA_THREAD_OVERSUBSCRIBE * quota + 0.5)
+    floor = _MIN_THREADS_PER_GROUP * max(1, n_groups)
+    return max(1, min(mask, max(want, floor))), False
 
 
 def _core_slices(groups: list[dict], total_cores: int) -> list[list[int]]:
@@ -398,7 +422,7 @@ def run(reset_plates: bool = False, foreground: bool = False,
     if reset_plates:
         _reset_plates()
 
-    total_cores, pin = _cpu_budget()
+    total_cores, pin = _cpu_budget(len(groups))
     if not pin:
         print(
             f"[supervisor] cgroup CPU quota detected ({_quota_cores():.1f} cores) "
@@ -406,7 +430,9 @@ def run(reset_plates: bool = False, foreground: bool = False,
             f"*limit*, not a cpuset, so the mask is the whole node and those cores "
             f"are shared. Running UNPINNED with {total_cores} threads apportioned "
             f"across {len(groups)} groups — pinning would nail each group to host "
-            f"CPUs it does not own and make raising the CPU limit a no-op."
+            f"CPUs it does not own and make raising the CPU limit a no-op. Threads "
+            f"deliberately exceed the quota: CFS caps the burn, and these workers "
+            f"block on decode, so quota-many threads would leave the quota idle."
         )
     total_cams = sum(_cam_count(g) for g in groups)
 
