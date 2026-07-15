@@ -442,6 +442,30 @@ class MatchingConfig:
     slot_reid_solo_min_score_reserved: float = 0.60
     slot_reid_solo_min_margin_reserved: float = 0.20
 
+    # Keep asking appearance, every N seconds, while a slot is occupied and still
+    # nameless. The 12-attempt budget covers the parking manoeuvre and is then spent
+    # forever, which on a never-readable slot gave ReID five shots ~4s apart on ONE pose
+    # in ONE light. The gallery is not static — a car gains references as it is seen
+    # elsewhere — so the same query can clear the margin later. Costs one embedding
+    # (~15ms), no OCR. 0 disables the retry.
+    #
+    # DELIBERATELY SLOW. Re-asking a noisy scorer will eventually cross any threshold by
+    # luck, and these slots have no OCR witness that could ever catch a wrong answer, so
+    # the margin gate is all that protects the customer. A minute samples genuinely
+    # changed conditions; seconds would just resample the same frame until it got lucky.
+    slot_reid_retry_interval_s: float = 60.0
+
+    # Slots whose plate is NEVER in frame — the camera films them side-on or at
+    # point-blank range (verified 2026-07-15: CAM-13 fills 87% of frame with B22's flank;
+    # CAM-21 has logged 455 attempts / zero reads on B1_CRO). On these, OCR is not a
+    # slow path, it is a DEAD path: it burns 12 x ~200-670ms of the frame loop per park
+    # to read the wall, the floor, or the camera's own OSD watermark, and then hands the
+    # slot to appearance anyway. Listing a slot here skips OCR entirely and lets ReID
+    # answer from the first attempt, on the SAME score/margin gates as everywhere else.
+    # This is a statement of physical fact about a camera's view, so it is operator-set
+    # (config.yaml `matching.slot_no_plate_view`), never inferred.
+    slot_no_plate_view: List[str] = field(default_factory=list)
+
     # How many of the 12 identify attempts may pay for OCR's enlarged retry pass.
     # The retry rescues a plate that is present but too small for the text detector to
     # find (slot B13, CAM-24: '' -> '9990BHD' -> BHD-9990, a C-level slot dark for 60
@@ -1008,6 +1032,16 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.slot_reid_solo_min_margin_reserved = m.get(
             "slot_reid_solo_min_margin_reserved", cm.slot_reid_solo_min_margin_reserved
         )
+        cm.slot_reid_retry_interval_s = float(
+            m.get("slot_reid_retry_interval_s", cm.slot_reid_retry_interval_s) or 0.0
+        )
+        # Normalised once, here, so every lookup downstream is a plain set membership
+        # on the same spelling the DB/API use for slot_id.
+        cm.slot_no_plate_view = [
+            str(s).strip()
+            for s in (m.get("slot_no_plate_view", cm.slot_no_plate_view) or [])
+            if str(s).strip()
+        ]
         cm.decision_log_enabled = m.get("decision_log_enabled", cm.decision_log_enabled)
         cm.decision_log_dir = m.get("decision_log_dir", cm.decision_log_dir)
         cm.decision_log_queue_max = m.get(

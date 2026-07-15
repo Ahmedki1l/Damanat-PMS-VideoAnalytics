@@ -1156,10 +1156,22 @@ class ParkingEngineRuntimeMixin:
         if not getattr(self, "_ocr_armed", {}).get(slot.id):
             return  # only fires on a fresh park (armed by vehicle_parked)
 
+        now_ts = time.time()
+
+        # Slots the operator has told us can NEVER show a plate to this camera (verified
+        # by eye, see matching.slot_no_plate_view). Do not spend a single OCR read on the
+        # wall: appearance is the only witness that will ever exist here, so go straight
+        # to it, from the first attempt rather than the ninth.
+        if slot.id in self._no_plate_view_slots():
+            self._retry_reid_identify(cam_id, frame, slot, state_machine, detection, now_ts)
+            return
+
         attempts = self._ocr_id_attempts.get(slot.id, 0)
         if attempts >= self._OCR_ID_MAX_ATTEMPTS:
+            # OCR's budget is spent and the slot is STILL nameless. Appearance is the
+            # only witness left, so keep asking it — see _retry_reid_identify.
+            self._retry_reid_identify(cam_id, frame, slot, state_machine, detection, now_ts)
             return
-        now_ts = time.time()
         if now_ts - self._ocr_id_last_at.get(slot.id, 0.0) < self._OCR_ID_MIN_INTERVAL_S:
             return
 
@@ -1246,12 +1258,112 @@ class ParkingEngineRuntimeMixin:
         # ...and teach the gallery this car's parked pose, now that we KNOW who it is.
         self.vehicle_registry.save_parked_reference(plate, crop, cam_id)
 
+    def _no_plate_view_slots(self) -> set:
+        """Slots whose plate is never in frame (matching.slot_no_plate_view). Cached —
+        this is read on every frame of every occupied slot."""
+        cached = getattr(self, "_no_plate_view_cache", None)
+        if cached is None:
+            mc = getattr(self.vehicle_registry, "matching_config", None)
+            cached = self._no_plate_view_cache = set(
+                getattr(mc, "slot_no_plate_view", None) or []
+            )
+            if cached:
+                logger.info(
+                    "[reid-solo] %d slot(s) flagged no-plate-view — OCR skipped, "
+                    "appearance-only from the first attempt: %s",
+                    len(cached), ", ".join(sorted(cached)),
+                )
+        return cached
+
+    def _retry_reid_identify(
+        self, cam_id, frame, slot, state_machine, detection, now_ts: float
+    ) -> None:
+        """Keep asking APPEARANCE to name a parked car OCR could not read.
+
+        WHY THIS EXISTS. The 12-attempt budget covers the manoeuvre — a few seconds —
+        and then `_try_ocr_identify` returned forever. On a slot whose plate is never in
+        frame (CAM-13 films B22 in side profile at point-blank range; CAM-21 does the
+        same to B1_CRO, 455 attempts and zero reads) that gave appearance exactly five
+        shots, ~4 seconds apart, on one pose in one light — and then the slot was NULL
+        until the car left. That is not "ReID could not identify it". That is "ReID was
+        asked five times in four seconds and never asked again".
+
+        The retry is worth it because THE GALLERY IS NOT STATIC. A car unidentifiable at
+        park time gains references as it is seen elsewhere, so the same query can start
+        clearing the margin an hour later. Cost is one embedding (~15ms) per slot per
+        interval — no OCR, which is the ~200-670ms part.
+
+        NOT A LOWER BAR. `try_reid_identify_slot` is called with the same score/margin
+        gates as the in-budget path; this only changes HOW OFTEN it is asked. The bind
+        stays PROVISIONAL (never locked, never taught to the gallery) so a later OCR read
+        can still overrule it.
+
+        Note the interval is deliberately slow. Re-asking a noisy scorer often enough
+        will eventually cross any threshold by luck alone, and on these slots there is no
+        OCR witness that could ever catch a wrong answer — so the margin gate is the only
+        thing standing between a customer and a stranger's plate. Seconds would be
+        reckless; a minute samples genuinely changed conditions instead of the same frame
+        over and over.
+        """
+        mc = self.vehicle_registry.matching_config
+        if not getattr(mc, "slot_reid_solo_enabled", False):
+            return
+        # Named already (by OCR, an earlier solo bind, or a restart restore) — done.
+        if self.vehicle_registry.get_slot_plate(slot.id):
+            return
+        interval = float(getattr(mc, "slot_reid_retry_interval_s", 60.0) or 0.0)
+        if interval <= 0.0:
+            return  # retry disabled
+        if now_ts - self._reid_retry_last_at.get(slot.id, 0.0) < interval:
+            return
+        self._reid_retry_last_at[slot.id] = now_ts
+
+        crop = self._bbox_crop(frame, detection)
+        if crop is None or crop.size == 0:
+            return
+
+        reserved_map = getattr(self, "_reserved_for_map", None) or {}
+        special = getattr(self, "_special_slots", None) or set()
+        is_reserved = slot.id in reserved_map or slot.id in special
+        plate = self.vehicle_registry.try_reid_identify_slot(
+            slot.id, crop, cam_id,
+            is_reserved=bool(is_reserved),
+            decision_ctx={
+                "is_reserved": is_reserved,
+                "reserved_for": reserved_map.get(slot.id),
+                "attempt": self._OCR_ID_MAX_ATTEMPTS,  # budget spent; this is the retry
+                "max_attempts": self._OCR_ID_MAX_ATTEMPTS,
+                "reid_retry": True,
+            },
+        )
+        if not plate:
+            return
+
+        conf = float(getattr(mc, "slot_reid_solo_min_score", 0.70))
+        state_machine.bind_identity(
+            plate, self._build_slot_snapshot_url(slot.id), confidence=conf, lock=False
+        )
+        self.vehicle_registry.bind_plate_to_slot(
+            slot.id, plate, cam_id, floor=None, source="reid_solo"
+        )
+        if self.db_manager:
+            self._persist_slot_plate_binding(slot.id, plate, conf, False, cam_id)
+        logger.info(
+            "[reid-solo] slot=%s BOUND plate=%s (cam=%s) on a RETRY after OCR's %d "
+            "attempts were spent — appearance only, NOT locked and NOT taught to the "
+            "gallery; OCR may still overrule it",
+            slot.id, plate, cam_id, self._OCR_ID_MAX_ATTEMPTS,
+        )
+
     def _arm_ocr_for_slot(self, slot_id: str) -> None:
         """A car just parked here: give it a fresh OCR budget."""
         if not hasattr(self, "_ocr_id_attempts"):
             self._ocr_id_attempts, self._ocr_id_last_at, self._ocr_armed = {}, {}, {}
+        if not hasattr(self, "_reid_retry_last_at"):
+            self._reid_retry_last_at = {}
         self._ocr_id_attempts[slot_id] = 0
         self._ocr_id_last_at[slot_id] = 0.0
+        self._reid_retry_last_at.pop(slot_id, None)
         self._ocr_armed[slot_id] = True
 
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
