@@ -42,6 +42,21 @@ _PINNED_CPUS = _apply_cpu_affinity()
 if _PINNED_CPUS:
     print(f"[INFO] pinned to {len(_PINNED_CPUS)} CPUs: {_PINNED_CPUS}")
 
+# Unpinned (the supervisor found a CFS quota, so the affinity mask is the whole
+# node and pinning would nail us to host cores we don't own): OpenCV would size
+# its pool to every core on the node, in every group at once. Cap it explicitly —
+# the pool cap is what the pinning was really buying. OpenVINO's equivalent cap
+# rides in via VA_OV_NUM_THREADS -> detector.ov_num_threads (see src/config.py).
+_CV_THREADS = os.environ.get("VA_CV_NUM_THREADS", "").strip()
+if _CV_THREADS:
+    try:
+        import cv2
+
+        cv2.setNumThreads(max(1, int(_CV_THREADS)))
+        print(f"[INFO] unpinned: OpenCV thread pool capped at {_CV_THREADS}")
+    except (ImportError, ValueError) as _exc:
+        print(f"[WARN] could not cap OpenCV threads to {_CV_THREADS!r}: {_exc!r}")
+
 from src.config import load_config
 from src.core.engine import ParkingEngine
 from src.database import init_db

@@ -118,6 +118,22 @@ _FULL_VIEW_MIN = 0.9
 _REF_MAX_ASPECT = 2.2
 _REF_MIN_SIDE_PX = 24
 
+# ...and a crop is not a car if it is the WHOLE PICTURE. Aspect alone cannot say
+# so: a 2688x1552 gate frame is aspect 1.73, well inside the 2.2 cap, so it
+# sailed through this guard as "one whole car". A camera frame is a scene — road,
+# sky, buildings, often several cars — and embeds as such.
+#
+# This is a BACKSTOP, not the fix. The fix is not handing this function a frame in
+# the first place (see latest_park_entry_candidate_for_plate's camera filter); the
+# bar here only has to catch a raw sensor frame without eating real detections.
+# Calibrated against all 307 refs in the live gallery, 2026-07-15: the streams are
+# 2688x1552, and the largest GENUINE car crop measured 2012x1309 (a car close to
+# the lens). 2400 sits in that gap — it refuses every full frame by width with
+# room to spare, and passes all 245 real crops. A box wider than this is ~90% of
+# the sensor: either the frame itself, or a car so close it is a poor reference
+# anyway. Re-derive if the stream resolution changes.
+_REF_MAX_SIDE_PX = 2400
+
 
 def is_plausible_car_crop(crop_bgr) -> bool:
     """Is this crop shaped like a single car? Geometry only — no appearance."""
@@ -128,6 +144,8 @@ def is_plausible_car_crop(crop_bgr) -> bool:
     except Exception:
         return False
     if h < _REF_MIN_SIDE_PX or w < _REF_MIN_SIDE_PX:
+        return False
+    if h >= _REF_MAX_SIDE_PX or w >= _REF_MAX_SIDE_PX:
         return False
     return (w / float(h)) <= _REF_MAX_ASPECT
 
@@ -658,6 +676,18 @@ class VehicleRegistryIdentityMixin:
         # — the seed re-fires on a later, better in-zone crop.
         if crop is None or getattr(crop, "size", 0) == 0:
             logger.info("[gallery] seed_gallery_from_park_entry candidate=%s: crop is empty", candidate_id)
+            return False
+        # Geometry gate — this path writes a MATCHABLE ref straight to disk and was
+        # the only save_ref caller with no shape check at all, which is how the raw
+        # gate frame got in (see latest_park_entry_candidate_for_plate). Cheap, and
+        # it belongs here regardless of which camera the candidate came from.
+        if not is_plausible_car_crop(crop):
+            logger.warning(
+                "[gallery] seed_gallery_from_park_entry candidate=%s plate=%s: "
+                "crop %s is not one car — refusing to seed.",
+                candidate_id, plate,
+                "x".join(str(d) for d in crop.shape[1::-1]),
+            )
             return False
         if feature is None:
             feature = self.reid_matcher.extract_feature(crop)
@@ -1671,7 +1701,9 @@ class VehicleRegistryIdentityMixin:
         if seeded_session is not None and "CAM-23" not in (
             getattr(seeded_session, "reference_source_cameras", None) or []
         ):
-            fallback_cid = self.latest_park_entry_candidate_for_plate(plate)
+            fallback_cid = self.latest_park_entry_candidate_for_plate(
+                plate, camera_id="CAM-23"
+            )
             if fallback_cid is not None:
                 self.seed_gallery_from_park_entry(fallback_cid, plate)
         return result_sid

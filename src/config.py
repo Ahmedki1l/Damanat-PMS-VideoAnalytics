@@ -777,6 +777,20 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             d.get("ov_performance_hint", config.detector.ov_performance_hint) or ""
         )
 
+    # The supervisor's per-group thread cap. When each group is pinned to a
+    # disjoint core slice, OpenVINO sizes its pool from the affinity mask and
+    # this stays unset (see src/ov_tuning.py). But under a Kubernetes CPU *limit*
+    # the mask is the whole NODE and pinning to host cores we don't own starves
+    # whichever groups land on contended CPUs — so the supervisor unpins and caps
+    # the pool explicitly instead. YAML/DB never carry this: it is a property of
+    # how THIS process was launched, not of the deployment's tuning.
+    _ov_env = os.environ.get("VA_OV_NUM_THREADS", "").strip()
+    if _ov_env:
+        try:
+            config.detector.ov_num_threads = max(0, int(_ov_env))
+        except ValueError:
+            print(f"[WARN] VA_OV_NUM_THREADS={_ov_env!r} is not an int — ignored.")
+
     # --- Tracker ---
     if "tracker" in raw:
         config.tracker.type = raw["tracker"].get("type", config.tracker.type)

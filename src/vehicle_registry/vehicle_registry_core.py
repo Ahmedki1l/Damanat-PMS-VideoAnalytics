@@ -641,14 +641,31 @@ class VehicleRegistryCoreMixin:
             event = self._pending_events.get(candidate.bound_event_id)
             return event.plate if event is not None else None
 
-    def latest_park_entry_candidate_for_plate(self, plate: str) -> Optional[str]:
+    def latest_park_entry_candidate_for_plate(
+        self, plate: str, camera_id: Optional[str] = None
+    ) -> Optional[str]:
         """Most-recent Park_Entry candidate bound to ``plate`` that still holds a
         usable crop. Used by the CAM-03 confirmation fallback to seed the CAM-23
-        top view when the in-zone Park_Entry seed never fired this visit."""
+        top view when the in-zone Park_Entry seed never fired this visit.
+
+        ``camera_id`` restricts the search to candidates opened by that camera.
+        PASS IT. Park_Entry candidates are not all top views: src/api.py opens one
+        on the "ANPR" camera holding the RAW GATE FRAME, uncropped and on purpose
+        (it is the durable gate photo). Unfiltered, this returned that ANPR
+        candidate whenever CAM-23 had not seeded — the common case — and the
+        caller then filed a 2688x1552 frame of road-and-sky as a MATCHABLE
+        reference. Measured 2026-07-15: 62 such refs, in all 38 plate folders.
+        They embed the scene, not the car (0.41 cosine against their own car's
+        crops, below the match bar; 0.33 against OTHER cars' gate frames), and
+        multishot scores them ~1900 on sharpness, so at prune time they outrank
+        the real 999-quality crop and evict it.
+        """
         with self._lock:
             best = None
             for cand in self._park_entry_candidates.values():
                 if not cand.bound_event_id:
+                    continue
+                if camera_id and cand.camera_id != camera_id:
                     continue
                 event = self._pending_events.get(cand.bound_event_id)
                 if event is None or event.plate != plate:
