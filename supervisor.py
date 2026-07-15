@@ -36,6 +36,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
@@ -184,18 +185,82 @@ def _cam_count(group: dict) -> int:
     return len([c for c in group["cams"].split(",") if c.strip()])
 
 
-def _available_cores() -> int:
-    """Cores this process is actually allowed to run on — NOT the host total.
+def _affinity_cores() -> int:
+    """Cores this process is allowed to run ON (the cpuset/affinity mask).
     Under Docker --cpuset-cpus (or taskset), os.cpu_count() still reports every
     host CPU, which would over-slice the per-group thread budget and
-    oversubscribe. sched_getaffinity reflects the cgroup/affinity mask; fall
-    back to os.cpu_count() where it's unavailable (e.g. Windows)."""
+    oversubscribe. sched_getaffinity reflects the cpuset mask; fall back to
+    os.cpu_count() where it's unavailable (e.g. Windows)."""
     if hasattr(os, "sched_getaffinity"):
         try:
             return max(1, len(os.sched_getaffinity(0)))
         except OSError:
             pass
     return os.cpu_count() or 1
+
+
+def _quota_cores() -> Optional[float]:
+    """CPU-seconds per second this cgroup may burn, or None if unlimited.
+
+    THE MASK IS NOT THE BUDGET. A Kubernetes CPU *limit* is enforced with a CFS
+    quota (cgroup v2 `cpu.max`, v1 `cpu.cfs_quota_us`), NOT a cpuset — so
+    sched_getaffinity still returns every core on the NODE. Sizing the per-group
+    slices from that mask hands out cores the pod does not own and pins each
+    worker to host CPUs shared with every other pod on the node. Measured
+    2026-07-15: the mask said 20, the pod's real budget was ~12, and the four
+    groups pinned to contended host CPUs ran at 0.003-0.015 fps/camera (5-26
+    MINUTES per slot flip) while the four on quiet cores held 1.3-2.0 fps. The
+    kernel could not rebalance them, because affinity forbade it.
+    """
+    # cgroup v2: "<quota> <period>", or "max <period>" when unlimited.
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="ascii") as fh:
+            quota_s, period_s = fh.read().split()[:2]
+        if quota_s != "max":
+            period = float(period_s)
+            if period > 0:
+                return float(quota_s) / period
+        return None
+    except (OSError, ValueError):
+        pass
+    # cgroup v1: quota is -1 when unlimited.
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="ascii") as fh:
+            quota = float(fh.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="ascii") as fh:
+            period = float(fh.read().strip())
+        if quota > 0 and period > 0:
+            return quota / period
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _cpu_budget() -> tuple[int, bool]:
+    """(threads to apportion, whether pinning is safe).
+
+    PIN ONLY WHAT WE EXCLUSIVELY OWN. A cpuset (docker --cpuset-cpus / taskset)
+    grants us those cores outright, so slicing them per group is real isolation.
+    A CFS quota grants us a SHARE OF TIME on cores everybody else is also using —
+    the mask still lists the whole node. Pinning against a quota is strictly
+    worse than not pinning: it cannot add throughput, and it forfeits the
+    kernel's ability to route around a core a neighbouring pod is hogging.
+
+    So the presence of a quota — at ANY value — is what decides this, not
+    whether the quota is smaller than the mask. Raising the pod's CPU limit
+    above the mask does NOT make pinning safe again: the cores were never ours.
+    That is exactly the trap this hit in production — the limit was raised, the
+    pod stayed at ~11.9 cores, because affinity (not quota) was the real cap.
+    """
+    mask = _affinity_cores()
+    quota = _quota_cores()
+    if quota is None:
+        # No quota: the mask IS our exclusive budget (cpuset, or a whole box).
+        return mask, True
+    # Quota-limited: we may burn `quota` CPU-seconds/sec, but only ever across
+    # cores we share. Never pin. Apportion min(quota, mask) — more threads than
+    # either would just oversubscribe.
+    return max(1, min(int(quota), mask)), False
 
 
 def _core_slices(groups: list[dict], total_cores: int) -> list[list[int]]:
@@ -242,15 +307,30 @@ def _core_slices(groups: list[dict], total_cores: int) -> list[list[int]]:
     return slices
 
 
-def _child_env(cores: list[int]) -> dict:
+def _child_env(cores: list[int], pin: bool = True) -> dict:
     """Copy of the parent env carrying one group's CPU slice.
 
     VA_CPU_LIST is applied by main.py before it imports cv2/torch/openvino; the
     *_NUM_THREADS vars still cap the OpenMP/BLAS pools (NMS, ByteTrack, numpy)
     which read them at first use rather than from the affinity mask.
+
+    ``pin=False`` (quota-limited: see _cpu_budget) keeps the THREAD CAP but drops
+    the affinity pin, so a group can still only run len(cores) threads yet may
+    run them on whichever cores are idle. The thread cap is what prevents the
+    oversubscription the pinning was introduced to stop — OpenVINO (TBB) and
+    OpenCV size their pools from the affinity mask and ignore OMP_NUM_THREADS,
+    so they are capped explicitly by VA_OV_NUM_THREADS / VA_CV_NUM_THREADS
+    rather than by starving them of cores.
     """
     env = os.environ.copy()
-    env["VA_CPU_LIST"] = ",".join(str(c) for c in cores)
+    if pin:
+        env["VA_CPU_LIST"] = ",".join(str(c) for c in cores)
+    else:
+        env.pop("VA_CPU_LIST", None)
+        env["VA_NO_AFFINITY"] = "1"
+        # TBB/OpenCV would otherwise each spin a pool sized to the whole node.
+        env["VA_OV_NUM_THREADS"] = str(len(cores))
+        env["VA_CV_NUM_THREADS"] = str(len(cores))
     for var in (
         "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
         "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
@@ -318,7 +398,16 @@ def run(reset_plates: bool = False, foreground: bool = False,
     if reset_plates:
         _reset_plates()
 
-    total_cores = _available_cores()
+    total_cores, pin = _cpu_budget()
+    if not pin:
+        print(
+            f"[supervisor] cgroup CPU quota detected ({_quota_cores():.1f} cores) "
+            f"alongside a {_affinity_cores()}-core affinity mask: this is a CPU "
+            f"*limit*, not a cpuset, so the mask is the whole node and those cores "
+            f"are shared. Running UNPINNED with {total_cores} threads apportioned "
+            f"across {len(groups)} groups — pinning would nail each group to host "
+            f"CPUs it does not own and make raising the CPU limit a no-op."
+        )
     total_cams = sum(_cam_count(g) for g in groups)
 
     # On Windows: NEW_PROCESS_GROUP so a stray CTRL_C to us isn't broadcast to
@@ -352,14 +441,18 @@ def run(reset_plates: bool = False, foreground: bool = False,
         out_path = LOG_DIR / f"va_{g['name']}.out.log"
         err_path = LOG_DIR / f"va_{g['name']}.err.log"
         label = f"{g['name']} (+API :{port})" if g.get("api") else g["name"]
-        span = f"{cores[0]}-{cores[-1]}" if len(cores) > 1 else str(cores[0])
+        if pin:
+            span = f"{cores[0]}-{cores[-1]}" if len(cores) > 1 else str(cores[0])
+            budget = f"CPUs {span} = {len(cores)}/{total_cores}"
+        else:
+            budget = f"{len(cores)}/{total_cores} threads, unpinned"
         print(f"[supervisor] starting group '{label}' "
-              f"(CPUs {span} = {len(cores)}/{total_cores}) -> {g['cams']}")
+              f"({budget}) -> {g['cams']}")
 
         out_fh = out_path.open("w", encoding="utf-8")
         err_fh = err_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
-            cli, cwd=str(ROOT), env=_child_env(cores),
+            cli, cwd=str(ROOT), env=_child_env(cores, pin=pin),
             stdout=out_fh, stderr=err_fh, **popen_kwargs,
         )
         children.append((g["name"], proc))
