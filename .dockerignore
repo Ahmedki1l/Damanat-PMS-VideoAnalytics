@@ -22,3 +22,26 @@ venv
 # Runtime output that should be a mounted volume, not baked into the image.
 logs
 run_all.pids
+
+# --- Unused YOLO checkpoints ---------------------------------------------
+# `COPY . .` pulls the whole models/ dir in, and *.pt is NOT excluded above, so
+# every checkpoint on the build host lands in the image. These four have no
+# reference in src/ — only setup_model.py's download default, a README example,
+# and tools/ — so they were adding ~135 MiB of dead weight to every image.
+#
+# EXCLUDED FROM THE IMAGE, NOT DELETED: *.pt is gitignored, so these files exist
+# only on the build host. Removing them from disk would be permanent.
+#
+# Deliberately NOT excluded:
+#   models/yolo11l.pt  — REQUIRED. CAM-00 is a fisheye roof cam; the global int8
+#                        IR detects zero vehicles on it. See detector.
+#                        camera_overrides. Tracked in git via a !-exception.
+#   models/yolo11n.pt  — DetectorConfig.model_path's dataclass default
+#                        (src/config.py); cheap insurance at 5 MiB if a code path
+#                        ever falls back to it.
+#   models/PS_carMatching.pt — carries the ReID training id_names and is not
+#                        re-downloadable; tools/eval_identity_disjoint.py reads it.
+models/yolo11m.pt
+models/yolo11m_320.pt
+models/yolo11m_fp16.pt
+models/yolo11s.pt
