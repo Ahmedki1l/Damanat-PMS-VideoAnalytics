@@ -46,6 +46,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from src import perf_trace
 from src.matching.plugins import PlateOCR
 
 logger = logging.getLogger(__name__)
@@ -256,6 +257,7 @@ class PaddlePlateOCR(PlateOCR):
         plate_roi_right: float = DEFAULT_PLATE_ROI_RIGHT,
         empty_read_upscale: float = DEFAULT_EMPTY_READ_UPSCALE,
         max_upscaled_pixels: int = DEFAULT_MAX_UPSCALED_PIXELS,
+        cpu_threads: int = 2,
     ) -> None:
         # Fail fast at construction so callers know whether the plugin is
         # usable before the first frame arrives. The actual heavy model load
@@ -278,6 +280,12 @@ class PaddlePlateOCR(PlateOCR):
         self._rec_score_thresh = float(rec_score_thresh)
         self._empty_read_upscale = float(empty_read_upscale)
         self._max_upscaled_pixels = int(max_upscaled_pixels)
+        # Paddle's math-library pool, set per-predictor at engine construction.
+        # Deliberately decoupled from OMP_NUM_THREADS: the supervisor pins the
+        # OMP env to 1 in the unpinned/quota regime (idle OMP workers spin-burn
+        # the CFS budget), but a single-threaded det+rec pass on a weak server
+        # core takes SECONDS and runs inline in the serial camera loop.
+        self._cpu_threads = max(1, int(cpu_threads or 1))
         # Default to PaddleOCR v5 mobile det/rec; callers can override for
         # an explicit model upgrade or downgrade.
         self._det_model_name = det_model_name or self.DEFAULT_DET_V3
@@ -339,17 +347,24 @@ class PaddlePlateOCR(PlateOCR):
         if self._rec_model_name:
             v3_kwargs["text_recognition_model_name"] = self._rec_model_name
 
-        try:
-            self._engine = PaddleOCR(
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=self._use_angle_cls,
-                enable_mkldnn=self._enable_mkldnn,
-                device="cpu",
-                **v3_kwargs,
-            )
-            self._api_version = 3
-        except TypeError:
+        # cpu_threads tried first, dropped on TypeError — never let a thread
+        # knob demote us to the 2.x code path on a 3.x install.
+        for extra in ({"cpu_threads": self._cpu_threads}, {}):
+            try:
+                self._engine = PaddleOCR(
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=self._use_angle_cls,
+                    enable_mkldnn=self._enable_mkldnn,
+                    device="cpu",
+                    **v3_kwargs,
+                    **extra,
+                )
+                self._api_version = 3
+                break
+            except TypeError:
+                continue
+        if self._engine is None:
             # 2.x signature — fall back. Reset common_kwargs (model dirs use
             # the older ``det_model_dir`` / ``rec_model_dir`` names).
             kwargs_2x = {"lang": self._lang, "use_angle_cls": self._use_angle_cls}
@@ -359,20 +374,23 @@ class PaddlePlateOCR(PlateOCR):
             try:
                 kwargs_2x["enable_mkldnn"] = self._enable_mkldnn
                 kwargs_2x["show_log"] = False
+                kwargs_2x["cpu_threads"] = self._cpu_threads
                 self._engine = PaddleOCR(**kwargs_2x)
             except TypeError:
                 # ultra-old signature — drop the optional kwargs
                 kwargs_2x.pop("enable_mkldnn", None)
                 kwargs_2x.pop("show_log", None)
+                kwargs_2x.pop("cpu_threads", None)
                 self._engine = PaddleOCR(**kwargs_2x)
             self._api_version = 2
 
         logger.info(
-            "[PaddlePlateOCR] initialised: api=%s lang=%s angle_cls=%s mkldnn=%s",
+            "[PaddlePlateOCR] initialised: api=%s lang=%s angle_cls=%s mkldnn=%s threads=%s",
             self._api_version,
             self._lang,
             self._use_angle_cls,
             self._enable_mkldnn,
+            self._cpu_threads,
         )
 
     # ----- Preprocessing -------------------------------------------------- #
@@ -573,6 +591,17 @@ class PaddlePlateOCR(PlateOCR):
             logger.warning("[PaddlePlateOCR] engine init failed: %r", exc)
             return ("", 0.0)
 
+        # PERF_TRACE stage: OCR runs INLINE in the engine's serial camera loop
+        # (inside the "slot" stage — so ocr is a subset of slot, not additive).
+        # It is the dominant per-frame cost when armed slots read empty: the
+        # enlarged retry alone measured 199-759ms on a fast dev core, seconds
+        # on the production Xeon.
+        with perf_trace.stage("ocr"):
+            return self._read_timed(crop_bgr, allow_retry, apply_plate_roi)
+
+    def _read_timed(
+        self, crop_bgr: np.ndarray, allow_retry: bool, apply_plate_roi: bool
+    ) -> Tuple[str, float]:
         prepped = self._preprocess(crop_bgr, apply_roi=apply_plate_roi)
         text, conf = self._infer(prepped)
         if text:
