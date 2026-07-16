@@ -83,15 +83,39 @@ GATE_CAMERAS = [
 # ---------------------------------------------------------------------------
 
 
-def _groups_from_db() -> list[dict]:
-    """Build one supervisor group per parking AREA from the DB `cameras.area`
-    column — the same roster main.py loads (ANPR cams already excluded).
+def _grouping_mode() -> str:
+    """``"area"`` (one group per aisle) or ``"floor"`` (one group per floor).
 
-    WHY PER-AREA: per-camera fps is 1/(cams_in_group x ~50ms) and only one
-    inference runs at a time per group, so a few big groups leave cores idle.
-    One group per aisle (B1-A/B/C, B2-A/B/C, ...) gives ~3-4 cams/group =~ 2x the
-    concurrent inferences (fills the idle cores) while keeping each aisle's
-    cameras in ONE process, so live identity handoff WITHIN an aisle is preserved.
+    Per-aisle was designed for the PINNED regime: many small groups = many
+    concurrent serial-inference loops = idle cores filled. Under a CFS quota the
+    same fan-out is what kills us — 8 processes x (OpenVINO TBB + OpenCV +
+    PaddleOCR OMP + ReID) pools burst together, blow the period budget, and the
+    WHOLE cgroup freezes (cpu.stat 2026-07-16: 57% of periods throttled at both
+    14- and 20-core limits, ~16 cores burned for ~8 inferences/s — ~99% of the
+    spend was pool spin + scheduling churn, not detection). Fewer, fatter
+    processes is the right shape there.
+
+    ``VA_GROUP_BY=area|floor`` forces either without a rebuild — the escape
+    hatch if the isolated bench (tools/bench_yolo.py) shows inference is
+    genuinely compute-bound, where fewer serial loops would halve throughput.
+    """
+    forced = os.environ.get("VA_GROUP_BY", "").strip().lower()
+    if forced in ("area", "floor"):
+        return forced
+    return "floor" if _quota_cores() is not None else "area"
+
+
+def _groups_from_db() -> list[dict]:
+    """Build one supervisor group per parking AREA (pinned/cpuset regime) or
+    per FLOOR (quota regime) from the DB `cameras` roster — the same roster
+    main.py loads (ANPR cams already excluded). See _grouping_mode for why.
+
+    WHY PER-AREA when pinned: per-camera fps is 1/(cams_in_group x ~50ms) and
+    only one inference runs at a time per group, so a few big groups leave cores
+    idle. One group per aisle (B1-A/B/C, B2-A/B/C, ...) gives ~3-4 cams/group =~
+    2x the concurrent inferences while keeping each aisle's cameras in ONE
+    process, so live identity handoff WITHIN an aisle is preserved. Per-floor
+    grouping keeps that property too (a floor is a superset of its aisles).
 
     Raises on any problem (no cameras, entrance cam missing) so the caller can
     fall back to the static GROUPS. Never returns a topology with != 1 api group.
@@ -128,13 +152,20 @@ def _groups_from_db() -> list[dict]:
     gate_ids = [by_upper[g] for g in GATE_CAMERAS if g in by_upper]
     gate_set = set(gate_ids)
 
-    # Bucket the REMAINING cameras by area; un-zoned cameras (e.g. Ground) fall
-    # back to their floor so they stay grouped instead of scattering into one blob.
+    # Bucket the REMAINING cameras by area or floor (mode-dependent); a camera
+    # missing its primary key falls back to the other so it stays grouped
+    # instead of scattering into one "unzoned" blob.
+    mode = _grouping_mode()
+    print(f"[supervisor] grouping cameras by {mode.upper()} "
+          f"(override with VA_GROUP_BY=area|floor)")
     buckets: "OrderedDict[str, list[str]]" = OrderedDict()
     for cam in config.cameras:
         if cam.id in gate_set:
             continue
-        key = (cam.area or "").strip() or (cam.floor or "").strip() or "unzoned"
+        if mode == "floor":
+            key = (cam.floor or "").strip() or (cam.area or "").strip() or "unzoned"
+        else:
+            key = (cam.area or "").strip() or (cam.floor or "").strip() or "unzoned"
         buckets.setdefault(key, []).append(cam.id)
 
     groups = [
@@ -237,23 +268,34 @@ def _quota_cores() -> Optional[float]:
 
 
 # Threads per CPU-second of quota, when the quota (not a cpuset) is the limit.
-# A QUOTA IS NOT A THREAD COUNT. It caps CPU-seconds burned per second; it says
-# nothing about how many threads should exist. These workers are not CPU-bound end
-# to end — they block on RTSP/HEVC decode, the DB and disk — so sizing the pools to
-# the quota leaves the quota itself UNUSED, and the kernel cannot spend what no
-# runnable thread is asking for.
+# A QUOTA IS NOT A THREAD COUNT — but bursting past it is NOT free either.
 #
-# Measured 2026-07-15, the hard way: apportioning exactly `quota` threads (14 across
-# 8 groups) gave gate and ground ONE thread each, dropping them from 1.8/1.6 fps to
-# 0.40/0.20 — worse than the bug it replaced — while the pod drew only 8.8 of its
-# 14 cores. Single-threaded HEVC decode was the floor. Mild oversubscription is the
-# correct posture under a quota: CFS throttles the burn, and a thread blocked on
-# decode costs nothing while it waits.
-_QUOTA_THREAD_OVERSUBSCRIBE = 1.5
+# History, both measured in production:
+#   2026-07-15: apportioning exactly `quota` threads (14 across 8 groups) gave gate
+#   and ground ONE thread each — 1.8/1.6 fps -> 0.40/0.20, single-threaded HEVC
+#   decode was the floor. The fix that mattered was _MIN_THREADS_PER_GROUP, but it
+#   shipped bundled with 1.5x oversubscription "to keep the quota busy".
+#   2026-07-16: cpu.stat deltas showed 57% of CFS periods THROTTLED at BOTH the 14-
+#   and 20-core limits, ~16 cores burned for ~8 inferences/s (~2 core-seconds per
+#   11ms inference — ~99% of the spend was pool spin + churn). CFS does not
+#   "smooth" a burst: threads that wake together burn the period budget early and
+#   the WHOLE cgroup freezes for the rest of the 100ms — which is exactly how an
+#   11ms inference stretches to ~1000ms wall.
+#
+# So: size to the quota, no oversubscription. The per-group floor below is what
+# actually protects decode concurrency; the excess only bought throttling.
+_QUOTA_THREAD_OVERSUBSCRIBE = 1.0
 
 # Never choke a group below this, whatever the arithmetic says. One thread cannot
 # decode a 1080p HEVC stream and run inference on it.
 _MIN_THREADS_PER_GROUP = 2
+
+# Cap each group's OpenVINO pool regardless of slice width. A 320px int8 inference
+# has too little parallel work to fill a wide pool (src/ov_tuning.py: widening
+# 8->15 measured 0-10%, sometimes negative) — and the spare TBB workers don't sit
+# free, they spin-wait between inferences. Under a CFS quota, spin IS spend: it
+# burns period budget the decoder then can't use.
+_OV_THREADS_MAX = 4
 
 
 def _cpu_budget(n_groups: int = 1) -> tuple[int, bool]:
@@ -287,12 +329,17 @@ def _cpu_budget(n_groups: int = 1) -> tuple[int, bool]:
     return max(1, min(mask, max(want, floor))), False
 
 
-def _core_slices(groups: list[dict], total_cores: int) -> list[list[int]]:
+def _core_slices(
+    groups: list[dict], total_cores: int, min_size: int = 1
+) -> list[list[int]]:
     """Carve the CPU into one DISJOINT core range per group, sized by camera share.
 
-    Every group gets at least 1 core and the slices together cover all cores
-    (largest-remainder apportionment, ties broken toward the busier group), so
-    no core sits idle and no core is claimed twice.
+    Every group gets at least ``min_size`` cores and the slices together cover
+    all cores (largest-remainder apportionment, ties broken toward the busier
+    group), so no core sits idle and no core is claimed twice. ``min_size`` is
+    _MIN_THREADS_PER_GROUP in the unpinned regime — camera-share apportionment
+    alone can hand a 2-camera group a single thread, which cannot decode HEVC
+    and run inference at once (the 0.40/0.20 fps regression).
 
     Why ranges and not just a thread count: OMP_NUM_THREADS only reaches
     numpy/BLAS/torch. OpenVINO (TBB) and OpenCV ignore it and size their pools
@@ -305,10 +352,12 @@ def _core_slices(groups: list[dict], total_cores: int) -> list[list[int]]:
     # us handing out overlapping "slices" that would just mislead the logs.
     if total_cores < len(groups):
         return [list(range(total_cores)) for _ in groups]
+    if total_cores < min_size * len(groups):
+        min_size = 1  # not enough to honour the floor — degrade, don't overflow
 
     total_cams = sum(_cam_count(g) for g in groups) or 1
     exact = [total_cores * _cam_count(g) / total_cams for g in groups]
-    sizes = [max(1, int(e)) for e in exact]
+    sizes = [max(min_size, int(e)) for e in exact]
 
     # Hand the remaining cores to whoever was shortchanged most by the floor
     # (most cameras wins a tie). Measure the shortfall against what each group
@@ -323,6 +372,23 @@ def _core_slices(groups: list[dict], total_cores: int) -> list[list[int]]:
     )
     for i in range(max(0, leftover)):
         sizes[order[i % len(order)]] += 1
+
+    # The minimums can also push the floors PAST the total (e.g. many tiny
+    # groups lifted to min_size next to one big one). Claw back from whoever is
+    # most over-granted relative to their camera share, never below min_size —
+    # otherwise the slice loop below would silently hand later groups EMPTY
+    # ranges once next_core runs off the end.
+    excess = sum(sizes) - total_cores
+    while excess > 0:
+        candidates = [i for i in range(len(groups)) if sizes[i] > min_size]
+        if not candidates:
+            break
+        victim = max(
+            candidates,
+            key=lambda i: (sizes[i] - exact[i], -_cam_count(groups[i])),
+        )
+        sizes[victim] -= 1
+        excess -= 1
 
     slices, next_core = [], 0
     for size in sizes:
@@ -353,13 +419,22 @@ def _child_env(cores: list[int], pin: bool = True) -> dict:
         env.pop("VA_CPU_LIST", None)
         env["VA_NO_AFFINITY"] = "1"
         # TBB/OpenCV would otherwise each spin a pool sized to the whole node.
-        env["VA_OV_NUM_THREADS"] = str(len(cores))
+        # OpenVINO is additionally capped: past ~4 threads a 320px int8
+        # inference gains ~nothing and the spare workers spin-burn the quota
+        # (see _OV_THREADS_MAX). Decode (OpenCV) keeps the full slice — that
+        # pool does real concurrent work, one stream per camera.
+        env["VA_OV_NUM_THREADS"] = str(min(len(cores), _OV_THREADS_MAX))
         env["VA_CV_NUM_THREADS"] = str(len(cores))
+    # Pinned: OMP/BLAS pools bounded by the slice, as always. Unpinned (quota):
+    # one thread each — PaddleOCR's own boot warning says OMP>1 hurts it, the
+    # numpy/BLAS ops here are tiny, and under CFS an idle-spinning OMP worker
+    # burns period budget the detector and decoder needed.
+    omp = str(len(cores)) if pin else "1"
     for var in (
         "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
         "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
     ):
-        env[var] = str(len(cores))
+        env[var] = omp
     return env
 
 
@@ -431,8 +506,9 @@ def run(reset_plates: bool = False, foreground: bool = False,
             f"are shared. Running UNPINNED with {total_cores} threads apportioned "
             f"across {len(groups)} groups — pinning would nail each group to host "
             f"CPUs it does not own and make raising the CPU limit a no-op. Threads "
-            f"deliberately exceed the quota: CFS caps the burn, and these workers "
-            f"block on decode, so quota-many threads would leave the quota idle."
+            f"are sized TO the quota (min {_MIN_THREADS_PER_GROUP}/group): bursting "
+            f"past it doesn't add throughput, it freezes the whole cgroup for the "
+            f"rest of each CFS period (measured 57% of periods throttled, 2026-07-16)."
         )
     total_cams = sum(_cam_count(g) for g in groups)
 
@@ -457,7 +533,9 @@ def run(reset_plates: bool = False, foreground: bool = False,
 
     PID_FILE.unlink(missing_ok=True)
 
-    slices = _core_slices(groups, total_cores)
+    slices = _core_slices(
+        groups, total_cores, min_size=1 if pin else _MIN_THREADS_PER_GROUP
+    )
 
     for g, cores in zip(groups, slices):
         cli = [sys.executable, "main.py", "--cameras", g["cams"]]

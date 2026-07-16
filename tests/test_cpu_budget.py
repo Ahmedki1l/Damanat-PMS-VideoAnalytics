@@ -1,6 +1,6 @@
-"""The supervisor's CPU budget: pin only what we own, and size threads for concurrency.
+"""The supervisor's CPU budget: pin only what we own, size threads TO the quota.
 
-Two bugs, both found in production on 2026-07-15, both locked down here.
+Three bugs, all found in production 2026-07-15/16, all locked down here.
 
 1. PINNING AGAINST A QUOTA. `_available_cores` read sched_getaffinity and treated it
    as the budget. That is true for `docker --cpuset-cpus`; under a Kubernetes CPU
@@ -11,12 +11,21 @@ Two bugs, both found in production on 2026-07-15, both locked down here.
    it. Raising the pod's CPU limit did nothing, which is the tell: affinity, not quota,
    was the cap.
 
-2. SIZING THREADS TO THE QUOTA. The first fix apportioned exactly `quota` threads,
-   giving gate and ground ONE each — dropping them from 1.8/1.6 fps to 0.40/0.20,
-   worse than the bug it replaced, while the pod drew only 8.8 of its 14 cores. A
-   quota caps CPU-seconds burned; it is not a thread count. These workers block on
-   HEVC decode, so quota-many threads leave the quota idle.
+2. SIZING THREADS TO THE QUOTA WITHOUT A PER-GROUP FLOOR. The first fix apportioned
+   exactly `quota` threads by camera share, giving gate and ground ONE each —
+   dropping them from 1.8/1.6 fps to 0.40/0.20, worse than the bug it replaced. One
+   thread cannot decode a 1080p HEVC stream AND run inference on it. The floor
+   (_MIN_THREADS_PER_GROUP, enforced per-slice via _core_slices min_size) is the fix.
+
+3. OVERSUBSCRIBING THE QUOTA. Bug 2's fix shipped bundled with 1.5x thread
+   oversubscription "to keep the quota busy across decode waits". cpu.stat deltas
+   (2026-07-16) showed 57% of CFS periods THROTTLED at both the 14- and 20-core
+   limits, ~16 cores burned for ~8 inferences/s — bursting threads blow the period
+   budget early and the whole cgroup freezes for the rest of the 100ms, which is how
+   an 11ms int8 inference stretched to ~1000ms wall-clock. CFS caps the burn per
+   PERIOD, not on average; excess threads buy freezes, not throughput.
 """
+import os
 import unittest
 from unittest import mock
 
@@ -31,6 +40,14 @@ GROUPS = [
     {"name": "b2-a", "cams": "CAM-09,CAM-12,CAM-13,CAM-16,CAM-19"},
     {"name": "b2-b", "cams": "CAM-17,CAM-18,CAM-25"},
     {"name": "b2-c", "cams": "CAM-10,CAM-11,CAM-14,CAM-15"},
+    {"name": "ground", "cams": "CAM-01,CAM-02,CAM-00"},
+]
+
+# The same 26 cameras consolidated per-floor (the quota-regime topology).
+FLOOR_GROUPS = [
+    {"name": "gate", "cams": "CAM-23,CAM-03"},
+    {"name": "b1", "cams": "CAM-07,CAM-20,CAM-24,CAM-21,CAM-22,CAM-04,CAM-05,CAM-06,CAM-08"},
+    {"name": "b2", "cams": "CAM-09,CAM-12,CAM-13,CAM-16,CAM-19,CAM-17,CAM-18,CAM-25,CAM-10,CAM-11,CAM-14,CAM-15"},
     {"name": "ground", "cams": "CAM-01,CAM-02,CAM-00"},
 ]
 
@@ -60,41 +77,109 @@ class TestPinningDecision(unittest.TestCase):
 
 
 class TestThreadSizing(unittest.TestCase):
-    """A quota caps the BURN. Threads exist to keep it busy across I/O waits."""
+    """Threads are sized TO the quota. Bursting past it freezes the cgroup."""
 
-    def test_threads_exceed_the_quota(self):
-        total, _ = _budget(14.0, 20)
-        self.assertGreater(
-            total, 14, "quota-many threads leave the quota idle — decode blocks"
-        )
+    def test_sized_to_the_quota(self):
+        # 57% of CFS periods throttled was the price of oversubscription.
+        self.assertEqual(_budget(18.0, 20)[0], 18)
 
     def test_never_exceeds_the_mask(self):
         # More threads than the node has cores buys nothing.
         self.assertLessEqual(_budget(64.0, 20)[0], 20)
 
+    def test_tiny_quota_still_gives_every_group_a_floor(self):
+        # The floor is the ONLY sanctioned excess over the quota: below 2
+        # threads a group cannot decode and infer at once (bug 2).
+        self.assertGreaterEqual(_budget(2.0, 20)[0], 2 * len(GROUPS))
+
     def test_no_group_is_choked_to_one_thread(self):
-        # The 0.40/0.20 fps regression: one thread cannot decode a 1080p HEVC
-        # stream AND run inference on it.
-        total, _ = _budget(14.0, 20)
-        for g, cores in zip(GROUPS, S._core_slices(GROUPS, total)):
+        # Camera-share apportionment alone would hand the 2-camera gate group a
+        # single thread. min_size re-creates bug 2's fix at the slice level.
+        total, pin = _budget(14.0, 20)
+        self.assertFalse(pin)
+        for g, cores in zip(GROUPS, S._core_slices(GROUPS, total, min_size=2)):
             self.assertGreaterEqual(len(cores), 2, f"{g['name']} choked to {len(cores)}")
 
-    def test_restores_the_thread_counts_that_worked(self):
-        # 14-core quota on the 20-core node must reproduce the per-group counts the
-        # PINNED config had when the healthy groups were doing 1.3-2.0 fps — only
-        # now unpinned, so no group can be locked out of its cores.
-        total, pin = _budget(14.0, 20)
-        got = {g["name"]: len(c) for g, c in zip(GROUPS, S._core_slices(GROUPS, total))}
-        self.assertEqual(
-            got,
-            {"gate": 2, "b1-a": 2, "b1-b": 2, "b1-c": 3,
-             "b2-a": 4, "b2-b": 2, "b2-c": 3, "ground": 2},
-        )
+    def test_floor_groups_get_camera_share_slices(self):
+        # The live regime: 20-core quota on the 20-core node, 4 floor groups.
+        # Big floors get the cores; small groups keep the 2-thread floor.
+        total, pin = _budget(20.0, 20, n_groups=len(FLOOR_GROUPS))
+        self.assertEqual(total, 20)
         self.assertFalse(pin)
+        got = {
+            g["name"]: len(c)
+            for g, c in zip(FLOOR_GROUPS, S._core_slices(FLOOR_GROUPS, total, min_size=2))
+        }
+        self.assertEqual(got, {"gate": 2, "b1": 7, "b2": 9, "ground": 2})
 
-    def test_tiny_quota_still_gives_every_group_a_floor(self):
-        total, _ = _budget(2.0, 20)
-        self.assertGreaterEqual(total, 2 * len(GROUPS))
+
+class TestCoreSlices(unittest.TestCase):
+    def test_min_size_overshoot_is_clawed_back(self):
+        # Lifting small groups to min_size can push the floors past the total;
+        # the surplus must come back from the over-granted, never below min_size,
+        # and the slices must still be disjoint and cover exactly the total.
+        slices = S._core_slices(GROUPS, 16, min_size=2)
+        sizes = [len(s) for s in slices]
+        self.assertEqual(sum(sizes), 16)
+        self.assertTrue(all(n >= 2 for n in sizes), sizes)
+        flat = [c for s in slices for c in s]
+        self.assertEqual(flat, list(range(16)))  # disjoint, contiguous, complete
+
+    def test_skewed_shares_never_produce_empty_slices(self):
+        # Latent overflow: one huge group next to many tiny ones made the floor
+        # lifts exceed the total, and later groups got EMPTY ranges.
+        skewed = [{"name": "big", "cams": ",".join(f"C{i}" for i in range(20))}] + [
+            {"name": f"tiny{i}", "cams": f"T{i}"} for i in range(7)
+        ]
+        slices = S._core_slices(skewed, 8, min_size=1)
+        self.assertTrue(all(len(s) >= 1 for s in slices), [len(s) for s in slices])
+        self.assertEqual(sum(len(s) for s in slices), 8)
+
+    def test_impossible_floor_degrades_to_one(self):
+        # 8 groups on 10 cores cannot honour min_size=2; degrade rather than lie.
+        slices = S._core_slices(GROUPS, 10, min_size=2)
+        self.assertEqual(sum(len(s) for s in slices), 10)
+        self.assertTrue(all(len(s) >= 1 for s in slices))
+
+
+class TestChildEnv(unittest.TestCase):
+    """Unpinned = quota regime: OMP pools are pure burn, OpenVINO capped at 4."""
+
+    def test_unpinned_kills_omp_spin_and_caps_openvino(self):
+        env = S._child_env([0, 1, 2, 3, 4, 5, 6], pin=False)
+        self.assertEqual(env["OMP_NUM_THREADS"], "1")  # PaddleOCR's own warning
+        self.assertEqual(env["VA_OV_NUM_THREADS"], "4")  # _OV_THREADS_MAX
+        self.assertEqual(env["VA_CV_NUM_THREADS"], "7")  # decode keeps the slice
+        self.assertEqual(env["VA_NO_AFFINITY"], "1")
+        self.assertNotIn("VA_CPU_LIST", env)
+
+    def test_pinned_keeps_slice_sized_pools(self):
+        env = S._child_env([4, 5, 6], pin=True)
+        self.assertEqual(env["VA_CPU_LIST"], "4,5,6")
+        self.assertEqual(env["OMP_NUM_THREADS"], "3")
+
+
+class TestGroupingMode(unittest.TestCase):
+    """Quota regime consolidates to per-floor; cpuset keeps per-area. Env forces."""
+
+    def test_quota_groups_by_floor(self):
+        with mock.patch.object(S, "_quota_cores", return_value=20.0), \
+             mock.patch.dict(os.environ):
+            os.environ.pop("VA_GROUP_BY", None)
+            self.assertEqual(S._grouping_mode(), "floor")
+
+    def test_no_quota_groups_by_area(self):
+        with mock.patch.object(S, "_quota_cores", return_value=None), \
+             mock.patch.dict(os.environ):
+            os.environ.pop("VA_GROUP_BY", None)
+            self.assertEqual(S._grouping_mode(), "area")
+
+    def test_env_overrides_without_a_rebuild(self):
+        # The escape hatch if the isolated bench proves inference compute-bound
+        # (fewer serial loops would then halve throughput).
+        with mock.patch.object(S, "_quota_cores", return_value=20.0), \
+             mock.patch.dict(os.environ, {"VA_GROUP_BY": "area"}):
+            self.assertEqual(S._grouping_mode(), "area")
 
 
 class TestQuotaParsing(unittest.TestCase):
