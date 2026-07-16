@@ -23,11 +23,12 @@ RUN THIS ON THE 5090 BOX (where the photos and the big GPU are), inside the repo
 venv (needs `ultralytics`, `openvino`, `nncf`):
 
     # unlabelled facility frames -> teacher-labelled -> fine-tuned int8:
+    # (strongest teacher, high-res + TTA labels — it's a one-time offline pass)
     python tools/finetune_yolo_facility.py \
         --photos /data/facility_frames \
-        --teacher models/yolo11m.pt --teacher-imgsz 640 \
+        --teacher models/yolo11x.pt --teacher-imgsz 1280 --teacher-augment \
         --student models/yolo11s.pt --imgsz 320 \
-        --epochs 100 --output models/yolo11s_facility
+        --epochs 100 --batch 64 --output models/yolo11s_facility
 
     # already-labelled data (YOLO format), skip the teacher:
     python tools/finetune_yolo_facility.py \
@@ -89,9 +90,16 @@ def list_images(photos: Path) -> List[Path]:
 
 
 def autolabel(images: List[Path], teacher: Path, imgsz: int, conf: float,
-              labels_dir: Path, min_side: int) -> int:
+              labels_dir: Path, min_side: int, augment: bool = False) -> int:
     """Run the teacher on each frame, write YOLO-format labels (normalised
-    xywh, class kept as the COCO id). Returns the count of labelled frames."""
+    xywh, class kept as the COCO id). Returns the count of labelled frames.
+
+    Labelling is a ONE-TIME OFFLINE pass, so make the teacher as accurate as it
+    can be — its recall is the ceiling on the student's. Use the biggest model
+    (yolo11x), a large ``imgsz`` (small distant cars are exactly what a fast
+    320px student misses), and optionally ``augment`` (TTA: multi-scale/flip
+    inference, slower but higher recall). None of this cost reaches production —
+    it only shapes the labels."""
     import cv2
     from ultralytics import YOLO
 
@@ -105,7 +113,7 @@ def autolabel(images: List[Path], teacher: Path, imgsz: int, conf: float,
             continue
         h, w = im.shape[:2]
         res = model.predict(im, imgsz=imgsz, conf=conf, classes=VEHICLE_CLASSES,
-                            verbose=False)[0]
+                            augment=augment, verbose=False)[0]
         lines = []
         if res.boxes is not None:
             for b in res.boxes:
@@ -234,11 +242,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Directory of facility camera FRAMES (recursive).")
     p.add_argument("--labels-dir", type=Path, default=None,
                    help="Existing YOLO labels (skip the teacher; train on these).")
-    p.add_argument("--teacher", type=Path, default=Path("models/yolo11m.pt"),
-                   help="Teacher weights for auto-labelling.")
-    p.add_argument("--teacher-imgsz", type=int, default=640,
-                   help="Label at the teacher's most accurate size, not the student's.")
-    p.add_argument("--teacher-conf", type=float, default=0.25)
+    p.add_argument("--teacher", type=Path, default=Path("models/yolo11x.pt"),
+                   help="Teacher weights for auto-labelling. Use the strongest "
+                        "model you have (yolo11x) — its recall caps the student's.")
+    p.add_argument("--teacher-imgsz", type=int, default=1280,
+                   help="Label at the teacher's most accurate size, NOT the "
+                        "student's. Big = catches the small distant cars a 320px "
+                        "student misses. Offline, so cost is irrelevant.")
+    p.add_argument("--teacher-conf", type=float, default=0.20,
+                   help="Slightly loose so faint cars get labelled; too low adds "
+                        "false-positive labels, so keep ~0.2-0.25.")
+    p.add_argument("--teacher-augment", action="store_true",
+                   help="TTA (multi-scale/flip) on the teacher — slower labelling, "
+                        "higher recall labels. Worth it for a one-time pass.")
     p.add_argument("--student", type=Path, default=Path("models/yolo11s.pt"),
                    help="Student weights to fine-tune.")
     p.add_argument("--imgsz", type=int, default=320,
@@ -276,7 +292,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"@{args.teacher_imgsz} ...")
         labels_dir = dataset / "_autolabels"
         n = autolabel(images, args.teacher, args.teacher_imgsz,
-                      args.teacher_conf, labels_dir, args.min_side)
+                      args.teacher_conf, labels_dir, args.min_side,
+                      augment=args.teacher_augment)
         print(f"  labelled {n} frame(s)")
         if n < 50:
             print("  ERROR: too few usable frames after --min-side filter.")
