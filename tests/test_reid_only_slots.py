@@ -74,11 +74,12 @@ class _SM:
         self.identity = (plate, confidence, lock)
 
 
-def _cfg(no_plate_view=(), interval=60.0):
+def _cfg(no_plate_view=(), interval=60.0, ocr_gap=5.0):
     c = MatchingConfig()
     c.slot_reid_solo_enabled = True
     c.slot_no_plate_view = list(no_plate_view)
     c.slot_reid_retry_interval_s = interval
+    c.slot_ocr_min_gap_s = ocr_gap
     return c
 
 
@@ -115,6 +116,60 @@ class TestNoPlateViewSkipsOCR(unittest.TestCase):
         self.assertEqual(plate, "ZRS-6511")
         # NEVER locked: a solo bind is inference, and OCR must be able to overrule it.
         self.assertFalse(lock)
+
+
+class TestOcrGroupPacing(unittest.TestCase):
+    """One PaddleOCR read is 2-8s on the production Xeon and runs INLINE in the
+    serial camera loop. The per-slot 0.7s interval cannot pace the loop — with
+    ~10 armed slots (every post-restart boot) some slot is always eligible, so
+    every frame paid a read: measured 2026-07-16 at ocr=8.8s of a 19s frame on
+    b2-a. slot_ocr_min_gap_s is a PROCESS-wide floor between reads."""
+
+    def test_second_slot_in_the_same_window_is_paced(self):
+        h = _Harness(_cfg(ocr_gap=5.0))
+        h._arm_ocr_for_slot("B15")
+        h._arm_ocr_for_slot("B16")
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B15"), _SM(), object())
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B16"), _SM(), object())
+        self.assertEqual(h.vehicle_registry.ocr_calls, 1)
+
+    def test_pacing_does_not_consume_the_paced_slots_budget(self):
+        # A skip is a deferral, not an attempt: B16 must keep its full budget
+        # and an untouched per-slot clock for the next window.
+        h = _Harness(_cfg(ocr_gap=5.0))
+        h._arm_ocr_for_slot("B15")
+        h._arm_ocr_for_slot("B16")
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B15"), _SM(), object())
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B16"), _SM(), object())
+        self.assertEqual(h._ocr_id_attempts.get("B16", 0), 0)  # armed init, unspent
+        self.assertEqual(h._ocr_id_last_at.get("B16", 0.0), 0.0)
+
+    def test_paced_slot_reads_once_the_window_opens(self):
+        h = _Harness(_cfg(ocr_gap=5.0))
+        h._arm_ocr_for_slot("B15")
+        h._arm_ocr_for_slot("B16")
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B15"), _SM(), object())
+        h._ocr_group_last_at -= 6.0  # the gap elapses
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B16"), _SM(), object())
+        self.assertEqual(h.vehicle_registry.ocr_calls, 2)
+
+    def test_zero_gap_disables_pacing(self):
+        h = _Harness(_cfg(ocr_gap=0.0))
+        h._arm_ocr_for_slot("B15")
+        h._arm_ocr_for_slot("B16")
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B15"), _SM(), object())
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B16"), _SM(), object())
+        self.assertEqual(h.vehicle_registry.ocr_calls, 2)
+
+    def test_no_plate_view_reid_is_not_paced(self):
+        # The gate exists to pace OCR, the expensive path. Appearance-only slots
+        # must keep answering even when OCR just spent the window.
+        h = _Harness(_cfg(no_plate_view=["B22"], ocr_gap=5.0))
+        h._arm_ocr_for_slot("B15")
+        h._arm_ocr_for_slot("B22")
+        h._try_ocr_identify("CAM-14", FRAME, SimpleNamespace(id="B15"), _SM(), object())
+        h._try_ocr_identify("CAM-13", FRAME, SimpleNamespace(id="B22"), _SM(), object())
+        self.assertEqual(h.vehicle_registry.reid_calls, 1)
 
 
 class TestReidRetryCadence(unittest.TestCase):

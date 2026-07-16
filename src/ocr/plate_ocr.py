@@ -260,7 +260,7 @@ class PaddlePlateOCR(PlateOCR):
         plate_roi_right: float = DEFAULT_PLATE_ROI_RIGHT,
         empty_read_upscale: float = DEFAULT_EMPTY_READ_UPSCALE,
         max_upscaled_pixels: int = DEFAULT_MAX_UPSCALED_PIXELS,
-        cpu_threads: int = 2,
+        cpu_threads: int = 4,
     ) -> None:
         # Fail fast at construction so callers know whether the plugin is
         # usable before the first frame arrives. The actual heavy model load

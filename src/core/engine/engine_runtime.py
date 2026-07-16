@@ -1175,12 +1175,25 @@ class ParkingEngineRuntimeMixin:
         if now_ts - self._ocr_id_last_at.get(slot.id, 0.0) < self._OCR_ID_MIN_INTERVAL_S:
             return
 
+        # GROUP-LEVEL pacing, on top of the per-slot interval. The per-slot 0.7s
+        # alone cannot pace the loop: with ~10 armed slots (every post-restart
+        # boot) some slot is always eligible, so EVERY frame paid a 2-8 SECOND
+        # inline PaddleOCR read — measured 2026-07-16 at ocr=8.8s of a 19s frame
+        # on b2-a. One read per slot_ocr_min_gap_s per process keeps the camera
+        # loop alive; round-robin over cameras spreads the reads across slots.
+        # Not counted as an attempt and the per-slot clock is untouched, so no
+        # slot loses budget to the pacing.
+        gap = self._ocr_group_gap_s()
+        if gap > 0 and now_ts - getattr(self, "_ocr_group_last_at", 0.0) < gap:
+            return
+
         crop = self._bbox_crop(frame, detection)
         if crop is None or crop.size == 0:
             return
 
         self._ocr_id_attempts[slot.id] = attempts + 1
         self._ocr_id_last_at[slot.id] = now_ts
+        self._ocr_group_last_at = now_ts
 
         # Context the registry cannot see: which slot this is, whether it is reserved,
         # which area the camera watches, and how far into the attempt budget we are.
@@ -1273,6 +1286,19 @@ class ParkingEngineRuntimeMixin:
                     "appearance-only from the first attempt: %s",
                     len(cached), ", ".join(sorted(cached)),
                 )
+        return cached
+
+    def _ocr_group_gap_s(self) -> float:
+        """Process-wide floor between two slot-identify OCR reads
+        (matching.slot_ocr_min_gap_s). Cached — read on every armed frame."""
+        cached = getattr(self, "_ocr_group_gap_cache", None)
+        if cached is None:
+            mc = getattr(self.vehicle_registry, "matching_config", None)
+            try:
+                cached = float(getattr(mc, "slot_ocr_min_gap_s", 5.0))
+            except (TypeError, ValueError):
+                cached = 5.0
+            self._ocr_group_gap_cache = cached
         return cached
 
     def _retry_reid_identify(

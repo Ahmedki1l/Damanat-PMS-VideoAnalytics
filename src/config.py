@@ -534,6 +534,17 @@ class MatchingConfig:
     # (config.yaml `matching.slot_no_plate_view`), never inferred.
     slot_no_plate_view: List[str] = field(default_factory=list)
 
+    # Minimum seconds between ANY two slot-identify OCR reads in one worker
+    # PROCESS (the per-slot 0.7s interval alone cannot pace the loop: with ~10
+    # armed slots some slot is always eligible, so every frame pays a read).
+    # A PaddleOCR read is 2-8 SECONDS on the production Xeon and runs INLINE in
+    # the serial camera loop — unpaced, a post-restart arming storm took b2-a to
+    # 19s/frame (measured 2026-07-16: ocr=8.8s of every frame, 50 frames in
+    # 8 minutes across 5 cameras). At 5s the loop spends at most ~1 read per
+    # 5s of wall time (~12 reads/min/group when saturated), identification
+    # still converges, and the cameras keep flipping slots. 0 disables pacing.
+    slot_ocr_min_gap_s: float = 5.0
+
     # How many of the 12 identify attempts may pay for OCR's enlarged retry pass.
     # The retry rescues a plate that is present but too small for the text detector to
     # find (slot B13, CAM-24: '' -> '9990BHD' -> BHD-9990, a C-level slot dark for 60
@@ -1108,6 +1119,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         cm.slot_reid_retry_interval_s = float(
             m.get("slot_reid_retry_interval_s", cm.slot_reid_retry_interval_s) or 0.0
+        )
+        cm.slot_ocr_min_gap_s = float(
+            m.get("slot_ocr_min_gap_s", cm.slot_ocr_min_gap_s) or 0.0
         )
         # Normalised once, here, so every lookup downstream is a plain set membership
         # on the same spelling the DB/API use for slot_id.

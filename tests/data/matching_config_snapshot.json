@@ -68,6 +68,7 @@
   "slot_acquire_min_similarity": 0.5,
   "slot_camera_ref_weight": 0.8,
   "slot_no_plate_view": [],
+  "slot_ocr_min_gap_s": 5.0,
   "slot_plate_requires_ocr": false,
   "slot_reid_retry_interval_s": 60.0,
   "slot_reid_solo_after_attempts": 8,
