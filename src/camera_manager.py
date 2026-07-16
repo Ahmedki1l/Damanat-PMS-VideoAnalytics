@@ -60,6 +60,18 @@ class CameraStream:
     ensures the stream stays alive.
     """
 
+    # FFMPEG per-decoder options. `threads;2` is load-bearing: without it FFMPEG
+    # sizes EVERY capture's HEVC frame-thread pool from the visible CPUs — which
+    # under the unpinned/quota regime is the whole 20-core node, i.e. 26 cameras
+    # x ~20 threads ≈ 500 decoder threads fleet-wide (measured 2026-07-16: the
+    # 12-camera b2 group carried ~240 of them in one process, wall-stretched
+    # decode to 442-844ms/frame vs gate's 10-25ms, and starved its serial
+    # inference loop to ~1 frame per 2 MINUTES per camera). Pinned/cpuset mode
+    # never hit this because the affinity mask capped what FFMPEG saw. Two
+    # threads decode 1080p HEVC comfortably at max_grab_fps; the total decode
+    # WORK is unchanged, only the pointless parallelism is gone.
+    _FFMPEG_OPTIONS = "rtsp_transport;tcp|threads;2"
+
     def __init__(self, config: CameraConfig, max_grab_fps: float = 0.0):
         self.config = config
         # Cap decode rate (frames/sec) in the grabber loop. 0 = unthrottled.
@@ -78,8 +90,8 @@ class CameraStream:
     def open(self) -> bool:
         """Open the RTSP stream and start the background grabber."""
         try:
-            # Set FFmpeg to use TCP before opening
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            # TCP transport + capped decoder threads (see _FFMPEG_OPTIONS).
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._FFMPEG_OPTIONS
 
             self.cap = cv2.VideoCapture(
                 self.config.rtsp_url,
@@ -169,7 +181,7 @@ class CameraStream:
         if self.cap is not None:
             self.cap.release()
 
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._FFMPEG_OPTIONS
         self.cap = cv2.VideoCapture(
             self.config.rtsp_url,
             cv2.CAP_FFMPEG,
