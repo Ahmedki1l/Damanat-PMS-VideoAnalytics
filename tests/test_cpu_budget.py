@@ -143,15 +143,25 @@ class TestCoreSlices(unittest.TestCase):
 
 
 class TestChildEnv(unittest.TestCase):
-    """Unpinned = quota regime: OMP pools are pure burn, OpenVINO capped at 4."""
+    """Unpinned = quota regime: OMP pools are pure burn, OpenVINO capped at 8.
+
+    The OV cap sits at 8 because that is where 320px int8 thread scaling ends on
+    BOTH boxes — but not below it: bench_yolo on the production Xeon (2026-07-16)
+    measured 185ms/inf at 2 threads vs 35ms at 8. A tighter cap starves the big
+    floor groups; a looser one buys spin, not speed.
+    """
 
     def test_unpinned_kills_omp_spin_and_caps_openvino(self):
-        env = S._child_env([0, 1, 2, 3, 4, 5, 6], pin=False)
+        env = S._child_env(list(range(9)), pin=False)  # b2's 9-core slice
         self.assertEqual(env["OMP_NUM_THREADS"], "1")  # PaddleOCR's own warning
-        self.assertEqual(env["VA_OV_NUM_THREADS"], "4")  # _OV_THREADS_MAX
-        self.assertEqual(env["VA_CV_NUM_THREADS"], "7")  # decode keeps the slice
+        self.assertEqual(env["VA_OV_NUM_THREADS"], "8")  # _OV_THREADS_MAX
+        self.assertEqual(env["VA_CV_NUM_THREADS"], "9")  # decode keeps the slice
         self.assertEqual(env["VA_NO_AFFINITY"], "1")
         self.assertNotIn("VA_CPU_LIST", env)
+
+    def test_small_slice_is_not_padded_to_the_cap(self):
+        env = S._child_env([0, 1], pin=False)  # gate/ground
+        self.assertEqual(env["VA_OV_NUM_THREADS"], "2")
 
     def test_pinned_keeps_slice_sized_pools(self):
         env = S._child_env([4, 5, 6], pin=True)

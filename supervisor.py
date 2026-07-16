@@ -290,12 +290,14 @@ _QUOTA_THREAD_OVERSUBSCRIBE = 1.0
 # decode a 1080p HEVC stream and run inference on it.
 _MIN_THREADS_PER_GROUP = 2
 
-# Cap each group's OpenVINO pool regardless of slice width. A 320px int8 inference
-# has too little parallel work to fill a wide pool (src/ov_tuning.py: widening
-# 8->15 measured 0-10%, sometimes negative) — and the spare TBB workers don't sit
-# free, they spin-wait between inferences. Under a CFS quota, spin IS spend: it
-# burns period budget the decoder then can't use.
-_OV_THREADS_MAX = 4
+# Cap each group's OpenVINO pool regardless of slice width. Past 8 threads a
+# 320px int8 inference has too little parallel work left (src/ov_tuning.py:
+# widening 8->15 measured 0-10%, sometimes negative) and the spare TBB workers
+# spin-wait — under a CFS quota, spin IS spend. BELOW 8 is a different story on
+# weak server cores: tools/bench_yolo.py on the production Xeon Silver 4410Y
+# (2.0GHz) measured 5.4 inf/s at 2 threads vs 28.7 at 8 (185ms -> 35ms), so an
+# aggressive cap starves the big floor groups. 8 = where scaling ends, both boxes.
+_OV_THREADS_MAX = 8
 
 
 def _cpu_budget(n_groups: int = 1) -> tuple[int, bool]:
@@ -419,10 +421,11 @@ def _child_env(cores: list[int], pin: bool = True) -> dict:
         env.pop("VA_CPU_LIST", None)
         env["VA_NO_AFFINITY"] = "1"
         # TBB/OpenCV would otherwise each spin a pool sized to the whole node.
-        # OpenVINO is additionally capped: past ~4 threads a 320px int8
-        # inference gains ~nothing and the spare workers spin-burn the quota
-        # (see _OV_THREADS_MAX). Decode (OpenCV) keeps the full slice — that
-        # pool does real concurrent work, one stream per camera.
+        # OpenVINO is additionally capped at _OV_THREADS_MAX (=8, where 320px
+        # int8 scaling ends — measured on both the dev box and the production
+        # Xeon); the spare workers past that only spin-burn the quota. Decode
+        # (OpenCV) keeps the full slice — that pool does real concurrent work,
+        # one stream per camera.
         env["VA_OV_NUM_THREADS"] = str(min(len(cores), _OV_THREADS_MAX))
         env["VA_CV_NUM_THREADS"] = str(len(cores))
     # Pinned: OMP/BLAS pools bounded by the slice, as always. Unpinned (quota):
