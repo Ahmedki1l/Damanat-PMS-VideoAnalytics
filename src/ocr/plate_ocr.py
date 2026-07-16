@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -317,6 +318,11 @@ class PaddlePlateOCR(PlateOCR):
 
         self._engine = None
         self._api_version: Optional[int] = None  # 2 or 3, resolved at first use
+        # The paddle predictor is NOT thread-safe. Slot-identify OCR runs on a
+        # background worker (see engine async_slot_ocr) while the gate/entry path
+        # may read on the main thread — serialise every read through one lock so a
+        # single instance can be shared without corrupting the predictor state.
+        self._read_lock = threading.Lock()
 
         # Suppress paddle's oneDNN noise unless an env var explicitly enables it.
         if not enable_mkldnn:
@@ -600,7 +606,8 @@ class PaddlePlateOCR(PlateOCR):
         # enlarged retry alone measured 199-759ms on a fast dev core, seconds
         # on the production Xeon.
         with perf_trace.stage("ocr"):
-            return self._read_timed(crop_bgr, allow_retry, apply_plate_roi)
+            with self._read_lock:
+                return self._read_timed(crop_bgr, allow_retry, apply_plate_roi)
 
     def _read_timed(
         self, crop_bgr: np.ndarray, allow_retry: bool, apply_plate_roi: bool

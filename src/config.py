@@ -545,6 +545,22 @@ class MatchingConfig:
     # still converges, and the cameras keep flipping slots. 0 disables pacing.
     slot_ocr_min_gap_s: float = 5.0
 
+    # Run the slot-identify OCR read on a BACKGROUND thread instead of inline in the
+    # serial camera loop. A PaddleOCR read is 2-8s on the production Xeon; inline, it
+    # is the single largest per-frame cost and it freezes slot flips for EVERY camera
+    # in the group while it runs. Off-thread, the loop submits a (crop, candidates)
+    # job and keeps flipping slots at infer+zones speed; the read's result binds a
+    # frame or two later, once the worker finishes.
+    #
+    # ONLY the paddle read moves — the ReID ranking and the classifier-based decision
+    # log stay on the main thread (they share OpenVINO models with the tracking loop,
+    # which is not safe to call from two threads). The binding itself also stays on
+    # the main thread, and RE-VALIDATES the slot first: a read that lands after the
+    # car has left, or after the slot was already named, is discarded, never bound.
+    # So async cannot bind a stale plate; at worst it binds a few hundred ms later
+    # than inline would have. False = the historical inline path (kept as a fallback).
+    slot_ocr_async: bool = True
+
     # How many of the 12 identify attempts may pay for OCR's enlarged retry pass.
     # The retry rescues a plate that is present but too small for the text detector to
     # find (slot B13, CAM-24: '' -> '9990BHD' -> BHD-9990, a C-level slot dark for 60
@@ -1123,6 +1139,8 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.slot_ocr_min_gap_s = float(
             m.get("slot_ocr_min_gap_s", cm.slot_ocr_min_gap_s) or 0.0
         )
+        if "slot_ocr_async" in m:
+            cm.slot_ocr_async = bool(m.get("slot_ocr_async"))
         # Normalised once, here, so every lookup downstream is a plain set membership
         # on the same spelling the DB/API use for slot_id.
         cm.slot_no_plate_view = [

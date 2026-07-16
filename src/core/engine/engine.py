@@ -230,6 +230,12 @@ class ParkingEngine(
             f"{self.config.processing.target_fps_per_camera}\n"
         )
 
+        # Background worker for slot-identify OCR reads (matching.slot_ocr_async).
+        # A PaddleOCR read is 2-8s and, inline, freezes slot flips for the whole
+        # group — off-thread, the loop submits the read and binds its result a
+        # frame or two later. Only started when the registry can read plates.
+        self._start_slot_ocr_worker()
+
         show = self.config.output.show_video
         show_camera = self.config.output.show_camera
 
@@ -259,6 +265,9 @@ class ParkingEngine(
 
         try:
             while True:
+                # Bind any async OCR reads that finished since the last frame
+                # (main thread; each is re-validated against its slot first).
+                self._drain_slot_ocr_results()
                 with perf_trace.stage("fetch"):
                     cam_id, frame = self.cam_manager.next_frame()
                 if cam_id is None:
@@ -348,6 +357,7 @@ class ParkingEngine(
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted - shutting down.")
         finally:
+            self._stop_slot_ocr_worker()
             self.cam_manager.close_all()
             if show:
                 cv2.destroyAllWindows()

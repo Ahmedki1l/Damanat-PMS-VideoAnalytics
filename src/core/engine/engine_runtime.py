@@ -1187,6 +1187,12 @@ class ParkingEngineRuntimeMixin:
         if gap > 0 and now_ts - getattr(self, "_ocr_group_last_at", 0.0) < gap:
             return
 
+        # An async read for this slot is already in flight — the fresh crop will be
+        # submitted next time the slot is eligible, so skip WITHOUT spending an attempt.
+        worker = self._ocr_worker_if_async()
+        if worker is not None and worker.pending_or_inflight(slot.id):
+            return
+
         crop = self._bbox_crop(frame, detection)
         if crop is None or crop.size == 0:
             return
@@ -1210,66 +1216,185 @@ class ParkingEngineRuntimeMixin:
             "attempt": attempts + 1,
             "max_attempts": self._OCR_ID_MAX_ATTEMPTS,
         }
+
+        # ASYNC: plan the read here (ReID ranking is main-thread), hand the heavy
+        # PaddleOCR read to the worker, and fold the result back in a frame or two
+        # later via _drain_slot_ocr_results. The loop keeps flipping slots meanwhile.
+        if worker is not None:
+            plan = self.vehicle_registry.plan_slot_ocr(
+                slot.id, crop, cam_id, decision_ctx=decision_ctx
+            )
+            if plan is None:
+                return  # no OCR plugin
+            from src.core.engine.async_slot_ocr import SlotOcrJob
+
+            token = getattr(self, "_ocr_generation", {}).get(slot.id)
+            worker.submit(
+                SlotOcrJob(
+                    slot_id=slot.id, cam_id=cam_id, crop=crop, plan=plan,
+                    attempts=attempts + 1, token=token,
+                )
+            )
+            return
+
+        # SYNC (matching.slot_ocr_async = false): read inline, exactly as before.
         plate = self.vehicle_registry.try_ocr_identify_slot(
             slot.id, crop, cam_id, decision_ctx=decision_ctx
         )
         if not plate:
-            # OCR could not name the car. On a slot whose plate is never in frame — CAM-21
-            # sees B1_CRO in pure profile, 455 attempts and zero reads — waiting for a
-            # second witness that can never arrive just leaves the slot NULL forever. So
-            # once OCR has had most of its budget, let appearance decide ALONE, and only
-            # when it is genuinely certain (see try_reid_identify_slot: the bar is the
-            # margin over the runner-up, not the raw score).
-            mc = self.vehicle_registry.matching_config
-            after = int(getattr(mc, "slot_reid_solo_after_attempts", 8))
-            if not getattr(mc, "slot_reid_solo_enabled", False) or attempts + 1 < after:
-                return
-            plate = self.vehicle_registry.try_reid_identify_slot(
-                slot.id, crop, cam_id,
-                is_reserved=bool(decision_ctx["is_reserved"]),
-                decision_ctx=decision_ctx,
-            )
-            if not plate:
-                return
-
-            # Appearance-only: bind it PROVISIONALLY. Not locked, so a later OCR read can
-            # still overrule it, and deliberately NOT taught to the gallery — a solo bind
-            # is inference, not evidence, and a wrong one would poison the references it
-            # was inferred from.
-            conf = float(getattr(mc, "slot_reid_solo_min_score", 0.70))
-            state_machine.bind_identity(
-                plate, self._build_slot_snapshot_url(slot.id), confidence=conf, lock=False
-            )
-            self.vehicle_registry.bind_plate_to_slot(
-                slot.id, plate, cam_id, floor=None, source="reid_solo"
-            )
-            if self.db_manager:
-                self._persist_slot_plate_binding(slot.id, plate, conf, False, cam_id)
-            logger.info(
-                "[reid-solo] slot=%s BOUND plate=%s (cam=%s) on attempt %d/%d — "
-                "appearance only, NOT locked and NOT taught to the gallery; OCR may still "
-                "overrule it",
-                slot.id, plate, cam_id, attempts + 1, self._OCR_ID_MAX_ATTEMPTS,
+            self._maybe_bind_reid_solo(
+                cam_id, slot.id, state_machine, crop, attempts + 1, decision_ctx
             )
             return
+        self._bind_ocr_identified_plate(
+            cam_id, slot.id, state_machine, plate, crop, attempts + 1
+        )
 
-        # READ, not inferred — so bind it, lock it, and stop reading this slot.
+    def _ocr_worker_if_async(self):
+        """The async OCR worker, or None when matching.slot_ocr_async is off (the
+        inline path) or the worker has not been started (single-frame tools/tests)."""
+        mc = getattr(getattr(self, "vehicle_registry", None), "matching_config", None)
+        if not getattr(mc, "slot_ocr_async", False):
+            return None
+        return getattr(self, "_ocr_worker", None)
+
+    def _start_slot_ocr_worker(self) -> None:
+        """Spin up the background OCR worker when matching.slot_ocr_async is on.
+
+        A no-op (and _ocr_worker stays unset) when the flag is off, there is no
+        registry, or no plate-OCR plugin is loaded — the engine then runs the
+        historical inline path. Idempotent."""
+        if getattr(self, "_ocr_worker", None) is not None:
+            return
+        registry = getattr(self, "vehicle_registry", None)
+        mc = getattr(registry, "matching_config", None)
+        if registry is None or not getattr(mc, "slot_ocr_async", False):
+            return
+        if not hasattr(registry, "read_slot_plate"):
+            return
+        from src.core.engine.async_slot_ocr import AsyncSlotOcr
+
+        self._ocr_worker = AsyncSlotOcr(read_fn=registry.read_slot_plate)
+        self._ocr_worker.start()
+        logger.info(
+            "[slot-ocr] async worker started — slot-identify OCR reads run off the "
+            "camera loop; results bind a frame late (matching.slot_ocr_async)"
+        )
+
+    def _stop_slot_ocr_worker(self) -> None:
+        worker = getattr(self, "_ocr_worker", None)
+        if worker is not None:
+            worker.stop()
+            self._ocr_worker = None
+
+    def _drain_slot_ocr_results(self) -> None:
+        """Fold every finished async OCR read back into its slot — MAIN THREAD.
+
+        Called once per processed frame. Each result is re-validated against the
+        slot's CURRENT state before it can bind: a read that finished after the car
+        left, after the slot was re-armed for a different car, or after another path
+        already named it, is discarded. So the async path can only ever bind the same
+        answer the inline path would have — just a frame or two later."""
+        worker = getattr(self, "_ocr_worker", None)
+        if worker is None:
+            return
+        for res in worker.drain():
+            self._apply_async_ocr_result(res)
+
+    def _apply_async_ocr_result(self, res) -> None:
+        job = res.job
+        slot_id, cam_id = job.slot_id, job.cam_id
+        # Re-validate the occupancy this read belongs to still stands.
+        if not getattr(self, "_ocr_armed", {}).get(slot_id):
+            return  # vacated, or already bound+disarmed
+        if getattr(self, "_ocr_generation", {}).get(slot_id) != job.token:
+            return  # slot was re-armed for a different car since this read began
+        if self.vehicle_registry.get_slot_plate(slot_id):
+            self._ocr_armed[slot_id] = False
+            return  # named by another path while this read was in flight
+        pipeline = (getattr(self, "pipelines", None) or {}).get(cam_id)
+        if pipeline is None:
+            return
+        state_machine = pipeline.state_machines.get(slot_id)
+        if state_machine is None:
+            return
+        if state_machine.state != SlotState.OCCUPIED or state_machine.plate_number:
+            return  # no longer an unnamed, occupied slot
+
+        plate = self.vehicle_registry.confirm_slot_ocr(
+            job.plan, job.crop, res.text, res.conf
+        )
+        if plate:
+            self._bind_ocr_identified_plate(
+                cam_id, slot_id, state_machine, plate, job.crop, job.attempts
+            )
+            return
+        # OCR could not name it — fall through to appearance-only, same gates as sync.
+        self._maybe_bind_reid_solo(
+            cam_id, slot_id, state_machine, job.crop, job.attempts,
+            job.plan.decision_ctx or {},
+        )
+
+    def _bind_ocr_identified_plate(
+        self, cam_id, slot_id, state_machine, plate, crop, attempt_num
+    ) -> None:
+        """READ, not inferred — bind it, LOCK it, stop reading this slot, learn the
+        parked pose. Shared by the inline and async paths."""
         conf = 1.0
         state_machine.bind_identity(
-            plate, self._build_slot_snapshot_url(slot.id), confidence=conf, lock=True
+            plate, self._build_slot_snapshot_url(slot_id), confidence=conf, lock=True
         )
-        self.vehicle_registry.bind_plate_to_slot(slot.id, plate, cam_id, floor=None)
+        self.vehicle_registry.bind_plate_to_slot(slot_id, plate, cam_id, floor=None)
         if self.db_manager:
-            self._persist_slot_plate_binding(slot.id, plate, conf, True, cam_id)
-        self._ocr_armed[slot.id] = False
+            self._persist_slot_plate_binding(slot_id, plate, conf, True, cam_id)
+        self._ocr_armed[slot_id] = False
         logger.info(
             "[ocr-id] slot=%s BOUND + LOCKED plate=%s on attempt %d/%d (cam=%s) — "
             "held until the car leaves",
-            slot.id, plate, attempts + 1, self._OCR_ID_MAX_ATTEMPTS, cam_id,
+            slot_id, plate, attempt_num, self._OCR_ID_MAX_ATTEMPTS, cam_id,
         )
-
         # ...and teach the gallery this car's parked pose, now that we KNOW who it is.
         self.vehicle_registry.save_parked_reference(plate, crop, cam_id)
+
+    def _maybe_bind_reid_solo(
+        self, cam_id, slot_id, state_machine, crop, attempt_num, decision_ctx
+    ) -> None:
+        """OCR could not name the car. On a slot whose plate is never in frame — CAM-21
+        sees B1_CRO in pure profile, 455 attempts and zero reads — waiting for a second
+        witness that can never arrive just leaves the slot NULL forever. So once OCR has
+        had most of its budget, let appearance decide ALONE, and only when it is genuinely
+        certain (try_reid_identify_slot: the bar is the margin over the runner-up, not the
+        raw score). Shared by the inline and async paths."""
+        mc = self.vehicle_registry.matching_config
+        after = int(getattr(mc, "slot_reid_solo_after_attempts", 8))
+        if not getattr(mc, "slot_reid_solo_enabled", False) or attempt_num < after:
+            return
+        plate = self.vehicle_registry.try_reid_identify_slot(
+            slot_id, crop, cam_id,
+            is_reserved=bool((decision_ctx or {}).get("is_reserved")),
+            decision_ctx=decision_ctx,
+        )
+        if not plate:
+            return
+        # Appearance-only: bind it PROVISIONALLY. Not locked, so a later OCR read can
+        # still overrule it, and deliberately NOT taught to the gallery — a solo bind is
+        # inference, not evidence, and a wrong one would poison the references it was
+        # inferred from.
+        conf = float(getattr(mc, "slot_reid_solo_min_score", 0.70))
+        state_machine.bind_identity(
+            plate, self._build_slot_snapshot_url(slot_id), confidence=conf, lock=False
+        )
+        self.vehicle_registry.bind_plate_to_slot(
+            slot_id, plate, cam_id, floor=None, source="reid_solo"
+        )
+        if self.db_manager:
+            self._persist_slot_plate_binding(slot_id, plate, conf, False, cam_id)
+        logger.info(
+            "[reid-solo] slot=%s BOUND plate=%s (cam=%s) on attempt %d/%d — "
+            "appearance only, NOT locked and NOT taught to the gallery; OCR may still "
+            "overrule it",
+            slot_id, plate, cam_id, attempt_num, self._OCR_ID_MAX_ATTEMPTS,
+        )
 
     def _no_plate_view_slots(self) -> set:
         """Slots whose plate is never in frame (matching.slot_no_plate_view). Cached —
@@ -1391,6 +1516,16 @@ class ParkingEngineRuntimeMixin:
         self._ocr_id_last_at[slot_id] = 0.0
         self._reid_retry_last_at.pop(slot_id, None)
         self._ocr_armed[slot_id] = True
+        # Occupancy generation: bumped every arm so an ASYNC read that finishes
+        # after the car left — and a new car has since parked — is recognised as
+        # stale and dropped instead of bound to the wrong occupant.
+        gen = getattr(self, "_ocr_generation", None)
+        if gen is None:
+            gen = self._ocr_generation = {}
+        gen[slot_id] = gen.get(slot_id, 0) + 1
+        worker = getattr(self, "_ocr_worker", None)
+        if worker is not None:
+            worker.forget(slot_id)  # discard any queued read for the previous car
 
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
         all_events = []
@@ -1500,6 +1635,9 @@ class ParkingEngineRuntimeMixin:
                         self._ocr_id_attempts.pop(slot.id, None)
                         self._ocr_id_last_at.pop(slot.id, None)
                         self._ocr_armed.pop(slot.id, None)
+                    worker = getattr(self, "_ocr_worker", None)
+                    if worker is not None:
+                        worker.forget(slot.id)  # drop any queued read for this slot
                     # Car left — the restored plate is no longer valid for this
                     # slot; drop restart-stickiness so a new car is resolved fresh.
                     if getattr(self, "_restored_plate_slots", None):

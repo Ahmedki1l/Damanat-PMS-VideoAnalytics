@@ -3,7 +3,7 @@ import os
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -33,6 +33,26 @@ class RankedCandidate:
     warm: bool
     rank: int
     session: Any = None  # live VehicleSession; never serialised
+
+
+@dataclass(frozen=True)
+class SlotOcrPlan:
+    """The main-thread half of a slot-identify OCR read, ready to hand off.
+
+    ``plan_slot_ocr`` builds this using the ReID matcher and gallery (both
+    main-thread-only). The heavy PaddleOCR read that follows takes only
+    ``candidates``/``allow_retry`` and the crop, so it can run on a worker
+    thread; ``confirm_slot_ocr`` then folds the read back in — on the main
+    thread again, because the decision log touches the colour/type classifiers.
+    """
+
+    slot_id: str
+    camera_id: Optional[str]
+    candidates: List[str]
+    kept: List["RankedCandidate"]
+    rejected: List["RejectedCandidate"]
+    allow_retry: bool
+    decision_ctx: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -4432,11 +4452,41 @@ class VehicleRegistryIdentityMixin:
 
         Distinct from :meth:`try_ocr_confirm_slot`, which only CONFIRMS a plate already
         bound and cannot identify a car from nothing.
+
+        This is the SYNCHRONOUS composition of the three phases below (plan → read →
+        confirm), preserved verbatim for callers that want the read inline. The engine's
+        async path calls the three directly so the PaddleOCR read runs off-thread; see
+        matching.slot_ocr_async.
         """
         existing = self.get_slot_plate(slot_id)
         if existing:
             return existing  # already identified; nothing to do
 
+        plan = self.plan_slot_ocr(slot_id, crop_bgr, camera_id, decision_ctx=decision_ctx)
+        if plan is None:
+            return None  # no OCR plugin / no crop
+        ocr_text, ocr_conf = self.read_slot_plate(crop_bgr, plan.allow_retry)
+        return self.confirm_slot_ocr(plan, crop_bgr, ocr_text, ocr_conf)
+
+    def plan_slot_ocr(
+        self,
+        slot_id: str,
+        crop_bgr,
+        camera_id: Optional[str] = None,
+        *,
+        decision_ctx: Optional[Dict[str, Any]] = None,
+    ) -> Optional["SlotOcrPlan"]:
+        """Phase 1 (MAIN THREAD): rank the candidates for a parked-slot read.
+
+        Returns ``None`` when there is nothing to read (no OCR plugin, no crop) —
+        the caller has already handled the already-identified case. Otherwise returns
+        the shortlist + retry budget the read needs, carrying the kept/rejected
+        candidates so the decision log can be written after the read.
+
+        Runs on the main thread because it uses the ReID matcher, which shares its
+        OpenVINO infer request with the tracking loop and is not safe to call from a
+        second thread.
+        """
         ocr = getattr(self._match_decision, "plate_ocr", None)
         if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
             return None
@@ -4467,9 +4517,6 @@ class VehicleRegistryIdentityMixin:
                 if not self._is_plate_locked_elsewhere(p, slot_id)
             ]
 
-        # OCR is heavy — never hold the registry lock across it, or the frame loop for
-        # every other camera in this worker stalls behind one PaddleOCR read.
-        #
         # The enlarged-retry pass rescues a distant plate (B13: '' -> '9990BHD'), but on
         # a slot whose plate is simply not in frame it costs ~670ms and finds nothing. So
         # spend it on the FIRST few attempts only: if the plate were visible at all, an
@@ -4479,33 +4526,60 @@ class VehicleRegistryIdentityMixin:
         retry_budget = int(
             getattr(self._matching_config, "ocr_upscale_retry_max_attempts", 4)
         )
+        return SlotOcrPlan(
+            slot_id=slot_id,
+            camera_id=camera_id,
+            candidates=candidates,
+            kept=kept,
+            rejected=rejected,
+            allow_retry=(attempt <= retry_budget),
+            decision_ctx=decision_ctx,
+        )
+
+    def read_slot_plate(self, crop_bgr, allow_retry: bool) -> Tuple[str, float]:
+        """Phase 2 (ANY THREAD): the heavy PaddleOCR read, and nothing else.
+
+        This is the only phase safe to run off the main loop — it touches solely the
+        plate-OCR plugin, whose ``read`` serialises itself with an internal lock. The
+        slot camera looks DOWN, so the plate is at the bottom of the whole-car box, not
+        in the gate's bottom-centre band: read the full crop (``apply_plate_roi=False``).
+        """
+        ocr = getattr(self._match_decision, "plate_ocr", None)
+        if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
+            return ("", 0.0)
         try:
-            ocr_text, ocr_conf = ocr.read(
-                crop_bgr,
-                allow_retry=(attempt <= retry_budget),
-                # Slot camera looks DOWN: the plate is at the bottom of the box,
-                # not in the gate's bottom-centre band, so read the full car crop.
-                apply_plate_roi=False,
-            )
+            return ocr.read(crop_bgr, allow_retry=allow_retry, apply_plate_roi=False)
         except TypeError:
             # A PlateOCR implementation without the retry knob (e.g. NoopPlateOCR).
-            ocr_text, ocr_conf = ocr.read(crop_bgr)
+            return ocr.read(crop_bgr)
         except Exception as exc:
-            logger.debug("[ocr-id] slot=%s read failed: %r", slot_id, exc)
-            ocr_text, ocr_conf = "", 0.0
+            logger.debug("[ocr-id] read failed: %r", exc)
+            return ("", 0.0)
 
+    def confirm_slot_ocr(
+        self, plan: "SlotOcrPlan", crop_bgr, ocr_text: str, ocr_conf: float
+    ) -> Optional[str]:
+        """Phase 3 (MAIN THREAD): fold the read back in — confirm, log, decide.
+
+        Returns the plate only when the read confirms exactly one shortlisted car;
+        otherwise ``None`` (slot stays NULL). Runs on the main thread: the decision log
+        scores the crop through the colour/type classifiers, which — like the ReID
+        matcher — share their OpenVINO requests with the main loop.
+        """
+        slot_id, camera_id = plan.slot_id, plan.camera_id
+        candidates = plan.candidates
         plate = confirm_plate(ocr_text, candidates) if ocr_text else None
 
         self._log_slot_decision(
             slot_id=slot_id,
             camera_id=camera_id,
             crop_bgr=crop_bgr,
-            kept=kept,
-            rejected=rejected,
+            kept=plan.kept,
+            rejected=plan.rejected,
             ocr_text=ocr_text,
             ocr_conf=ocr_conf,
             bound_plate=plate,
-            ctx=decision_ctx,
+            ctx=plan.decision_ctx,
         )
 
         if not ocr_text:
