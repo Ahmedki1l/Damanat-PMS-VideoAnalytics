@@ -620,16 +620,12 @@ class VehicleRegistry(
                 from src.ocr.plate_ocr import PaddlePlateOCR
 
                 model_dir = ocr_path if _P(ocr_path).is_dir() else None
-                # oneDNN is off by default only because of a Windows
-                # paddlepaddle-3.x PIR bug (see plate_ocr.py). On the Linux
-                # production Xeon (avx512_vnni/amx_int8) it is a large det+rec
-                # speedup, and OCR runs INLINE in the serial camera loop —
-                # every ms here is a ms no camera in the group is processed.
-                import sys as _sys
-                ocr_plugin = PaddlePlateOCR(
-                    model_dir=model_dir,
-                    enable_mkldnn=_sys.platform.startswith("linux"),
-                )
+                # enable_mkldnn stays False: the paddlepaddle-3.x PIR bug
+                # (ConvertPirAttribute2RuntimeAttribute NotImplementedError)
+                # is NOT Windows-only — flipping it on for Linux killed every
+                # read in production (3,950 failures, 2026-07-16, paddle 3.x
+                # on the Xeon). cpu_threads is the safe speed knob instead.
+                ocr_plugin = PaddlePlateOCR(model_dir=model_dir)
                 logger.info(
                     "[MatchDecision] plate OCR plugin loaded (model_dir=%s)",
                     model_dir or "<paddleocr default cache>",

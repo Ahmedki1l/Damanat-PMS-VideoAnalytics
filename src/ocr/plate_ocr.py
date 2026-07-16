@@ -177,9 +177,12 @@ class PaddlePlateOCR(PlateOCR):
         default — license-plate crops are usually axis-aligned by the upstream
         detector, and the classifier adds ~10 ms.
     enable_mkldnn:
-        Toggle oneDNN. Off by default because on Windows + paddlepaddle 3.x
-        oneDNN can trip a ``ConvertPirAttribute2RuntimeAttribute`` NotImpl.
-        Production Linux deployments can flip this on for ~30 % more speed.
+        Toggle oneDNN. Off by default because paddlepaddle 3.x oneDNN trips a
+        ``ConvertPirAttribute2RuntimeAttribute`` NotImpl at predict time — on
+        Windows AND Linux (verified in production 2026-07-16: every read
+        failed on the Linux Xeon with paddle 3.x). Do not enable until the
+        image ships a paddle build where oneDNN+PIR actually works; use
+        ``cpu_threads`` for speed instead.
     model_dir:
         Optional override for the PaddleOCR home directory (where det/rec
         weights are downloaded). Defaults to ``~/.paddlex/official_models``.
