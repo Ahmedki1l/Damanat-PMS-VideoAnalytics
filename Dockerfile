@@ -97,32 +97,40 @@ ENV PYTHONUNBUFFERED=1
 # The effective-FPS summary is always on and needs nothing.
 # ============================================================================
 # >>> MEASUREMENT BUILDS — edit this block, rebuild, deploy, grab the log.
-# Three states. PROD = all four lines below empty/off (restore when done).
+# PROD = all overrides empty, PERF_TRACE=0 (restore when done).
 #
 #   BUILD 1  Isolated b1 (uncontended `ov` floor). Runs ONLY b1 — other floors
 #            stop updating while deployed; keep it brief.
 #              PERF_TRACE=1  VA_OV_NUM_THREADS=7  SEED_GEOMETRY_ON_START=false
 #              VA_CMD="python main.py --cameras CAM-04,CAM-05,CAM-06,CAM-07,CAM-08,CAM-20,CAM-21,CAM-22,CAM-24"
+#            RESULT: ov ~24ms, ~2.2 fps/cam (floor).
 #
-#   BUILD 2  Fix-B under FULL workload (all groups run; prod stays up). Caps
-#            total OpenVINO threads to the real core count so the per-group split
-#            becomes 2/2/5/6 instead of 2/2/7/8 — no VA_CMD, so the supervisor
-#            runs normally.
-#              PERF_TRACE=1  VA_OV_TOTAL_THREADS=15   (VA_CMD empty)
+#   BUILD 2  Full workload, thread cap → 2/2/5/6.  PERF_TRACE=1 VA_OV_TOTAL_THREADS=15
+#            RESULT: ov ~123ms (~10% only) — thread count is NOT the lever.
+#
+#   BUILD 3  Full workload, MERGE to 2 processes (2 OpenVINO pools instead of 4),
+#            same 15-thread total. Tests whether the residual gap is PROCESS-level
+#            contention. No VA_CMD; supervisor runs normally. Groups become
+#            gate+b2 (8 thr, api) and b1+ground (7 thr) — read b1's numbers from
+#            the [b1+ground] infer-breakdown line.
+#              PERF_TRACE=1  VA_OV_TOTAL_THREADS=15  VA_MERGE_GROUPS=2
+#            Note: measurement topology only (re-buckets cameras across floors) —
+#            revert after. If ov moves toward ~24ms, process contention is dominant.
 #
 #   PROD     PERF_TRACE=0, all overrides empty.
 #
-# Currently set to: BUILD 1 (isolated b1).
+# Currently set to: BUILD 3 (merge to 2 processes).
 # ============================================================================
 ENV PERF_TRACE=1
 ENV PERF_TRACE_EVERY=50
 ENV SEED_GEOMETRY_ON_START=false
-# --- BUILD 1 knobs (isolated b1) ---
+# BUILD 1 only: ENV VA_OV_NUM_THREADS=7  and set VA_CMD below.
 ENV VA_OV_NUM_THREADS=""
 ENV VA_CMD=""
-# --- BUILD 2 knob (full workload, capped threads → 2/2/5/6). Set for build 2,
-#     and clear VA_CMD + VA_OV_NUM_THREADS above. ---
+# BUILD 2 & 3: cap total OpenVINO threads to the real core count.
 ENV VA_OV_TOTAL_THREADS=15
+# BUILD 3 only: collapse the 4 groups into N OS processes (N OpenVINO pools).
+ENV VA_MERGE_GROUPS=2
 
 # Copy app code
 COPY . .

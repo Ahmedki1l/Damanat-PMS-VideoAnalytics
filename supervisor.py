@@ -209,6 +209,44 @@ def resolve_groups() -> list[dict]:
         print(f"[supervisor] DB area-grouping failed ({exc!r}); "
               f"falling back to static GROUPS.")
         return GROUPS
+
+
+def _merge_groups(groups: list[dict], target: int) -> list[dict]:
+    """Merge the resolved groups down to ``target`` OS processes, balanced by
+    camera count, keeping the single api group's cameras inside one bucket.
+
+    MEASUREMENT KNOB (VA_MERGE_GROUPS): halving the process count halves the
+    number of independent OpenVINO thread pools competing on the shared cores.
+    If per-inference `ov` moves toward the isolated single-process floor, the
+    dominant cost is PROCESS-LEVEL contention (pool interaction / cache /
+    bandwidth / scheduler — this test does not distinguish the mechanism), which
+    makes "fewer processes + async" the right direction. A no-op unless
+    0 < target < len(groups). This re-buckets cameras across floors, so it is a
+    THROUGHPUT-measurement topology, not a correctness one (cross-floor identity
+    flows only through the DB); use it to measure, then revert.
+    """
+    if target <= 0 or target >= len(groups):
+        return groups
+    # api group first so it anchors bucket 0 (exactly one group has api=True).
+    ordered = sorted(groups, key=lambda g: not g.get("api"))
+    buckets: list[list[dict]] = [[] for _ in range(target)]
+    sizes = [0] * target
+    buckets[0].append(ordered[0])
+    sizes[0] += _cam_count(ordered[0])
+    for g in ordered[1:]:
+        j = sizes.index(min(sizes))       # least-full bucket
+        buckets[j].append(g)
+        sizes[j] += _cam_count(g)
+    merged = []
+    for bucket in buckets:
+        if not bucket:
+            continue
+        merged.append({
+            "name": "+".join(g["name"] for g in bucket),
+            "cams": ",".join(g["cams"] for g in bucket),
+            "api": any(g.get("api") for g in bucket),
+        })
+    return merged
 # ---------------------------------------------------------------------------
 
 
@@ -504,6 +542,23 @@ def run(reset_plates: bool = False, foreground: bool = False,
     # Per-area topology from the DB (or the static fallback). Resolve ONCE here so
     # the sanity check, core-slicing and the spawn loop all see the same groups.
     groups = resolve_groups()
+
+    # MEASUREMENT: collapse to fewer OS processes (fewer OpenVINO pools) to test
+    # whether the residual inference contention is process-level. Reverts by
+    # unsetting VA_MERGE_GROUPS.
+    _merge_env = os.environ.get("VA_MERGE_GROUPS", "").strip()
+    if _merge_env:
+        try:
+            _target = int(_merge_env)
+        except ValueError:
+            print(f"[supervisor] VA_MERGE_GROUPS={_merge_env!r} not an int — ignored.")
+        else:
+            before = len(groups)
+            groups = _merge_groups(groups, _target)
+            if len(groups) != before:
+                print(f"[supervisor] VA_MERGE_GROUPS={_target}: merged "
+                      f"{before} groups -> {len(groups)} "
+                      f"({', '.join(g['name'] for g in groups)})")
 
     # Sanity: exactly one API host owns the entrance camera + ANPR webhooks.
     api_groups = [g for g in groups if g.get("api")]
