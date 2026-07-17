@@ -12,6 +12,13 @@
 # over GitHub's hard file limit. See detector.camera_overrides in config.yaml.
 !models/yolo11l.pt
 
+# EXCEPTION — fine-tuned vehicle detector (2026-07-17). yolo26n fine-tuned on the
+# parking full-frame pool, single 'vehicle' class @320. On the gold parking set it
+# beats the live yolo11m-int8 by +0.18 mAP50 / +0.25 recall (misses 35%->10%) and
+# is ~2x faster end-to-end once exported to int8 OpenVINO. Raw .pt kept in-tree
+# (5.3 MB, dynamic imgsz) as the source for re-export; deploy via the int8 IR.
+!models/yolo26n_ft_320.pt
+
 # WS-B color classifier — training intermediates and generated synthetic
 # dataset live under models/color_classifier_openvino/. The IR (model.xml /
 # model.bin / labels.json / README.md) is what we ship; everything else is
