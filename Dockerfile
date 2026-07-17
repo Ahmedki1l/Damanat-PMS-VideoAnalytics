@@ -118,11 +118,11 @@ ENV PERF_TRACE=1
 ENV PERF_TRACE_EVERY=50
 ENV SEED_GEOMETRY_ON_START=false
 # --- BUILD 1 knobs (isolated b1) ---
-ENV VA_OV_NUM_THREADS=7
-ENV VA_CMD="python main.py --cameras CAM-04,CAM-05,CAM-06,CAM-07,CAM-08,CAM-20,CAM-21,CAM-22,CAM-24"
+ENV VA_OV_NUM_THREADS=""
+ENV VA_CMD=""
 # --- BUILD 2 knob (full workload, capped threads → 2/2/5/6). Set for build 2,
 #     and clear VA_CMD + VA_OV_NUM_THREADS above. ---
-ENV VA_OV_TOTAL_THREADS=""
+ENV VA_OV_TOTAL_THREADS=15
 
 # Copy app code
 COPY . .
