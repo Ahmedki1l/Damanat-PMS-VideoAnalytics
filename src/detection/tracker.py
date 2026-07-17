@@ -13,6 +13,7 @@ Why not a standalone tracker?
 """
 
 import inspect
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -78,6 +79,7 @@ class TrackedDetector:
         )
         self.model = YOLO(detector_config.model_path, task="detect")
         self.imgsz = self._resolve_imgsz()
+        self.classes = self._resolve_classes()
 
         # Resolve device: "auto" picks CUDA if available, else CPU
         if detector_config.device == "auto":
@@ -86,8 +88,9 @@ class TrackedDetector:
             self.device = detector_config.device
 
         pp_status = "ON" if self.preprocessing_config.enabled else "OFF"
+        cls_status = "ALL" if self.classes is None else self.classes
         print(f"[INFO] Model loaded. Tracker: {tracker_config.type} | Device: {self.device} "
-              f"| imgsz: {self.imgsz} | Preprocessing: {pp_status}")
+              f"| imgsz: {self.imgsz} | classes: {cls_status} | Preprocessing: {pp_status}")
 
     def _resolve_imgsz(self) -> int:
         """The size the model ACTUALLY runs at, not the one config.yaml asks for.
@@ -110,6 +113,38 @@ class TrackedDetector:
             except (OSError, ValueError, TypeError):
                 pass
         return int(self.detector_config.imgsz)
+
+    def _resolve_classes(self):
+        """The class ids to KEEP, matched to the loaded model — not blindly from config.
+
+        ``detector_config.classes`` holds COCO vehicle ids [2,5,7] (car/bus/truck),
+        correct for a stock COCO model. But ``model_path`` is DB-owned and may point
+        at the facility fine-tune, which is SINGLE-CLASS (``names={0: 'vehicle'}``):
+        it only ever emits class 0, so filtering it by [2,5,7] matches nothing and
+        drops EVERY detection — no car is ever seen and no slot can flip (observed on
+        CAM-23 with yolo26n_ft, 2026-07-17). Rather than trust the static/DB value,
+        keep only the configured ids that actually exist in this model's class map:
+
+          - stock COCO model      -> [2,5,7] survive        -> filter to vehicles
+          - single-class fine-tune-> none of [2,5,7] exist  -> return None (keep all)
+
+        Returning None means "no class filter"; safe here because a dedicated vehicle
+        model emits only vehicles. Mirrors ``_resolve_imgsz`` reading the export's own
+        metadata instead of trusting dead config.
+        """
+        names = getattr(self.model, "names", None) or {}
+        wanted = self.detector_config.classes
+        if not wanted:
+            return None
+        valid = [c for c in wanted if c in names]
+        if not valid:
+            print(
+                f"[INFO] Configured classes {list(wanted)} are absent from this "
+                f"model's class map {dict(names)} — keeping ALL detections "
+                f"(single-class vehicle model)."
+            )
+            return None
+        return valid
 
     def _preprocess_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, float, float]:
         """
@@ -219,17 +254,42 @@ class TrackedDetector:
         if predictor is not None and getattr(predictor, "trackers", None):
             predictor.trackers[0] = self._tracker_for(camera_id)
 
+        # Split the "infer" wall-time into OpenVINO compute vs scheduler-wait /
+        # cgroup-throttle / framework overhead. wall = whole model.track() call;
+        # cpu = THIS thread's CPU time over it (wall-cpu ⇒ time off-core: pool
+        # compute + preemption + CFS throttle); pre/ov/post from results.speed
+        # isolate the pure forward pass; throttled-delta attributes the freeze to
+        # the cgroup. All gated by PERF_TRACE (zero cost when off).
         with perf_trace.stage("infer"):
+            _w0 = time.perf_counter()
+            _c0 = perf_trace._thread_cpu_s() if perf_trace.enabled() else 0.0
+            _t0 = perf_trace.read_cgroup_throttle() if perf_trace.enabled() else None
             results = self.model.track(
                 inference_frame,
                 conf=self.detector_config.confidence,
-                classes=self.detector_config.classes,
+                classes=self.classes,
                 imgsz=self.imgsz,
                 device=self.device,
                 persist=True,               # Maintain tracker state across frames
                 tracker=tracker_cfg,         # e.g., "bytetrack.yaml"
                 verbose=False,
             )
+            if perf_trace.enabled():
+                _wall = (time.perf_counter() - _w0) * 1000.0
+                _cpu = (perf_trace._thread_cpu_s() - _c0) * 1000.0
+                _t1 = perf_trace.read_cgroup_throttle()
+                _thr_ms = ((_t1[2] - _t0[2]) / 1000.0) if (_t0 and _t1) else 0.0
+                try:
+                    _spd = results[0].speed  # {'preprocess','inference','postprocess'} ms
+                except (IndexError, AttributeError, TypeError):
+                    _spd = {}
+                perf_trace.record_infer(
+                    wall_ms=_wall, cpu_ms=_cpu,
+                    pre_ms=float(_spd.get("preprocess", 0.0) or 0.0),
+                    ov_ms=float(_spd.get("inference", 0.0) or 0.0),
+                    post_ms=float(_spd.get("postprocess", 0.0) or 0.0),
+                    throttled_ms=_thr_ms,
+                )
 
         # First-call bootstrap: adopt the predictor's auto-created tracker for
         # this camera so subsequent calls swap the correct instance back in.

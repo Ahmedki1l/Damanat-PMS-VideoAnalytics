@@ -91,7 +91,17 @@ class VehicleDetector:
         self.preprocessing_config = preprocessing_config or DetectorPreprocessingConfig()
         print(f"[INFO] Loading YOLO model from '{config.model_path}'...")
         self.model = YOLO(config.model_path)
-        print(f"[INFO] Model loaded. Classes to detect: {config.classes}")
+        # Match the class filter to the loaded model rather than trusting the
+        # static/DB `classes`. A single-class fine-tune (names={0:'vehicle'}) has
+        # none of the COCO vehicle ids [2,5,7], so filtering by them drops EVERY
+        # detection; keep only configured ids the model actually has, else None
+        # (no filter — a dedicated vehicle model emits only vehicles). See
+        # TrackedDetector._resolve_classes for the full rationale.
+        names = getattr(self.model, "names", None) or {}
+        valid = [c for c in (config.classes or []) if c in names]
+        self.classes = valid or None
+        print(f"[INFO] Model loaded. Classes to detect: "
+              f"{'ALL' if self.classes is None else self.classes}")
 
     def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -132,7 +142,7 @@ class VehicleDetector:
         results = self.model(
             inference_frame,
             conf=self.config.confidence,
-            classes=self.config.classes,
+            classes=self.classes,
             imgsz=self.config.imgsz,
             verbose=False,
         )
