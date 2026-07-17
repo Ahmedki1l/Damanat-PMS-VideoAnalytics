@@ -323,6 +323,22 @@ def _cpu_budget(n_groups: int = 1) -> tuple[int, bool]:
     """
     mask = _affinity_cores()
     quota = _quota_cores()
+    # Explicit total OpenVINO thread budget across ALL groups, overriding the
+    # mask/quota heuristic. Set VA_OV_TOTAL_THREADS to the pod's REAL usable core
+    # count when the affinity mask overreports it (the 2026-07-15 trap: mask said
+    # 20, real budget ~12), so the per-group pools don't oversubscribe the cores.
+    # Apportioned by camera share downstream, so e.g. 15 -> gate2/ground2/b1 5/b2 6.
+    override = os.environ.get("VA_OV_TOTAL_THREADS", "").strip()
+    if override:
+        try:
+            n = int(override)
+        except ValueError:
+            print(f"[supervisor] VA_OV_TOTAL_THREADS={override!r} not an int — ignored.")
+        else:
+            if n > 0:
+                # Unpinned (thread-cap only) whenever a quota is present, same as
+                # the heuristic path; a cpuset (no quota) can still pin its slice.
+                return max(1, n), (quota is None)
     if quota is None:
         # No quota: the mask IS our exclusive budget (cpuset, or a whole box).
         return mask, True

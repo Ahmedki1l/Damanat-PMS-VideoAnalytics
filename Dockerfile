@@ -95,7 +95,34 @@ ENV PYTHONUNBUFFERED=1
 # opt-in — flip it on at run time, no rebuild:
 #   docker run -e PERF_TRACE=1 -e PERF_TRACE_EVERY=50 ...
 # The effective-FPS summary is always on and needs nothing.
-ENV PERF_TRACE=0
+# ============================================================================
+# >>> MEASUREMENT BUILDS — edit this block, rebuild, deploy, grab the log.
+# Three states. PROD = all four lines below empty/off (restore when done).
+#
+#   BUILD 1  Isolated b1 (uncontended `ov` floor). Runs ONLY b1 — other floors
+#            stop updating while deployed; keep it brief.
+#              PERF_TRACE=1  VA_OV_NUM_THREADS=7  SEED_GEOMETRY_ON_START=false
+#              VA_CMD="python main.py --cameras CAM-04,CAM-05,CAM-06,CAM-07,CAM-08,CAM-20,CAM-21,CAM-22,CAM-24"
+#
+#   BUILD 2  Fix-B under FULL workload (all groups run; prod stays up). Caps
+#            total OpenVINO threads to the real core count so the per-group split
+#            becomes 2/2/5/6 instead of 2/2/7/8 — no VA_CMD, so the supervisor
+#            runs normally.
+#              PERF_TRACE=1  VA_OV_TOTAL_THREADS=15   (VA_CMD empty)
+#
+#   PROD     PERF_TRACE=0, all overrides empty.
+#
+# Currently set to: BUILD 1 (isolated b1).
+# ============================================================================
+ENV PERF_TRACE=1
+ENV PERF_TRACE_EVERY=50
+ENV SEED_GEOMETRY_ON_START=false
+# --- BUILD 1 knobs (isolated b1) ---
+ENV VA_OV_NUM_THREADS=7
+ENV VA_CMD="python main.py --cameras CAM-04,CAM-05,CAM-06,CAM-07,CAM-08,CAM-20,CAM-21,CAM-22,CAM-24"
+# --- BUILD 2 knob (full workload, capped threads → 2/2/5/6). Set for build 2,
+#     and clear VA_CMD + VA_OV_NUM_THREADS above. ---
+ENV VA_OV_TOTAL_THREADS=""
 
 # Copy app code
 COPY . .
@@ -107,4 +134,4 @@ EXPOSE 8000
 # and spawns/supervises the 5 camera groups instead of one `main.py --api`. It
 # mirrors each group's logs to stdout and forwards SIGTERM on `docker stop`.
 # Extra launcher flags via RUN_ALL_ARGS, e.g. -e RUN_ALL_ARGS="--reset-plates".
-ENTRYPOINT ["sh", "-c", "if [ \"${SEED_GEOMETRY_ON_START:-true}\" = true ] && [ -f \"${GEOMETRY_FILE:-geometry.json}\" ]; then echo '[entrypoint] seeding geometry into empty tables...'; python tools/sync_geometry.py seed --in \"${GEOMETRY_FILE:-geometry.json}\" --if-empty || echo '[entrypoint] geometry seed skipped (continuing)'; fi; exec python main.py --supervise --foreground ${RUN_ALL_ARGS:-}"]
+ENTRYPOINT ["sh", "-c", "if [ \"${SEED_GEOMETRY_ON_START:-true}\" = true ] && [ -f \"${GEOMETRY_FILE:-geometry.json}\" ]; then echo '[entrypoint] seeding geometry into empty tables...'; python tools/sync_geometry.py seed --in \"${GEOMETRY_FILE:-geometry.json}\" --if-empty || echo '[entrypoint] geometry seed skipped (continuing)'; fi; exec ${VA_CMD:-python main.py --supervise --foreground ${RUN_ALL_ARGS:-}}"]
