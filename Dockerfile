@@ -154,8 +154,8 @@ ENV SEED_GEOMETRY_ON_START=false
 # lowers VA_OV_NUM_THREADS (~10) to give feeders CPU.
 ENV VA_SINGLE_PROCESS=1
 ENV VA_INFER=async
-ENV VA_OV_NUM_THREADS=15
-ENV VA_FEED_THREADS=4
+ENV VA_OV_NUM_THREADS=10
+ENV VA_FEED_THREADS=6
 ENV VA_CMD="python main.py --api"
 # --- Supervisor-only knobs (ignored while VA_CMD bypasses the supervisor) ---
 ENV VA_OV_TOTAL_THREADS=""
