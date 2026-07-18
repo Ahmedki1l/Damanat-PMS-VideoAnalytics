@@ -1336,6 +1336,9 @@ class ParkingEngineRuntimeMixin:
 
     def _apply_async_ocr_result(self, res) -> None:
         job = res.job
+        if getattr(job, "kind", "slot") == "track":
+            self._apply_async_track_ocr_result(res)
+            return
         slot_id, cam_id = job.slot_id, job.cam_id
         # Re-validate the occupancy this read belongs to still stands.
         if not getattr(self, "_ocr_armed", {}).get(slot_id):
@@ -1367,6 +1370,40 @@ class ParkingEngineRuntimeMixin:
             cam_id, slot_id, state_machine, job.crop, job.attempts,
             job.plan.decision_ctx or {},
         )
+
+    def _apply_async_track_ocr_result(self, res) -> None:
+        """Fold a finished APPROACH read back in — MAIN THREAD.
+
+        The track equivalent of ``_apply_async_ocr_result``. Re-validated against the
+        track's CURRENT state before it can bind, so a read that finished after the car
+        was named by another path is discarded rather than re-bound. Everything here is
+        main-thread work by necessity: ``confirm_track_ocr`` uses the ReID matcher, and
+        the transit hop mutates registry sessions.
+        """
+        job = res.job
+        cam_id = job.cam_id
+        key, tid, detection = job.ctx
+        registry = self.vehicle_registry
+        if registry is None:
+            return
+        if registry.get_plate_for_track(cam_id, tid):
+            return  # named by another path while this read was in flight
+
+        plate = registry.confirm_track_ocr(job.plan, job.crop, res.text)
+        if plate:
+            logger.info(
+                "[ocr-id] track (%s, %s) IDENTIFIED as %s while driving — "
+                "the plate is known BEFORE it parks",
+                cam_id, tid, plate,
+            )
+            return
+
+        # OCR could not name it — same fall-through as the sync path. ``detection`` is
+        # the one the crop came from, so it is a frame or two old by now; it is used
+        # only to ask which slot polygon the car is in, which does not change over that
+        # span for a car still manoeuvring.
+        now_ts = time.time()
+        self._try_adopt_transit_identity(cam_id, tid, key, job.crop, now_ts, detection)
 
     def _bind_ocr_identified_plate(
         self, cam_id, slot_id, state_machine, plate, crop, attempt_num

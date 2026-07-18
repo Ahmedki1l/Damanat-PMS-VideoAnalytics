@@ -56,6 +56,22 @@ class SlotOcrPlan:
 
 
 @dataclass(frozen=True)
+class TrackOcrPlan:
+    """The same three-phase hand-off as :class:`SlotOcrPlan`, for the APPROACH read.
+
+    The approach read (a still-driving car, ``try_ocr_identify_track``) differs from
+    the slot read in one way that matters here: it ranks AFTER the read, not before
+    (``reid_shortlist`` is only consulted once there is text to confirm). So the
+    plan phase has no ReID work to do and carries only what the read itself needs —
+    everything expensive stays in phase 2 (worker) and phase 3 (main thread).
+    """
+
+    camera_id: str
+    track_id: int
+    allow_retry: bool
+
+
+@dataclass(frozen=True)
 class RejectedCandidate:
     """A candidate a deterministic rule threw out, and why.
 
@@ -4745,15 +4761,53 @@ class VehicleRegistryIdentityMixin:
 
         Same contract as everywhere else: bind only what was READ, and only when exactly
         one car inside can explain the read. Otherwise leave it anonymous.
+
+        SYNCHRONOUS PATH. Composed from the same three phases the async path uses
+        (``plan_track_ocr`` -> ``read_slot_plate`` -> ``confirm_track_ocr``) so there is
+        exactly one implementation of the logic and the two paths cannot drift.
+        """
+        plan = self.plan_track_ocr(camera_id, track_id, crop_bgr)
+        if plan is None:
+            return None
+        ocr_text, _conf = self.read_slot_plate(crop_bgr, plan.allow_retry)
+        return self.confirm_track_ocr(plan, crop_bgr, ocr_text)
+
+    def plan_track_ocr(
+        self, camera_id: str, track_id: int, crop_bgr, *, allow_retry: bool = True
+    ) -> Optional["TrackOcrPlan"]:
+        """Phase 1 (MAIN THREAD): decide whether an approach read is possible at all.
+
+        Returns ``None`` when there is no OCR plugin or no crop — i.e. when phase 2
+        would be pure waste. Unlike ``plan_slot_ocr`` this does NO ReID work: the
+        approach path ranks after the read (see :class:`TrackOcrPlan`), so phase 1 is
+        deliberately trivial and nothing expensive is left on the caller's thread.
+
+        ``allow_retry`` defaults to True to preserve the historical behaviour of this
+        path exactly (``ocr.read`` itself defaults to True and the old inline call passed
+        no override). Worth revisiting separately: the enlarged pass costs ~670ms and the
+        approach path sees the same car over many frames, so a second look may well be
+        cheaper than an upscaled re-read of this one — but that is a behaviour change to
+        measure on its own, not to smuggle into a threading change.
         """
         ocr = getattr(self._match_decision, "plate_ocr", None)
         if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
             return None
-        try:
-            # Slot camera: read the full car crop, not the gate's bottom-centre ROI.
-            ocr_text, _conf = ocr.read(crop_bgr, apply_plate_roi=False)  # heavy — never under the lock
-        except Exception:
-            return None
+        return TrackOcrPlan(
+            camera_id=camera_id, track_id=track_id, allow_retry=allow_retry
+        )
+
+    def confirm_track_ocr(
+        self, plan: "TrackOcrPlan", crop_bgr, ocr_text: str
+    ) -> Optional[str]:
+        """Phase 3 (MAIN THREAD): fold the approach read back in — narrow, confirm, bind.
+
+        Main-thread-only for two reasons: ``reid_shortlist`` uses the ReID matcher
+        (shared OpenVINO infer request), and the bind mutates ``_track_session_map`` and
+        live ``VehicleSession`` fields, which the registry does not synchronize per
+        transaction. Returns the plate only when exactly one car inside explains the
+        read; otherwise ``None`` and the track stays anonymous.
+        """
+        camera_id, track_id = plan.camera_id, plan.track_id
         if not ocr_text:
             return None
 
