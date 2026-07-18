@@ -197,6 +197,101 @@ def record_infer(wall_ms: float, cpu_ms: float, pre_ms: float, ov_ms: float,
     _infer_frames += 1
 
 
+# --- Per-camera processed-fps + async queue depth (Phase 0 scaffolding) ------ #
+# These support the single-process AsyncInferQueue migration: per-camera fps
+# tells us whether the scheduler is fair (the original per-camera FPS disparity
+# was invisible in the aggregate number), and the queue-depth gauge surfaces
+# back-pressure / stale-frame pileup in the async design. Both are no-ops when
+# PERF_TRACE is off, and are reported on the same cadence as the decode meter.
+_cam_lock = threading.Lock()
+_cam_counts: dict[str, int] = defaultdict(int)
+_cam_last_report = time.time()
+
+# Named gauges (e.g. queue depths, drop counters) sampled by the async engine.
+_gauges: dict[str, float] = {}
+_gauge_lock = threading.Lock()
+
+
+def record_camera_frame(camera_id: str) -> None:
+    """Count one processed frame for ``camera_id``; emit a per-camera fps table
+    roughly every 10s. No-op when disabled."""
+    if not _ENABLED:
+        return
+    global _cam_last_report
+    with _cam_lock:
+        _cam_counts[camera_id] += 1
+        now = time.time()
+        elapsed = now - _cam_last_report
+        if elapsed >= 10.0 and _cam_counts:
+            rows = sorted(_cam_counts.items())
+            body = " ".join(f"{cid}={n / elapsed:.2f}" for cid, n in rows)
+            total = sum(_cam_counts.values()) / elapsed
+            print(
+                f"[PERF] per-camera-fps ({elapsed:.0f}s window, total={total:.1f}/s): "
+                f"{body}"
+            )
+            _cam_counts.clear()
+            _cam_last_report = now
+
+
+_cons_lock = threading.Lock()
+_cons_busy_ms = 0.0
+_cons_frames = 0
+_cons_last_report = time.time()
+
+
+def record_consumer(busy_ms: float) -> None:
+    """Record one consumer-thread frame's processing time (single-process engine).
+
+    ``busy_ms`` is the wall time the ONE consumer thread spent on a frame — the
+    post-detection body (ROI/zones/assign/slot/events) plus the inline ReID/OCR/
+    snapshot/DB work — excluding the time it sat waiting for the next frame.
+
+    Reports ``busy%`` (share of wall time the consumer was actually working) and
+    ms/frame roughly every 10s. This is the metric that tells inference-bound
+    from consumer-bound: if ``ov`` drops to ~24-40ms but per-camera fps stays
+    capped, a consumer ``busy%`` near 100 says the bottleneck moved onto the
+    consumer (inline ReID/DB/snapshots — the Phase 3/4 offload targets); a low
+    ``busy%`` says fps is limited upstream (scheduler pace / pool / cameras).
+    No-op when disabled."""
+    if not _ENABLED:
+        return
+    global _cons_busy_ms, _cons_frames, _cons_last_report
+    with _cons_lock:
+        _cons_busy_ms += busy_ms
+        _cons_frames += 1
+        now = time.time()
+        elapsed = now - _cons_last_report
+        if elapsed >= 10.0 and _cons_frames:
+            busy_pct = 100.0 * (_cons_busy_ms / 1000.0) / elapsed
+            avg = _cons_busy_ms / _cons_frames
+            print(
+                f"[PERF] consumer: busy={busy_pct:.0f}% | {avg:.1f}ms/frame | "
+                f"{_cons_frames} frames in {elapsed:.0f}s "
+                f"({'consumer-bound' if busy_pct >= 85 else 'not consumer-bound'})"
+            )
+            _cons_busy_ms = 0.0
+            _cons_frames = 0
+            _cons_last_report = now
+
+
+def set_gauge(name: str, value: float) -> None:
+    """Record the current value of a named gauge (queue depth, drop count, …).
+    Cheap; read back in the async engine's periodic report. No-op when disabled."""
+    if not _ENABLED:
+        return
+    with _gauge_lock:
+        _gauges[name] = value
+
+
+def snapshot_gauges() -> dict[str, float]:
+    """Copy of the current gauges (empty when disabled)."""
+    if not _ENABLED:
+        return {}
+    with _gauge_lock:
+        return dict(_gauges)
+
+
 # --- Decode meter (background grabber threads, many) ------------------------- #
 _dec_lock = threading.Lock()
 _dec_ms = 0.0

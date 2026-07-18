@@ -81,6 +81,13 @@ class CameraStream:
         self.frame_width: int = 0
         self.frame_height: int = 0
         self._latest_frame: Optional[np.ndarray] = None
+        # Provenance of _latest_frame, stamped at grab time so any downstream
+        # stage can compute frame_age_ms and reject stale evidence, and so the
+        # async pipeline can order per-camera completions by capture sequence.
+        # capture_ts is a wall clock (time.time); seq is a per-camera monotonic
+        # counter that increments on every successfully grabbed frame.
+        self._latest_ts: float = 0.0
+        self._latest_seq: int = 0
         self._frame_lock = threading.Lock()
         self._grab_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -154,6 +161,8 @@ class CameraStream:
             if ret and frame is not None:
                 with self._frame_lock:
                     self._latest_frame = frame
+                    self._latest_ts = time.time()
+                    self._latest_seq += 1
             else:
                 # Read failed — reconnect
                 self.is_open = False
@@ -207,6 +216,20 @@ class CameraStream:
                 frame = self._latest_frame.copy()
                 return True, frame
         return False, None
+
+    def read_stamped(self) -> Tuple[bool, Optional[np.ndarray], float, int]:
+        """Latest frame plus its grab-time provenance ``(ok, frame, capture_ts, seq)``.
+
+        Same non-blocking latest-frame semantics as ``read()``, but also returns
+        the wall-clock capture timestamp and the per-camera monotonic sequence
+        number stamped by the grabber. The async pipeline uses ``seq`` to apply
+        per-camera completions in order and ``capture_ts`` to drop stale frames.
+        Returns ``(False, None, 0.0, 0)`` when no frame has been grabbed yet.
+        """
+        with self._frame_lock:
+            if self._latest_frame is not None:
+                return True, self._latest_frame.copy(), self._latest_ts, self._latest_seq
+        return False, None, 0.0, 0
 
     def close(self):
         """Stop the grabber thread and release the stream."""
@@ -291,6 +314,18 @@ class CameraManager:
         if camera_id not in self.cameras:
             return False, None
         return self.cameras[camera_id].read()
+
+    def read_camera_stamped(
+        self, camera_id: str
+    ) -> Tuple[bool, Optional[np.ndarray], float, int]:
+        """Read a specific camera's latest frame with grab-time provenance.
+
+        See ``CameraStream.read_stamped``. Used by the single-process async
+        scheduler to pick fresh frames per camera and order completions by seq.
+        """
+        if camera_id not in self.cameras:
+            return False, None, 0.0, 0
+        return self.cameras[camera_id].read_stamped()
 
     def get_camera_config(self, camera_id: str) -> Optional[CameraConfig]:
         """Get config for a specific camera."""

@@ -1041,6 +1041,39 @@ class ParkingEngineRuntimeMixin:
         )
         grid_frames[cam_id] = label_frame
 
+    def _process_detections_and_events(self, cam_id: str, frame, pipeline, detections):
+        """Post-detection pipeline body: ROI filter → special zones → slot
+        assignment → slot-state update → violation filtering → persist events.
+
+        Extracted from ``run_multi_camera`` so the single-process async engine
+        can reuse the exact same body from its consumer thread. Returns the slot
+        ``assignment`` (the multi-camera visualization path still needs it).
+
+        MUST run on a single thread — it mutates shared registry / slot-state /
+        event-bus state and is not internally synchronized. In the async engine
+        it is called only from the one consumer thread (see ``run_single_process``).
+        """
+        from src import perf_trace
+
+        with perf_trace.stage("roi"):
+            detections = pipeline.filter_detections_to_roi(detections)
+        with perf_trace.stage("zones"):
+            self._process_special_zones(cam_id, frame, detections)
+
+        with perf_trace.stage("assign"):
+            assignment = pipeline.assigner.assign(detections)
+        with perf_trace.stage("slot"):
+            all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
+        if all_events:
+            final_events = self._filter_violation_events(
+                frame,
+                assignment,
+                cam_id,
+                all_events,
+            )
+            self._persist_final_events(final_events)
+        return assignment
+
     def _process_special_zones(self, cam_id: str, frame, detections) -> None:
         if cam_id == "CAM-23":
             logger.info(

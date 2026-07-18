@@ -13,6 +13,7 @@ Why not a standalone tracker?
 """
 
 import inspect
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -91,6 +92,48 @@ class TrackedDetector:
         cls_status = "ALL" if self.classes is None else self.classes
         print(f"[INFO] Model loaded. Tracker: {tracker_config.type} | Device: {self.device} "
               f"| imgsz: {self.imgsz} | classes: {cls_status} | Preprocessing: {pp_status}")
+
+        # Inference backend selection (single-process migration, Phase 1+):
+        #   VA_INFER=ultra  (default) — Ultralytics model.track(), unchanged.
+        #   VA_INFER=async            — raw-OpenVINO AsyncInferQueue core, reusing
+        #                               Ultralytics pre/post for numeric parity.
+        # The async core is what removes the serial ceiling once the scheduler
+        # (Phase 2) drives it; in the serial loop it runs one frame at a time and
+        # must produce identical detections (the Phase 1 parity gate).
+        self._infer_mode = os.environ.get("VA_INFER", "ultra").strip().lower()
+        self._ov_core = None
+        if self._infer_mode == "async":
+            self._ov_core = self._build_ov_core()
+
+    def _build_ov_core(self):
+        """Construct the raw-OpenVINO async inference core, or None on failure
+        (in which case detect_and_track transparently falls back to model.track)."""
+        try:
+            from src.detection.ov_infer_core import OVInferCore
+
+            try:
+                nireq = int(os.environ.get("VA_INFER_NIREQ", "0") or "0")
+            except ValueError:
+                nireq = 0
+            core = OVInferCore(
+                model=self.model,
+                model_path=self.detector_config.model_path,
+                imgsz=self.imgsz,
+                confidence=self.detector_config.confidence,
+                classes=self.classes,
+                device=self.device,
+                num_threads=int(getattr(self.detector_config, "ov_num_threads", 0) or 0),
+                nireq=nireq,
+                max_box_area_ratio=float(
+                    getattr(self.detector_config, "max_box_area_ratio", 0.0) or 0.0
+                ),
+            )
+            print("[INFO] VA_INFER=async — raw-OpenVINO AsyncInferQueue core active.")
+            return core
+        except Exception as exc:
+            print(f"[WARN] Failed to build async OV core ({exc!r}); "
+                  f"falling back to Ultralytics model.track().")
+            return None
 
     def _resolve_imgsz(self) -> int:
         """The size the model ACTUALLY runs at, not the one config.yaml asks for.
@@ -244,6 +287,28 @@ class TrackedDetector:
         with perf_trace.stage("clahe"):
             inference_frame, scale_x, scale_y = self._preprocess_frame(frame)
 
+        # Async raw-OV core path (VA_INFER=async): same CLAHE/scale preprocessing,
+        # then a raw-OpenVINO forward + Ultralytics postprocess + this camera's
+        # ByteTracker. Detections come back in inference_frame coords, so apply
+        # the same scale-back the model.track path does in _parse_results.
+        if self._ov_core is not None:
+            with perf_trace.stage("infer"):
+                _w0 = time.perf_counter()
+                dets = self._ov_core.detect_track_sync(
+                    inference_frame, self._tracker_for(camera_id)
+                )
+                if perf_trace.enabled():
+                    perf_trace.record_infer(
+                        wall_ms=(time.perf_counter() - _w0) * 1000.0,
+                        cpu_ms=0.0, pre_ms=0.0, ov_ms=0.0, post_ms=0.0,
+                        throttled_ms=0.0,
+                    )
+            if scale_x != 1.0 or scale_y != 1.0:
+                for d in dets:
+                    x1, y1, x2, y2 = d.bbox
+                    d.bbox = (x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y)
+            return dets
+
         # Build tracker config filename — Ultralytics expects e.g. "bytetrack.yaml"
         tracker_cfg = f"{self.tracker_config.type}.yaml"
 
@@ -302,6 +367,37 @@ class TrackedDetector:
             self._camera_trackers[camera_id] = predictor.trackers[0]
 
         return self._parse_results(results, scale_x, scale_y, frame.shape)
+
+    def has_async_core(self) -> bool:
+        """True when the raw-OpenVINO AsyncInferQueue core is active (VA_INFER=async)."""
+        return self._ov_core is not None
+
+    def submit_async(self, frame: np.ndarray, camera_id: str, done, userdata=None) -> None:
+        """Asynchronous detect+track: CLAHE/scale preprocess on the CALLING
+        thread, then start a non-blocking OpenVINO forward. The completion
+        callback (an OV worker thread) runs postprocess + this camera's
+        ByteTracker and invokes ``done(detections, userdata)`` with detections in
+        ORIGINAL-frame coordinates.
+
+        Back-pressure: the underlying ``start_async`` blocks when all infer
+        requests are busy, so the caller (the single-process scheduler) paces
+        itself against the pool. Requires the async core; raises otherwise.
+        """
+        if self._ov_core is None:
+            raise RuntimeError("submit_async requires VA_INFER=async (no OV core)")
+        inference_frame, scale_x, scale_y = self._preprocess_frame(frame)
+        tracker = self._tracker_for(camera_id)
+        if scale_x == 1.0 and scale_y == 1.0:
+            self._ov_core.submit(inference_frame, tracker, done, userdata)
+            return
+
+        def _scaled(dets, ud):
+            for d in dets:
+                x1, y1, x2, y2 = d.bbox
+                d.bbox = (x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y)
+            done(dets, ud)
+
+        self._ov_core.submit(inference_frame, tracker, _scaled, userdata)
 
     def _parse_results(
         self,
