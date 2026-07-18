@@ -1171,6 +1171,7 @@ class ParkingEngineRuntimeMixin:
                                   dequeued_at)
 
         _t = time.perf_counter()
+        n_raw = len(detections) if detections else 0
         with perf_trace.stage("roi"):
             detections = pipeline.filter_detections_to_roi(detections)
         _t = tr.mark("roi", _t)
@@ -1185,6 +1186,7 @@ class ParkingEngineRuntimeMixin:
         with perf_trace.stage("assign"):
             assignment = pipeline.assigner.assign(detections)
         _t = tr.mark("assign", _t)
+        self._log_camera_detections(cam_id, pipeline, n_raw, detections, assignment)
         with perf_trace.stage("slot"):
             all_events, slot_ctx = self._update_slot_occupancy(
                 cam_id, frame, pipeline, assignment
@@ -1871,6 +1873,72 @@ class ParkingEngineRuntimeMixin:
     # How often, per slot, to log what is holding it OCCUPIED. A slot stuck for
     # minutes then produces a readable trail rather than one line per frame.
     _SLOTHOLD_INTERVAL_S = 10.0
+
+    # How often, per slot-hosting camera, to log the detection ledger. 30s keeps
+    # ~21 slot cameras to ~40 lines/min while still bounding how long a silent
+    # failure can hide.
+    _CAMDETS_INTERVAL_S = 30.0
+
+    def _log_camera_detections(
+        self, cam_id, pipeline, n_raw, detections, assignment
+    ) -> None:
+        """Per-camera detection LEDGER — where did this frame's detections go?
+
+        Exists because of CAM-04 on 2026-07-18: a car parked in slot B3 for ~2
+        minutes and the 12-minute log contained ZERO lines for B2/B3 — no
+        [SLOTLAT], no [SLOTHOLD], no track activity. The camera was healthy
+        (~2.4 fps, 68/69 windows), so the failure was upstream of slot
+        assignment, but NOTHING distinguished the three candidate causes:
+
+          raw=0                        -> YOLO sees nothing (stream frozen at the
+                                          encoder, or the detector misses the car)
+          raw>0, roi=0                 -> the ROI polygon is eating detections
+                                          (filter_detections_to_roi drops silently)
+          roi>0, assigned=0, near=...  -> detections exist but the probe lands
+                                          outside every slot polygon (geometry /
+                                          scaling / probe mismatch — `near` shows
+                                          the closest slot and the pixel gap)
+
+        One line per slot-hosting camera per _CAMDETS_INTERVAL_S, INFO-gated.
+        Cameras without slots never log (an empty aisle camera has nothing to
+        account for).
+        """
+        if not logger.isEnabledFor(logging.INFO) or not pipeline.slots:
+            return
+        seen = getattr(self, "_camdets_last_at", None)
+        if seen is None:
+            seen = self._camdets_last_at = {}
+        now_ts = time.time()
+        if now_ts - seen.get(cam_id, 0.0) < self._CAMDETS_INTERVAL_S:
+            return
+        seen[cam_id] = now_ts
+
+        n_roi = len(detections) if detections else 0
+        n_assigned = len(assignment.slot_vehicle_map)
+        unassigned = assignment.unassigned or []
+
+        near = ""
+        if unassigned:
+            # Show where the first unassigned car's probe fell and which slot
+            # polygon it was closest to — the number that separates "geometry is
+            # off by 40px" from "the car is nowhere near a slot".
+            d = unassigned[0]
+            px, py = d.bottom_center
+            best_id, best_dist = None, float("inf")
+            for slot in pipeline.slots:
+                dist = ((px - slot.centroid_x) ** 2 + (py - slot.centroid_y) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_id, best_dist = slot.id, dist
+            near = (
+                f" | first_unassigned: track={d.track_id} "
+                f"bbox={tuple(round(float(v), 1) for v in d.bbox)} "
+                f"probe=({px:.0f},{py:.0f}) nearest_slot={best_id} "
+                f"dist={best_dist:.0f}px"
+            )
+        logger.info(
+            "[CAMDETS] cam=%s raw=%d roi=%d assigned=%d unassigned=%d%s",
+            cam_id, n_raw, n_roi, n_assigned, len(unassigned), near,
+        )
 
     def _log_slot_hold(
         self, cam_id, slot, state_machine, assignment, vehicle_in_slot
