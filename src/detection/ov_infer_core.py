@@ -149,6 +149,10 @@ class OVInferCore:
         # postprocess is not guaranteed thread-safe across concurrent OV
         # callbacks (it mutates predictor.results); serialize just the post step.
         self._post_lock = threading.Lock()
+        # start_async is called from a POOL of feeder threads (preprocess runs in
+        # parallel — OpenCV/numpy release the GIL — so the single scheduler thread
+        # is no longer the ceiling). Only the enqueue itself is serialized.
+        self._submit_lock = threading.Lock()
 
         print(
             f"[OVInferCore] ready: imgsz={self.imgsz} nireq={self._nireq} "
@@ -246,11 +250,17 @@ class OVInferCore:
         blocks when all ``nireq`` requests are busy, which is the design's natural
         back-pressure — the scheduler paces itself against the pool.
         """
+        # Heavy preprocess (letterbox + tensor build) runs OUTSIDE the lock, so
+        # multiple feeder threads overlap it on different cores. Only start_async
+        # (cheap enqueue; blocks when all nireq are busy = correct back-pressure)
+        # is serialized. t_submit is stamped at enqueue so req_wall measures the
+        # forward, not the preprocess.
         input_np, im = self._preprocess(frame_bgr)
-        self._queue.start_async(
-            {self._input_name: input_np},
-            userdata=(im, frame_bgr, tracker, done, userdata, time.perf_counter()),
-        )
+        with self._submit_lock:
+            self._queue.start_async(
+                {self._input_name: input_np},
+                userdata=(im, frame_bgr, tracker, done, userdata, time.perf_counter()),
+            )
 
     def _on_complete(self, request, userdata) -> None:
         im, frame_bgr, tracker, done, ud, t_submit = userdata

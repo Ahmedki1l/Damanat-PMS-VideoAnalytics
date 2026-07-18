@@ -145,9 +145,17 @@ ENV PERF_TRACE_EVERY=50
 ENV SEED_GEOMETRY_ON_START=false
 # --- Phase 2 (BUILD 4) single-process async engine -------------------------
 # One process, one AsyncInferQueue, all cameras. Bypasses the supervisor.
+# 1st prod run (8->10->9->11) showed the pool STARVED (~2/15 in flight) while the
+# consumer + decode were idle: the single scheduler thread doing all preprocess
+# was the ceiling (~20 inf/s). VA_FEED_THREADS spreads preprocess across N feeder
+# threads (OpenCV/numpy release the GIL) so the pool fills. Watch [PERF] async-infer
+# `~in flight` rise from ~2 toward nireq, and inf/s climb from ~20. If req_wall
+# INFLATES and concurrency stays low, feeders+15 threads oversubscribe → next build
+# lowers VA_OV_NUM_THREADS (~10) to give feeders CPU.
 ENV VA_SINGLE_PROCESS=1
 ENV VA_INFER=async
 ENV VA_OV_NUM_THREADS=15
+ENV VA_FEED_THREADS=4
 ENV VA_CMD="python main.py --api"
 # --- Supervisor-only knobs (ignored while VA_CMD bypasses the supervisor) ---
 ENV VA_OV_TOTAL_THREADS=""

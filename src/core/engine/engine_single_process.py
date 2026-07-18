@@ -29,6 +29,7 @@ Phase 2 success is judged on the [PERF] infer-breakdown ``ov`` dropping toward
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -64,6 +65,19 @@ class ParkingEngineSingleProcessMixin:
         out_q: "queue.Queue" = queue.Queue(maxsize=max(4, 2 * nireq))
         stop = threading.Event()
 
+        # Feeder pool: preprocessing (frame copy + CLAHE + letterbox + tensor
+        # build) is heavy and, done on the single scheduler thread, was the ceiling
+        # — the pool sat at ~2/nireq in flight while decode + consumer were idle.
+        # OpenCV/numpy release the GIL, so N feeder threads overlap preprocess on
+        # different cores and keep the queue full. The picker below stays single-
+        # threaded (owns pacing + in-flight bookkeeping) and just hands work off.
+        try:
+            n_feeders = int(os.environ.get("VA_FEED_THREADS", "4") or "4")
+        except ValueError:
+            n_feeders = 4
+        n_feeders = max(1, n_feeders)
+        feed_q: "queue.Queue" = queue.Queue(maxsize=max(2, 2 * n_feeders))
+
         # Per-camera in-flight guard (one submitted frame per camera at a time →
         # strict per-camera tracker ordering + bounded memory). Cleared in the
         # completion callback so the camera can re-submit as soon as its forward
@@ -95,6 +109,25 @@ class ParkingEngineSingleProcessMixin:
                     out_q.put_nowait(item)
                 except queue.Full:
                     pass
+
+        def feeder() -> None:
+            # Pull a picked (camera, frame) and do the heavy preprocess + submit.
+            # Runs on N threads so preprocessing parallelizes across cores. Only
+            # the async-queue enqueue inside submit_async is lock-serialized.
+            while not stop.is_set():
+                try:
+                    cam_id, frame, seq, cap_ts, detector = feed_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                try:
+                    detector.submit_async(
+                        frame, cam_id, on_infer_done,
+                        userdata=(cam_id, frame, seq, cap_ts),
+                    )
+                except Exception as exc:
+                    print(f"[single] submit error cam={cam_id}: {exc!r}")
+                    with inflight_lock:
+                        inflight.pop(cam_id, None)
 
         def _housekeeping() -> None:
             # Registry/DB-touching maintenance — MUST stay on the consumer thread
@@ -141,22 +174,31 @@ class ParkingEngineSingleProcessMixin:
             target=consumer, name="va-postproc", daemon=True
         )
         consumer_thread.start()
+        feeder_threads = [
+            threading.Thread(target=feeder, name=f"va-feeder-{i}", daemon=True)
+            for i in range(n_feeders)
+        ]
+        for t in feeder_threads:
+            t.start()
         print(
             f"[single] scheduler up: {len(camera_ids)} cameras, nireq={nireq}, "
-            f"target_fps={target_fps}, out_q={out_q.maxsize}"
+            f"feeders={n_feeders}, target_fps={target_fps}, out_q={out_q.maxsize}"
         )
 
         last_gauge_report = time.time()
         try:
             while not stop.is_set():
-                # Periodic queue-health line: in-flight vs pool, output backlog,
-                # and cumulative drops. Tells scheduler-bound (in-flight < nireq,
-                # pool starved) from pool-bound (in-flight ≈ nireq, saturated).
+                # Periodic queue-health line. `outstanding` = cameras picked but
+                # not yet completed (feed_q + preprocess + OV pool). `feed_q` is the
+                # backlog waiting on feeders: feed_q pinned at max = feeders can't
+                # keep up (raise VA_FEED_THREADS / give them CPU). The REAL OV pool
+                # concurrency is the `~in flight` on the [PERF] async-infer line.
                 if perf_trace.enabled() and time.time() - last_gauge_report >= 10.0:
                     with inflight_lock:
-                        n_inflight = len(inflight)
+                        n_outstanding = len(inflight)
                     print(
-                        f"[PERF] sched: in_flight={n_inflight}/{nireq} "
+                        f"[PERF] sched: outstanding={n_outstanding} "
+                        f"feed_q={feed_q.qsize()}/{feed_q.maxsize} "
                         f"out_q={out_q.qsize()}/{out_q.maxsize} "
                         f"drops(out_full={drops['out_full']}, stale={drops['stale']})"
                     )
@@ -182,11 +224,10 @@ class ParkingEngineSingleProcessMixin:
                     if detector.has_async_core():
                         with inflight_lock:
                             inflight[cam_id] = seq
-                        # Blocks under back-pressure when the pool is full — the pace.
-                        detector.submit_async(
-                            frame, cam_id, on_infer_done,
-                            userdata=(cam_id, frame, seq, cap_ts),
-                        )
+                        # Hand the heavy preprocess + submit to the feeder pool.
+                        # put() blocks when feeders are saturated → correct
+                        # back-pressure without the picker doing the work itself.
+                        feed_q.put((cam_id, frame, seq, cap_ts, detector))
                     else:
                         # Rare camera_override on a non-OpenVINO model (e.g. a .pt):
                         # no async core exists, so run one synchronous inference on
@@ -209,6 +250,8 @@ class ParkingEngineSingleProcessMixin:
             print("\n[single] interrupted — shutting down.")
         finally:
             stop.set()
+            for t in feeder_threads:
+                t.join(timeout=1)
             try:
                 shared._ov_core.wait_all()
             except Exception:
