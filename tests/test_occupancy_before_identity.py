@@ -105,7 +105,11 @@ class _Harness(ParkingEngineRuntimeMixin):
         self.calls.append("filter")
         return events
 
-    def _persist_final_events(self, events):
+    def _persist_final_events(self, events, trace=None):
+        # Signature must track the production one (engine_runtime passes
+        # trace=... since the [SLOTTRACE] change) — a stale stub here made the
+        # ordering tests fail with a TypeError that full-suite runs masked
+        # behind the known collection-error group. Run this file in isolation.
         self.calls.append("EMIT")
 
     # -- identity side ----------------------------------------------------- #

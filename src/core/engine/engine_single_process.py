@@ -135,10 +135,23 @@ class ParkingEngineSingleProcessMixin:
         def _housekeeping() -> None:
             # Registry/DB-touching maintenance — MUST stay on the consumer thread
             # so it never races the pipeline body. All internally time-gated.
-            self._drain_slot_ocr_results()
-            self._cleanup_stale_data()
-            self._exit_janitor_tick()
-            self._session_sync_tick()
+            #
+            # GUARDED for the same reason the pipeline call below is: an escape
+            # here would kill the consumer daemon thread while the scheduler,
+            # grabbers and OV pool all keep running — every slot state machine,
+            # event and OCR fold-back stops FOREVER with the process still
+            # "healthy". (The serial engine crashes the process instead, which
+            # restarts and heals; a silent dead thread never does.) The OCR
+            # fold-back path in particular (_apply_async_ocr_result → registry
+            # confirm/bind, ReID inference, gallery disk I/O) is not internally
+            # try/excepted.
+            try:
+                self._drain_slot_ocr_results()
+                self._cleanup_stale_data()
+                self._exit_janitor_tick()
+                self._session_sync_tick()
+            except Exception as exc:
+                print(f"[single] housekeeping error: {exc!r}")
 
         def consumer() -> None:
             while not stop.is_set():
@@ -209,6 +222,17 @@ class ParkingEngineSingleProcessMixin:
                         f"drops(out_full={drops['out_full']}, stale={drops['stale']})"
                     )
                     last_gauge_report = time.time()
+                # Liveness: if the consumer thread has died despite its guards,
+                # running headless would mean grabbing/inferring forever while no
+                # slot state updates — a silent outage. Exit the loop instead:
+                # the finally block tears down and the supervisor/k8s restart
+                # heals visibly.
+                if not consumer_thread.is_alive():
+                    print(
+                        "[single] FATAL: consumer thread died — shutting down "
+                        "so the supervisor can restart the worker."
+                    )
+                    break
                 submitted_any = False
                 for cam_id in camera_ids:
                     now = time.time()
