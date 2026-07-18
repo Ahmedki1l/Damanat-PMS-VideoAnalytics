@@ -12,16 +12,97 @@ import numpy as np
 from src.camera_manager import CameraConfig
 from src.core.engine.camera_pipeline import CameraPipeline
 from src.detection.tracking_manager import TrackingManager
+from src.detection.detector import is_untracked
 from src.models.state_machine import SlotState
 from src.services.parking_service import (
     bootstrap_camera_slots_from_json,
     load_camera_slots,
 )
 from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
-from src.vehicle_registry.vehicle_registry_identity import is_reid_disabled_floor
+from src.vehicle_registry.vehicle_registry_identity import (
+    is_identity_disabled,
+    is_reid_disabled_floor,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+class _SlotTrace:
+    """End-to-end stage timings for one frame, emitted when a slot changes state.
+
+    WHY THIS EXISTS. Slot flips were measured only at the state machine
+    (``[SLOTLAT]``), which reported 0.61s and 1.01s on 2026-07-18 while the
+    operator observed minutes. Those two facts are only compatible if the time is
+    spent OUTSIDE the state machine — but every other stage between the camera
+    and the database row the frontend reads was unmeasured, so "where" was
+    unanswerable. This makes the whole chain visible in one line:
+
+        capture -> submit -> infer -> queue -> consumer
+                -> roi -> assign -> state_machine
+                -> violation_filter -> db_commit -> event_bus
+
+    ``capture_ts`` is the wall clock stamped by the grab thread, so
+    ``total_ms`` is true photons-to-committed latency, not just in-process time.
+    The upstream stamps are optional: the serial engine passes none, and those
+    segments are simply omitted rather than reported as zero.
+
+    Cost is a handful of ``perf_counter()`` calls per frame; the log line is
+    emitted ONLY on an actual state change, which is rare.
+    """
+
+    __slots__ = ("cam_id", "capture_ts", "submitted_at", "inferred_at",
+                 "dequeued_at", "stages", "db_commit_ms")
+
+    def __init__(self, cam_id, capture_ts, submitted_at, inferred_at, dequeued_at):
+        self.cam_id = cam_id
+        self.capture_ts = capture_ts
+        self.submitted_at = submitted_at
+        self.inferred_at = inferred_at
+        self.dequeued_at = dequeued_at
+        self.stages: Dict[str, float] = {}
+        self.db_commit_ms: Optional[float] = None
+
+    def mark(self, name: str, since: float) -> float:
+        """Record ms elapsed since ``since`` under ``name``; return a fresh stamp."""
+        now = time.perf_counter()
+        self.stages[name] = (now - since) * 1000.0
+        return now
+
+    def _upstream(self) -> str:
+        """Segments before the consumer thread, from the wall-clock stamps."""
+        out = []
+        c, s, i, d = (self.capture_ts, self.submitted_at,
+                      self.inferred_at, self.dequeued_at)
+        if c and s:
+            out.append(f"grab->submit={ (s - c) * 1000.0:.0f}ms")
+        if s and i:
+            out.append(f"infer={ (i - s) * 1000.0:.0f}ms")
+        if i and d:
+            out.append(f"out_q={ (d - i) * 1000.0:.0f}ms")
+        return " ".join(out)
+
+    def emit(self, events) -> None:
+        """Log one ``[SLOTTRACE]`` line per state-change event in this frame."""
+        if not events or not logger.isEnabledFor(logging.INFO):
+            return
+        stages = " ".join(f"{k}={v:.1f}ms" for k, v in self.stages.items())
+        if self.db_commit_ms is not None:
+            stages += f" db_commit={self.db_commit_ms:.1f}ms"
+        upstream = self._upstream()
+        # Photons -> row committed. This is the number the operator experiences.
+        total = ""
+        if self.capture_ts:
+            total = f" TOTAL_capture->committed={ (time.time() - self.capture_ts) * 1000.0:.0f}ms"
+        for ev in events:
+            etype = getattr(ev, "event_type", "?")
+            if etype not in ("vehicle_parked", "slot_vacant"):
+                continue
+            logger.info(
+                "[SLOTTRACE] slot=%s cam=%s event=%s | %s | %s |%s",
+                getattr(ev, "slot_id", "?"), self.cam_id, etype,
+                upstream or "upstream=n/a", stages, total,
+            )
 
 
 class ParkingEngineRuntimeMixin:
@@ -1041,6 +1122,101 @@ class ParkingEngineRuntimeMixin:
         )
         grid_frames[cam_id] = label_frame
 
+    def _new_slot_trace(
+        self, cam_id, capture_ts, submitted_at, inferred_at, dequeued_at
+    ) -> "_SlotTrace":
+        """Build the per-frame stage trace. See :class:`_SlotTrace`."""
+        return _SlotTrace(
+            cam_id=cam_id,
+            capture_ts=capture_ts,
+            submitted_at=submitted_at,
+            inferred_at=inferred_at,
+            dequeued_at=dequeued_at,
+        )
+
+    def _process_detections_and_events(
+        self, cam_id: str, frame, pipeline, detections,
+        *, capture_ts=None, submitted_at=None, inferred_at=None, dequeued_at=None,
+    ):
+        """Post-detection pipeline body, in two independent halves:
+
+            ROI -> assign -> slot occupancy -> EMIT        (occupancy, bounded)
+            ROI -> zones -> slot identity                  (identity, may be slow)
+
+        Occupancy is computed and published FIRST, so a slow OCR/ReID pass can no
+        longer delay a slot becoming occupied or vacant. Identity then resolves and
+        enriches the record through its own persistence path
+        (``parking_slots.current_plate`` / ``update_current_slot_plate``), which
+        already exists for exactly this "occupied first, identified later" case.
+
+        Ordering note: the identity half must run AFTER ``assign``, which stamps
+        synthetic negative ``track_id``s in place (``slot_assigner.py:77``). Identity
+        guards therefore test :func:`~src.detection.detector.is_untracked` rather than
+        ``== -1``, so they stay correct in this order.
+
+        Extracted from ``run_multi_camera`` so the single-process async engine
+        can reuse the exact same body from its consumer thread. Returns the slot
+        ``assignment`` (the multi-camera visualization path still needs it).
+
+        MUST run on a single thread — it mutates shared registry / slot-state /
+        event-bus state and is not internally synchronized. In the async engine
+        it is called only from the one consumer thread (see ``run_single_process``).
+        """
+        from src import perf_trace
+
+        # End-to-end stage trace. Populated only when the caller supplies the
+        # upstream stamps (the single-process consumer does); the serial path
+        # passes none and every stage below simply records into a throwaway dict.
+        tr = self._new_slot_trace(cam_id, capture_ts, submitted_at, inferred_at,
+                                  dequeued_at)
+
+        _t = time.perf_counter()
+        n_raw = len(detections) if detections else 0
+        with perf_trace.stage("roi"):
+            detections = pipeline.filter_detections_to_roi(detections)
+        _t = tr.mark("roi", _t)
+
+        # ---- OCCUPANCY: is the slot full or empty? -------------------------- #
+        # Runs FIRST and is published before any identity work begins. Occupancy is
+        # the product-critical signal — a slot must flip, and the UI must be able to
+        # see it flip, without waiting on OCR or ReID. Measured on prod 2026-07-18
+        # this whole block costs <= ~37ms while the identity block below peaked at
+        # 517ms; when identity ran first (as it used to) every one of those 517ms
+        # was added directly to how long a slot looked stale.
+        with perf_trace.stage("assign"):
+            assignment = pipeline.assigner.assign(detections)
+        _t = tr.mark("assign", _t)
+        self._log_camera_detections(cam_id, pipeline, n_raw, detections, assignment)
+        with perf_trace.stage("slot"):
+            all_events, slot_ctx = self._update_slot_occupancy(
+                cam_id, frame, pipeline, assignment
+            )
+        _t = tr.mark("state_machine", _t)
+        # Publish occupancy NOW. Previously uninstrumented, which hid a ReID compare
+        # loop and a synchronous DB lookup inside _filter_violation_events (restricted
+        # slots only) on this path — measure it rather than move the stall somewhere
+        # invisible.
+        with perf_trace.stage("emit"):
+            if all_events:
+                final_events = self._filter_violation_events(
+                    frame,
+                    assignment,
+                    cam_id,
+                    all_events,
+                )
+                _t = tr.mark("violation_filter", _t)
+                self._persist_final_events(final_events, trace=tr)
+
+        # ---- IDENTITY: who is in the slot? --------------------------------- #
+        # Everything below may land a beat late. The plate reaches the UI via
+        # parking_slots.current_plate / the SlotStatus row, not via the occupancy
+        # event payload, so a late answer enriches the record rather than delaying it.
+        with perf_trace.stage("zones"):
+            self._process_special_zones(cam_id, frame, detections)
+        with perf_trace.stage("identity"):
+            self._update_slot_identity(cam_id, frame, pipeline, slot_ctx)
+        return assignment
+
     def _process_special_zones(self, cam_id: str, frame, detections) -> None:
         if cam_id == "CAM-23":
             logger.info(
@@ -1081,7 +1257,7 @@ class ParkingEngineRuntimeMixin:
         # appearance. Gated by floor so any ground camera is covered, not just a
         # hardcoded id pair.
         floor = self.pipelines[cam_id].floor if cam_id in self.pipelines else ""
-        if not is_reid_disabled_floor(floor) and detections:
+        if not is_identity_disabled(cam_id, floor) and detections:
             if cam_id not in self._tracking_managers:
                 self._tracking_managers[cam_id] = TrackingManager(cam_id)
             tracking_manager = self._tracking_managers[cam_id]
@@ -1110,7 +1286,10 @@ class ParkingEngineRuntimeMixin:
         boundaries = list(self.boundaries.get(cam_id, {}).values())
         inside_band: set = set()
         if boundaries:
-            tracks = [(d.track_id, d.bbox) for d in detections if d.track_id != -1]
+            tracks = [
+                (d.track_id, d.bbox) for d in detections
+                if not is_untracked(d.track_id)
+            ]
             crossings = self.boundary_crossing_detector.detect(
                 cam_id, tracks, boundaries
             )
@@ -1122,7 +1301,7 @@ class ParkingEngineRuntimeMixin:
 
         for detection in detections:
             tid = detection.track_id
-            if tid == -1 or tid in inside_band:
+            if is_untracked(tid) or tid in inside_band:
                 continue
             self.vehicle_registry.settle_track_area(cam_id, tid)
 
@@ -1303,6 +1482,9 @@ class ParkingEngineRuntimeMixin:
 
     def _apply_async_ocr_result(self, res) -> None:
         job = res.job
+        if getattr(job, "kind", "slot") == "track":
+            self._apply_async_track_ocr_result(res)
+            return
         slot_id, cam_id = job.slot_id, job.cam_id
         # Re-validate the occupancy this read belongs to still stands.
         if not getattr(self, "_ocr_armed", {}).get(slot_id):
@@ -1334,6 +1516,40 @@ class ParkingEngineRuntimeMixin:
             cam_id, slot_id, state_machine, job.crop, job.attempts,
             job.plan.decision_ctx or {},
         )
+
+    def _apply_async_track_ocr_result(self, res) -> None:
+        """Fold a finished APPROACH read back in — MAIN THREAD.
+
+        The track equivalent of ``_apply_async_ocr_result``. Re-validated against the
+        track's CURRENT state before it can bind, so a read that finished after the car
+        was named by another path is discarded rather than re-bound. Everything here is
+        main-thread work by necessity: ``confirm_track_ocr`` uses the ReID matcher, and
+        the transit hop mutates registry sessions.
+        """
+        job = res.job
+        cam_id = job.cam_id
+        key, tid, detection = job.ctx
+        registry = self.vehicle_registry
+        if registry is None:
+            return
+        if registry.get_plate_for_track(cam_id, tid):
+            return  # named by another path while this read was in flight
+
+        plate = registry.confirm_track_ocr(job.plan, job.crop, res.text)
+        if plate:
+            logger.info(
+                "[ocr-id] track (%s, %s) IDENTIFIED as %s while driving — "
+                "the plate is known BEFORE it parks",
+                cam_id, tid, plate,
+            )
+            return
+
+        # OCR could not name it — same fall-through as the sync path. ``detection`` is
+        # the one the crop came from, so it is a frame or two old by now; it is used
+        # only to ask which slot polygon the car is in, which does not change over that
+        # span for a car still manoeuvring.
+        now_ts = time.time()
+        self._try_adopt_transit_identity(cam_id, tid, key, job.crop, now_ts, detection)
 
     def _bind_ocr_identified_plate(
         self, cam_id, slot_id, state_machine, plate, crop, attempt_num
@@ -1528,7 +1744,40 @@ class ParkingEngineRuntimeMixin:
             worker.forget(slot_id)  # discard any queued read for the previous car
 
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
+        """Occupancy then identity, in one call — the historical signature.
+
+        Kept for the serial ``run_multi_camera`` path and for callers that do not
+        care about the split. The single-process engine calls the two halves
+        separately so it can EMIT occupancy before identity runs; see
+        ``_process_detections_and_events``.
+        """
+        all_events, slot_ctx = self._update_slot_occupancy(
+            cam_id, frame, pipeline, assignment
+        )
+        self._update_slot_identity(cam_id, frame, pipeline, slot_ctx)
+        return all_events
+
+    def _update_slot_occupancy(self, cam_id: str, frame, pipeline, assignment):
+        """PHASE 1 — is the slot occupied? Nothing here may wait on identity.
+
+        This is the product-critical path: a slot must flip OCCUPIED/VACANT (and the
+        UI must be able to see it) without waiting on OCR or ReID. Measured on prod
+        2026-07-18 this whole phase costs at most ~10ms, while the identity work that
+        used to run BEFORE it peaked at 517ms — the delay was pure statement order.
+
+        Returns ``(all_events, slot_ctx)`` where ``slot_ctx`` carries the per-slot
+        state phase 2 needs, so identity does not have to recompute the assignment.
+
+        Deliberately KEPT here rather than deferred to phase 2:
+          * ``_arm_ocr_for_slot`` — arming is what makes the later read possible; it
+            is a dict write.
+          * the whole ``slot_vacant`` teardown — it drops the plate, the lock and any
+            queued read. If that lagged behind the vacancy, ``/api/slots`` would
+            serve a plate for an empty slot (it reads ``registry.get_slot_plate`` for
+            live slots). "Vacant" must mean "and nobody is in it" atomically.
+        """
         all_events = []
+        slot_ctx = []
         # Per-slot forced-OCR attempt counter (bounded dead-zone pass, §3b).
         if not hasattr(self, "_forced_ocr_attempts"):
             self._forced_ocr_attempts = {}
@@ -1536,7 +1785,9 @@ class ParkingEngineRuntimeMixin:
         # identity matching — they only run occupancy state machines. Short-
         # circuit here (by floor) so we don't even ask the registry; the
         # registry guards remain as defense-in-depth.
-        plate_matching_enabled = not is_reid_disabled_floor(pipeline.floor)
+        plate_matching_enabled = not is_identity_disabled(
+            cam_id, pipeline.floor
+        )
 
         for slot in pipeline.slots:
             state_machine = pipeline.state_machines[slot.id]
@@ -1556,6 +1807,8 @@ class ParkingEngineRuntimeMixin:
                 vehicle_present=vehicle_in_slot,
                 track_id=track_id,
             )
+            parked_events = []
+            self._log_slot_hold(cam_id, slot, state_machine, assignment, vehicle_in_slot)
 
             for event in events:
                 event.camera_id = cam_id
@@ -1582,49 +1835,9 @@ class ParkingEngineRuntimeMixin:
                     and self.vehicle_registry
                     and plate_matching_enabled
                 ):
-                    # Attempt to get plate first to save crop with correct filename
-                    plate = self.vehicle_registry.get_plate_for_track(cam_id, track_id)
-                    snapshot_path = None
-                    if plate and detection is not None:
-                        snapshot_path = self._save_car_crop(frame, detection, plate, cam_id)
-
-                    linked_plate = self.vehicle_registry.try_link_to_slot(
-                        slot_id=slot.id,
-                        slot_name=slot.label,
-                        zone_id=slot.zone_id,
-                        zone_name=slot.zone_name,
-                        camera_id=cam_id,
-                        floor=pipeline.floor,
-                        track_id=track_id,
-                        timestamp=datetime.now(),
-                        snapshot_path=snapshot_path,
-                        # Real vacant->occupied transition: the only place the
-                        # single-slot/single-pending-plate auto-lock may fire.
-                        allow_auto_lock=True,
-                    )
-                    if linked_plate:
-                        event.plate_number = linked_plate
-                        location = self.vehicle_registry.get_plate_location(linked_plate)
-                        if location:
-                            event.snapshot_url = location.get("snapshot_url", "")
-                        # Bind the initial plate as PROVISIONAL (unlocked) with its
-                        # confidence; the per-frame resolver upgrades it and locks
-                        # once the confidence/OCR bar is met.
-                        conf = self.vehicle_registry.get_slot_binding_confidence(slot.id)
-                        state_machine.bind_identity(
-                            linked_plate,
-                            self._build_slot_snapshot_url(slot.id),
-                            confidence=conf,
-                        )
-                        if self.db_manager:
-                            self._persist_slot_plate_binding(
-                                slot.id, linked_plate, conf, False, cam_id
-                            )
-                    else:
-                        state_machine.bind_identity(
-                            None,
-                            self._build_slot_snapshot_url(slot.id),
-                        )
+                    # PHASE 2 work, deferred — see _identify_parked_slot. Recorded
+                    # rather than run so the occupancy event can be emitted first.
+                    parked_events.append(event)
                 elif event.event_type == "slot_vacant" and self.vehicle_registry:
                     # unlink_slot also drops any plate-lock on the slot.
                     plate = self.vehicle_registry.unlink_slot(slot.id)
@@ -1648,6 +1861,144 @@ class ParkingEngineRuntimeMixin:
                         self._persist_slot_plate_binding(
                             slot.id, None, 0.0, False, cam_id
                         )
+
+            slot_ctx.append(
+                (slot, state_machine, vehicle_in_slot, track_id, detection,
+                 parked_events, plate_matching_enabled)
+            )
+            all_events.extend(events)
+
+        return all_events, slot_ctx
+
+    # How often, per slot, to log what is holding it OCCUPIED. A slot stuck for
+    # minutes then produces a readable trail rather than one line per frame.
+    _SLOTHOLD_INTERVAL_S = 10.0
+
+    # How often, per slot-hosting camera, to log the detection ledger. 30s keeps
+    # ~21 slot cameras to ~40 lines/min while still bounding how long a silent
+    # failure can hide.
+    _CAMDETS_INTERVAL_S = 30.0
+
+    def _log_camera_detections(
+        self, cam_id, pipeline, n_raw, detections, assignment
+    ) -> None:
+        """Per-camera detection LEDGER — where did this frame's detections go?
+
+        Exists because of CAM-04 on 2026-07-18: a car parked in slot B3 for ~2
+        minutes and the 12-minute log contained ZERO lines for B2/B3 — no
+        [SLOTLAT], no [SLOTHOLD], no track activity. The camera was healthy
+        (~2.4 fps, 68/69 windows), so the failure was upstream of slot
+        assignment, but NOTHING distinguished the three candidate causes:
+
+          raw=0                        -> YOLO sees nothing (stream frozen at the
+                                          encoder, or the detector misses the car)
+          raw>0, roi=0                 -> the ROI polygon is eating detections
+                                          (filter_detections_to_roi drops silently)
+          roi>0, assigned=0, near=...  -> detections exist but the probe lands
+                                          outside every slot polygon (geometry /
+                                          scaling / probe mismatch — `near` shows
+                                          the closest slot and the pixel gap)
+
+        One line per slot-hosting camera per _CAMDETS_INTERVAL_S, INFO-gated.
+        Cameras without slots never log (an empty aisle camera has nothing to
+        account for).
+        """
+        if not logger.isEnabledFor(logging.INFO) or not pipeline.slots:
+            return
+        seen = getattr(self, "_camdets_last_at", None)
+        if seen is None:
+            seen = self._camdets_last_at = {}
+        now_ts = time.time()
+        if now_ts - seen.get(cam_id, 0.0) < self._CAMDETS_INTERVAL_S:
+            return
+        seen[cam_id] = now_ts
+
+        n_roi = len(detections) if detections else 0
+        n_assigned = len(assignment.slot_vehicle_map)
+        unassigned = assignment.unassigned or []
+
+        near = ""
+        if unassigned:
+            # Show where the first unassigned car's probe fell and which slot
+            # polygon it was closest to — the number that separates "geometry is
+            # off by 40px" from "the car is nowhere near a slot".
+            d = unassigned[0]
+            px, py = d.bottom_center
+            best_id, best_dist = None, float("inf")
+            for slot in pipeline.slots:
+                dist = ((px - slot.centroid_x) ** 2 + (py - slot.centroid_y) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_id, best_dist = slot.id, dist
+            near = (
+                f" | first_unassigned: track={d.track_id} "
+                f"bbox={tuple(round(float(v), 1) for v in d.bbox)} "
+                f"probe=({px:.0f},{py:.0f}) nearest_slot={best_id} "
+                f"dist={best_dist:.0f}px"
+            )
+        logger.info(
+            "[CAMDETS] cam=%s raw=%d roi=%d assigned=%d unassigned=%d%s",
+            cam_id, n_raw, n_roi, n_assigned, len(unassigned), near,
+        )
+
+    def _log_slot_hold(
+        self, cam_id, slot, state_machine, assignment, vehicle_in_slot
+    ) -> None:
+        """Record WHICH detection is holding a slot occupied — diagnostic only.
+
+        Exists because "slot X is occupied" was previously unfalsifiable. On
+        2026-07-18 slot B3 stayed OCCUPIED for 7min19s after the car had left and
+        was already parked in B5; the log proved only that *something* was seen in
+        B3 on ~99.6% of frames, never what. Distinguishing a real parked car from a
+        neighbour's box bleeding over the polygon edge required guessing.
+
+        Emits ``[SLOTHOLD]`` with the track id, the box, the probe point tested
+        against the polygon, whether it won by point-in-polygon or by the overlap
+        fallback, the fraction of the vehicle inside this slot, and the rival slots
+        the same box also overlaps. A small ``overlap`` or a strong ``rivals``
+        entry means the box is straddling a boundary, not parked in the slot.
+        """
+        if not logger.isEnabledFor(logging.INFO) or not vehicle_in_slot:
+            return
+        if state_machine.state not in (SlotState.OCCUPIED, SlotState.LEAVING):
+            return
+        seen = getattr(self, "_slothold_last_at", None)
+        if seen is None:
+            seen = self._slothold_last_at = {}
+        now_ts = time.time()
+        if now_ts - seen.get(slot.id, 0.0) < self._SLOTHOLD_INTERVAL_S:
+            return
+        seen[slot.id] = now_ts
+
+        ev = (getattr(assignment, "evidence", None) or {}).get(slot.id)
+        if not ev:
+            return
+        rivals = " ".join(f"{sid}:{ov:.2f}" for sid, ov in ev["rivals"]) or "-"
+        logger.info(
+            "[SLOTHOLD] slot=%s cam=%s state=%s held_by track=%s bbox=%s probe=%s "
+            "via=%s overlap=%.2f rivals=%s",
+            slot.id, cam_id, state_machine.state.value, ev["track_id"],
+            ev["bbox"], ev["probe"], ev["method"], ev["overlap"], rivals,
+        )
+
+    def _update_slot_identity(self, cam_id: str, frame, pipeline, slot_ctx) -> None:
+        """PHASE 2 — WHO is in the slot. Runs after occupancy has been emitted.
+
+        Everything here is allowed to land a beat late: the plate reaches the UI
+        through ``parking_slots.current_plate`` / the ``SlotStatus`` row rather than
+        the occupancy event payload (``update_current_slot_plate`` exists precisely
+        for "the slot became occupied first and identity resolved slightly later").
+        Nothing in phase 1 reads what this writes, so deferring it cannot delay or
+        change an occupancy decision.
+        """
+        for (
+            slot, state_machine, vehicle_in_slot, track_id, detection,
+            parked_events, plate_matching_enabled,
+        ) in slot_ctx:
+            for event in parked_events:
+                self._identify_parked_slot(
+                    cam_id, frame, pipeline, slot, state_machine, track_id,
+                    detection, event,
+                )
 
             # OCR IDENTIFICATION — the only mechanism that can fill current_plate
             # correctly. Runs while the car is STILL MANOEUVRING (ENTERING) as well as
@@ -1699,9 +2050,62 @@ class ParkingEngineRuntimeMixin:
                 if self.db_manager:
                     self._persist_late_slot_plate(slot.id, None, cam_id)
 
-            all_events.extend(events)
+    def _identify_parked_slot(
+        self, cam_id, frame, pipeline, slot, state_machine, track_id, detection, event
+    ) -> None:
+        """The identity half of a ``vehicle_parked`` transition.
 
-        return all_events
+        Lifted verbatim out of the occupancy loop so the event can be emitted before
+        this runs. Note ``try_link_to_slot`` is inert in production —
+        ``matching.slot_plate_requires_ocr`` is true (``config.yaml:380``) and the
+        function returns None on its third statement
+        (``vehicle_registry_identity.py:3608``), so today this reliably takes the
+        ``else`` branch. It is kept intact rather than pruned because flipping that
+        flag back is the documented way to restore appearance-based linking.
+        """
+        # Attempt to get plate first to save crop with correct filename
+        plate = self.vehicle_registry.get_plate_for_track(cam_id, track_id)
+        snapshot_path = None
+        if plate and detection is not None:
+            snapshot_path = self._save_car_crop(frame, detection, plate, cam_id)
+
+        linked_plate = self.vehicle_registry.try_link_to_slot(
+            slot_id=slot.id,
+            slot_name=slot.label,
+            zone_id=slot.zone_id,
+            zone_name=slot.zone_name,
+            camera_id=cam_id,
+            floor=pipeline.floor,
+            track_id=track_id,
+            timestamp=datetime.now(),
+            snapshot_path=snapshot_path,
+            # Real vacant->occupied transition: the only place the
+            # single-slot/single-pending-plate auto-lock may fire.
+            allow_auto_lock=True,
+        )
+        if linked_plate:
+            event.plate_number = linked_plate
+            location = self.vehicle_registry.get_plate_location(linked_plate)
+            if location:
+                event.snapshot_url = location.get("snapshot_url", "")
+            # Bind the initial plate as PROVISIONAL (unlocked) with its
+            # confidence; the per-frame resolver upgrades it and locks
+            # once the confidence/OCR bar is met.
+            conf = self.vehicle_registry.get_slot_binding_confidence(slot.id)
+            state_machine.bind_identity(
+                linked_plate,
+                self._build_slot_snapshot_url(slot.id),
+                confidence=conf,
+            )
+            if self.db_manager:
+                self._persist_slot_plate_binding(
+                    slot.id, linked_plate, conf, False, cam_id
+                )
+        else:
+            state_machine.bind_identity(
+                None,
+                self._build_slot_snapshot_url(slot.id),
+            )
 
     def _resolve_locked_plate(
         self, cam_id, frame, pipeline, slot, state_machine, track_id, detection
@@ -2020,14 +2424,17 @@ class ParkingEngineRuntimeMixin:
         finally:
             session.close()
 
-    def _persist_final_events(self, events) -> None:
+    def _persist_final_events(self, events, trace=None) -> None:
         if not events:
             return
 
         if not self.db_manager:
             self.event_bus.emit_batch(events)
+            if trace is not None:
+                trace.emit(events)
             return
 
+        _t_db = time.perf_counter()
         session = self.db_manager.SessionLocal()
         try:
             for event in events:
@@ -2060,7 +2467,14 @@ class ParkingEngineRuntimeMixin:
                         event.alert_id = db_alert_id
 
             # Emit AFTER updating with database IDs
+            if trace is not None:
+                # The commit inside log_vehicle_event is what makes the flip
+                # visible to the frontend, so stop the clock here — before the
+                # event-bus fan-out, which the DB reader never waits on.
+                trace.db_commit_ms = (time.perf_counter() - _t_db) * 1000.0
             self.event_bus.emit_batch(events)
+            if trace is not None:
+                trace.emit(events)
 
         except Exception as exc:
             session.rollback()

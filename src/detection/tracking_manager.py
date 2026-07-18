@@ -11,7 +11,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from src.detection.detector import Detection
+from src.detection.detector import Detection, is_untracked
 from src.reid_matcher import VehicleReIDMatcher, get_reid_matcher
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,10 @@ class TrackingManager:
         # one dense re-extraction phase per surviving track; the alternative
         # is silently blending two different cars into one feature.
         for det in detections:
-            if det.track_id == -1:
+            # Untracked ids must be skipped here above all: a synthetic -100 is both
+            # "not in self.tracks" AND "<= the watermark", so it would masquerade as a
+            # tracker reset and wipe every cached TrackState on the camera.
+            if is_untracked(det.track_id):
                 continue
             if (
                 det.track_id not in self.tracks
@@ -120,7 +123,7 @@ class TrackingManager:
                 break
 
         for i, det in enumerate(detections):
-            if det.track_id == -1:
+            if is_untracked(det.track_id):
                 continue
 
             active_tids.add(det.track_id)

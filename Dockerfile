@@ -117,20 +117,49 @@ ENV PYTHONUNBUFFERED=1
 #            Note: measurement topology only (re-buckets cameras across floors) —
 #            revert after. If ov moves toward ~24ms, process contention is dominant.
 #
-#   PROD     PERF_TRACE=0, all overrides empty.
+#   BUILD 4  *** PHASE 2 — READY FOR PRODUCTION VALIDATION (not yet production-ready). ***
+#            ONE process feeds every camera through ONE OpenVINO AsyncInferQueue
+#            (THROUGHPUT). Bypasses the supervisor entirely (VA_CMD runs main.py
+#            directly, with --api for the ANPR webhook + SSE). VA_SINGLE_PROCESS=1
+#            forces the async detector core. Set VA_OV_NUM_THREADS to the pod's real
+#            core count (the single pool). Parity + concurrency are dev-box proven;
+#            the live 26-camera load and the real ReID/registry path are the unknowns
+#            this build exists to measure.
+#              PERF_TRACE=1  VA_SINGLE_PROCESS=1  VA_INFER=async
+#              VA_OV_NUM_THREADS=15  VA_CMD="python main.py --api"
+#            HARD GATE (design doc): ov must drop toward ~24-40ms and per-camera fps
+#            must rise. Watch [PERF] infer-breakdown + [PERF] per-camera-fps, and
+#            [PERF] consumer busy% — if ov drops but fps stays capped AND consumer
+#            busy% is near 100, the bottleneck moved to the inline ReID/DB/snapshots
+#            (Phase 3/4 targets). If it regresses, revert to PROD (multi-process) —
+#            do NOT proceed to Phase 3-5.
 #
-# Currently set to: BUILD 3 (merge to 2 processes).
+#   PROD     PERF_TRACE=0, all overrides empty (multi-process supervisor).
+#
+# Currently set to: BUILD 4 (Phase 2 single-process async).
+# To revert to prod multi-process: set VA_SINGLE_PROCESS/VA_INFER/VA_CMD empty,
+# PERF_TRACE=0, and restore VA_OV_TOTAL_THREADS/VA_MERGE_GROUPS as needed.
 # ============================================================================
 ENV PERF_TRACE=1
 ENV PERF_TRACE_EVERY=50
 ENV SEED_GEOMETRY_ON_START=false
-# BUILD 1 only: ENV VA_OV_NUM_THREADS=7  and set VA_CMD below.
-ENV VA_OV_NUM_THREADS=""
-ENV VA_CMD=""
-# BUILD 2 & 3: cap total OpenVINO threads to the real core count.
-ENV VA_OV_TOTAL_THREADS=15
-# BUILD 3 only: collapse the 4 groups into N OS processes (N OpenVINO pools).
-ENV VA_MERGE_GROUPS=2
+# --- Phase 2 (BUILD 4) single-process async engine -------------------------
+# One process, one AsyncInferQueue, all cameras. Bypasses the supervisor.
+# 1st prod run (8->10->9->11) showed the pool STARVED (~2/15 in flight) while the
+# consumer + decode were idle: the single scheduler thread doing all preprocess
+# was the ceiling (~20 inf/s). VA_FEED_THREADS spreads preprocess across N feeder
+# threads (OpenCV/numpy release the GIL) so the pool fills. Watch [PERF] async-infer
+# `~in flight` rise from ~2 toward nireq, and inf/s climb from ~20. If req_wall
+# INFLATES and concurrency stays low, feeders+15 threads oversubscribe → next build
+# lowers VA_OV_NUM_THREADS (~10) to give feeders CPU.
+ENV VA_SINGLE_PROCESS=1
+ENV VA_INFER=async
+ENV VA_OV_NUM_THREADS=15
+ENV VA_FEED_THREADS=4
+ENV VA_CMD="python main.py --api"
+# --- Supervisor-only knobs (ignored while VA_CMD bypasses the supervisor) ---
+ENV VA_OV_TOTAL_THREADS=""
+ENV VA_MERGE_GROUPS=""
 
 # Copy app code
 COPY . .

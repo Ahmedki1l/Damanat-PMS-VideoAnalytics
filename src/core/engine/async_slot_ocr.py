@@ -30,10 +30,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SlotOcrJob:
-    """One slot-identify read in flight. ``plan`` is the registry's SlotOcrPlan;
-    ``token`` pins the exact occupancy this crop belongs to, so a result that
-    lands after the car left (or after the slot was re-armed for a new car) is
-    dropped instead of bound. Everything else is what the bind needs."""
+    """One identify read in flight. ``plan`` is the registry's SlotOcrPlan (or
+    TrackOcrPlan when ``kind == "track"``); ``token`` pins the exact occupancy this
+    crop belongs to, so a result that lands after the car left (or after the slot was
+    re-armed for a new car) is dropped instead of bound. Everything else is what the
+    bind needs.
+
+    ``kind`` discriminates the two producers that share this worker:
+
+      * ``"slot"`` — a car already parked in ``slot_id`` (the original path).
+      * ``"track"`` — the APPROACH read: a car still driving up the aisle, keyed by
+        track rather than slot. ``slot_id`` then carries the synthetic coalescing key
+        ``track:<cam>:<tid>`` so one queue serves both without their keys colliding.
+
+    They share one worker deliberately: PaddleOCR is a single engine with an internal
+    lock, so two queues would only let the two paths queue behind each other twice.
+    """
 
     slot_id: str
     cam_id: str
@@ -41,6 +53,17 @@ class SlotOcrJob:
     plan: Any
     attempts: int
     token: Any
+    kind: str = "slot"
+    # Engine-side context the fold-back needs but the read does not — currently the
+    # approach path's (key, first_seen_ts, detection) for the transit hop. Opaque to
+    # this module; the worker only ever carries it.
+    ctx: Any = None
+
+    @staticmethod
+    def track_key(cam_id: str, track_id: int) -> str:
+        """The coalescing key for an approach read. Namespaced so it can never
+        collide with a real slot id."""
+        return f"track:{cam_id}:{track_id}"
 
 
 @dataclass

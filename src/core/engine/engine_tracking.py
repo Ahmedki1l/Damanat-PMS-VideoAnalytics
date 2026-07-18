@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from shapely.geometry import Point, box
 
+from src.detection.detector import is_untracked
 from src.models.slot import ParkingSlot
 from src.models.state_machine import SlotState
 
@@ -506,7 +507,7 @@ class ParkingEngineTrackingMixin:
                 if other is detection:
                     continue
                 other_tid = getattr(other, "track_id", None)
-                if other_tid == -1 or (
+                if is_untracked(other_tid) or (
                     self_tid is not None and other_tid == self_tid
                 ):
                     continue
@@ -749,7 +750,7 @@ class ParkingEngineTrackingMixin:
         """
         candidates = []
         for detection in detections:
-            if detection.track_id == -1:
+            if is_untracked(detection.track_id):
                 continue
 
             overlap_ratio = self._zone_overlap_ratio(detection, zone)
@@ -801,13 +802,13 @@ class ParkingEngineTrackingMixin:
         """
         in_zone_detections = [
             d for d in detections
-            if d.track_id != -1 and self._detection_in_zone(d, zone)
+            if not is_untracked(d.track_id) and self._detection_in_zone(d, zone)
         ]
         currently_inside = {d.track_id for d in in_zone_detections}
 
         if cam_id == "CAM-23":
             for detection in detections:
-                if detection.track_id == -1:
+                if is_untracked(detection.track_id):
                     continue
                 logger.debug(
                     "[PARK_ENTRY] Track %d zone-contains: %s (bottom_center=%s)",
@@ -925,7 +926,7 @@ class ParkingEngineTrackingMixin:
         primary_detection = self._select_primary_zone_detection(frame, detections, zone)
 
         for detection in detections:
-            if detection.track_id == -1:
+            if is_untracked(detection.track_id):
                 continue
 
             if primary_detection is not None and detection.track_id != primary_detection.track_id:
@@ -1178,14 +1179,28 @@ class ParkingEngineTrackingMixin:
             self._ocr_track_attempts, self._ocr_track_last_at = {}, {}
             self._ocr_track_first_seen = {}
 
+        # Local import: src.core.engine.__init__ pulls in the mixins, so importing a
+        # sibling module at file scope would be circular (same reason as the slot path).
+        from src.core.engine.async_slot_ocr import SlotOcrJob
+
+        # When did we FIRST see each car? The transit hop needs it: a car already being
+        # tracked before another car's plate was read cannot be that car. Recorded for
+        # EVERY track in its own pass, before any early return below — the pacing gate
+        # must never cost a track its first_seen stamp, or the hop's ordering guard
+        # silently weakens.
         for detection in detections:
             tid = getattr(detection, "track_id", -1)
-            if tid == -1:
+            if not is_untracked(tid):
+                self._ocr_track_first_seen.setdefault((cam_id, tid), now_ts)
+
+        # Config-driven and constant for this frame.
+        worker = self._ocr_worker_if_async()
+
+        for detection in detections:
+            tid = getattr(detection, "track_id", -1)
+            if is_untracked(tid):
                 continue
             key = (cam_id, tid)
-            # When did we FIRST see this car? The transit hop needs it: a car already
-            # being tracked before another car's plate was read cannot be that car.
-            self._ocr_track_first_seen.setdefault(key, now_ts)
             if registry.get_plate_for_track(cam_id, tid):
                 continue  # already identified — nothing to read
             if self._ocr_track_attempts.get(key, 0) >= self._OCR_TRACK_MAX_ATTEMPTS:
@@ -1193,13 +1208,58 @@ class ParkingEngineTrackingMixin:
             if now_ts - self._ocr_track_last_at.get(key, 0.0) < self._OCR_TRACK_MIN_INTERVAL_S:
                 continue
 
+            # An approach read for this track is already in flight — the fresh crop will
+            # be submitted next time the track is eligible, so skip WITHOUT spending an
+            # attempt (same rule as the slot path).
+            if worker is not None and worker.pending_or_inflight(
+                SlotOcrJob.track_key(cam_id, tid)
+            ):
+                continue
+
+            # PROCESS-WIDE pacing, shared with the slot-identify path. The per-track 1.0s
+            # gate alone paces nothing: with several unidentified cars driving at once
+            # some track is always eligible, so ONE frame paid for N back-to-back
+            # PaddleOCR reads — measured 2026-07-18 at ocr=517ms as a 50-frame AVERAGE,
+            # which was the entire zones stage. The slot path grew this floor after the
+            # 19s-frame incident; this path never got it. Returns rather than continues:
+            # the floor is process-wide, so no later detection this frame can pass it.
+            # Not counted as an attempt and the per-track clock is untouched, so no track
+            # loses budget to the pacing.
+            gap = self._ocr_group_gap_s()
+            if gap > 0 and now_ts - getattr(self, "_ocr_group_last_at", 0.0) < gap:
+                return
+
             crop = self._crop_detection(frame, detection)
             if crop is None or crop.size == 0:
                 continue
 
             self._ocr_track_attempts[key] = self._ocr_track_attempts.get(key, 0) + 1
             self._ocr_track_last_at[key] = now_ts
+            self._ocr_group_last_at = now_ts
 
+            # ASYNC: hand the heavy PaddleOCR read to the shared worker and fold the
+            # result back in via _drain_slot_ocr_results a frame or two later. The
+            # narrowing (ReID), the confirm and the transit hop all stay on this thread —
+            # see _apply_async_track_ocr_result.
+            if worker is not None:
+                plan = registry.plan_track_ocr(cam_id, tid, crop)
+                if plan is None:
+                    continue  # no OCR plugin
+                worker.submit(
+                    SlotOcrJob(
+                        slot_id=SlotOcrJob.track_key(cam_id, tid),
+                        cam_id=cam_id,
+                        crop=crop,
+                        plan=plan,
+                        attempts=self._ocr_track_attempts[key],
+                        token=None,
+                        kind="track",
+                        ctx=(key, tid, detection),
+                    )
+                )
+                continue
+
+            # SYNC (matching.slot_ocr_async = false): read inline, exactly as before.
             plate = registry.try_ocr_identify_track(cam_id, tid, crop)
             if plate:
                 logger.info(
@@ -1308,7 +1368,7 @@ class ParkingEngineTrackingMixin:
         self._try_ocr_identify_tracks(cam_id, frame, detections, now_ts)
 
         for detection in detections:
-            if detection.track_id == -1:
+            if is_untracked(detection.track_id):
                 continue
 
             # Record how fully this camera sees the car — feeds the ReID

@@ -19,6 +19,7 @@ from src.camera_manager import CameraManager
 from src.config import AppConfig, norm_camera_id
 from src.core.engine.camera_pipeline import CameraPipeline
 from src.core.engine.engine_runtime import ParkingEngineRuntimeMixin
+from src.core.engine.engine_single_process import ParkingEngineSingleProcessMixin
 from src.core.engine.engine_tracking import ParkingEngineTrackingMixin
 from src.core.engine.engine_visualization import ParkingEngineVisualizationMixin
 from src.detection.tracker import TrackedDetector
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 class ParkingEngine(
     ParkingEngineRuntimeMixin,
+    ParkingEngineSingleProcessMixin,
     ParkingEngineTrackingMixin,
     ParkingEngineVisualizationMixin,
 ):
@@ -188,11 +190,18 @@ class ParkingEngine(
             "db_ok": self.db_manager is not None,
         }
 
-    def run_multi_camera(self) -> None:
-        """Multi-camera round-robin processing loop."""
+    def _bootstrap_camera_runtime(self):
+        """Shared setup for both processing loops: open cameras, build pipelines,
+        prime the registry, start the OCR worker, mark the engine running.
+
+        Returns the list of ``CameraConfig`` on success, or ``None`` if there are
+        no cameras or none could be opened (the caller then returns early). Used
+        by ``run_multi_camera`` and ``run_single_process`` so the two loops share
+        identical startup behaviour.
+        """
         if not self.config.cameras:
             print("[ERROR] No cameras defined in config.")
-            return
+            return None
 
         camera_configs = self._build_camera_configs()
         self.cam_manager = CameraManager(
@@ -202,7 +211,7 @@ class ParkingEngine(
         opened = self.cam_manager.open_all()
         if opened == 0:
             print("[ERROR] No cameras could be opened. Exiting.")
-            return
+            return None
 
         total_slots = self._initialize_camera_pipelines(camera_configs)
         print(f"[INFO] Total parking slots across all cameras: {total_slots}")
@@ -236,14 +245,21 @@ class ParkingEngine(
         # frame or two later. Only started when the registry can read plates.
         self._start_slot_ocr_worker()
 
-        show = self.config.output.show_video
-        show_camera = self.config.output.show_camera
-
         self.is_running = True
         self.start_time = time.time()
         self._start_time = self.start_time
         self._last_summary_frame = 0
         self._last_summary_ts = self.start_time
+        return camera_configs
+
+    def run_multi_camera(self) -> None:
+        """Multi-camera round-robin processing loop."""
+        camera_configs = self._bootstrap_camera_runtime()
+        if camera_configs is None:
+            return
+
+        show = self.config.output.show_video
+        show_camera = self.config.output.show_camera
 
         summary_interval = max(1, len(camera_configs) * 10)
 
@@ -316,26 +332,13 @@ class ParkingEngine(
                 # applied AFTER detection as a bottom-center membership filter,
                 # preserving the "exclude out-of-area cars" behaviour at no cost.
                 detections = self._detector_for(cam_id).detect_and_track(frame, cam_id)
-                with perf_trace.stage("roi"):
-                    detections = pipeline.filter_detections_to_roi(detections)
-                with perf_trace.stage("zones"):
-                    self._process_special_zones(cam_id, frame, detections)
-
-                with perf_trace.stage("assign"):
-                    assignment = pipeline.assigner.assign(detections)
-                with perf_trace.stage("slot"):
-                    all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
-                if all_events:
-                    final_events = self._filter_violation_events(
-                        frame,
-                        assignment,
-                        cam_id,
-                        all_events,
-                    )
-                    self._persist_final_events(final_events)
+                assignment = self._process_detections_and_events(
+                    cam_id, frame, pipeline, detections
+                )
 
                 self._frame_count += 1
                 perf_trace.frame_done()
+                perf_trace.record_camera_frame(cam_id)
                 if self._frame_count % summary_interval == 0:
                     self._emit_full_summary()
 

@@ -435,6 +435,18 @@ Examples:
         db_manager=db,
     )
 
+    # Single-process async engine (Phase 2 migration): one process feeds ALL
+    # cameras through one OpenVINO AsyncInferQueue instead of the per-group
+    # serial loops. It needs the async detector core, which TrackedDetector
+    # selects at construction from VA_INFER — so force it on here, before the
+    # engine (and its detector) is built.
+    _single_process = os.environ.get("VA_SINGLE_PROCESS", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    if _single_process and os.environ.get("VA_INFER", "").strip().lower() != "async":
+        os.environ["VA_INFER"] = "async"
+        print("[INFO] VA_SINGLE_PROCESS=1 → forcing VA_INFER=async")
+
     engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)
 
     # --- Start API server if requested ---
@@ -484,8 +496,12 @@ Examples:
         )
 
     else:
-        # Multi-camera mode (default)
-        engine.run_multi_camera()
+        # Multi-camera mode (default). VA_SINGLE_PROCESS=1 switches to the
+        # single-process async loop (one AsyncInferQueue for every camera).
+        if _single_process:
+            engine.run_single_process()
+        else:
+            engine.run_multi_camera()
 
 
 if __name__ == "__main__":

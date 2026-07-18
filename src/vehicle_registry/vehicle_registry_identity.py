@@ -56,6 +56,22 @@ class SlotOcrPlan:
 
 
 @dataclass(frozen=True)
+class TrackOcrPlan:
+    """The same three-phase hand-off as :class:`SlotOcrPlan`, for the APPROACH read.
+
+    The approach read (a still-driving car, ``try_ocr_identify_track``) differs from
+    the slot read in one way that matters here: it ranks AFTER the read, not before
+    (``reid_shortlist`` is only consulted once there is text to confirm). So the
+    plan phase has no ReID work to do and carries only what the read itself needs —
+    everything expensive stays in phase 2 (worker) and phase 3 (main thread).
+    """
+
+    camera_id: str
+    track_id: int
+    allow_retry: bool
+
+
+@dataclass(frozen=True)
 class RejectedCandidate:
     """A candidate a deterministic rule threw out, and why.
 
@@ -96,8 +112,56 @@ match_logger = logging.getLogger("reid_match_perf")
 # test spelling ("Ground Floor") both resolve. Replaces the former hardcoded
 # ``IDENTITY_MATCHING_DISABLED_CAMERAS = {"CAM-01", "CAM-02"}`` camera-id set so
 # any ground-floor camera is covered automatically, regardless of id.
+# Floors where identity work is ALWAYS off. Ground runs YOLO occupancy only —
+# identity there comes from ANPR plates, not appearance.
+_REID_DISABLED_FLOORS = {"ground", "ground floor"}
+
+# Extra floors / cameras to disable at runtime, from VA_IDENTITY_DISABLED
+# (comma-separated, case-insensitive). Exists so identity can be switched off
+# for a subset WITHOUT a code change, to answer "does the identity work affect
+# occupancy latency?" as a controlled experiment. Cached — read per frame.
+_identity_disabled_cache: Optional[frozenset] = None
+
+
+def identity_disabled_tokens() -> frozenset:
+    """Floors/cameras disabled via ``VA_IDENTITY_DISABLED``, lowercased."""
+    global _identity_disabled_cache
+    if _identity_disabled_cache is None:
+        raw = os.environ.get("VA_IDENTITY_DISABLED", "") or ""
+        _identity_disabled_cache = frozenset(
+            t.strip().lower() for t in raw.split(",") if t.strip()
+        )
+        if _identity_disabled_cache:
+            logger.info(
+                "[identity] DISABLED for: %s (VA_IDENTITY_DISABLED) — these run "
+                "YOLO occupancy only: no ReID embedding, no approach-OCR, no "
+                "slot-OCR, no plate binding",
+                ", ".join(sorted(_identity_disabled_cache)),
+            )
+    return _identity_disabled_cache
+
+
 def is_reid_disabled_floor(floor: str) -> bool:
-    return (floor or "").strip().lower() in {"ground", "ground floor"}
+    """True when identity work is off for this floor.
+
+    Gates BOTH halves: the per-frame ReID embedding + approach-OCR in
+    ``_process_special_zones``, and ``plate_matching_enabled`` (slot-OCR,
+    plate binding, _resolve_locked_plate) in ``_update_slot_occupancy``.
+    """
+    f = (floor or "").strip().lower()
+    return f in _REID_DISABLED_FLOORS or f in identity_disabled_tokens()
+
+
+def is_identity_disabled(camera_id: str, floor: str) -> bool:
+    """As :func:`is_reid_disabled_floor`, but also honours a CAMERA id.
+
+    Camera granularity matters because ReID and the approach-OCR are computed
+    per camera FRAME, not per slot — there is no way to disable them "for one
+    slot". Disabling CAM-04 therefore covers every slot that camera watches.
+    """
+    if is_reid_disabled_floor(floor):
+        return True
+    return (camera_id or "").strip().lower() in identity_disabled_tokens()
 
 # Single-camera ownership: a session observed by several cameras at once is
 # owned by exactly one — the live observer with the highest ReID score. A track
@@ -4745,15 +4809,53 @@ class VehicleRegistryIdentityMixin:
 
         Same contract as everywhere else: bind only what was READ, and only when exactly
         one car inside can explain the read. Otherwise leave it anonymous.
+
+        SYNCHRONOUS PATH. Composed from the same three phases the async path uses
+        (``plan_track_ocr`` -> ``read_slot_plate`` -> ``confirm_track_ocr``) so there is
+        exactly one implementation of the logic and the two paths cannot drift.
+        """
+        plan = self.plan_track_ocr(camera_id, track_id, crop_bgr)
+        if plan is None:
+            return None
+        ocr_text, _conf = self.read_slot_plate(crop_bgr, plan.allow_retry)
+        return self.confirm_track_ocr(plan, crop_bgr, ocr_text)
+
+    def plan_track_ocr(
+        self, camera_id: str, track_id: int, crop_bgr, *, allow_retry: bool = True
+    ) -> Optional["TrackOcrPlan"]:
+        """Phase 1 (MAIN THREAD): decide whether an approach read is possible at all.
+
+        Returns ``None`` when there is no OCR plugin or no crop — i.e. when phase 2
+        would be pure waste. Unlike ``plan_slot_ocr`` this does NO ReID work: the
+        approach path ranks after the read (see :class:`TrackOcrPlan`), so phase 1 is
+        deliberately trivial and nothing expensive is left on the caller's thread.
+
+        ``allow_retry`` defaults to True to preserve the historical behaviour of this
+        path exactly (``ocr.read`` itself defaults to True and the old inline call passed
+        no override). Worth revisiting separately: the enlarged pass costs ~670ms and the
+        approach path sees the same car over many frames, so a second look may well be
+        cheaper than an upscaled re-read of this one — but that is a behaviour change to
+        measure on its own, not to smuggle into a threading change.
         """
         ocr = getattr(self._match_decision, "plate_ocr", None)
         if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
             return None
-        try:
-            # Slot camera: read the full car crop, not the gate's bottom-centre ROI.
-            ocr_text, _conf = ocr.read(crop_bgr, apply_plate_roi=False)  # heavy — never under the lock
-        except Exception:
-            return None
+        return TrackOcrPlan(
+            camera_id=camera_id, track_id=track_id, allow_retry=allow_retry
+        )
+
+    def confirm_track_ocr(
+        self, plan: "TrackOcrPlan", crop_bgr, ocr_text: str
+    ) -> Optional[str]:
+        """Phase 3 (MAIN THREAD): fold the approach read back in — narrow, confirm, bind.
+
+        Main-thread-only for two reasons: ``reid_shortlist`` uses the ReID matcher
+        (shared OpenVINO infer request), and the bind mutates ``_track_session_map`` and
+        live ``VehicleSession`` fields, which the registry does not synchronize per
+        transaction. Returns the plate only when exactly one car inside explains the
+        read; otherwise ``None`` and the track stays anonymous.
+        """
+        camera_id, track_id = plan.camera_id, plan.track_id
         if not ocr_text:
             return None
 
