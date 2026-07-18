@@ -5,6 +5,12 @@ from sqlalchemy.engine.url import make_url
 
 Base = declarative_base()
 
+# Covering index for SlotStatusRepository.get_latest_by_slot. Named so the
+# back-fill in _ensure_schema_updates can detect it on an existing database —
+# this repo has no migrations, so create_all alone will not add it to a table
+# that already exists.
+_SLOT_STATUS_LOOKUP_INDEX = "ix_slot_status_slot_id_time"
+
 # Module-level reference — set from main.py after initialization
 _db_manager = None
 
@@ -157,3 +163,39 @@ class DatabaseManager:
                     conn.execute(text(
                         f"ALTER TABLE parking_slots {add_kw} plate_locked_at DATETIME"
                     ))
+
+        # ---- slot_status lookup index (occupancy publish latency) ----------- #
+        # SlotStatusRepository.get_latest_by_slot runs
+        #     WHERE slot_id = ? ORDER BY time DESC
+        # and BOTH columns were unindexed, on a table that is append-only and has
+        # no retention — so it degrades into a full scan + sort as the table grows.
+        #
+        # Why it matters here specifically: that query runs inside
+        # log_vehicle_event on every VACATE (the occupied->empty check) and on
+        # every plate resolution, on the engine's consumer thread — and the
+        # db.commit() that publishes `parking_slots.is_available` to the frontend
+        # happens AFTER it. So the scan sits directly between a slot going vacant
+        # and the UI being able to see it, and gets slower every day the system
+        # runs. Adding the index is the fix; pruning old rows is the follow-up.
+        if "slot_status" in table_names:
+            try:
+                existing = {ix["name"] for ix in inspector.get_indexes("slot_status")}
+            except Exception:
+                existing = set()
+            if _SLOT_STATUS_LOOKUP_INDEX not in existing:
+                try:
+                    with self.engine.begin() as conn:
+                        conn.execute(text(
+                            f"CREATE INDEX {_SLOT_STATUS_LOOKUP_INDEX} "
+                            "ON slot_status (slot_id, time DESC)"
+                        ))
+                    print(
+                        f"[DB] created {_SLOT_STATUS_LOOKUP_INDEX} on "
+                        "slot_status(slot_id, time DESC)"
+                    )
+                except Exception as exc:
+                    # Never block startup on an index: the system is correct
+                    # without it, just slower.
+                    print(
+                        f"[WARN] could not create {_SLOT_STATUS_LOOKUP_INDEX}: {exc}"
+                    )
