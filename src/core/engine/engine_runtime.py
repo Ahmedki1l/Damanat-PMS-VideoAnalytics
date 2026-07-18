@@ -1698,6 +1698,7 @@ class ParkingEngineRuntimeMixin:
                 track_id=track_id,
             )
             parked_events = []
+            self._log_slot_hold(cam_id, slot, state_machine, assignment, vehicle_in_slot)
 
             for event in events:
                 event.camera_id = cam_id
@@ -1758,6 +1759,50 @@ class ParkingEngineRuntimeMixin:
             all_events.extend(events)
 
         return all_events, slot_ctx
+
+    # How often, per slot, to log what is holding it OCCUPIED. A slot stuck for
+    # minutes then produces a readable trail rather than one line per frame.
+    _SLOTHOLD_INTERVAL_S = 10.0
+
+    def _log_slot_hold(
+        self, cam_id, slot, state_machine, assignment, vehicle_in_slot
+    ) -> None:
+        """Record WHICH detection is holding a slot occupied — diagnostic only.
+
+        Exists because "slot X is occupied" was previously unfalsifiable. On
+        2026-07-18 slot B3 stayed OCCUPIED for 7min19s after the car had left and
+        was already parked in B5; the log proved only that *something* was seen in
+        B3 on ~99.6% of frames, never what. Distinguishing a real parked car from a
+        neighbour's box bleeding over the polygon edge required guessing.
+
+        Emits ``[SLOTHOLD]`` with the track id, the box, the probe point tested
+        against the polygon, whether it won by point-in-polygon or by the overlap
+        fallback, the fraction of the vehicle inside this slot, and the rival slots
+        the same box also overlaps. A small ``overlap`` or a strong ``rivals``
+        entry means the box is straddling a boundary, not parked in the slot.
+        """
+        if not logger.isEnabledFor(logging.INFO) or not vehicle_in_slot:
+            return
+        if state_machine.state not in (SlotState.OCCUPIED, SlotState.LEAVING):
+            return
+        seen = getattr(self, "_slothold_last_at", None)
+        if seen is None:
+            seen = self._slothold_last_at = {}
+        now_ts = time.time()
+        if now_ts - seen.get(slot.id, 0.0) < self._SLOTHOLD_INTERVAL_S:
+            return
+        seen[slot.id] = now_ts
+
+        ev = (getattr(assignment, "evidence", None) or {}).get(slot.id)
+        if not ev:
+            return
+        rivals = " ".join(f"{sid}:{ov:.2f}" for sid, ov in ev["rivals"]) or "-"
+        logger.info(
+            "[SLOTHOLD] slot=%s cam=%s state=%s held_by track=%s bbox=%s probe=%s "
+            "via=%s overlap=%.2f rivals=%s",
+            slot.id, cam_id, state_machine.state.value, ev["track_id"],
+            ev["bbox"], ev["probe"], ev["method"], ev["overlap"], rivals,
+        )
 
     def _update_slot_identity(self, cam_id: str, frame, pipeline, slot_ctx) -> None:
         """PHASE 2 — WHO is in the slot. Runs after occupancy has been emitted.

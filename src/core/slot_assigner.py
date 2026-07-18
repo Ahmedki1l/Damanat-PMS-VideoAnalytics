@@ -34,11 +34,30 @@ class SlotAssignment:
     Attributes:
         slot_vehicle_map: Maps slot_id -> (track_id, detection).
         unassigned: Detections that don't fall in any slot.
+        evidence: Maps slot_id -> why that detection won the slot. Diagnostic
+            only; nothing in the pipeline branches on it.
+
+    ``evidence`` exists because "slot X is occupied" was previously unfalsifiable
+    from the logs: the assigner knew the track id, the box, the probe point and
+    the overlap fraction, and discarded all of it. When a slot stuck OCCUPIED
+    there was no way to tell a real parked car from a neighbour's box bleeding
+    over a polygon edge without guessing. Each entry carries:
+
+        track_id  : the (possibly synthetic) id that held the slot
+        bbox      : the detection box, (x1, y1, x2, y2)
+        probe     : the ground-contact point tested against the polygon
+        method    : "point"   -> probe was inside the polygon (primary rule)
+                    "overlap" -> probe was OUTSIDE; won on bbox-overlap fallback
+        overlap   : fraction of the vehicle's box inside this slot's polygon
+        rivals    : [(slot_id, overlap), ...] for other slots this box also
+                    overlaps — a high rival overlap means the box straddles a
+                    boundary and the winner was decided by centroid distance
     """
 
     def __init__(self):
         self.slot_vehicle_map: Dict[str, Tuple[int, Detection]] = {}
         self.unassigned: List[Detection] = []
+        self.evidence: Dict[str, dict] = {}
 
 
 class SlotAssigner:
@@ -67,6 +86,10 @@ class SlotAssigner:
 
         # Collect all candidate (slot, detection, distance) triples
         candidates: List[Tuple[str, Detection, float]] = []
+        # Diagnostic side-tables, keyed by detection identity. Never read by the
+        # assignment logic — only folded into result.evidence at the end.
+        how: Dict[int, Tuple[str, float]] = {}
+        rivals: Dict[int, List[Tuple[str, float]]] = {}
 
         # Track a simple counter for detections without stable IDs
         temp_id_counter = -100
@@ -87,6 +110,7 @@ class SlotAssigner:
                 if slot.polygon.contains(bc_point):
                     dist = self._distance_to_centroid(bc_x, bc_y, slot)
                     candidates.append((slot.id, det, dist))
+                    how[id(det)] = ("point", self._overlap_for(det, slot))
                     assigned = True
                     break  # One vehicle can only be in one slot
 
@@ -105,11 +129,8 @@ class SlotAssigner:
 
             for slot in self.slots:
                 overlap = self._compute_overlap(det_box, slot.polygon)
-                # Debug: show why assignment fails
-                contains = slot.polygon.contains(bc_point)
-                # print(f"[DEBUG-ASSIGN] Track:{det.track_id} → Slot:{slot.id} | "
-                #       f"center=({bc_x:.0f},{bc_y:.0f}) in_poly={contains} | "
-                #       f"overlap={overlap:.2%} (thresh={self.overlap_threshold:.0%})")
+                if overlap > 0.0:
+                    rivals.setdefault(id(det), []).append((slot.id, overlap))
 
                 if overlap > self.overlap_threshold and overlap > best_overlap:
                     best_overlap = overlap
@@ -118,6 +139,7 @@ class SlotAssigner:
 
             if best_slot_id is not None:
                 candidates.append((best_slot_id, det, best_dist))
+                how[id(det)] = ("overlap", best_overlap)
             else:
                 result.unassigned.append(det)
 
@@ -135,11 +157,42 @@ class SlotAssigner:
             winner_det, _ = entries[0]
             result.slot_vehicle_map[slot_id] = (winner_det.track_id, winner_det)
 
+            method, own_overlap = how.get(id(winner_det), ("unknown", 0.0))
+            result.evidence[slot_id] = {
+                "track_id": winner_det.track_id,
+                "bbox": tuple(round(float(v), 1) for v in winner_det.bbox),
+                "probe": tuple(round(float(v), 1) for v in winner_det.bottom_center),
+                "method": method,
+                "overlap": round(float(own_overlap), 3),
+                "rivals": sorted(
+                    (
+                        (sid, round(ov, 3))
+                        for sid, ov in rivals.get(id(winner_det), [])
+                        if sid != slot_id
+                    ),
+                    key=lambda t: -t[1],
+                )[:3],
+            }
+
             # Others are unassigned
             for det, _ in entries[1:]:
                 result.unassigned.append(det)
 
         return result
+
+    def _overlap_for(self, det: Detection, slot: ParkingSlot) -> float:
+        """Fraction of ``det``'s box inside ``slot``. Diagnostic only.
+
+        Computed for the point-in-polygon winner so the log can distinguish a car
+        genuinely sitting in the slot (large fraction) from one whose probe merely
+        clipped the polygon edge (small fraction) — the two look identical in the
+        assignment result but mean very different things when a slot sticks.
+        """
+        try:
+            det_box = shapely_box(det.bbox[0], det.bbox[1], det.bbox[2], det.bbox[3])
+            return self._compute_overlap(det_box, slot.polygon)
+        except Exception:
+            return 0.0
 
     @staticmethod
     def _distance_to_centroid(x: float, y: float, slot: ParkingSlot) -> float:
