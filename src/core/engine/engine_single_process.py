@@ -92,10 +92,13 @@ class ParkingEngineSingleProcessMixin:
         def on_infer_done(detections, ud) -> None:
             # Runs on an OV worker thread. Keep it minimal: free the camera, then
             # hand off. Never block here (would stall the OV pool).
-            cam_id, frame, seq, cap_ts = ud
+            # sub_ts/done_ts feed the [SLOTTRACE] end-to-end breakdown so the
+            # inference and queue segments are attributable, not lumped together.
+            cam_id, frame, seq, cap_ts, sub_ts = ud
+            done_ts = time.time()
             with inflight_lock:
                 inflight.pop(cam_id, None)
-            item = (cam_id, frame, detections, seq, cap_ts)
+            item = (cam_id, frame, detections, seq, cap_ts, sub_ts, done_ts)
             try:
                 out_q.put_nowait(item)
             except queue.Full:
@@ -122,7 +125,7 @@ class ParkingEngineSingleProcessMixin:
                 try:
                     detector.submit_async(
                         frame, cam_id, on_infer_done,
-                        userdata=(cam_id, frame, seq, cap_ts),
+                        userdata=(cam_id, frame, seq, cap_ts, time.time()),
                     )
                 except Exception as exc:
                     print(f"[single] submit error cam={cam_id}: {exc!r}")
@@ -140,7 +143,8 @@ class ParkingEngineSingleProcessMixin:
         def consumer() -> None:
             while not stop.is_set():
                 try:
-                    cam_id, frame, detections, seq, cap_ts = out_q.get(timeout=0.5)
+                    (cam_id, frame, detections, seq,
+                     cap_ts, sub_ts, done_ts) = out_q.get(timeout=0.5)
                 except queue.Empty:
                     _housekeeping()  # keep janitor/session-sync alive when quiet
                     continue
@@ -159,7 +163,9 @@ class ParkingEngineSingleProcessMixin:
                 self.last_processed_at = datetime.now()
                 try:
                     self._process_detections_and_events(
-                        cam_id, frame, pipeline, detections
+                        cam_id, frame, pipeline, detections,
+                        capture_ts=cap_ts, submitted_at=sub_ts,
+                        inferred_at=done_ts, dequeued_at=time.time(),
                     )
                 except Exception as exc:  # one bad frame must not kill the loop
                     print(f"[single] pipeline error cam={cam_id}: {exc!r}")
@@ -238,7 +244,7 @@ class ParkingEngineSingleProcessMixin:
                         except Exception as exc:
                             print(f"[single] sync detect error cam={cam_id}: {exc!r}")
                             dets = []
-                        on_infer_done(dets, (cam_id, frame, seq, cap_ts))
+                        on_infer_done(dets, (cam_id, frame, seq, cap_ts, time.time()))
                     submitted_any = True
                     perf_trace.set_gauge("infer_inflight", float(len(inflight)))
                     perf_trace.set_gauge("out_q", float(out_q.qsize()))

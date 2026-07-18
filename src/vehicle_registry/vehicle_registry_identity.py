@@ -112,8 +112,56 @@ match_logger = logging.getLogger("reid_match_perf")
 # test spelling ("Ground Floor") both resolve. Replaces the former hardcoded
 # ``IDENTITY_MATCHING_DISABLED_CAMERAS = {"CAM-01", "CAM-02"}`` camera-id set so
 # any ground-floor camera is covered automatically, regardless of id.
+# Floors where identity work is ALWAYS off. Ground runs YOLO occupancy only —
+# identity there comes from ANPR plates, not appearance.
+_REID_DISABLED_FLOORS = {"ground", "ground floor"}
+
+# Extra floors / cameras to disable at runtime, from VA_IDENTITY_DISABLED
+# (comma-separated, case-insensitive). Exists so identity can be switched off
+# for a subset WITHOUT a code change, to answer "does the identity work affect
+# occupancy latency?" as a controlled experiment. Cached — read per frame.
+_identity_disabled_cache: Optional[frozenset] = None
+
+
+def identity_disabled_tokens() -> frozenset:
+    """Floors/cameras disabled via ``VA_IDENTITY_DISABLED``, lowercased."""
+    global _identity_disabled_cache
+    if _identity_disabled_cache is None:
+        raw = os.environ.get("VA_IDENTITY_DISABLED", "") or ""
+        _identity_disabled_cache = frozenset(
+            t.strip().lower() for t in raw.split(",") if t.strip()
+        )
+        if _identity_disabled_cache:
+            logger.info(
+                "[identity] DISABLED for: %s (VA_IDENTITY_DISABLED) — these run "
+                "YOLO occupancy only: no ReID embedding, no approach-OCR, no "
+                "slot-OCR, no plate binding",
+                ", ".join(sorted(_identity_disabled_cache)),
+            )
+    return _identity_disabled_cache
+
+
 def is_reid_disabled_floor(floor: str) -> bool:
-    return (floor or "").strip().lower() in {"ground", "ground floor"}
+    """True when identity work is off for this floor.
+
+    Gates BOTH halves: the per-frame ReID embedding + approach-OCR in
+    ``_process_special_zones``, and ``plate_matching_enabled`` (slot-OCR,
+    plate binding, _resolve_locked_plate) in ``_update_slot_occupancy``.
+    """
+    f = (floor or "").strip().lower()
+    return f in _REID_DISABLED_FLOORS or f in identity_disabled_tokens()
+
+
+def is_identity_disabled(camera_id: str, floor: str) -> bool:
+    """As :func:`is_reid_disabled_floor`, but also honours a CAMERA id.
+
+    Camera granularity matters because ReID and the approach-OCR are computed
+    per camera FRAME, not per slot — there is no way to disable them "for one
+    slot". Disabling CAM-04 therefore covers every slot that camera watches.
+    """
+    if is_reid_disabled_floor(floor):
+        return True
+    return (camera_id or "").strip().lower() in identity_disabled_tokens()
 
 # Single-camera ownership: a session observed by several cameras at once is
 # owned by exactly one — the live observer with the highest ReID score. A track

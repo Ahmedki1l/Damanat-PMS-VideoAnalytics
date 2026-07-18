@@ -19,10 +19,90 @@ from src.services.parking_service import (
     load_camera_slots,
 )
 from src.services.slot_status_service import log_vehicle_event, update_current_slot_plate
-from src.vehicle_registry.vehicle_registry_identity import is_reid_disabled_floor
+from src.vehicle_registry.vehicle_registry_identity import (
+    is_identity_disabled,
+    is_reid_disabled_floor,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+class _SlotTrace:
+    """End-to-end stage timings for one frame, emitted when a slot changes state.
+
+    WHY THIS EXISTS. Slot flips were measured only at the state machine
+    (``[SLOTLAT]``), which reported 0.61s and 1.01s on 2026-07-18 while the
+    operator observed minutes. Those two facts are only compatible if the time is
+    spent OUTSIDE the state machine — but every other stage between the camera
+    and the database row the frontend reads was unmeasured, so "where" was
+    unanswerable. This makes the whole chain visible in one line:
+
+        capture -> submit -> infer -> queue -> consumer
+                -> roi -> assign -> state_machine
+                -> violation_filter -> db_commit -> event_bus
+
+    ``capture_ts`` is the wall clock stamped by the grab thread, so
+    ``total_ms`` is true photons-to-committed latency, not just in-process time.
+    The upstream stamps are optional: the serial engine passes none, and those
+    segments are simply omitted rather than reported as zero.
+
+    Cost is a handful of ``perf_counter()`` calls per frame; the log line is
+    emitted ONLY on an actual state change, which is rare.
+    """
+
+    __slots__ = ("cam_id", "capture_ts", "submitted_at", "inferred_at",
+                 "dequeued_at", "stages", "db_commit_ms")
+
+    def __init__(self, cam_id, capture_ts, submitted_at, inferred_at, dequeued_at):
+        self.cam_id = cam_id
+        self.capture_ts = capture_ts
+        self.submitted_at = submitted_at
+        self.inferred_at = inferred_at
+        self.dequeued_at = dequeued_at
+        self.stages: Dict[str, float] = {}
+        self.db_commit_ms: Optional[float] = None
+
+    def mark(self, name: str, since: float) -> float:
+        """Record ms elapsed since ``since`` under ``name``; return a fresh stamp."""
+        now = time.perf_counter()
+        self.stages[name] = (now - since) * 1000.0
+        return now
+
+    def _upstream(self) -> str:
+        """Segments before the consumer thread, from the wall-clock stamps."""
+        out = []
+        c, s, i, d = (self.capture_ts, self.submitted_at,
+                      self.inferred_at, self.dequeued_at)
+        if c and s:
+            out.append(f"grab->submit={ (s - c) * 1000.0:.0f}ms")
+        if s and i:
+            out.append(f"infer={ (i - s) * 1000.0:.0f}ms")
+        if i and d:
+            out.append(f"out_q={ (d - i) * 1000.0:.0f}ms")
+        return " ".join(out)
+
+    def emit(self, events) -> None:
+        """Log one ``[SLOTTRACE]`` line per state-change event in this frame."""
+        if not events or not logger.isEnabledFor(logging.INFO):
+            return
+        stages = " ".join(f"{k}={v:.1f}ms" for k, v in self.stages.items())
+        if self.db_commit_ms is not None:
+            stages += f" db_commit={self.db_commit_ms:.1f}ms"
+        upstream = self._upstream()
+        # Photons -> row committed. This is the number the operator experiences.
+        total = ""
+        if self.capture_ts:
+            total = f" TOTAL_capture->committed={ (time.time() - self.capture_ts) * 1000.0:.0f}ms"
+        for ev in events:
+            etype = getattr(ev, "event_type", "?")
+            if etype not in ("vehicle_parked", "slot_vacant"):
+                continue
+            logger.info(
+                "[SLOTTRACE] slot=%s cam=%s event=%s | %s | %s |%s",
+                getattr(ev, "slot_id", "?"), self.cam_id, etype,
+                upstream or "upstream=n/a", stages, total,
+            )
 
 
 class ParkingEngineRuntimeMixin:
@@ -1042,7 +1122,22 @@ class ParkingEngineRuntimeMixin:
         )
         grid_frames[cam_id] = label_frame
 
-    def _process_detections_and_events(self, cam_id: str, frame, pipeline, detections):
+    def _new_slot_trace(
+        self, cam_id, capture_ts, submitted_at, inferred_at, dequeued_at
+    ) -> "_SlotTrace":
+        """Build the per-frame stage trace. See :class:`_SlotTrace`."""
+        return _SlotTrace(
+            cam_id=cam_id,
+            capture_ts=capture_ts,
+            submitted_at=submitted_at,
+            inferred_at=inferred_at,
+            dequeued_at=dequeued_at,
+        )
+
+    def _process_detections_and_events(
+        self, cam_id: str, frame, pipeline, detections,
+        *, capture_ts=None, submitted_at=None, inferred_at=None, dequeued_at=None,
+    ):
         """Post-detection pipeline body, in two independent halves:
 
             ROI -> assign -> slot occupancy -> EMIT        (occupancy, bounded)
@@ -1069,8 +1164,16 @@ class ParkingEngineRuntimeMixin:
         """
         from src import perf_trace
 
+        # End-to-end stage trace. Populated only when the caller supplies the
+        # upstream stamps (the single-process consumer does); the serial path
+        # passes none and every stage below simply records into a throwaway dict.
+        tr = self._new_slot_trace(cam_id, capture_ts, submitted_at, inferred_at,
+                                  dequeued_at)
+
+        _t = time.perf_counter()
         with perf_trace.stage("roi"):
             detections = pipeline.filter_detections_to_roi(detections)
+        _t = tr.mark("roi", _t)
 
         # ---- OCCUPANCY: is the slot full or empty? -------------------------- #
         # Runs FIRST and is published before any identity work begins. Occupancy is
@@ -1081,10 +1184,12 @@ class ParkingEngineRuntimeMixin:
         # was added directly to how long a slot looked stale.
         with perf_trace.stage("assign"):
             assignment = pipeline.assigner.assign(detections)
+        _t = tr.mark("assign", _t)
         with perf_trace.stage("slot"):
             all_events, slot_ctx = self._update_slot_occupancy(
                 cam_id, frame, pipeline, assignment
             )
+        _t = tr.mark("state_machine", _t)
         # Publish occupancy NOW. Previously uninstrumented, which hid a ReID compare
         # loop and a synchronous DB lookup inside _filter_violation_events (restricted
         # slots only) on this path — measure it rather than move the stall somewhere
@@ -1097,7 +1202,8 @@ class ParkingEngineRuntimeMixin:
                     cam_id,
                     all_events,
                 )
-                self._persist_final_events(final_events)
+                _t = tr.mark("violation_filter", _t)
+                self._persist_final_events(final_events, trace=tr)
 
         # ---- IDENTITY: who is in the slot? --------------------------------- #
         # Everything below may land a beat late. The plate reaches the UI via
@@ -1149,7 +1255,7 @@ class ParkingEngineRuntimeMixin:
         # appearance. Gated by floor so any ground camera is covered, not just a
         # hardcoded id pair.
         floor = self.pipelines[cam_id].floor if cam_id in self.pipelines else ""
-        if not is_reid_disabled_floor(floor) and detections:
+        if not is_identity_disabled(cam_id, floor) and detections:
             if cam_id not in self._tracking_managers:
                 self._tracking_managers[cam_id] = TrackingManager(cam_id)
             tracking_manager = self._tracking_managers[cam_id]
@@ -1677,7 +1783,9 @@ class ParkingEngineRuntimeMixin:
         # identity matching — they only run occupancy state machines. Short-
         # circuit here (by floor) so we don't even ask the registry; the
         # registry guards remain as defense-in-depth.
-        plate_matching_enabled = not is_reid_disabled_floor(pipeline.floor)
+        plate_matching_enabled = not is_identity_disabled(
+            cam_id, pipeline.floor
+        )
 
         for slot in pipeline.slots:
             state_machine = pipeline.state_machines[slot.id]
@@ -2248,14 +2356,17 @@ class ParkingEngineRuntimeMixin:
         finally:
             session.close()
 
-    def _persist_final_events(self, events) -> None:
+    def _persist_final_events(self, events, trace=None) -> None:
         if not events:
             return
 
         if not self.db_manager:
             self.event_bus.emit_batch(events)
+            if trace is not None:
+                trace.emit(events)
             return
 
+        _t_db = time.perf_counter()
         session = self.db_manager.SessionLocal()
         try:
             for event in events:
@@ -2288,7 +2399,14 @@ class ParkingEngineRuntimeMixin:
                         event.alert_id = db_alert_id
 
             # Emit AFTER updating with database IDs
+            if trace is not None:
+                # The commit inside log_vehicle_event is what makes the flip
+                # visible to the frontend, so stop the clock here — before the
+                # event-bus fan-out, which the DB reader never waits on.
+                trace.db_commit_ms = (time.perf_counter() - _t_db) * 1000.0
             self.event_bus.emit_batch(events)
+            if trace is not None:
+                trace.emit(events)
 
         except Exception as exc:
             session.rollback()
