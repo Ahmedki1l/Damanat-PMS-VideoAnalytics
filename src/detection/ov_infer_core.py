@@ -37,12 +37,14 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
 import numpy as np
 import torch
 
+from src import perf_trace
 from src.detection.detector import Detection
 
 
@@ -247,11 +249,12 @@ class OVInferCore:
         input_np, im = self._preprocess(frame_bgr)
         self._queue.start_async(
             {self._input_name: input_np},
-            userdata=(im, frame_bgr, tracker, done, userdata),
+            userdata=(im, frame_bgr, tracker, done, userdata, time.perf_counter()),
         )
 
     def _on_complete(self, request, userdata) -> None:
-        im, frame_bgr, tracker, done, ud = userdata
+        im, frame_bgr, tracker, done, ud, t_submit = userdata
+        perf_trace.record_async_infer((time.perf_counter() - t_submit) * 1000.0)
         try:
             results = self._decode(request.results, im, frame_bgr)
             tracks = self._update_tracker(results, frame_bgr, tracker)

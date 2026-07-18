@@ -240,6 +240,47 @@ _cons_frames = 0
 _cons_last_report = time.time()
 
 
+# --- Async inference meter (single-process AsyncInferQueue) ------------------ #
+# The serial infer-breakdown (ov via results.speed) does not exist on the async
+# path — there is no per-call Ultralytics speed dict. Instead we time each
+# request from start_async to its completion callback and report:
+#   * throughput  inf/s              — the real capacity of the one pool
+#   * req wall ms  mean per-request  — submit→callback (INCLUDES queue wait)
+#   * concurrency  ~wall*tput/1000   — how many requests were effectively in
+#                                      flight; if this ≈ nireq and wall is high,
+#                                      the pool is saturated/oversubscribed, and
+#                                      raising fps needs FEWER threads, not more.
+# This is the async-mode replacement for the ov gate number.
+_ainf_lock = threading.Lock()
+_ainf_wall_ms = 0.0
+_ainf_count = 0
+_ainf_last_report = time.time()
+
+
+def record_async_infer(wall_ms: float) -> None:
+    """Record one async forward pass (submit→completion). No-op when disabled."""
+    if not _ENABLED:
+        return
+    global _ainf_wall_ms, _ainf_count, _ainf_last_report
+    with _ainf_lock:
+        _ainf_wall_ms += wall_ms
+        _ainf_count += 1
+        now = time.time()
+        elapsed = now - _ainf_last_report
+        if elapsed >= 10.0 and _ainf_count:
+            tput = _ainf_count / elapsed
+            mean_wall = _ainf_wall_ms / _ainf_count
+            concurrency = mean_wall / 1000.0 * tput
+            print(
+                f"[PERF] async-infer: {tput:.1f} inf/s | req_wall={mean_wall:.0f}ms "
+                f"(submit→done, incl queue) | ~{concurrency:.1f} in flight "
+                f"({_ainf_count} reqs in {elapsed:.0f}s)"
+            )
+            _ainf_wall_ms = 0.0
+            _ainf_count = 0
+            _ainf_last_report = now
+
+
 def record_consumer(busy_ms: float) -> None:
     """Record one consumer-thread frame's processing time (single-process engine).
 

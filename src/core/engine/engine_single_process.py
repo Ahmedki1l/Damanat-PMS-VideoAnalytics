@@ -146,8 +146,21 @@ class ParkingEngineSingleProcessMixin:
             f"target_fps={target_fps}, out_q={out_q.maxsize}"
         )
 
+        last_gauge_report = time.time()
         try:
             while not stop.is_set():
+                # Periodic queue-health line: in-flight vs pool, output backlog,
+                # and cumulative drops. Tells scheduler-bound (in-flight < nireq,
+                # pool starved) from pool-bound (in-flight ≈ nireq, saturated).
+                if perf_trace.enabled() and time.time() - last_gauge_report >= 10.0:
+                    with inflight_lock:
+                        n_inflight = len(inflight)
+                    print(
+                        f"[PERF] sched: in_flight={n_inflight}/{nireq} "
+                        f"out_q={out_q.qsize()}/{out_q.maxsize} "
+                        f"drops(out_full={drops['out_full']}, stale={drops['stale']})"
+                    )
+                    last_gauge_report = time.time()
                 submitted_any = False
                 for cam_id in camera_ids:
                     now = time.time()
