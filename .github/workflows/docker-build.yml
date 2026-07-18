@@ -10,13 +10,9 @@ on:
 env:
   # Build context
   DOCKERFILE_PATH: "."
-  # Which Dockerfile to build. A bare `docker build .` reads ./Dockerfile, which
-  # is the SINGLE-process image (main.py --api): one process, one inference at a
-  # time, so the detector's OpenVINO pool caps at ~8 threads and the rest of the
-  # box sits idle. Dockerfile.multiprocess runs the supervisor instead (5 camera
-  # groups, each pinned to its own core slice = 5 concurrent inferences), which
-  # is the ~2x lever. The two files are identical apart from the ENTRYPOINT.
-  DOCKERFILE: "Dockerfile.multiprocess"
+  # The supervisor and single-process async modes now share this image; runtime
+  # selection is controlled by VA_CMD/VA_SINGLE_PROCESS in Dockerfile/env.
+  DOCKERFILE: "Dockerfile"
   # Docker image name
   IMAGE_NAME: "damanat-pms-video-analytics"
   # Image tag starting number (will increment by 1 per push)

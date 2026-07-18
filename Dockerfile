@@ -91,7 +91,7 @@ RUN python -c 'import numpy as np; from paddleocr import PaddleOCR; PaddleOCR(us
 # and `[PERF]` lines only reach `docker logs` in delayed bursts.
 ENV PYTHONUNBUFFERED=1
 
-# Per-stage timing (roi/clahe/infer/zones/assign/slot + the decode meter) is
+# Per-stage timing plus RTSP-drain/frame-publication meters is
 # opt-in — flip it on at run time, no rebuild:
 #   docker run -e PERF_TRACE=1 -e PERF_TRACE_EVERY=50 ...
 # The effective-FPS summary is always on and needs nothing.

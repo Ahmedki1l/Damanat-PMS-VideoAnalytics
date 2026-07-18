@@ -3,13 +3,12 @@ perf_trace.py — opt-in per-stage performance timing for the processing loop.
 
 Enabled only when the ``PERF_TRACE`` env var is truthy (1/true/yes/on), so it is
 a zero-overhead no-op in production — just don't set the var. When on it prints
-two kinds of ``[PERF]`` lines:
+three kinds of ``[PERF]`` lines:
 
   * per-frame pipeline stages (main loop, single-threaded): roi / clahe / infer /
     zones / assign / slot, averaged over the last N processed frames.
-  * a decode meter (background grabber threads, all cameras): average decode
-    time per frame and how many frames/sec are being decoded across all streams —
-    the cost the decode-throttle is meant to cut.
+  * an RTSP drain meter: compressed frames consumed per second across all cameras.
+  * a frame-publication meter: BGR materialization time and published frames/sec.
 
 Usage:
     PERF_TRACE=1 python main.py --api            # bash
@@ -202,7 +201,7 @@ def record_infer(wall_ms: float, cpu_ms: float, pre_ms: float, ov_ms: float,
 # tells us whether the scheduler is fair (the original per-camera FPS disparity
 # was invisible in the aggregate number), and the queue-depth gauge surfaces
 # back-pressure / stale-frame pileup in the async design. Both are no-ops when
-# PERF_TRACE is off, and are reported on the same cadence as the decode meter.
+# PERF_TRACE is off, and are reported on the same cadence as the capture meters.
 _cam_lock = threading.Lock()
 _cam_counts: dict[str, int] = defaultdict(int)
 _cam_last_report = time.time()
@@ -333,16 +332,78 @@ def snapshot_gauges() -> dict[str, float]:
         return dict(_gauges)
 
 
-# --- Decode meter (background grabber threads, many) ------------------------- #
+# --- RTSP drain + frame materialization meters (many grabber threads) -------- #
+_grab_lock = threading.Lock()
+_grab_ms = 0.0
+_grab_ok: dict[str, int] = defaultdict(int)
+_grab_failed: dict[str, int] = defaultdict(int)
+_grab_known: set[str] = set()
+_grab_last_success: dict[str, float] = {}
+_grab_last_report = time.time()
 _dec_lock = threading.Lock()
 _dec_ms = 0.0
 _dec_count = 0
 _dec_last_report = time.time()
 
 
+def record_rtsp_grab(camera_id: str, ok: bool, ms: float) -> None:
+    """Record one FFmpeg grab/read attempt, including failures and wall time.
+
+    In throttled mode this must remain near the source FPS, not the lower BGR
+    publication cap. A low drain rate warns that hidden RTSP lag can return.
+    """
+    if not _ENABLED:
+        return
+    global _grab_ms, _grab_last_report
+    with _grab_lock:
+        now = time.time()
+        _grab_known.add(camera_id)
+        _grab_ms += max(0.0, ms)
+        if ok:
+            _grab_ok[camera_id] += 1
+            _grab_last_success[camera_id] = now
+        else:
+            _grab_failed[camera_id] += 1
+        elapsed = now - _grab_last_report
+        if elapsed >= 5.0:
+            successes = sum(_grab_ok.values())
+            failures = sum(_grab_failed.values())
+            attempts = successes + failures
+            rate = successes / elapsed
+            avg_ms = _grab_ms / attempts if attempts else 0.0
+            camera_rates = [count / elapsed for count in _grab_ok.values()]
+            spread = "n/a"
+            if camera_rates:
+                spread = f"{min(camera_rates):.1f}-{max(camera_rates):.1f}/s"
+            stale = [
+                f"{cam}:{now - seen:.1f}s"
+                for cam, seen in _grab_last_success.items()
+                if now - seen >= 5.0
+            ]
+            stale.extend(
+                f"{cam}:never"
+                for cam in _grab_known
+                if cam not in _grab_last_success
+            )
+            stale.sort()
+            stale_text = ",".join(stale[:5]) or "none"
+            print(
+                f"[PERF] rtsp-drain: {rate:.0f} ok/s across all cams | "
+                f"grab_wall={avg_ms:.1f}ms | failures={failures} | "
+                f"per-camera={spread} | stale={stale_text}"
+            )
+            _grab_ms = 0.0
+            _grab_ok.clear()
+            _grab_failed.clear()
+            _grab_last_report = now
+
+
 def record_decode(ms: float) -> None:
-    """Record one frame decode (cap.read) from a grabber thread. Reports a
-    rolling summary roughly every 5s."""
+    """Record one published BGR frame materialization.
+
+    This times ``retrieve()`` in throttled mode and ``read()`` in unthrottled
+    mode. Grab-only compressed frames are counted by ``record_rtsp_grab``.
+    """
     if not _ENABLED:
         return
     global _dec_ms, _dec_count, _dec_last_report
@@ -354,12 +415,9 @@ def record_decode(ms: float) -> None:
         if elapsed >= 5.0 and _dec_count:
             rate = _dec_count / elapsed
             avg = _dec_ms / _dec_count
-            # _dec_ms is wall-ms spent decoding across all grabber threads in the
-            # window; /elapsed*100 ≈ how many CPU-cores-worth of decode that is.
-            cores = _dec_ms / 1000.0 / elapsed
             print(
-                f"[PERF] decode: {avg:.1f}ms/frame | {rate:.0f} decodes/s across all cams "
-                f"(~{cores:.1f} CPU-core(s) busy decoding)"
+                f"[PERF] frame-publish: {avg:.1f}ms/materialized frame | "
+                f"{rate:.0f} frames/s across all cams"
             )
             _dec_ms = 0.0
             _dec_count = 0

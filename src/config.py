@@ -58,10 +58,9 @@ class ProcessingConfig:
     mode: str = "round_robin"
     target_fps_per_camera: int = 1
     stream_channel: int = 102  # 101=main(4K), 102=sub(720p)
-    # Cap how often each camera's background grabber decodes a frame (frames/sec).
-    # 0 = unthrottled (decode every frame — the legacy behaviour). Decoding all
-    # streams at full rate when only ~target_fps_per_camera is consumed wastes a
-    # lot of CPU; set this to ~target_fps + a little headroom (e.g. 8) to cut it.
+    # Cap how often each camera materializes/publishes a drained RTSP frame.
+    # The capture still consumes the compressed stream continuously so FFmpeg
+    # cannot build a stale backlog. 0 publishes every source frame.
     max_grab_fps: int = 0
     # Resolution that slot polygons (slots/*.json) were drawn at.
     # The runtime will scale polygon coords from this to the actual stream resolution.

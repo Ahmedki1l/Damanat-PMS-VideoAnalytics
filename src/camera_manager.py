@@ -68,13 +68,15 @@ class CameraStream:
     # decode to 442-844ms/frame vs gate's 10-25ms, and starved its serial
     # inference loop to ~1 frame per 2 MINUTES per camera). Pinned/cpuset mode
     # never hit this because the affinity mask capped what FFMPEG saw. Two
-    # threads decode 1080p HEVC comfortably at max_grab_fps; the total decode
-    # WORK is unchanged, only the pointless parallelism is gone.
+    # threads drain 1080p HEVC comfortably; the total decode WORK is unchanged,
+    # only the pointless parallelism is gone.
     _FFMPEG_OPTIONS = "rtsp_transport;tcp|threads;2"
 
     def __init__(self, config: CameraConfig, max_grab_fps: float = 0.0):
         self.config = config
-        # Cap decode rate (frames/sec) in the grabber loop. 0 = unthrottled.
+        # Cap how often a drained frame is materialized and published. The
+        # compressed RTSP stream itself must still be consumed continuously;
+        # sleeping between reads lets FFmpeg queue old frames behind our back.
         self._max_grab_fps = max_grab_fps
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_open = False
@@ -117,21 +119,28 @@ class CameraStream:
                     f"  [OK] {self.config.id} ({self.config.name}) "
                     f"— connected [{self.frame_width}×{self.frame_height}]"
                 )
-                # Start the background grabber thread
-                self._stop_event.clear()
-                self._grab_thread = threading.Thread(
-                    target=self._grabber_loop,
-                    name=f"grab-{self.config.id}",
-                    daemon=True,
-                )
-                self._grab_thread.start()
             else:
                 print(f"  [FAIL] {self.config.id} ({self.config.name}) — cannot open stream")
+            # A failed initial connection must keep retrying; otherwise one
+            # transient startup outage leaves this camera dead until restart.
+            self._start_grabber()
             return self.is_open
         except Exception as e:
             print(f"  [FAIL] {self.config.id} ({self.config.name}) — {e}")
             self.is_open = False
+            self._start_grabber()
             return False
+
+    def _start_grabber(self) -> None:
+        if self._grab_thread is not None and self._grab_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._grab_thread = threading.Thread(
+            target=self._grabber_loop,
+            name=f"grab-{self.config.id}",
+            daemon=True,
+        )
+        self._grab_thread.start()
 
     def _grabber_loop(self):
         """
@@ -140,52 +149,107 @@ class CameraStream:
         Only keeps the latest frame — old frames are discarded.
         This is the key to preventing RTSP buffer overflow.
         """
-        # Minimum seconds between decoded frames. 0 = decode as fast as the
-        # stream delivers (legacy). Throttling here is the single biggest CPU
-        # saver: we only need ~target_fps/cam, not the full ~20-25 fps the NVR
-        # sends, and decoding the rest just to discard it pegs the cores.
-        min_interval = (
+        # ``CAP_PROP_BUFFERSIZE=1`` is ignored by OpenCV's FFmpeg backend on the
+        # production cameras. Sleeping between cap.read() calls therefore makes
+        # a 20+ fps RTSP stream accumulate behind an 8 fps reader. Drain every
+        # compressed frame with grab(), but only retrieve/materialize BGR frames
+        # at the configured rate. This keeps the published frame near-live
+        # without paying full-rate colorspace/copy cost.
+        publish_interval = (
             1.0 / self._max_grab_fps if self._max_grab_fps and self._max_grab_fps > 0 else 0.0
         )
+        next_publish_at = 0.0
         while not self._stop_event.is_set():
             if self.cap is None or not self.cap.isOpened():
                 # Stream died — try reconnecting
-                time.sleep(self._reconnect_interval)
+                self._invalidate_latest_frame()
+                if perf_trace.enabled():
+                    perf_trace.record_rtsp_grab(self.config.id, False, 0.0)
+                if self._stop_event.wait(self._reconnect_interval):
+                    break
                 self._reconnect()
                 continue
 
-            t0 = time.perf_counter()
-            ret, frame = self.cap.read()
-            if perf_trace.enabled():
-                perf_trace.record_decode((time.perf_counter() - t0) * 1000.0)
+            if publish_interval > 0.0:
+                ret = self._grab_frame()
+                frame = None
+                if ret:
+                    # Evaluate the deadline AFTER the blocking grab. The frame
+                    # that crosses the deadline is the one we must publish.
+                    now = time.perf_counter()
+                    if now < next_publish_at:
+                        continue
+                    ret, frame = self._retrieve_frame()
+            else:
+                ret, frame = self._read_frame()
+
             if ret and frame is not None:
                 with self._frame_lock:
                     self._latest_frame = frame
                     self._latest_ts = time.time()
                     self._latest_seq += 1
+                if publish_interval > 0.0:
+                    now = time.perf_counter()
+                    if next_publish_at <= 0.0:
+                        next_publish_at = now + publish_interval
+                    else:
+                        while next_publish_at <= now:
+                            next_publish_at += publish_interval
             else:
                 # Read failed — reconnect
                 self.is_open = False
+                self._invalidate_latest_frame()
                 self._reconnect()
                 continue
 
-            # Throttle decode rate. CAP_PROP_BUFFERSIZE=1 keeps the next read
-            # recent, so sleeping here drops the surplus frames before they are
-            # decoded rather than after.
-            if min_interval > 0.0:
-                sleep_for = min_interval - (time.perf_counter() - t0)
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
+    def _grab_frame(self) -> bool:
+        """Consume one compressed frame without materializing a BGR image."""
+        if self.cap is None:
+            return False
+        t0 = time.perf_counter()
+        ok = self.cap.grab()
+        if perf_trace.enabled():
+            perf_trace.record_rtsp_grab(
+                self.config.id, ok, (time.perf_counter() - t0) * 1000.0
+            )
+        return ok
+
+    def _retrieve_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if self.cap is None:
+            return False, None
+        t0 = time.perf_counter()
+        result = self.cap.retrieve()
+        if perf_trace.enabled():
+            perf_trace.record_decode((time.perf_counter() - t0) * 1000.0)
+        return result
+
+    def _read_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if self.cap is None:
+            return False, None
+        t0 = time.perf_counter()
+        result = self.cap.read()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if perf_trace.enabled():
+            perf_trace.record_rtsp_grab(self.config.id, result[0], elapsed_ms)
+            perf_trace.record_decode(elapsed_ms)
+        return result
+
+    def _invalidate_latest_frame(self) -> None:
+        """Stop readers from treating the last pre-failure image as current."""
+        with self._frame_lock:
+            self._latest_frame = None
+            self._latest_ts = 0.0
 
     def _reconnect(self):
         """Reconnect the stream (called from grabber thread)."""
         now = time.time()
         if now - self._last_reconnect < self._reconnect_interval:
-            time.sleep(1)
+            self._stop_event.wait(1)
             return
 
         self._last_reconnect = now
         print(f"[WARN] {self.config.id} — reconnecting...")
+        self._invalidate_latest_frame()
 
         if self.cap is not None:
             self.cap.release()
@@ -201,6 +265,8 @@ class CameraStream:
 
         self.is_open = self.cap.isOpened()
         if self.is_open:
+            self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             print(f"  [OK] {self.config.id} ({self.config.name}) — reconnected")
         else:
             print(f"  [FAIL] {self.config.id} — reconnect failed")
@@ -241,7 +307,7 @@ class CameraStream:
             self.cap.release()
             self.cap = None
         self.is_open = False
-        self._latest_frame = None
+        self._invalidate_latest_frame()
 
 
 class CameraManager:

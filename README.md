@@ -739,16 +739,16 @@ several × faster than FP32@640 on AMX hardware.
   | `imgsz` | `320` |
   | `target_fps` | `5` |
 
-**2. Decode throttle.** Unthrottled HEVC decode pulls every camera at full stream
-rate (~21 fps), burning ~10 of 16 cores on decode alone and starving inference.
-Cap it in the **server's `config.yaml`** (this knob is YAML-only — *not* synced
-from the DB):
+**2. Capture publication throttle.** The RTSP reader continuously drains the
+compressed stream so FFmpeg cannot queue stale video, but it only retrieves and
+publishes BGR frames at `max_grab_fps`. Cap it in the **server's `config.yaml`**
+(this knob is YAML-only — *not* synced from the DB):
 ```yaml
 processing:
-  max_grab_fps: 6        # ≈ target_fps + headroom; 0 = unthrottled (do NOT use in prod)
+  max_grab_fps: 6        # ≈ target_fps + headroom; 0 publishes every source frame
 ```
-Cleanest production equivalent: lower the NVR **sub-stream FPS to ~6** (avoids the
-benign `Could not find ref with POC` HEVC log spam the sleep-throttle causes).
+Also lower the camera/NVR **sub-stream FPS to ~6** where possible. Source-side
+rate control avoids decoding frames the application will not publish.
 > `per_camera_tracker` in `config.yaml` is **dead** (parsed but never read —
 > detection is always a shared model with per-camera ByteTrack state). Safe to delete.
 

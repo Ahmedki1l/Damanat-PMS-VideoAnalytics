@@ -204,6 +204,12 @@ class ParkingEngine(
             return None
 
         camera_configs = self._build_camera_configs()
+        publish_cap = self.config.processing.max_grab_fps
+        publish_label = f"{publish_cap:g} fps" if publish_cap > 0 else "source rate"
+        print(
+            f"[INFO] RTSP frame publication cap: {publish_label} per camera "
+            "(compressed streams drain continuously)"
+        )
         self.cam_manager = CameraManager(
             camera_configs,
             max_grab_fps=self.config.processing.max_grab_fps,
@@ -211,6 +217,7 @@ class ParkingEngine(
         opened = self.cam_manager.open_all()
         if opened == 0:
             print("[ERROR] No cameras could be opened. Exiting.")
+            self.cam_manager.close_all()
             return None
 
         total_slots = self._initialize_camera_pipelines(camera_configs)

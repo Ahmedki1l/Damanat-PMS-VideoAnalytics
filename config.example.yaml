@@ -216,9 +216,9 @@ processing:
   per_camera_tracker: false     # DEPRECATED/ignored: detection is now always a single shared
                                 # model with per-camera ByteTrack state kept inside TrackedDetector
                                 # (low RAM + stable per-camera IDs, no need for N model copies).
-  max_grab_fps: 0               # Cap per-camera decode rate (fps). 0=unthrottled.
-                                # Set ~target_fps+headroom (e.g. 8) to stop wasting
-                                # CPU decoding frames that are never processed.
+  max_grab_fps: 0               # Cap BGR frame publication rate. The compressed RTSP
+                                # stream is still drained continuously to prevent lag.
+                                # 0 publishes every source frame.
 
 # --- Detector Settings ---
 # Production detector is yolo11m (better recall on oblique floor angles).
