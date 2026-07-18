@@ -15,36 +15,39 @@ os.environ.setdefault("YOLO_CONFIG_DIR", os.path.abspath(".ultralytics_test"))
 from src.models.state_machine import SlotEvent
 from src.services import alert_service, slot_status_service
 
-sys.modules.setdefault("src.camera_manager", types.SimpleNamespace(CameraConfig=object))
-sys.modules.setdefault(
-    "src.core.engine.camera_pipeline",
-    types.SimpleNamespace(CameraPipeline=object),
-)
-sys.modules.setdefault(
-    "src.detection.tracking_manager",
-    types.SimpleNamespace(TrackingManager=object),
-)
-sys.modules.setdefault(
-    "src.model.parkingslot",
-    types.SimpleNamespace(ParkingSlot=object),
-)
-sys.modules.setdefault(
-    "src.models.slot",
-    types.SimpleNamespace(load_slots=lambda *args, **kwargs: ([], None)),
-)
-sys.modules.setdefault(
-    "src.services.parking_service",
-    types.SimpleNamespace(sync_slots_from_config=lambda *args, **kwargs: None),
-)
-
-engine_runtime_spec = importlib.util.spec_from_file_location(
-    "test_engine_runtime_module",
-    os.path.join("src", "core", "engine", "engine_runtime.py"),
-)
-engine_runtime_module = importlib.util.module_from_spec(engine_runtime_spec)
-assert engine_runtime_spec.loader is not None
-engine_runtime_spec.loader.exec_module(engine_runtime_module)
-ParkingEngineRuntimeMixin = engine_runtime_module.ParkingEngineRuntimeMixin
+# Stub the heavy/circular imports ONLY while loading engine_runtime standalone,
+# then remove every stub we inserted. Leaving them in sys.modules poisoned every
+# test module imported after this one (alphabetically: almost all of them) —
+# e.g. `from src.core.engine.camera_pipeline import CameraPipeline` silently
+# returned `object`, making test_slot_probe_geometry's ROI tests fail in full
+# runs while passing in isolation.
+_stubs = {
+    "src.camera_manager": types.SimpleNamespace(CameraConfig=object),
+    "src.core.engine.camera_pipeline": types.SimpleNamespace(CameraPipeline=object),
+    "src.detection.tracking_manager": types.SimpleNamespace(TrackingManager=object),
+    "src.model.parkingslot": types.SimpleNamespace(ParkingSlot=object),
+    "src.models.slot": types.SimpleNamespace(
+        load_slots=lambda *args, **kwargs: ([], None)
+    ),
+    "src.services.parking_service": types.SimpleNamespace(
+        sync_slots_from_config=lambda *args, **kwargs: None
+    ),
+}
+_inserted = [name for name, stub in _stubs.items()
+             if sys.modules.setdefault(name, stub) is stub]
+try:
+    engine_runtime_spec = importlib.util.spec_from_file_location(
+        "test_engine_runtime_module",
+        os.path.join("src", "core", "engine", "engine_runtime.py"),
+    )
+    engine_runtime_module = importlib.util.module_from_spec(engine_runtime_spec)
+    assert engine_runtime_spec.loader is not None
+    engine_runtime_spec.loader.exec_module(engine_runtime_module)
+    ParkingEngineRuntimeMixin = engine_runtime_module.ParkingEngineRuntimeMixin
+finally:
+    for _name in _inserted:
+        if sys.modules.get(_name) is _stubs[_name]:
+            del sys.modules[_name]
 
 
 class DummyEngine(ParkingEngineRuntimeMixin):
