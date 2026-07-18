@@ -105,6 +105,23 @@ class OVInferCore:
         # 1-element path list so a single-image postprocess never IndexErrors.
         self._predictor.batch = [["async"]]
 
+        # The shared Ultralytics predictor is MUTABLE GLOBAL STATE: any other
+        # caller of this YOLO model (the API/ANPR path calls model.predict at the
+        # DB's imgsz=416) rewrites predictor.imgsz / predictor.args, which would
+        # make our preprocess letterbox to the wrong size (observed live: a burst
+        # of "[1,3,416,416] vs expecting [1,3,320,320]" submit errors) and change
+        # our NMS. Decouple: own a fixed-size LetterBox for preprocess, and snapshot
+        # the decode args to restore before each postprocess. Now no external
+        # predict() can perturb this core.
+        from ultralytics.data.augment import LetterBox
+
+        stride = int(getattr(self._predictor.model, "stride", 32) or 32)
+        self._letterbox = LetterBox((self.imgsz, self.imgsz), auto=False, stride=stride)
+        self._post_args = {
+            k: getattr(self._predictor.args, k, None)
+            for k in ("conf", "iou", "classes", "max_det", "agnostic_nms")
+        }
+
         # 2) Compile our own THROUGHPUT copy of the IR + a persistent
         #    AsyncInferQueue. THROUGHPUT (not LATENCY) is what fills the cores with
         #    concurrent requests — the measured 2x+ over the serial LATENCY path.
@@ -163,13 +180,19 @@ class OVInferCore:
     # --- shared pre/post ---------------------------------------------------- #
 
     def _preprocess(self, frame_bgr: np.ndarray):
-        """Ultralytics preprocess → (input_np float32 [1,3,H,W], input_tensor).
+        """Preprocess → (input_np float32 [1,3,H,W], input_tensor).
 
-        Returns both the numpy tensor for OpenVINO and the torch tensor
-        ``img`` that postprocess needs for box scaling (it reads img.shape[2:]).
+        Byte-for-byte what ``predictor.preprocess([frame])`` does (fixed-size
+        LetterBox → BGR→RGB → HWC→CHW → /255), but on OUR own LetterBox so a
+        concurrent ``model.predict()`` elsewhere can't change the target size.
+        Returns the numpy tensor for OpenVINO and the torch tensor ``img`` that
+        postprocess needs for box scaling (it reads ``img.shape[2:]``).
         """
-        im = self._predictor.preprocess([frame_bgr])   # torch [1,3,H,W], /255
-        return im.cpu().numpy(), im
+        img = self._letterbox(image=frame_bgr)          # HWC, letterboxed
+        img = img[..., ::-1].transpose(2, 0, 1)         # BGR→RGB, HWC→CHW
+        img = np.ascontiguousarray(img)[None]           # [1,3,H,W]
+        img = img.astype(np.float32) / 255.0
+        return img, torch.from_numpy(img)
 
     def _decode(self, raw_results, im, frame_bgr: np.ndarray):
         """Ultralytics postprocess on a raw OV output → list[Results] (len 1).
@@ -180,8 +203,12 @@ class OVInferCore:
         """
         y = list(raw_results.values())
         preds = torch.from_numpy(y[0]) if len(y) == 1 else [torch.from_numpy(x) for x in y]
-        # postprocess mutates predictor state (results); guard for async callers.
+        # postprocess reads predictor.args (conf/iou/classes/…) for NMS and
+        # mutates predictor state; another caller's predict() can change those
+        # args, so restore OUR snapshot and serialize the whole step.
         with self._post_lock:
+            for k, v in self._post_args.items():
+                setattr(self._predictor.args, k, v)
             results = self._predictor.postprocess(preds, im, [frame_bgr])
         return results
 
