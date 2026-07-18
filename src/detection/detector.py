@@ -65,22 +65,29 @@ class Detection:
 
     @property
     def bottom_center(self) -> Tuple[float, float]:
-        """
-        Vehicle ground-contact point: horizontal center of the bbox at its
-        bottom edge ``(x_mid, y2)``.
+        """The slot-membership probe point: ``(x_mid, (y1 + y2) / 1.5)``.
 
-        This is the point tested against slot polygons (``slot_assigner``) and
-        boundary/zone polygons, all of which are authored on the ground plane.
-        It must match ``zoning.boundary_detector._bottom_center`` exactly so
-        slot membership and boundary crossings reference the same point.
+        DECISION — DO NOT "FIX" THIS TO ``y2``. The formula is deliberately NOT
+        the geometric bbox bottom. The production slot polygons were drawn and
+        operator-calibrated against THIS probe, so the polygon shapes already
+        compensate for it; changing the formula without re-drawing every slot
+        polygon shifts slot membership by up to ~180px on near cameras and
+        breaks occupancy fleet-wide. This exact change has now been made and
+        reverted THREE times (fixed to y2 in 4668002, reverted in db1c55e,
+        re-fixed in an AI session 2026-07-18, reverted again the same day by
+        operator decision — twice explicitly stated in review).
 
-        (Historically this returned ``cy = (y1 + y2) / 1.5`` — neither the
-        center nor the bottom; for boxes low in the frame it fell *below* the
-        box entirely and mis-attributed slot occupancy.)
+        ``zoning.boundary_detector._bottom_center`` intentionally differs (it
+        uses ``y2``): boundary polygons were calibrated against y2, slot
+        polygons against /1.5. The two probes match their own calibration, not
+        each other. If the fleet's slot polygons are ever re-drawn from
+        scratch, prefer ``y2`` for both and retire this note.
+
+        Pinned by tests/test_slot_probe_geometry.py.
         """
         x1, y1, x2, y2 = self.bbox
         cx = (x1 + x2) / 2.0
-        cy = ( y1 + y2) / 1.5
+        cy = (y1 + y2) / 1.5
         return (cx, cy)
 
     @property
