@@ -12,6 +12,7 @@ import numpy as np
 from src.camera_manager import CameraConfig
 from src.core.engine.camera_pipeline import CameraPipeline
 from src.detection.tracking_manager import TrackingManager
+from src.detection.detector import is_untracked
 from src.models.state_machine import SlotState
 from src.services.parking_service import (
     bootstrap_camera_slots_from_json,
@@ -1042,8 +1043,21 @@ class ParkingEngineRuntimeMixin:
         grid_frames[cam_id] = label_frame
 
     def _process_detections_and_events(self, cam_id: str, frame, pipeline, detections):
-        """Post-detection pipeline body: ROI filter → special zones → slot
-        assignment → slot-state update → violation filtering → persist events.
+        """Post-detection pipeline body, in two independent halves:
+
+            ROI -> assign -> slot occupancy -> EMIT        (occupancy, bounded)
+            ROI -> zones -> slot identity                  (identity, may be slow)
+
+        Occupancy is computed and published FIRST, so a slow OCR/ReID pass can no
+        longer delay a slot becoming occupied or vacant. Identity then resolves and
+        enriches the record through its own persistence path
+        (``parking_slots.current_plate`` / ``update_current_slot_plate``), which
+        already exists for exactly this "occupied first, identified later" case.
+
+        Ordering note: the identity half must run AFTER ``assign``, which stamps
+        synthetic negative ``track_id``s in place (``slot_assigner.py:77``). Identity
+        guards therefore test :func:`~src.detection.detector.is_untracked` rather than
+        ``== -1``, so they stay correct in this order.
 
         Extracted from ``run_multi_camera`` so the single-process async engine
         can reuse the exact same body from its consumer thread. Returns the slot
@@ -1057,21 +1071,42 @@ class ParkingEngineRuntimeMixin:
 
         with perf_trace.stage("roi"):
             detections = pipeline.filter_detections_to_roi(detections)
-        with perf_trace.stage("zones"):
-            self._process_special_zones(cam_id, frame, detections)
 
+        # ---- OCCUPANCY: is the slot full or empty? -------------------------- #
+        # Runs FIRST and is published before any identity work begins. Occupancy is
+        # the product-critical signal — a slot must flip, and the UI must be able to
+        # see it flip, without waiting on OCR or ReID. Measured on prod 2026-07-18
+        # this whole block costs <= ~37ms while the identity block below peaked at
+        # 517ms; when identity ran first (as it used to) every one of those 517ms
+        # was added directly to how long a slot looked stale.
         with perf_trace.stage("assign"):
             assignment = pipeline.assigner.assign(detections)
         with perf_trace.stage("slot"):
-            all_events = self._update_slot_state(cam_id, frame, pipeline, assignment)
-        if all_events:
-            final_events = self._filter_violation_events(
-                frame,
-                assignment,
-                cam_id,
-                all_events,
+            all_events, slot_ctx = self._update_slot_occupancy(
+                cam_id, frame, pipeline, assignment
             )
-            self._persist_final_events(final_events)
+        # Publish occupancy NOW. Previously uninstrumented, which hid a ReID compare
+        # loop and a synchronous DB lookup inside _filter_violation_events (restricted
+        # slots only) on this path — measure it rather than move the stall somewhere
+        # invisible.
+        with perf_trace.stage("emit"):
+            if all_events:
+                final_events = self._filter_violation_events(
+                    frame,
+                    assignment,
+                    cam_id,
+                    all_events,
+                )
+                self._persist_final_events(final_events)
+
+        # ---- IDENTITY: who is in the slot? --------------------------------- #
+        # Everything below may land a beat late. The plate reaches the UI via
+        # parking_slots.current_plate / the SlotStatus row, not via the occupancy
+        # event payload, so a late answer enriches the record rather than delaying it.
+        with perf_trace.stage("zones"):
+            self._process_special_zones(cam_id, frame, detections)
+        with perf_trace.stage("identity"):
+            self._update_slot_identity(cam_id, frame, pipeline, slot_ctx)
         return assignment
 
     def _process_special_zones(self, cam_id: str, frame, detections) -> None:
@@ -1143,7 +1178,10 @@ class ParkingEngineRuntimeMixin:
         boundaries = list(self.boundaries.get(cam_id, {}).values())
         inside_band: set = set()
         if boundaries:
-            tracks = [(d.track_id, d.bbox) for d in detections if d.track_id != -1]
+            tracks = [
+                (d.track_id, d.bbox) for d in detections
+                if not is_untracked(d.track_id)
+            ]
             crossings = self.boundary_crossing_detector.detect(
                 cam_id, tracks, boundaries
             )
@@ -1155,7 +1193,7 @@ class ParkingEngineRuntimeMixin:
 
         for detection in detections:
             tid = detection.track_id
-            if tid == -1 or tid in inside_band:
+            if is_untracked(tid) or tid in inside_band:
                 continue
             self.vehicle_registry.settle_track_area(cam_id, tid)
 
@@ -1598,7 +1636,40 @@ class ParkingEngineRuntimeMixin:
             worker.forget(slot_id)  # discard any queued read for the previous car
 
     def _update_slot_state(self, cam_id: str, frame, pipeline, assignment):
+        """Occupancy then identity, in one call — the historical signature.
+
+        Kept for the serial ``run_multi_camera`` path and for callers that do not
+        care about the split. The single-process engine calls the two halves
+        separately so it can EMIT occupancy before identity runs; see
+        ``_process_detections_and_events``.
+        """
+        all_events, slot_ctx = self._update_slot_occupancy(
+            cam_id, frame, pipeline, assignment
+        )
+        self._update_slot_identity(cam_id, frame, pipeline, slot_ctx)
+        return all_events
+
+    def _update_slot_occupancy(self, cam_id: str, frame, pipeline, assignment):
+        """PHASE 1 — is the slot occupied? Nothing here may wait on identity.
+
+        This is the product-critical path: a slot must flip OCCUPIED/VACANT (and the
+        UI must be able to see it) without waiting on OCR or ReID. Measured on prod
+        2026-07-18 this whole phase costs at most ~10ms, while the identity work that
+        used to run BEFORE it peaked at 517ms — the delay was pure statement order.
+
+        Returns ``(all_events, slot_ctx)`` where ``slot_ctx`` carries the per-slot
+        state phase 2 needs, so identity does not have to recompute the assignment.
+
+        Deliberately KEPT here rather than deferred to phase 2:
+          * ``_arm_ocr_for_slot`` — arming is what makes the later read possible; it
+            is a dict write.
+          * the whole ``slot_vacant`` teardown — it drops the plate, the lock and any
+            queued read. If that lagged behind the vacancy, ``/api/slots`` would
+            serve a plate for an empty slot (it reads ``registry.get_slot_plate`` for
+            live slots). "Vacant" must mean "and nobody is in it" atomically.
+        """
         all_events = []
+        slot_ctx = []
         # Per-slot forced-OCR attempt counter (bounded dead-zone pass, §3b).
         if not hasattr(self, "_forced_ocr_attempts"):
             self._forced_ocr_attempts = {}
@@ -1626,6 +1697,7 @@ class ParkingEngineRuntimeMixin:
                 vehicle_present=vehicle_in_slot,
                 track_id=track_id,
             )
+            parked_events = []
 
             for event in events:
                 event.camera_id = cam_id
@@ -1652,49 +1724,9 @@ class ParkingEngineRuntimeMixin:
                     and self.vehicle_registry
                     and plate_matching_enabled
                 ):
-                    # Attempt to get plate first to save crop with correct filename
-                    plate = self.vehicle_registry.get_plate_for_track(cam_id, track_id)
-                    snapshot_path = None
-                    if plate and detection is not None:
-                        snapshot_path = self._save_car_crop(frame, detection, plate, cam_id)
-
-                    linked_plate = self.vehicle_registry.try_link_to_slot(
-                        slot_id=slot.id,
-                        slot_name=slot.label,
-                        zone_id=slot.zone_id,
-                        zone_name=slot.zone_name,
-                        camera_id=cam_id,
-                        floor=pipeline.floor,
-                        track_id=track_id,
-                        timestamp=datetime.now(),
-                        snapshot_path=snapshot_path,
-                        # Real vacant->occupied transition: the only place the
-                        # single-slot/single-pending-plate auto-lock may fire.
-                        allow_auto_lock=True,
-                    )
-                    if linked_plate:
-                        event.plate_number = linked_plate
-                        location = self.vehicle_registry.get_plate_location(linked_plate)
-                        if location:
-                            event.snapshot_url = location.get("snapshot_url", "")
-                        # Bind the initial plate as PROVISIONAL (unlocked) with its
-                        # confidence; the per-frame resolver upgrades it and locks
-                        # once the confidence/OCR bar is met.
-                        conf = self.vehicle_registry.get_slot_binding_confidence(slot.id)
-                        state_machine.bind_identity(
-                            linked_plate,
-                            self._build_slot_snapshot_url(slot.id),
-                            confidence=conf,
-                        )
-                        if self.db_manager:
-                            self._persist_slot_plate_binding(
-                                slot.id, linked_plate, conf, False, cam_id
-                            )
-                    else:
-                        state_machine.bind_identity(
-                            None,
-                            self._build_slot_snapshot_url(slot.id),
-                        )
+                    # PHASE 2 work, deferred — see _identify_parked_slot. Recorded
+                    # rather than run so the occupancy event can be emitted first.
+                    parked_events.append(event)
                 elif event.event_type == "slot_vacant" and self.vehicle_registry:
                     # unlink_slot also drops any plate-lock on the slot.
                     plate = self.vehicle_registry.unlink_slot(slot.id)
@@ -1718,6 +1750,34 @@ class ParkingEngineRuntimeMixin:
                         self._persist_slot_plate_binding(
                             slot.id, None, 0.0, False, cam_id
                         )
+
+            slot_ctx.append(
+                (slot, state_machine, vehicle_in_slot, track_id, detection,
+                 parked_events, plate_matching_enabled)
+            )
+            all_events.extend(events)
+
+        return all_events, slot_ctx
+
+    def _update_slot_identity(self, cam_id: str, frame, pipeline, slot_ctx) -> None:
+        """PHASE 2 — WHO is in the slot. Runs after occupancy has been emitted.
+
+        Everything here is allowed to land a beat late: the plate reaches the UI
+        through ``parking_slots.current_plate`` / the ``SlotStatus`` row rather than
+        the occupancy event payload (``update_current_slot_plate`` exists precisely
+        for "the slot became occupied first and identity resolved slightly later").
+        Nothing in phase 1 reads what this writes, so deferring it cannot delay or
+        change an occupancy decision.
+        """
+        for (
+            slot, state_machine, vehicle_in_slot, track_id, detection,
+            parked_events, plate_matching_enabled,
+        ) in slot_ctx:
+            for event in parked_events:
+                self._identify_parked_slot(
+                    cam_id, frame, pipeline, slot, state_machine, track_id,
+                    detection, event,
+                )
 
             # OCR IDENTIFICATION — the only mechanism that can fill current_plate
             # correctly. Runs while the car is STILL MANOEUVRING (ENTERING) as well as
@@ -1769,9 +1829,62 @@ class ParkingEngineRuntimeMixin:
                 if self.db_manager:
                     self._persist_late_slot_plate(slot.id, None, cam_id)
 
-            all_events.extend(events)
+    def _identify_parked_slot(
+        self, cam_id, frame, pipeline, slot, state_machine, track_id, detection, event
+    ) -> None:
+        """The identity half of a ``vehicle_parked`` transition.
 
-        return all_events
+        Lifted verbatim out of the occupancy loop so the event can be emitted before
+        this runs. Note ``try_link_to_slot`` is inert in production —
+        ``matching.slot_plate_requires_ocr`` is true (``config.yaml:380``) and the
+        function returns None on its third statement
+        (``vehicle_registry_identity.py:3608``), so today this reliably takes the
+        ``else`` branch. It is kept intact rather than pruned because flipping that
+        flag back is the documented way to restore appearance-based linking.
+        """
+        # Attempt to get plate first to save crop with correct filename
+        plate = self.vehicle_registry.get_plate_for_track(cam_id, track_id)
+        snapshot_path = None
+        if plate and detection is not None:
+            snapshot_path = self._save_car_crop(frame, detection, plate, cam_id)
+
+        linked_plate = self.vehicle_registry.try_link_to_slot(
+            slot_id=slot.id,
+            slot_name=slot.label,
+            zone_id=slot.zone_id,
+            zone_name=slot.zone_name,
+            camera_id=cam_id,
+            floor=pipeline.floor,
+            track_id=track_id,
+            timestamp=datetime.now(),
+            snapshot_path=snapshot_path,
+            # Real vacant->occupied transition: the only place the
+            # single-slot/single-pending-plate auto-lock may fire.
+            allow_auto_lock=True,
+        )
+        if linked_plate:
+            event.plate_number = linked_plate
+            location = self.vehicle_registry.get_plate_location(linked_plate)
+            if location:
+                event.snapshot_url = location.get("snapshot_url", "")
+            # Bind the initial plate as PROVISIONAL (unlocked) with its
+            # confidence; the per-frame resolver upgrades it and locks
+            # once the confidence/OCR bar is met.
+            conf = self.vehicle_registry.get_slot_binding_confidence(slot.id)
+            state_machine.bind_identity(
+                linked_plate,
+                self._build_slot_snapshot_url(slot.id),
+                confidence=conf,
+            )
+            if self.db_manager:
+                self._persist_slot_plate_binding(
+                    slot.id, linked_plate, conf, False, cam_id
+                )
+        else:
+            state_machine.bind_identity(
+                None,
+                self._build_slot_snapshot_url(slot.id),
+            )
 
     def _resolve_locked_plate(
         self, cam_id, frame, pipeline, slot, state_machine, track_id, detection

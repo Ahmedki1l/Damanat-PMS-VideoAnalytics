@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from shapely.geometry import Point, box
 
+from src.detection.detector import is_untracked
 from src.models.slot import ParkingSlot
 from src.models.state_machine import SlotState
 
@@ -506,7 +507,7 @@ class ParkingEngineTrackingMixin:
                 if other is detection:
                     continue
                 other_tid = getattr(other, "track_id", None)
-                if other_tid == -1 or (
+                if is_untracked(other_tid) or (
                     self_tid is not None and other_tid == self_tid
                 ):
                     continue
@@ -749,7 +750,7 @@ class ParkingEngineTrackingMixin:
         """
         candidates = []
         for detection in detections:
-            if detection.track_id == -1:
+            if is_untracked(detection.track_id):
                 continue
 
             overlap_ratio = self._zone_overlap_ratio(detection, zone)
@@ -801,13 +802,13 @@ class ParkingEngineTrackingMixin:
         """
         in_zone_detections = [
             d for d in detections
-            if d.track_id != -1 and self._detection_in_zone(d, zone)
+            if not is_untracked(d.track_id) and self._detection_in_zone(d, zone)
         ]
         currently_inside = {d.track_id for d in in_zone_detections}
 
         if cam_id == "CAM-23":
             for detection in detections:
-                if detection.track_id == -1:
+                if is_untracked(detection.track_id):
                     continue
                 logger.debug(
                     "[PARK_ENTRY] Track %d zone-contains: %s (bottom_center=%s)",
@@ -925,7 +926,7 @@ class ParkingEngineTrackingMixin:
         primary_detection = self._select_primary_zone_detection(frame, detections, zone)
 
         for detection in detections:
-            if detection.track_id == -1:
+            if is_untracked(detection.track_id):
                 continue
 
             if primary_detection is not None and detection.track_id != primary_detection.track_id:
@@ -1189,7 +1190,7 @@ class ParkingEngineTrackingMixin:
         # silently weakens.
         for detection in detections:
             tid = getattr(detection, "track_id", -1)
-            if tid != -1:
+            if not is_untracked(tid):
                 self._ocr_track_first_seen.setdefault((cam_id, tid), now_ts)
 
         # Config-driven and constant for this frame.
@@ -1197,7 +1198,7 @@ class ParkingEngineTrackingMixin:
 
         for detection in detections:
             tid = getattr(detection, "track_id", -1)
-            if tid == -1:
+            if is_untracked(tid):
                 continue
             key = (cam_id, tid)
             if registry.get_plate_for_track(cam_id, tid):
@@ -1367,7 +1368,7 @@ class ParkingEngineTrackingMixin:
         self._try_ocr_identify_tracks(cam_id, frame, detections, now_ts)
 
         for detection in detections:
-            if detection.track_id == -1:
+            if is_untracked(detection.track_id):
                 continue
 
             # Record how fully this camera sees the car — feeds the ReID

@@ -22,6 +22,29 @@ from src.config import DetectorConfig, DetectorPreprocessingConfig
 from src.preprocessing import luminance_normalize_auto
 
 
+def is_untracked(track_id: int) -> bool:
+    """True when a detection has NO stable tracker identity.
+
+    Two different negative values mean this, and code that gates identity work must
+    treat them the same:
+
+      * ``-1`` — the tracker did not assign an id (:class:`Detection`'s default).
+      * ``-100``, ``-101``, ... — a SYNTHETIC id stamped in place by
+        ``SlotAssigner.assign`` (``slot_assigner.py:77``) so a slot can be keyed by
+        something when the tracker gave it nothing.
+
+    Anything that runs after the assigner therefore sees ``-100``, not ``-1``. Guards
+    written as ``track_id == -1`` silently stop firing in that case, which would let
+    untracked blobs acquire ReID features, gallery references and session bindings
+    keyed on an id that is re-minted every frame. Use this predicate instead of
+    comparing to ``-1`` so the guard is correct regardless of pipeline order.
+
+    ``vehicle_registry.py:417`` already used ``track_id < 0`` for exactly this reason;
+    this makes that convention explicit and shared.
+    """
+    return track_id is None or track_id < 0
+
+
 @dataclass
 class Detection:
     """
@@ -32,6 +55,8 @@ class Detection:
         class_id: COCO class ID (2 = car).
         confidence: Detection confidence score [0, 1].
         track_id: Stable tracker ID (set later by tracker, -1 if untracked).
+                  May also be a synthetic negative id from the slot assigner —
+                  test with :func:`is_untracked`, never ``== -1``.
     """
     bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2)
     class_id: int
