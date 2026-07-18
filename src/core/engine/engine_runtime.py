@@ -1809,6 +1809,9 @@ class ParkingEngineRuntimeMixin:
             )
             parked_events = []
             self._log_slot_hold(cam_id, slot, state_machine, assignment, vehicle_in_slot)
+            self._trace_occupancy_frame(
+                cam_id, slot, state_machine, assignment, vehicle_in_slot
+            )
 
             for event in events:
                 event.camera_id = cam_id
@@ -1878,6 +1881,17 @@ class ParkingEngineRuntimeMixin:
     # ~21 slot cameras to ~40 lines/min while still bounding how long a silent
     # failure can hide.
     _CAMDETS_INTERVAL_S = 30.0
+
+    # Per-FRAME occupancy trace, opt-in via VA_OCC_TRACE=1. Unlike [SLOTHOLD]
+    # (throttled to one line / _SLOTHOLD_INTERVAL_S and only when a box is
+    # present), this emits ONE [OCCFRAME] line for EVERY frame a slot is
+    # OCCUPIED or LEAVING — including frames with NO assigned detection. That is
+    # what separates the three failure modes for a stuck slot: a continuous
+    # (false/low-conf) detection, a stale/synthetic track, or a leave-debounce
+    # that never completes. Heavy by design — set the env var, restart, catch
+    # the incident, then turn it off. Evaluated at import so it costs nothing
+    # per frame when unset.
+    _OCC_TRACE = os.getenv("VA_OCC_TRACE", "") not in ("", "0", "false", "False")
 
     def _log_camera_detections(
         self, cam_id, pipeline, n_raw, detections, assignment
@@ -1979,6 +1993,83 @@ class ParkingEngineRuntimeMixin:
             slot.id, cam_id, state_machine.state.value, ev["track_id"],
             ev["bbox"], ev["probe"], ev["method"], ev["overlap"], rivals,
         )
+
+    def _trace_occupancy_frame(
+        self, cam_id, slot, state_machine, assignment, vehicle_in_slot
+    ) -> None:
+        """Per-frame occupancy trace (opt-in, VA_OCC_TRACE=1) — see ``_OCC_TRACE``.
+
+        Records, for EVERY frame a slot is OCCUPIED or LEAVING, exactly what the
+        occupancy engine saw this frame, so a slot that will not go VACANT can be
+        diagnosed from the log alone instead of by hypothesis:
+
+          present=1 : a detection was assigned to this slot this frame. Logs the
+                      track id, whether that track is real or a synthetic/untracked
+                      id (``tracked``), the detector confidence, the class id, the
+                      assignment method (``point`` = ground-point inside the
+                      polygon; ``overlap`` = ground-point OUTSIDE, won on the
+                      bbox-overlap fallback), the overlap fraction, the box, the
+                      probe point and any rival slots the same box also touched.
+          present=0 : NO detection was assigned — the slot is held only by the
+                      leave-debounce. Logs the leave counter vs the frames needed,
+                      so a debounce that keeps resetting is visible as a counter
+                      that never climbs to ``need``.
+
+        Reading it:
+          * present=1 every frame, low ``conf`` or ``cls`` != vehicle  -> a false/
+            ghost detection is holding the slot.
+          * present=1 every frame, ``tracked=0`` or a track id that never changes
+            while the real car is gone                                 -> a stale
+            /synthetic track is holding the slot.
+          * present=1 with ``via=overlap`` or a tiny ``overlap``       -> an
+            assignment bug: the box's ground point is not even in the slot.
+          * present flips 1/0 and ``leave`` never reaches ``need``     -> flicker;
+            the debounce is being reset by intermittent (re)detections.
+
+        Emits ``[OCCFRAME]``. Unthrottled by design; the ``_OCC_TRACE`` gate keeps
+        it out of steady-state prod.
+        """
+        if not self._OCC_TRACE:
+            return
+        if state_machine.state not in (SlotState.OCCUPIED, SlotState.LEAVING):
+            return
+
+        # ``frame`` is the engine's global processed-frame sequence (monotonic,
+        # shared across cameras — see engine_single_process). At ~2.5 fps over
+        # ~26 cams it advances by ~one-per-camera-frame, so the SAME slot's
+        # consecutive lines step by ~the camera count; the number still orders
+        # every [OCCFRAME] globally and lets a stuck slot be measured in exact
+        # frames. ``ts`` is epoch seconds in the payload, so the line is
+        # self-contained and machine-parseable without the log-prefix timestamp.
+        seq = getattr(self, "_frame_count", -1)
+        ts = time.time()
+
+        if vehicle_in_slot:
+            ev = (getattr(assignment, "evidence", None) or {}).get(slot.id) or {}
+            track_id = ev.get("track_id")
+            rivals = " ".join(
+                f"{sid}:{ov:.2f}" for sid, ov in ev.get("rivals", [])
+            ) or "-"
+            logger.info(
+                "[OCCFRAME] frame=%s ts=%.3f slot=%s cam=%s state=%s present=1 "
+                "track=%s tracked=%d conf=%s cls=%s via=%s overlap=%.2f "
+                "bbox=%s probe=%s rivals=%s",
+                seq, ts, slot.id, cam_id, state_machine.state.value,
+                track_id,
+                0 if is_untracked(track_id) else 1,
+                ev.get("confidence"), ev.get("class_id"),
+                ev.get("method", "?"), float(ev.get("overlap", 0.0)),
+                ev.get("bbox"), ev.get("probe"), rivals,
+            )
+        else:
+            need = getattr(state_machine, "confirm_leave_frames", 0)
+            had = getattr(state_machine, "_leave_counter", 0)
+            logger.info(
+                "[OCCFRAME] frame=%s ts=%.3f slot=%s cam=%s state=%s present=0 "
+                "no_detection leave=%d/%d (held by leave-debounce; no box "
+                "assigned this frame)",
+                seq, ts, slot.id, cam_id, state_machine.state.value, had, need,
+            )
 
     def _update_slot_identity(self, cam_id: str, frame, pipeline, slot_ctx) -> None:
         """PHASE 2 — WHO is in the slot. Runs after occupancy has been emitted.

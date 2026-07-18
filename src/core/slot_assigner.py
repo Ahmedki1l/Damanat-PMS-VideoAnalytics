@@ -44,6 +44,10 @@ class SlotAssignment:
     over a polygon edge without guessing. Each entry carries:
 
         track_id  : the (possibly synthetic) id that held the slot
+        confidence: the detector's confidence for that box [0, 1] — a persistent
+                    low-confidence holder points at a ghost/false detection
+        class_id  : the detected class id (2 = car) — a non-vehicle class holding
+                    a slot points at a misclassification, not a parked car
         bbox      : the detection box, (x1, y1, x2, y2)
         probe     : the ground-contact point tested against the polygon
         method    : "point"   -> probe was inside the polygon (primary rule)
@@ -160,6 +164,8 @@ class SlotAssigner:
             method, own_overlap = how.get(id(winner_det), ("unknown", 0.0))
             result.evidence[slot_id] = {
                 "track_id": winner_det.track_id,
+                "confidence": round(float(winner_det.confidence), 3),
+                "class_id": int(winner_det.class_id),
                 "bbox": tuple(round(float(v), 1) for v in winner_det.bbox),
                 "probe": tuple(round(float(v), 1) for v in winner_det.bottom_center),
                 "method": method,
