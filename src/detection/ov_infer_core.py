@@ -212,16 +212,29 @@ class OVInferCore:
             results = self._predictor.postprocess(preds, im, [frame_bgr])
         return results
 
-    def _tracks_to_detections(self, tracks: np.ndarray, frame_shape) -> List[Detection]:
+    def _tracks_to_detections(
+        self, tracks: np.ndarray, frame_shape, results=None
+    ) -> List[Detection]:
         """Ultralytics track rows → Detection list, applying the whole-frame box
         guard exactly like TrackedDetector._parse_results.
 
         ``tracks`` rows are ``[x1, y1, x2, y2, track_id, conf, cls, det_idx]``
         (see on_predict_postprocess_end); boxes are already in ``frame`` coords.
+
+        ZERO-TRACKS FALLBACK (parity, found 2026-07-18): when the tracker returns
+        no rows, Ultralytics' on_predict_postprocess_end leaves ``results[0]``
+        holding the RAW NMS boxes with no ids, and the serial path's
+        ``_parse_results`` emitted those with ``track_id=-1`` — which is why the
+        slot assigner has always handled ``-1`` (it stamps synthetic ids). This
+        core originally returned ``[]`` instead, so in the zero-tracks regime —
+        a lone parked car whose track hasn't activated or was just lost — the
+        async engine saw NOTHING where the old engine saw the car. Invisible to
+        every fps metric, and it also blinded the [CAMDETS] ``raw`` count, which
+        can only ever see what this function returns.
         """
         detections: List[Detection] = []
         if tracks is None or len(tracks) == 0:
-            return detections
+            return self._raw_boxes_to_detections(results, frame_shape)
 
         frame_area = (
             float(frame_shape[0] * frame_shape[1])
@@ -238,6 +251,41 @@ class OVInferCore:
                 class_id=int(row[6]),
                 confidence=float(row[5]),
                 track_id=int(row[4]),
+            ))
+        return detections
+
+    def _raw_boxes_to_detections(self, results, frame_shape) -> List[Detection]:
+        """The zero-tracks fallback body: raw NMS boxes → ``track_id=-1`` Detections.
+
+        Mirrors ``TrackedDetector._parse_results`` for the untracked case — same
+        whole-frame area guard, boxes already in frame coordinates (postprocess
+        ran against the original frame). Downstream is already built for these:
+        the assigner stamps synthetic negative ids and every identity guard uses
+        ``is_untracked()``.
+        """
+        detections: List[Detection] = []
+        if results is None:
+            return detections
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            return detections
+
+        frame_area = (
+            float(frame_shape[0] * frame_shape[1])
+            if self.max_box_area_ratio > 0.0 and frame_shape is not None
+            else 0.0
+        )
+        for i in range(len(boxes)):
+            xyxy = boxes.xyxy[i].cpu().numpy()
+            x1, y1, x2, y2 = (float(v) for v in xyxy[:4])
+            if frame_area > 0.0:
+                if ((x2 - x1) * (y2 - y1)) / frame_area > self.max_box_area_ratio:
+                    continue
+            detections.append(Detection(
+                bbox=(x1, y1, x2, y2),
+                class_id=int(boxes.cls[i]),
+                confidence=float(boxes.conf[i]),
+                track_id=-1,
             ))
         return detections
 
@@ -259,7 +307,7 @@ class OVInferCore:
         raw = self._compiled({self._input_name: input_np})
         results = self._decode(raw, im, frame_bgr)
         tracks = self._update_tracker(results, frame_bgr, tracker)
-        return self._tracks_to_detections(tracks, frame_bgr.shape)
+        return self._tracks_to_detections(tracks, frame_bgr.shape, results)
 
     # --- Phase 2: asynchronous path ---------------------------------------- #
 
@@ -295,7 +343,7 @@ class OVInferCore:
         try:
             results = self._decode(request.results, im, frame_bgr)
             tracks = self._update_tracker(results, frame_bgr, tracker)
-            detections = self._tracks_to_detections(tracks, frame_bgr.shape)
+            detections = self._tracks_to_detections(tracks, frame_bgr.shape, results)
         except Exception as exc:  # never let one bad frame kill the OV worker
             print(f"[OVInferCore] completion error: {exc!r}")
             detections = []
