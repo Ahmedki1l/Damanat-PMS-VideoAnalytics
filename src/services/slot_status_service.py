@@ -1,9 +1,13 @@
+import logging
+
 from sqlalchemy.orm import Session
 from src.model import SlotStatus, CameraFeed
 from src.repositories import SlotStatusRepository, ParkingSlotRepository
 from src.utils.datetime_helper import facility_now_naive
 from . import alert_service
 from . import pms_api_client
+
+logger = logging.getLogger(__name__)
 
 def log_camera_feed_event(db: Session, event_type: str, camera_id: str, plate: str = None, slot_id: str = None, snapshot_path: str = None):
     """
@@ -100,16 +104,43 @@ def log_vehicle_event(
 
     alert_id = None
     if is_parked:
-        alert = alert_service.report_alert(
-            db,
-            slot_id,
-            plate,
-            camera_id=camera_id,
-            severity=severity,
-            snapshot_path=snapshot_path,
-        )
-        if alert:
-            alert_id = alert.id
+        # A NAMED SLOT WITH NO PLATE IS NOT OURS TO JUDGE.
+        #
+        # A slot reserved for a person can only be "intruded" by someone who is
+        # NOT that person, and identity is not known at occupancy time — it
+        # resolves seconds to minutes later. The engine owns that verdict
+        # (_register_pending_ownership -> _evaluate_named_slot_ownership, with
+        # _sweep_pending_ownership as the deadline) and raises the alert itself,
+        # after an ownership check and carrying the plate.
+        #
+        # Raising here regardless is what produced 80 plateless vehicle_intrusion
+        # alerts on 2026-07-20 — every executive flagged as an intruder in his own
+        # slot — while the deferred path fired 0 times. report_alert with no
+        # alert_type derives "vehicle_intrusion" from reservation_type == EMPLOYEE
+        # alone (alert_service.py:66) and never looks at WHO parked, so the
+        # ownership machinery was bypassed entirely.
+        #
+        # When a plate IS present the engine has already ruled (engine_runtime.py
+        # :2570 returns vehicle_intrusion only for a proven non-owner), so that
+        # case still reports here and keeps its plate.
+        named_slot = getattr(slot, "reservation_type", None) == "EMPLOYEE"
+        if named_slot and not plate_value:
+            logger.debug(
+                "[alert] slot=%s is reserved for %r and no plate is known yet — "
+                "deferring the ownership verdict to the engine",
+                slot_id, getattr(slot, "reserved_for", None),
+            )
+        else:
+            alert = alert_service.report_alert(
+                db,
+                slot_id,
+                plate,
+                camera_id=camera_id,
+                severity=severity,
+                snapshot_path=snapshot_path,
+            )
+            if alert:
+                alert_id = alert.id
     else:
         alert = alert_service.resolve_alert(db, slot_id)
         if alert:
