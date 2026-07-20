@@ -62,7 +62,25 @@ def log_vehicle_event(
         # prefers current_plate and falls back to slot_status.plate_number)
         # can read either. report_alert may flush this row marginally before
         # the occupancy row is created — the value is identical either way.
-        slot.current_plate = plate_value
+        #
+        # OCCUPANCY MAY NOT ERASE IDENTITY. This is an occupancy event, and by
+        # design it carries no plate: identity (OCR/ReID) runs AFTER occupancy is
+        # published, so `plate` is empty on essentially every vehicle_parked
+        # (engine_runtime._get_slot_alert_type says so in as many words). Mirroring
+        # that empty value onto current_plate makes every occupancy write a plate
+        # ERASER — an already-identified slot re-emitting an occupied event (a
+        # re-park, an alert-typed event, a restart replay) is silently reset to
+        # NULL, and a LOCKED slot never rewrites it because _resolve_locked_plate
+        # freezes on is_plate_locked(). The slot then reads NULL for the rest of
+        # the occupancy. So: only VACATING clears identity — that is the one
+        # transition that actually proves the old plate is gone.
+        if not is_parked:
+            slot.current_plate = None
+            slot.plate_confidence = 0.0
+            slot.plate_locked = False
+            slot.plate_locked_at = None
+        elif plate_value:
+            slot.current_plate = plate_value
 
     is_occupied_to_empty_transition = False
     if not is_parked:
@@ -70,9 +88,13 @@ def log_vehicle_event(
         if prev_status is not None and prev_status.status == "occupied":
             is_occupied_to_empty_transition = True
 
+    # Keep the twins in step: the new occupancy row carries whatever identity the
+    # slot row now holds (the event's plate if it brought one, otherwise the plate
+    # already bound to the slot) so the two columns never disagree. A vacate row
+    # carries None, matching the clear above.
     new_log = SlotStatus(
         slot_id=slot_id,
-        plate_number=plate_value,
+        plate_number=(plate_value or getattr(slot, "current_plate", None)) if is_parked else None,
         status="occupied" if is_parked else "available"
     )
 
