@@ -10,7 +10,11 @@ import numpy as np
 from collections import Counter
 
 from src.matching.match_decision import Decision
-from src.matching.plate_ocr_match import confirm_plate, read_matches_plate
+from src.matching.plate_ocr_match import (
+    confirm_plate,
+    is_plausible_plate,
+    read_matches_plate,
+)
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
 
 logger = logging.getLogger(__name__)
@@ -4069,6 +4073,7 @@ class VehicleRegistryIdentityMixin:
                     s.plate
                     for s in self._sessions.values()
                     if s.plate
+                    and is_plausible_plate(s.plate)
                     and (not require_appearance or self._has_appearance_evidence(s))
                 }
             )

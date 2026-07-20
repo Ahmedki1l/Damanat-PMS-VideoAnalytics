@@ -50,6 +50,10 @@ _MIN_DIGITS = 2
 # ('SANNYL318AV0') "confirmed" EEB-80 and put a stranger's plate in B25 on 2026-07-12.
 _STRONG_DIGITS = 4
 
+# A STORED plate at this facility: 2-4 letters, then 1-4 digits, dash optional.
+# Anchors the ARRANGEMENT, not just the run lengths — see is_plausible_plate.
+_CANONICAL_PLATE = re.compile(r"^[A-Z]{2,4}-?[0-9]{1,4}$")
+
 
 def normalize(text: Optional[str]) -> str:
     """Upper-case, strip everything that is not A-Z0-9 (separators, Arabic glyphs)."""
@@ -65,6 +69,39 @@ def split_runs(text: str) -> Tuple[str, str]:
         "".join(ch for ch in norm if ch.isalpha()),
         "".join(ch for ch in norm if ch.isdigit()),
     )
+
+
+def is_plausible_plate(plate: Optional[str]) -> bool:
+    """Could this string be a real vehicle plate at this facility?
+
+    A CANDIDATE FILTER, not a reader. Saudi civilian plates are 2-4 letters and
+    2-4 digits; anything else is an ANPR artefact, and an artefact in the
+    candidate set can only ever subtract. Measured on the 2026-07-20 entry feed,
+    the gate minted these as *vehicles* — owner "Unknown", one sighting each:
+
+        36663XN   77842SJ   66466RA   87281EJ   666EIAI
+
+    ``77842SJ`` is a misread of DJS-7842 and ``36663XN`` of XRD-6663; ``36663XN``
+    was bound to slot B2 and would have been the plate shown on that slot's
+    intrusion alert. Since ``confirm_plate`` can only ever return a member of the
+    candidate set, dropping implausible members here makes it structurally
+    impossible for one to reach ``current_plate`` — which is the "CORRECT or
+    NULL, never wrong" contract the slot identity path is built on.
+
+    Deliberately shape-only: NO registry lookup, so a genuinely new visitor with
+    a well-formed plate passes untouched. Validated against the live facility
+    2026-07-20 — of 55 registered vehicles this rejects 0, and of the 15
+    unknown-owner rows it keeps the 12 that are real unregistered visitors
+    (BAS-6646, DJS-7842, ...) and drops only the artefacts.
+
+    The order matters, not just the counts: a stored plate is letters-then-digits
+    (``RGR-6466``, ``HDU-7``), while every artefact we have seen is digits-first
+    (``36663XN``, ``77842SJ``, ``666EIAI``). Counting runs alone would admit
+    ``666EIAI``; anchoring the arrangement does not.
+    """
+    if not plate:
+        return False
+    return bool(_CANONICAL_PLATE.match(str(plate).strip().upper()))
 
 
 def read_matches_plate(ocr_text: Optional[str], plate: Optional[str]) -> bool:
