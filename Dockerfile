@@ -151,7 +151,7 @@ ENV PERF_TRACE_EVERY=50
 # `~in flight` rise from ~2 toward nireq, and inf/s climb from ~20. If req_wall
 # INFLATES and concurrency stays low, feeders+15 threads oversubscribe → next build
 # lowers VA_OV_NUM_THREADS (~10) to give feeders CPU.
-ENV VA_INFER_NIREQ=4
+ENV VA_INFER_NIREQ=16
 ENV VA_SINGLE_PROCESS=1
 ENV VA_INFER=async
 ENV VA_OV_NUM_THREADS=16
