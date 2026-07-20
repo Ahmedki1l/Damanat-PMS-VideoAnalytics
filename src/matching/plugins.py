@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -95,8 +95,39 @@ class PlateOCR(ABC):
         """Return ``(text, confidence)`` where text is normalised alphanumerics.
 
         Implementations accept optional keyword flags (``allow_retry``,
-        ``apply_plate_roi``); the base contract ignores any it does not use, so
-        callers can pass them uniformly without probing the concrete type.
+        ``apply_plate_roi``, ``apply_hud_mask``); the base contract ignores any it
+        does not use, so callers can pass them uniformly without probing the
+        concrete type.
+        """
+
+
+class PlateRegionDetector(ABC):
+    """
+    Abstract interface for license plate region detection.
+
+    Allows different LPD models to be swapped in/out without changes to the OCR pipeline.
+    """
+
+    @abstractmethod
+    def detect(self, bgr: np.ndarray) -> List[Tuple[float, float, float, float, float]]:
+        """Detect plate bounding boxes in a vehicle crop.
+
+        Returns
+        -------
+        list of Tuple
+            List of (x1, y1, x2, y2, score) coordinates.
+        """
+
+    @abstractmethod
+    def crop_plate(
+        self, bgr: np.ndarray, *, pad_ratio: float = 0.15
+    ) -> Optional[np.ndarray]:
+        """Detect and return the cropped and padded license plate region.
+
+        Returns
+        -------
+        np.ndarray or None
+            The cropped BGR plate region, or None if no plate is detected.
         """
 
 
@@ -241,3 +272,15 @@ class NoopPlateOCR(PlateOCR):
 
     def read(self, crop_bgr: np.ndarray, **kwargs) -> Tuple[str, float]:
         return ("", 0.0)
+
+
+class NoopPlateRegionDetector(PlateRegionDetector):
+    """Fallback LPD that always returns no detections/crops."""
+
+    def detect(self, bgr: np.ndarray) -> List[Tuple[float, float, float, float, float]]:
+        return []
+
+    def crop_plate(
+        self, bgr: np.ndarray, *, pad_ratio: float = 0.15
+    ) -> Optional[np.ndarray]:
+        return None

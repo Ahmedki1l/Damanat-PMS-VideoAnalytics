@@ -354,6 +354,20 @@ matching:
   type_classifier_model: "models/type_classifier_openvino/model.xml"
   plate_ocr_model: ""          # DISABLED — see DEPLOYMENT.md to re-enable PaddleOCR
 
+  # --- License Plate Detector (LPD) and Preprocessing ---
+  # slot_lpd_enabled: false            # Set to true to localise plate crop before OCR
+  # slot_lpd_fallback_enabled: true    # Fall back to full car crop if LPD misses the plate
+  # slot_lpd_model_dir: "models/yolo11n_lpd_openvino_model"
+  # slot_lpd_confidence: 0.30
+  # slot_lpd_iou: 0.45
+  # slot_lpd_num_threads: 2
+  # slot_ocr_upscale: 1.0              # Super-resolution / upscaling factor for plate crop
+  # slot_ocr_preprocessing: []         # Enhancement steps, applied in the order given.
+                                       # Valid: clahe, sharpen, denoise, threshold.
+                                       # An unrecognised name is skipped with a WARNING —
+                                       # check the log if a step seems to do nothing.
+  # slot_ocr_debug: false              # If true, saves debug crop images to logs/debug_ocr/
+
   # FAISS-CPU gallery index (enable when session count exceeds ~5000)
   use_faiss_index: false
   faiss_index_dimension: 512

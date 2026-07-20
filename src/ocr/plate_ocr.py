@@ -262,6 +262,8 @@ class PaddlePlateOCR(PlateOCR):
         empty_read_upscale: float = DEFAULT_EMPTY_READ_UPSCALE,
         max_upscaled_pixels: int = DEFAULT_MAX_UPSCALED_PIXELS,
         cpu_threads: int = 4,
+        upscale_factor: float = 1.0,
+        preprocessing: Optional[List[str]] = None,
     ) -> None:
         # Fail fast at construction so callers know whether the plugin is
         # usable before the first frame arrives. The actual heavy model load
@@ -290,6 +292,8 @@ class PaddlePlateOCR(PlateOCR):
         # the CFS budget), but a single-threaded det+rec pass on a weak server
         # core takes SECONDS and runs inline in the serial camera loop.
         self._cpu_threads = max(1, int(cpu_threads or 1))
+        self._upscale_factor = float(upscale_factor or 1.0)
+        self._preprocessing = list(preprocessing or [])
         # Default to PaddleOCR v5 mobile det/rec; callers can override for
         # an explicit model upgrade or downgrade.
         self._det_model_name = det_model_name or self.DEFAULT_DET_V3
@@ -446,7 +450,12 @@ class PaddlePlateOCR(PlateOCR):
             return crop_bgr
         return crop_bgr[y0:y1, x0:x1]
 
-    def _preprocess(self, crop_bgr: np.ndarray, apply_roi: bool = True) -> np.ndarray:
+    def _preprocess(
+        self,
+        crop_bgr: np.ndarray,
+        apply_roi: bool = True,
+        apply_hud_mask: bool = True,
+    ) -> np.ndarray:
         """Mask HUD bands, crop the geometric plate ROI, then upsample tiny crops.
 
         ``apply_roi=False`` skips the bottom-centre plate-ROI crop. That crop
@@ -455,13 +464,22 @@ class PaddlePlateOCR(PlateOCR):
         the very bottom of the box and the 50-95% band lands on the grille (BMW
         kidney / Lexus spindle slats read as garbage). Slot reads pass False and
         let PaddleOCR's own text detector localise the plate in the full car crop.
+
+        ``apply_hud_mask=False`` skips the HUD bands. THIS IS REQUIRED WHEN THE
+        INPUT IS ALREADY A TIGHT PLATE CROP. The HUD ratios are fractions of the
+        input's HEIGHT, so they only mean "the recorder's overlay strip" on a
+        whole-frame-ish vehicle crop. On a ~130x35 plate box from the region
+        detector, 0.08 top + 0.08 bottom blanks ~3px at each edge — ~17% of the
+        plate, and precisely the rows carrying glyph ascenders/descenders. Left on,
+        it silently degrades exactly the reads this path exists to improve.
         """
         if crop_bgr is None or crop_bgr.size == 0:
             return crop_bgr
 
         # 1. Mask HUD bands FIRST so the ROI crop doesn't pull in timestamp
         #    pixels from a corner.
-        crop_bgr = self._mask_hud(crop_bgr)
+        if apply_hud_mask:
+            crop_bgr = self._mask_hud(crop_bgr)
 
         # 2. Geometric plate-ROI crop. Drops windshield stickers, branding,
         #    wide chassis background — leaves the bottom-centre region where
@@ -471,24 +489,76 @@ class PaddlePlateOCR(PlateOCR):
             crop_bgr = self._extract_plate_roi(crop_bgr)
 
         h, w = crop_bgr.shape[:2]
-        if h >= self._min_crop_h and w >= self._min_crop_w:
-            return crop_bgr
 
-        # Scale uniformly to lift the short side to roughly twice the floor —
-        # tiny ROIs (<32×64) hurt the mobile recogniser disproportionately.
-        scale_h = (2 * self._min_crop_h) / h if h < self._min_crop_h else 1.0
-        scale_w = (2 * self._min_crop_w) / w if w < self._min_crop_w else 1.0
-        scale = max(scale_h, scale_w)
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
+        # 3. Scale uniformly to lift the short side to roughly twice the floor if tiny
+        if h < self._min_crop_h or w < self._min_crop_w:
+            scale_h = (2 * self._min_crop_h) / h if h < self._min_crop_h else 1.0
+            scale_w = (2 * self._min_crop_w) / w if w < self._min_crop_w else 1.0
+            scale = max(scale_h, scale_w)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            try:
+                import cv2
+                crop_bgr = cv2.resize(crop_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            except Exception as exc:  # pragma: no cover
+                logger.debug("[PaddlePlateOCR] fallback resize failed: %r", exc)
 
-        try:
-            import cv2
+        # 4. Custom upscale / Super-resolution
+        if hasattr(self, "_upscale_factor") and self._upscale_factor > 1.0:
+            try:
+                import cv2
+                h, w = crop_bgr.shape[:2]
+                new_w = max(1, int(round(w * self._upscale_factor)))
+                new_h = max(1, int(round(h * self._upscale_factor)))
+                crop_bgr = cv2.resize(crop_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            except Exception as exc:
+                logger.debug("[PaddlePlateOCR] custom upscale failed: %r", exc)
 
-            return cv2.resize(crop_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-        except Exception as exc:  # pragma: no cover - opencv always present
-            logger.debug("[PaddlePlateOCR] resize failed: %r", exc)
-            return crop_bgr
+        # 5. Configurable image enhancements
+        if hasattr(self, "_preprocessing") and self._preprocessing:
+            try:
+                import cv2
+                for step in self._preprocessing:
+                    if step == "clahe":
+                        if len(crop_bgr.shape) == 3 and crop_bgr.shape[2] == 3:
+                            lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+                            l_channel, a_channel, b_channel = cv2.split(lab)
+                            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                            cl = clahe.apply(l_channel)
+                            limg = cv2.merge((cl, a_channel, b_channel))
+                            crop_bgr = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+                        else:
+                            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                            crop_bgr = clahe.apply(crop_bgr)
+                    elif step == "sharpen":
+                        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+                        crop_bgr = cv2.filter2D(crop_bgr, -1, kernel)
+                    elif step == "denoise":
+                        # Bilateral filter is edge-preserving, which is ideal for text
+                        crop_bgr = cv2.bilateralFilter(crop_bgr, 5, 50, 50)
+                    elif step == "threshold":
+                        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) if len(crop_bgr.shape) == 3 else crop_bgr
+                        thresh = cv2.adaptiveThreshold(
+                            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+                        )
+                        if len(crop_bgr.shape) == 3:
+                            crop_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+                        else:
+                            crop_bgr = thresh
+                    else:
+                        # Never silently ignore a step the operator asked for — a
+                        # typo'd name would otherwise look exactly like "this
+                        # enhancement does nothing", which is unfalsifiable from
+                        # the outside. Warned once per read; the list is tiny.
+                        logger.warning(
+                            "[PaddlePlateOCR] unknown slot_ocr_preprocessing step "
+                            "%r — skipped (valid: clahe, sharpen, denoise, threshold)",
+                            step,
+                        )
+            except Exception as exc:
+                logger.debug("[PaddlePlateOCR] custom preprocessing step failed: %r", exc)
+
+        return crop_bgr
 
     # ----- Result parsing ------------------------------------------------- #
 
@@ -570,9 +640,13 @@ class PaddlePlateOCR(PlateOCR):
         *,
         allow_retry: bool = True,
         apply_plate_roi: bool = True,
+        apply_hud_mask: bool = True,
     ) -> Tuple[str, float]:
         """
         Run OCR on a BGR crop and return ``(normalised_text, mean_conf)``.
+
+        ``apply_hud_mask=False`` MUST be passed when ``crop_bgr`` is already a tight
+        plate ROI (e.g. from the plate-region detector) — see :meth:`_preprocess`.
 
         ``allow_retry`` gates the enlarged second pass (see below). The enlarged pass is
         what rescues a distant plate, but on a slot whose plate is genuinely out of frame
@@ -607,12 +681,20 @@ class PaddlePlateOCR(PlateOCR):
         # on the production Xeon.
         with perf_trace.stage("ocr"):
             with self._read_lock:
-                return self._read_timed(crop_bgr, allow_retry, apply_plate_roi)
+                return self._read_timed(
+                    crop_bgr, allow_retry, apply_plate_roi, apply_hud_mask
+                )
 
     def _read_timed(
-        self, crop_bgr: np.ndarray, allow_retry: bool, apply_plate_roi: bool
+        self,
+        crop_bgr: np.ndarray,
+        allow_retry: bool,
+        apply_plate_roi: bool,
+        apply_hud_mask: bool = True,
     ) -> Tuple[str, float]:
-        prepped = self._preprocess(crop_bgr, apply_roi=apply_plate_roi)
+        prepped = self._preprocess(
+            crop_bgr, apply_roi=apply_plate_roi, apply_hud_mask=apply_hud_mask
+        )
         text, conf = self._infer(prepped)
         if text:
             return (text, conf)

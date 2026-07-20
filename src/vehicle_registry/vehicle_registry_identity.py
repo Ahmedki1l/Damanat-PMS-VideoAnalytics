@@ -4602,25 +4602,144 @@ class VehicleRegistryIdentityMixin:
             decision_ctx=decision_ctx,
         )
 
-    def read_slot_plate(self, crop_bgr, allow_retry: bool) -> Tuple[str, float]:
-        """Phase 2 (ANY THREAD): the heavy PaddleOCR read, and nothing else.
+    def read_slot_plate(
+        self, crop_bgr, allow_retry: bool, *, slot_id: str | None = None,
+    ) -> Tuple[str, float]:
+        """Phase 2 (ANY THREAD): detect plate region then run PaddleOCR.
+
+        Pipeline:
+          1. Run PlateRegionDetector on the full vehicle crop.
+          2. If a plate region is found, crop it and feed the plate-only image to OCR.
+          3. If no plate is detected and fallback is enabled, feed the full vehicle crop.
+          4. Optionally save debug images with bounding-box overlays.
 
         This is the only phase safe to run off the main loop — it touches solely the
-        plate-OCR plugin, whose ``read`` serialises itself with an internal lock. The
-        slot camera looks DOWN, so the plate is at the bottom of the whole-car box, not
-        in the gate's bottom-centre band: read the full crop (``apply_plate_roi=False``).
+        plate-OCR plugin and the plate-detector plugin, both of which serialise themselves
+        with internal locks.
         """
+        import time as _time
+
         ocr = getattr(self._match_decision, "plate_ocr", None)
         if ocr is None or not hasattr(ocr, "read") or crop_bgr is None:
             return ("", 0.0)
+
+        config = getattr(self._match_decision, "config", None)
+        lpd_enabled = getattr(config, "slot_lpd_enabled", False) if config else False
+        lpd_fallback = getattr(config, "slot_lpd_fallback_enabled", True) if config else True
+        debug = getattr(config, "slot_ocr_debug", False) if config else False
+
+        ocr_input = crop_bgr  # default: full vehicle crop
+        lpd_hit = False
+        t_lpd = 0.0
+
+        # --- Stage 1: Plate detection ------------------------------------ #
+        if lpd_enabled:
+            detector = getattr(self._match_decision, "plate_detector", None)
+            if detector is not None and hasattr(detector, "detect"):
+                t0 = _time.perf_counter()
+                try:
+                    boxes = detector.detect(crop_bgr)
+                except Exception as exc:
+                    logger.debug("[ocr-id] LPD detect failed: %r", exc)
+                    boxes = []
+                t_lpd = _time.perf_counter() - t0
+
+                if boxes:
+                    lpd_hit = True
+                    # Use the highest-confidence detection
+                    best = max(boxes, key=lambda b: b[4] if len(b) > 4 else 0)
+                    x1, y1, x2, y2 = best[0], best[1], best[2], best[3]
+                    h_img, w_img = crop_bgr.shape[:2]
+                    # Pad the plate region by 15% for PaddleOCR context
+                    pad_x = (x2 - x1) * 0.15
+                    pad_y = (y2 - y1) * 0.15
+                    xa = max(0, int(x1 - pad_x))
+                    ya = max(0, int(y1 - pad_y))
+                    xb = min(w_img, int(x2 + pad_x))
+                    yb = min(h_img, int(y2 + pad_y))
+                    if xb > xa and yb > ya:
+                        plate_crop = crop_bgr[ya:yb, xa:xb]
+                        if plate_crop is not None and plate_crop.size > 0:
+                            ocr_input = plate_crop
+                        else:
+                            lpd_hit = False
+                    else:
+                        lpd_hit = False  # crop degenerate
+
+                if not lpd_hit and not lpd_fallback:
+                    logger.debug(
+                        "[ocr-id] slot=%s LPD miss, fallback disabled → skip OCR",
+                        slot_id or "?",
+                    )
+                    return ("", 0.0)
+
+        # --- Stage 2: Debug image output --------------------------------- #
+        if debug and slot_id:
+            try:
+                import cv2
+                import os
+
+                dbg_dir = os.path.join("logs", "debug_ocr")
+                os.makedirs(dbg_dir, exist_ok=True)
+                ts = _time.strftime("%Y%m%d_%H%M%S")
+                # Save the OCR input (plate crop or full crop)
+                cv2.imwrite(
+                    os.path.join(dbg_dir, f"{slot_id}_{ts}_ocr_input.jpg"),
+                    ocr_input,
+                )
+                # If we have detection boxes, draw them on the full crop
+                if lpd_enabled and lpd_hit:
+                    vis = crop_bgr.copy()
+                    for box in boxes:
+                        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        if len(box) > 4:
+                            cv2.putText(
+                                vis, f"{box[4]:.2f}", (x1, max(0, y1 - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
+                            )
+                    cv2.imwrite(
+                        os.path.join(dbg_dir, f"{slot_id}_{ts}_lpd_boxes.jpg"),
+                        vis,
+                    )
+            except Exception as exc:
+                logger.debug("[ocr-id] debug image save failed: %r", exc)
+
+        # --- Stage 3: OCR read ------------------------------------------- #
+        t0_ocr = _time.perf_counter()
         try:
-            return ocr.read(crop_bgr, allow_retry=allow_retry, apply_plate_roi=False)
+            # apply_hud_mask is keyed to WHAT WE ARE FEEDING, not to the camera.
+            # On a tight plate box the HUD ratios (fractions of height) blank ~17%
+            # of the plate — the glyph rows themselves. Only the full-vehicle crop
+            # wants the recorder's overlay strips masked.
+            result = ocr.read(
+                ocr_input,
+                allow_retry=allow_retry,
+                apply_plate_roi=False,
+                apply_hud_mask=not lpd_hit,
+            )
         except TypeError:
-            # A PlateOCR implementation without the retry knob (e.g. NoopPlateOCR).
-            return ocr.read(crop_bgr)
+            # A PlateOCR without the newer knobs (NoopPlateOCR, older stubs).
+            try:
+                result = ocr.read(
+                    ocr_input, allow_retry=allow_retry, apply_plate_roi=False
+                )
+            except TypeError:
+                result = ocr.read(ocr_input)
         except Exception as exc:
             logger.debug("[ocr-id] read failed: %r", exc)
-            return ("", 0.0)
+            result = ("", 0.0)
+        t_ocr = _time.perf_counter() - t0_ocr
+
+        text, conf = result if isinstance(result, tuple) else ("", 0.0)
+
+        logger.debug(
+            "[ocr-id] slot=%s lpd_enabled=%s lpd_hit=%s fallback=%s "
+            "t_lpd=%.3fs t_ocr=%.3fs text=%r conf=%.2f",
+            slot_id or "?", lpd_enabled, lpd_hit, lpd_fallback,
+            t_lpd, t_ocr, text, conf,
+        )
+        return (text, conf)
 
     def confirm_slot_ocr(
         self, plan: "SlotOcrPlan", crop_bgr, ocr_text: str, ocr_conf: float

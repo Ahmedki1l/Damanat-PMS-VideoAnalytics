@@ -64,6 +64,8 @@ from .plugins import (
     NoopPlateOCR,
     NoopTypeClassifier,
     PlateOCR,
+    PlateRegionDetector,
+    NoopPlateRegionDetector,
     TypeClassifier,
 )
 
@@ -135,6 +137,7 @@ class MatchDecision:
         color_classifier: Optional[ColorClassifier] = None,
         type_classifier: Optional[TypeClassifier] = None,
         plate_ocr: Optional[PlateOCR] = None,
+        plate_detector: Optional[PlateRegionDetector] = None,
         image_matcher=None,
     ):
         self._config = config
@@ -147,6 +150,7 @@ class MatchDecision:
         )
         self._type_classifier = type_classifier or NoopTypeClassifier()
         self._plate_ocr = plate_ocr or NoopPlateOCR()
+        self._plate_detector = plate_detector or NoopPlateRegionDetector()
 
     # ------------------------------------------------------------------ #
     # Properties for callers that need to inspect / swap plugins later.
@@ -167,6 +171,10 @@ class MatchDecision:
     @property
     def plate_ocr(self) -> PlateOCR:
         return self._plate_ocr
+
+    @property
+    def plate_detector(self) -> PlateRegionDetector:
+        return self._plate_detector
 
     # ------------------------------------------------------------------ #
     # B1_Entrance confirmation (vehicle_registry_identity.py:429-480)

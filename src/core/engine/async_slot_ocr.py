@@ -177,7 +177,14 @@ class AsyncSlotOcr:
                 slot_id, job = self._pending.popitem()
                 self._inflight.add(slot_id)
             try:
-                text, conf = self._read_fn(job.crop, job.plan.allow_retry)
+                try:
+                    text, conf = self._read_fn(
+                        job.crop,
+                        job.plan.allow_retry,
+                        slot_id=getattr(job, "slot_id", None),
+                    )
+                except TypeError:
+                    text, conf = self._read_fn(job.crop, job.plan.allow_retry)
             except Exception as exc:  # never let one bad crop kill the worker
                 logger.debug("[slot-ocr] read failed slot=%s: %r", job.slot_id, exc)
                 text, conf = "", 0.0

@@ -722,6 +722,17 @@ class MatchingConfig:
     type_classifier_model: str = ""
     plate_ocr_model: str = ""
 
+    # --- License Plate Detector (LPD) and Preprocessing (Phase 2) ---
+    slot_lpd_enabled: bool = False
+    slot_lpd_fallback_enabled: bool = True
+    slot_lpd_model_dir: str = "models/yolo11n_lpd_openvino_model"
+    slot_lpd_confidence: float = 0.30
+    slot_lpd_iou: float = 0.45
+    slot_lpd_num_threads: int = 2
+    slot_ocr_upscale: float = 1.0
+    slot_ocr_preprocessing: List[str] = field(default_factory=list)
+    slot_ocr_debug: bool = False
+
     # --- Fast ReID backend (Phase 1 / WS-A) ---
     # When ``use_openvino_reid`` is on AND an OpenVINO IR for OSNet exists at
     # the specified directory, the matcher uses the OpenVINO runtime path
@@ -1248,6 +1259,25 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.anpr_min_accept_confidence = m.get(
             "anpr_min_accept_confidence", cm.anpr_min_accept_confidence
         )
+
+        # LPD and OCR Preprocessing configuration
+        if "slot_lpd_enabled" in m:
+            cm.slot_lpd_enabled = bool(m.get("slot_lpd_enabled"))
+        if "slot_lpd_fallback_enabled" in m:
+            cm.slot_lpd_fallback_enabled = bool(m.get("slot_lpd_fallback_enabled"))
+        cm.slot_lpd_model_dir = str(m.get("slot_lpd_model_dir", cm.slot_lpd_model_dir))
+        cm.slot_lpd_confidence = float(m.get("slot_lpd_confidence", cm.slot_lpd_confidence))
+        cm.slot_lpd_iou = float(m.get("slot_lpd_iou", cm.slot_lpd_iou))
+        cm.slot_lpd_num_threads = int(m.get("slot_lpd_num_threads", cm.slot_lpd_num_threads))
+        cm.slot_ocr_upscale = float(m.get("slot_ocr_upscale", cm.slot_ocr_upscale))
+        if "slot_ocr_preprocessing" in m:
+            cm.slot_ocr_preprocessing = [
+                str(p).strip().lower()
+                for p in (m.get("slot_ocr_preprocessing") or [])
+                if str(p).strip()
+            ]
+        if "slot_ocr_debug" in m:
+            cm.slot_ocr_debug = bool(m.get("slot_ocr_debug"))
         cm.identity_reconcile_min_similarity = m.get(
             "identity_reconcile_min_similarity", cm.identity_reconcile_min_similarity
         )

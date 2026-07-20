@@ -547,7 +547,12 @@ class VehicleRegistry(
         at boot. This keeps test bootstrap fast and prevents a fresh checkout
         from crashing before any model is trained.
         """
-        from src.matching import NoopColorClassifier, NoopPlateOCR, NoopTypeClassifier
+        from src.matching import (
+            NoopColorClassifier,
+            NoopPlateOCR,
+            NoopPlateRegionDetector,
+            NoopTypeClassifier,
+        )
 
         # --- Color classifier -------------------------------------------- #
         color_plugin = None
@@ -625,10 +630,16 @@ class VehicleRegistry(
                 # is NOT Windows-only — flipping it on for Linux killed every
                 # read in production (3,950 failures, 2026-07-16, paddle 3.x
                 # on the Xeon). cpu_threads is the safe speed knob instead.
-                ocr_plugin = PaddlePlateOCR(model_dir=model_dir)
+                ocr_plugin = PaddlePlateOCR(
+                    model_dir=model_dir,
+                    upscale_factor=config.slot_ocr_upscale,
+                    preprocessing=config.slot_ocr_preprocessing,
+                )
                 logger.info(
-                    "[MatchDecision] plate OCR plugin loaded (model_dir=%s)",
+                    "[MatchDecision] plate OCR plugin loaded (model_dir=%s, upscale=%.2f, preprocess=%s)",
                     model_dir or "<paddleocr default cache>",
+                    config.slot_ocr_upscale,
+                    config.slot_ocr_preprocessing,
                 )
             except Exception as exc:
                 logger.warning(
@@ -640,9 +651,36 @@ class VehicleRegistry(
         if ocr_plugin is None:
             ocr_plugin = NoopPlateOCR()
 
+        # --- Plate Region Detector --------------------------------------- #
+        detector_plugin = None
+        if config.slot_lpd_enabled:
+            try:
+                from src.ocr.plate_region_detector import OpenVINOPlateRegionDetector
+
+                detector_plugin = OpenVINOPlateRegionDetector(
+                    model_dir=config.slot_lpd_model_dir,
+                    confidence=config.slot_lpd_confidence,
+                    iou=config.slot_lpd_iou,
+                    num_threads=config.slot_lpd_num_threads,
+                )
+                logger.info(
+                    "[MatchDecision] plate region detector loaded (model_dir=%s)",
+                    config.slot_lpd_model_dir,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[MatchDecision] failed to load plate region detector (%r); "
+                    "falling back to NoopPlateRegionDetector",
+                    exc,
+                )
+                detector_plugin = None
+        if detector_plugin is None:
+            detector_plugin = NoopPlateRegionDetector()
+
         return MatchDecision(
             config,
             color_classifier=color_plugin,
             type_classifier=type_plugin,
             plate_ocr=ocr_plugin,
+            plate_detector=detector_plugin,
         )

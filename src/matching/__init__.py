@@ -18,6 +18,8 @@ Public surface:
     NoopColorClassifier  - Phase-0 default that wraps the legacy color predicate
     NoopTypeClassifier   - Phase-0 default; returns ("unknown", 0.0)
     NoopPlateOCR         - Phase-0 default; returns ("", 0.0)
+    PlateRegionDetector  - ABC for plate region detection plugins
+    NoopPlateRegionDetector - default no-op detector that returns empty list
     GalleryIndex         - Phase 3 / T3.2 FAISS-CPU IVF gallery index
 """
 
@@ -28,8 +30,10 @@ from .plugins import (
     ColorClassifier,
     NoopColorClassifier,
     NoopPlateOCR,
+    NoopPlateRegionDetector,
     NoopTypeClassifier,
     PlateOCR,
+    PlateRegionDetector,
     TypeClassifier,
 )
 
@@ -41,8 +45,10 @@ __all__ = [
     "ColorClassifier",
     "TypeClassifier",
     "PlateOCR",
+    "PlateRegionDetector",
     "NoopColorClassifier",
     "NoopTypeClassifier",
     "NoopPlateOCR",
+    "NoopPlateRegionDetector",
     "GalleryIndex",
 ]
