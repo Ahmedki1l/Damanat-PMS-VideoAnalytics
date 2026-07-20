@@ -5,22 +5,52 @@ from src.model.alert import Alert
 from src.repositories import AlertRepository, ParkingSlotRepository
 from src.utils.datetime_helper import facility_now_naive
 
-_RESTRICTED_GATED_TYPES = ("special_needs_violation", "vehicle_intrusion")
+_RESTRICTED_GATED_TYPES = (
+    "special_needs_violation",
+    "vehicle_intrusion",
+    "reserved_slot_unidentified",
+)
 
 SLOT_SCOPED_VIOLATION_ALERT_TYPES = (
     "vehicle_violation",
     "named_slot_violation",
     "special_needs_violation",
     "vehicle_intrusion",
+    # Raised when a car has occupied a named slot past the identity deadline and
+    # neither OCR nor ReID could name it, so ownership could never be tested. Not a
+    # proven intrusion — it says "nobody can vouch for this car". See
+    # ParkingEngineRuntimeMixin._sweep_pending_ownership.
+    "reserved_slot_unidentified",
     # Legacy short-form values written by older versions of get_alert_type_for_slot.
     # Included so the auto-resolver clears pre-existing rows on slot-empty transitions.
     "violation",
     "intrusion",
 )
 
+# Set from AppConfig via configure_alerts() at config-load time. None = never
+# configured, fall back to the env var.
+_ENABLE_RESTRICTED_ZONE_ALERTS: bool | None = None
+
+
+def configure_alerts(*, enable_restricted_zone_alerts: bool) -> None:
+    """Push the resolved AppConfig alert toggles into this module.
+
+    Called by load_config(). This module is reached from request handlers and DB
+    paths that have no access to the engine's AppConfig, so without this it read
+    os.environ directly and ignored YAML entirely — meaning YAML could open the
+    engine-side gate while this one stayed shut, yielding alert logs and snapshots
+    with no corresponding rows in the alerts table.
+    """
+    global _ENABLE_RESTRICTED_ZONE_ALERTS
+    _ENABLE_RESTRICTED_ZONE_ALERTS = bool(enable_restricted_zone_alerts)
+
 
 def _restricted_zone_alerts_enabled() -> bool:
-    return os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS", "false").lower() == "true"
+    if _ENABLE_RESTRICTED_ZONE_ALERTS is not None:
+        return _ENABLE_RESTRICTED_ZONE_ALERTS
+    # Unconfigured fallback. Mirrors AlertsConfig's default (True) rather than the
+    # old hardcoded "false", which silently disabled the feature everywhere.
+    return os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS", "true").strip().lower() == "true"
 
 def check_slot_restricted(db: Session, slot_id: str) -> bool:
     """True when a slot should trigger alerts (violation zone, employee, or special-needs)."""
@@ -41,6 +71,20 @@ def get_alert_type_for_slot(db: Session, slot_id: str) -> str:
         return "vehicle_violation"
     return "vehicle_intrusion"
 
+def _describe_alert(alert_type: str, slot_name: str, slot) -> str:
+    if alert_type == "special_needs_violation":
+        return f"Vehicle detected in special-needs reserved slot {slot_name}"
+    if alert_type == "reserved_slot_unidentified":
+        return (
+            f"Unidentified vehicle occupying reserved slot {slot_name} — neither "
+            f"plate OCR nor appearance matching could name it, so ownership could "
+            f"not be verified"
+        )
+    if alert_type == "vehicle_intrusion" and slot and slot.reservation_type == "EMPLOYEE":
+        return f"Unauthorized vehicle detected in reserved slot {slot_name}"
+    return f"Unauthorized vehicle detected in {slot_name}"
+
+
 def report_alert(
     db: Session,
     slot_id: str,
@@ -48,16 +92,22 @@ def report_alert(
     camera_id: str = None,
     severity: str = "critical",
     snapshot_path: str = None,
+    alert_type: str = None,
 ):
     """
     YOLO detects car in a slot -> check if restricted (is_violation_zone) -> create alert.
     Returns None if slot is not restricted or alert already active.
+
+    ``alert_type`` overrides the slot-derived type. The engine's deferred
+    named-slot path uses it to distinguish a PROVEN non-owner (vehicle_intrusion)
+    from a car nobody could identify in time (reserved_slot_unidentified) — a
+    distinction this function cannot make from the slot row alone.
     """
     if not check_slot_restricted(db, slot_id):
         return None
 
     if not _restricted_zone_alerts_enabled():
-        gated_alert_type = get_alert_type_for_slot(db, slot_id)
+        gated_alert_type = alert_type or get_alert_type_for_slot(db, slot_id)
         if gated_alert_type in _RESTRICTED_GATED_TYPES:
             return None
 
@@ -66,19 +116,37 @@ def report_alert(
     # slot's rolling latest image only if the dedicated save path is unavailable.
     resolved_snapshot_path = snapshot_path or (slot.last_snapshot_path if slot else None)
 
+    alert_type = alert_type or get_alert_type_for_slot(db, slot_id)
+    slot_name = slot.slot_name if slot and slot.slot_name else slot_id
+
     # Don't duplicate - check if there's already an active alert on this slot
     existing = AlertRepository.get_active_by_slot(db, slot_id)
     if existing:
+        dirty = False
         if resolved_snapshot_path and not existing.snapshot_path:
             existing.snapshot_path = resolved_snapshot_path
+            dirty = True
+        # Upgrade path: the slot alerted as "nobody could identify this car", and
+        # identity has since landed and proved a non-owner. Same car, same
+        # occupancy — promote the row in place instead of leaving a stale
+        # unidentified alert next to a new intrusion one for the same slot.
+        if (
+            existing.alert_type == "reserved_slot_unidentified"
+            and alert_type == "vehicle_intrusion"
+        ):
+            existing.alert_type = alert_type
+            existing.description = _describe_alert(alert_type, slot_name, slot)
+            existing.severity = severity
+            if plate_number:
+                existing.plate_number = plate_number
+            dirty = True
+        if dirty:
             db.commit()
             db.refresh(existing)
         return existing
 
-    alert_type = get_alert_type_for_slot(db, slot_id)
     zone_id = slot.zone_id if slot and slot.zone_id else None
     zone_name = slot.zone_name if slot and slot.zone_name else zone_id or slot_id
-    slot_name = slot.slot_name if slot and slot.slot_name else slot_id
 
     new_alert = Alert(
         alert_type=alert_type,
@@ -88,13 +156,7 @@ def report_alert(
         slot_id=slot_id,
         event_type="vehicle_detected",
         slot_number=slot_name,
-        description=(
-            f"Vehicle detected in special-needs reserved slot {slot_name}"
-            if alert_type == "special_needs_violation"
-            else f"Unauthorized vehicle detected in reserved slot {slot_name}"
-            if alert_type == "vehicle_intrusion" and slot and slot.reservation_type == "EMPLOYEE"
-            else f"Unauthorized vehicle detected in {slot_name}"
-        ),
+        description=_describe_alert(alert_type, slot_name, slot),
         snapshot_path=resolved_snapshot_path,
         is_resolved=False,
         triggered_at=facility_now_naive(),

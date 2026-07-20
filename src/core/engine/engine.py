@@ -18,7 +18,10 @@ import numpy as np
 from src.camera_manager import CameraManager
 from src.config import AppConfig, norm_camera_id
 from src.core.engine.camera_pipeline import CameraPipeline
-from src.core.engine.engine_runtime import ParkingEngineRuntimeMixin
+from src.core.engine.engine_runtime import (
+    ALERT_DEFER_PENDING_IDENTITY,
+    ParkingEngineRuntimeMixin,
+)
 from src.core.engine.engine_single_process import ParkingEngineSingleProcessMixin
 from src.core.engine.engine_tracking import ParkingEngineTrackingMixin
 from src.core.engine.engine_visualization import ParkingEngineVisualizationMixin
@@ -176,18 +179,101 @@ class ParkingEngine(
             self._shared_detector = self._build_tracked_detector()
         return self._shared_detector
 
+    # Health thresholds. ``last_processed_at`` is engine-global — the loop stamps it on
+    # every processed frame across ALL cameras, so even a starved <1fps group keeps it
+    # fresh while the loop is alive. A stale value therefore means the WHOLE loop is
+    # wedged, not that one camera is slow. SOFT -> degraded, HARD -> unhealthy.
+    _HEALTH_PROCESSING_STALE_SOFT_S = 30.0
+    _HEALTH_PROCESSING_STALE_HARD_S = 90.0
+    # A stream open but delivering no new frame for this long is frozen/reconnecting.
+    _HEALTH_STREAM_STALE_S = 15.0
+
     def get_engine_status(self) -> Dict:
-        """Return real-time metrics for the /api/health endpoint."""
+        """Real-time metrics AND a computed health verdict for /api/health.
+
+        ``status`` is derived, never hardcoded: ``unhealthy`` when the engine cannot be
+        doing its job (stopped, loop wedged, DB unreachable, or every stream dark),
+        ``degraded`` when it is impaired but partially working (some streams frozen, the
+        loop lagging, or the DB probe skipped), ``ok`` otherwise. ``health_reasons`` lists
+        what tripped it so an operator sees WHY without reading logs.
+        """
+        now = time.time()
+        has_cams = hasattr(self, "cam_manager") and self.cam_manager is not None
+
+        processing_age = (
+            (now - self.last_processed_at.timestamp())
+            if self.last_processed_at
+            else None
+        )
+        streams = (
+            self.cam_manager.stream_health(self._HEALTH_STREAM_STALE_S)
+            if has_cams
+            else {"delivering": 0, "stale": [], "down": [], "total": 0}
+        )
+        # Only probe the DB when we HAVE one; None (probe skipped) is distinct from False
+        # (probe ran and failed), so a skipped probe degrades rather than fails.
+        db_ok = self.db_manager.ping() if self.db_manager is not None else None
+
+        reasons: list[str] = []
+        status = "ok"
+
+        def _fail(reason: str):
+            nonlocal status
+            status = "unhealthy"
+            reasons.append(reason)
+
+        def _degrade(reason: str):
+            nonlocal status
+            if status != "unhealthy":
+                status = "degraded"
+            reasons.append(reason)
+
+        if not self.is_running:
+            _fail("engine not running")
+        else:
+            if processing_age is None:
+                _fail("engine running but no frame ever processed")
+            elif processing_age > self._HEALTH_PROCESSING_STALE_HARD_S:
+                _fail(f"processing loop stalled ({processing_age:.0f}s since last frame)")
+            elif processing_age > self._HEALTH_PROCESSING_STALE_SOFT_S:
+                _degrade(f"processing loop lagging ({processing_age:.0f}s since last frame)")
+
+            if has_cams:
+                if streams["total"] > 0 and streams["delivering"] == 0:
+                    _fail("no camera delivering frames")
+                elif streams["down"] or streams["stale"]:
+                    offenders = ", ".join(sorted(streams["down"] + streams["stale"]))
+                    _degrade(
+                        f"{len(streams['down']) + len(streams['stale'])}/"
+                        f"{streams['total']} cameras not delivering ({offenders})"
+                    )
+
+        if db_ok is False:
+            _fail("database unreachable")
+        elif db_ok is None and self.db_manager is None:
+            _degrade("no database configured")
+
+        if not self.model_loaded:
+            _degrade("model not loaded")
+
         return {
+            "status": status,
+            "health_reasons": reasons,
             "engine_running": self.is_running,
             "model_loaded": self.model_loaded,
             "camera_streams_count": len(self.pipelines),
-            "camera_streams_ok": self.cam_manager.active_count if hasattr(self, "cam_manager") else 0,
-            "total_cameras": self.cam_manager.total_count if hasattr(self, "cam_manager") else 0,
+            # Retained for compatibility: streams whose socket is open (may include frozen).
+            "camera_streams_ok": self.cam_manager.active_count if has_cams else 0,
+            # The honest count: streams actually producing fresh frames.
+            "camera_streams_delivering": streams["delivering"],
+            "camera_streams_stale": streams["stale"],
+            "camera_streams_down": streams["down"],
+            "total_cameras": self.cam_manager.total_count if has_cams else 0,
             "last_processed_at": self.last_processed_at.isoformat() if self.last_processed_at else None,
-            "uptime_seconds": int(time.time() - self.start_time) if self.is_running else 0,
+            "processing_age_seconds": round(processing_age, 1) if processing_age is not None else None,
+            "uptime_seconds": int(now - self.start_time) if self.is_running else 0,
             "frames_processed": self._frame_count,
-            "db_ok": self.db_manager is not None,
+            "db_ok": db_ok,
         }
 
     def _bootstrap_camera_runtime(self):
@@ -496,7 +582,16 @@ class ParkingEngine(
                                         event.slot_id,
                                         getattr(event, "plate_number", ""),
                                     )
-                                    if alert_type is None:
+                                    if alert_type in (
+                                        None,
+                                        ALERT_DEFER_PENDING_IDENTITY,
+                                    ):
+                                        # None = the owner. The sentinel = a named
+                                        # slot whose occupant is not identified yet;
+                                        # this legacy single-camera path has no
+                                        # deferred-verdict machinery, so it abstains
+                                        # rather than stamping the sentinel onto
+                                        # event_type as if it were an alert type.
                                         final_events.append(event)
                                     else:
                                         event.event_type = alert_type

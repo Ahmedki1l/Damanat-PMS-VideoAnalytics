@@ -17,7 +17,7 @@ import os
 import time
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -297,6 +297,24 @@ class CameraStream:
                 return True, self._latest_frame.copy(), self._latest_ts, self._latest_seq
         return False, None, 0.0, 0
 
+    @property
+    def seconds_since_frame(self) -> float:
+        """Age of the newest grabbed frame, in seconds (``inf`` if none yet).
+
+        The grabber thread runs independently of the processing loop, so this tracks
+        RTSP-stream liveness, not how fast frames are consumed. A dead stream, a stalled
+        grabber, or a reconnect loop all let this climb; it is the signal ``is_open``
+        misses, because ``is_open`` only flips on an outright read FAILURE. (It does NOT
+        catch a stream that keeps re-sending an identical frame — ``grab()`` still
+        succeeds there and ``_latest_ts`` keeps advancing; that duplicate-frame freeze is
+        what the VA_OCC_TRACE ``sig=`` proof is for.)
+        """
+        with self._frame_lock:
+            ts = self._latest_ts
+        if not ts:
+            return float("inf")
+        return max(0.0, time.time() - ts)
+
     def close(self):
         """Stop the grabber thread and release the stream."""
         self._stop_event.set()
@@ -414,3 +432,29 @@ class CameraManager:
     def total_count(self) -> int:
         """Total number of cameras."""
         return len(self.cameras)
+
+    def stream_health(self, max_age_s: float = 15.0) -> Dict[str, Any]:
+        """Split streams into delivering / stale / down — the truth ``active_count`` hides.
+
+        ``active_count`` counts streams whose socket is open; this counts streams actually
+        producing fresh frames. A stream that opened but has since frozen or entered a
+        reconnect loop is ``is_open`` True yet has a stale (or infinite) frame age — it
+        lands in ``stale``, not ``delivering``.
+
+        Returns counts plus the ids of the non-delivering streams so the health payload can
+        name the offenders.
+        """
+        delivering, stale, down = 0, [], []
+        for cam_id, s in self.cameras.items():
+            if not s.is_open:
+                down.append(cam_id)
+            elif s.seconds_since_frame > max_age_s:
+                stale.append(cam_id)
+            else:
+                delivering += 1
+        return {
+            "delivering": delivering,
+            "stale": stale,
+            "down": down,
+            "total": len(self.cameras),
+        }

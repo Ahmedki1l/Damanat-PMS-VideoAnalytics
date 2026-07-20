@@ -7,8 +7,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from collections import Counter
+
 from src.matching.match_decision import Decision
-from src.matching.plate_ocr_match import confirm_plate
+from src.matching.plate_ocr_match import confirm_plate, read_matches_plate
 from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
 
 logger = logging.getLogger(__name__)
@@ -4659,19 +4661,110 @@ class VehicleRegistryIdentityMixin:
             return None
 
         if not plate:
+            # Single-frame path abstained (ReID's shortlist did not contain the car this
+            # read names). Don't discard the read — fold it into the per-slot consensus
+            # buffer. A car with no parked-pose reference is invisible to ReID, so the
+            # ONLY way its correct read ever binds is by agreeing with itself over frames.
+            consensus = self.confirm_slot_ocr_consensus(
+                slot_id, ocr_text, gen_token=(plan.decision_ctx or {}).get("gen_token")
+            )
+            if consensus:
+                return consensus
             logger.info(
                 "[ocr-id] slot=%s read=%r confirms none of ReID's top-%d %s — "
-                "leaving NULL",
+                "leaving NULL (no temporal consensus yet)",
                 slot_id, ocr_text, len(candidates), candidates,
             )
             return None
 
+        # A clean single-frame confirm supersedes any accumulated votes for this slot.
+        self.clear_slot_ocr_votes(slot_id)
         logger.info(
             "[ocr-id] slot=%s CONFIRMED %s: ReID shortlisted it and OCR read %r off the "
             "car — two independent witnesses agree",
             slot_id, plate, ocr_text,
         )
         return plate
+
+    def confirm_slot_ocr_consensus(
+        self, slot_id: str, ocr_text: str, *, gen_token: Any = None
+    ) -> Optional[str]:
+        """Multi-frame OCR agreement — bind a parked car ReID can't shortlist.
+
+        The single-frame path (:meth:`confirm_slot_ocr`) needs appearance AND a read to
+        agree on the same frame. A slot with no parked-pose reference never gets the
+        appearance witness — its cross-view ReID score is inverted (measured: a car's own
+        parked view scores 0.583 against its gate refs, a DIFFERENT car 0.634) — so a
+        PERFECT read is thrown away, the pose is never learned, and ReID never improves.
+        That is the OCR/ReID learning deadlock.
+
+        This breaks it by letting REPEATED reads stand in for the appearance witness,
+        without loosening the never-wrong contract:
+
+        * the vote universe is exactly the fallback set — cars VA believes are inside
+          (phantoms excluded via ``plates_inside``) and not locked into another slot;
+        * a read is a vote ONLY when it is the UNAMBIGUOUS digit-run match for a single
+          such car. A read that fits two inside cars (the DJS-7842 vs BJA-7842/DJA-7842
+          collision) is the exact ambiguity the contract abstains on, so it counts for
+          nothing and the slot stays NULL;
+        * a bind requires ``slot_ocr_consensus_min_agreement`` distinct such reads leading
+          the runner-up by ``slot_ocr_consensus_margin``.
+
+        Votes are keyed by ``gen_token`` (the engine's per-occupancy OCR generation), so a
+        new car in the same slot never inherits the previous occupant's votes.
+        """
+        mc = self._matching_config
+        if not getattr(mc, "slot_ocr_consensus_enabled", True):
+            return None
+        if not ocr_text:
+            return None
+
+        universe = [
+            p
+            for p in self.plates_inside()
+            if not self._is_plate_locked_elsewhere(p, slot_id)
+        ]
+        matches = [p for p in universe if read_matches_plate(ocr_text, p)]
+        # Only an unambiguous single-car read is evidence. Ambiguity (or no inside car at
+        # all) is deliberately abstained on — never guessed.
+        if len(matches) != 1:
+            return None
+        voted = matches[0]
+
+        votes = getattr(self, "_slot_ocr_votes", None)
+        if votes is None:
+            votes = self._slot_ocr_votes = {}
+        buf = votes.get(slot_id)
+        if buf is None or buf.get("token") != gen_token:
+            buf = {"token": gen_token, "counts": Counter()}
+            votes[slot_id] = buf
+        buf["counts"][voted] += 1
+
+        counts = buf["counts"]
+        ranked = counts.most_common(2)
+        top_plate, top_n = ranked[0]
+        runner_n = ranked[1][1] if len(ranked) > 1 else 0
+        min_agree = int(getattr(mc, "slot_ocr_consensus_min_agreement", 3))
+        margin = int(getattr(mc, "slot_ocr_consensus_margin", 2))
+        if top_n >= min_agree and (top_n - runner_n) >= margin:
+            self.clear_slot_ocr_votes(slot_id)
+            logger.info(
+                "[ocr-id] slot=%s CONSENSUS %s: %d agreeing reads (runner-up %d) — bound "
+                "on temporal agreement where ReID could not shortlist it",
+                slot_id, top_plate, top_n, runner_n,
+            )
+            return top_plate
+        logger.info(
+            "[ocr-id] slot=%s consensus vote for %s (%d/%d, runner-up %d) — accumulating",
+            slot_id, voted, top_n, min_agree, runner_n,
+        )
+        return None
+
+    def clear_slot_ocr_votes(self, slot_id: str) -> None:
+        """Drop a slot's accumulated OCR consensus votes (on bind, vacate, or re-arm)."""
+        votes = getattr(self, "_slot_ocr_votes", None)
+        if votes:
+            votes.pop(slot_id, None)
 
     def ocr_transit_candidates(self, now=None):
         """Cars whose plate was READ moments ago and that have not parked yet.

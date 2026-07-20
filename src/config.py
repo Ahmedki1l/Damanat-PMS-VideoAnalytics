@@ -569,6 +569,29 @@ class MatchingConfig:
     # frame would have caught it, so spend the budget there.
     ocr_upscale_retry_max_attempts: int = 4
 
+    # --- Multi-frame OCR consensus (parked-slot identify) -----------------------
+    # The single-frame slot-identify path binds only when appearance (ReID shortlist)
+    # AND a plate read agree on the SAME frame. On a slot with no parked-pose gallery
+    # reference (e.g. B13/CAM-24), ReID's cross-view score is inverted, so its shortlist
+    # never contains the true car — and a PERFECT read is discarded because it "confirms
+    # none of ReID's top-k". The pose is therefore never learned, so ReID never improves:
+    # the OCR/ReID learning deadlock. This fallback breaks it WITHOUT loosening the
+    # never-wrong contract: it accumulates reads across frames and binds a plate only when
+    # the SAME inside-the-facility car (phantoms excluded) is the unique digit-run match on
+    # >= min_agreement distinct reads, leading the runner-up by >= margin. Repeated reads
+    # replace the appearance witness; each vote must still be an UNAMBIGUOUS single match,
+    # so a digit-run collision (DJS-7842 vs phantoms) contributes nothing and the slot
+    # stays NULL — correct-or-null preserved. Set enabled False for the historical
+    # single-frame-only behaviour.
+    slot_ocr_consensus_enabled: bool = True
+    # Distinct agreeing reads before a consensus bind. 3 independent frames reading the
+    # same >=4-digit run for the same inside car is ~1-in-10,000 per frame — far stronger
+    # corroboration than the single-frame ReID+OCR path it falls back from.
+    slot_ocr_consensus_min_agreement: int = 3
+    # The winner must lead the second-most-voted plate by this many reads. Guards the case
+    # where two inside cars share overlapping digit runs and reads split between them.
+    slot_ocr_consensus_margin: int = 2
+
     # Decision log — one JSONL record per slot-identity attempt: the ranked candidates,
     # their full feature vectors, the gate rejects, the OCR read, and which candidate the
     # read confirmed (THE LABEL). Every bind yields 1 positive + up to k-1 hard negatives.
@@ -727,6 +750,20 @@ class MatchingConfig:
 class AlertsConfig:
     """Alerting feature toggles."""
     enable_restricted_zone_alerts: bool = True
+
+    # Named-slot intrusion is decided from IDENTITY, which lands well after the car
+    # parks (OCR/ReID run after occupancy is published — see the identity block in
+    # ParkingEngineRuntimeMixin._process_detections_and_events). So the ownership
+    # verdict is deferred rather than guessed at park time.
+    #
+    # This is how long to wait for identity before giving up and raising a
+    # reserved_slot_unidentified alert instead. Without it, a slot whose identity
+    # NEVER resolves gets no alert at all — and that is not hypothetical: B1_CRO
+    # has OCR disabled outright (matching.slot_no_plate_view) and can only ever be
+    # named by appearance, which routinely abstains. That is a named slot with zero
+    # intrusion coverage. Set <= 0 to disable the fallback and alert only on a
+    # PROVEN non-owner.
+    reserved_slot_identity_timeout_s: float = 300.0
 
 
 @dataclass
@@ -984,16 +1021,53 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         os.environ.get("REID_USE_MULTISHOT", "false").lower() == "true"
     )
 
-    # Alert toggles — env-var first, YAML overrides below if present.
-    config.alerts.enable_restricted_zone_alerts = (
-        os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS", "false").lower() == "true"
-    )
+    # Alert toggles. Precedence: dataclass default -> YAML -> env var.
+    #
+    # This used to read the env var FIRST with a hardcoded "false" default, which
+    # unconditionally clobbered the AlertsConfig default of True. Nothing in the repo
+    # ever set that var, and no config.yaml ever carried an `alerts:` block — so from
+    # a9ce2ee (2026-05-20) until this fix, EVERY restricted-zone alert (named-slot
+    # intrusion, special-needs violation) was silently dead in every deployment.
+    # The var is now an explicit deploy-time OVERRIDE: unset means "use the config",
+    # not "off".
     if "alerts" in raw:
         a = raw["alerts"] or {}
-        config.alerts.enable_restricted_zone_alerts = a.get(
-            "enable_restricted_zone_alerts",
-            config.alerts.enable_restricted_zone_alerts,
+        config.alerts.enable_restricted_zone_alerts = bool(
+            a.get(
+                "enable_restricted_zone_alerts",
+                config.alerts.enable_restricted_zone_alerts,
+            )
         )
+        try:
+            config.alerts.reserved_slot_identity_timeout_s = float(
+                a.get(
+                    "reserved_slot_identity_timeout_s",
+                    config.alerts.reserved_slot_identity_timeout_s,
+                )
+            )
+        except (TypeError, ValueError):
+            pass
+    _env_restricted_alerts = os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS")
+    if _env_restricted_alerts is not None:
+        config.alerts.enable_restricted_zone_alerts = (
+            _env_restricted_alerts.strip().lower() == "true"
+        )
+
+    # alert_service reaches this flag through a module-level setter rather than
+    # AppConfig: it is called from request handlers and DB paths that never see the
+    # engine's config object. Without this the two gates desync — the engine would
+    # tag the event vehicle_intrusion and save a snapshot while report_alert silently
+    # dropped the row, producing alert LOGS with an empty alerts table.
+    # Deferred + guarded: config loading must not become dependent on the ORM/DB
+    # stack being importable (some tooling loads config standalone).
+    try:
+        from src.services import alert_service as _alert_service
+
+        _alert_service.configure_alerts(
+            enable_restricted_zone_alerts=config.alerts.enable_restricted_zone_alerts
+        )
+    except ImportError as exc:  # pragma: no cover - only in cut-down environments
+        print(f"[WARN] Could not push alert config to alert_service: {exc}")
 
     if "matching" in raw:
         m = raw["matching"] or {}
@@ -1140,6 +1214,14 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         if "slot_ocr_async" in m:
             cm.slot_ocr_async = bool(m.get("slot_ocr_async"))
+        if "slot_ocr_consensus_enabled" in m:
+            cm.slot_ocr_consensus_enabled = bool(m.get("slot_ocr_consensus_enabled"))
+        cm.slot_ocr_consensus_min_agreement = int(
+            m.get("slot_ocr_consensus_min_agreement", cm.slot_ocr_consensus_min_agreement)
+        )
+        cm.slot_ocr_consensus_margin = int(
+            m.get("slot_ocr_consensus_margin", cm.slot_ocr_consensus_margin)
+        )
         # Normalised once, here, so every lookup downstream is a plain set membership
         # on the same spelling the DB/API use for slot_id.
         cm.slot_no_plate_view = [

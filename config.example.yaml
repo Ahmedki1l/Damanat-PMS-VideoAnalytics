@@ -355,3 +355,33 @@ output:
   log_file: ""                  # Optional: path to event log file
   show_video: false             # Show annotated video (debug only)
   show_camera: ""               # Which camera to show when show_video=true (e.g., "CAM-04")
+
+
+# --- Alerting ---
+# Restricted-zone alerts = named-slot intrusion (reservation_type EMPLOYEE) and
+# special-needs violations (SPECIAL).
+#
+# HISTORY, so nobody re-mutes this by accident. This block did not exist, and
+# load_config used to read ENABLE_RESTRICTED_ZONE_ALERTS with a hardcoded default
+# of "false" — clobbering the code default of True. Nothing in the repo ever set
+# that var, so from 2026-05-20 (a9ce2ee) every restricted-zone alert was silently
+# dropped in every deployment. That commit landed a week after a false-positive
+# flood (452 vehicle_intrusion alerts in the datasets; 40 on B13_COO on 2026-05-07
+# alone), whose real cause was ownership being decided at vehicle_parked, when the
+# plate is never known yet. The verdict is now DEFERRED until identity lands, so
+# the flood cause is gone and the mute is no longer needed.
+#
+# The env var still wins over this file, as a deploy-time override.
+alerts:
+  enable_restricted_zone_alerts: true
+
+  # How long to wait for OCR/ReID to name the occupant of a named slot before
+  # giving up and raising a lower-severity `reserved_slot_unidentified` alert
+  # instead of a `vehicle_intrusion` one.
+  #
+  # Needed because some named slots may never resolve identity: B1_CRO is listed
+  # in matching.slot_no_plate_view (OCR skipped entirely — the plate is never in
+  # frame, 455 attempts and zero reads), so appearance is its only witness and it
+  # routinely abstains. Without this deadline that slot would have zero intrusion
+  # coverage. Set to 0 to disable the fallback and alert only on a PROVEN non-owner.
+  reserved_slot_identity_timeout_s: 300.0

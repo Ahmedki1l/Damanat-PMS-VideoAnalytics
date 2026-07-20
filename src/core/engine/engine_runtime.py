@@ -13,7 +13,7 @@ from src.camera_manager import CameraConfig
 from src.core.engine.camera_pipeline import CameraPipeline
 from src.detection.tracking_manager import TrackingManager
 from src.detection.detector import is_untracked
-from src.models.state_machine import SlotState
+from src.models.state_machine import SlotEvent, SlotState
 from src.services.parking_service import (
     bootstrap_camera_slots_from_json,
     load_camera_slots,
@@ -26,6 +26,12 @@ from src.vehicle_registry.vehicle_registry_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+# Sentinel returned by _get_slot_alert_type for a NAMED slot whose occupant is not
+# identified yet. It means "cannot decide" — distinct from None ("the owner, no
+# alert") and from a real alert type. Occupancy still publishes immediately; only
+# the ownership verdict waits. See _evaluate_named_slot_ownership.
+ALERT_DEFER_PENDING_IDENTITY = "__defer_pending_identity__"
 
 
 class _SlotTrace:
@@ -1215,6 +1221,11 @@ class ParkingEngineRuntimeMixin:
             self._process_special_zones(cam_id, frame, detections)
         with perf_trace.stage("identity"):
             self._update_slot_identity(cam_id, frame, pipeline, slot_ctx)
+        # Deadline check on named slots still waiting for identity. Runs after the
+        # identity pass so a plate that just landed settles the verdict properly
+        # (owner => silent) rather than racing the timeout. Costs one dict scan over
+        # a handful of slots.
+        self._sweep_pending_ownership(time.time())
         return assignment
 
     def _process_special_zones(self, cam_id: str, frame, detections) -> None:
@@ -1394,6 +1405,9 @@ class ParkingEngineRuntimeMixin:
             "reserved_for": reserved_map.get(slot.id),
             "attempt": attempts + 1,
             "max_attempts": self._OCR_ID_MAX_ATTEMPTS,
+            # Per-occupancy token so multi-frame OCR consensus keys its votes to THIS car
+            # and a re-armed slot never inherits the previous occupant's reads.
+            "gen_token": (getattr(self, "_ocr_generation", {}) or {}).get(slot.id),
         }
 
         # ASYNC: plan the read here (ReID ranking is main-thread), hand the heavy
@@ -1569,6 +1583,8 @@ class ParkingEngineRuntimeMixin:
             "held until the car leaves",
             slot_id, plate, attempt_num, self._OCR_ID_MAX_ATTEMPTS, cam_id,
         )
+        # We know who it is — settle any deferred named-slot ownership verdict.
+        self._evaluate_named_slot_ownership(slot_id, cam_id, plate)
         # ...and teach the gallery this car's parked pose, now that we KNOW who it is.
         self.vehicle_registry.save_parked_reference(plate, crop, cam_id)
 
@@ -1611,6 +1627,7 @@ class ParkingEngineRuntimeMixin:
             "overrule it",
             slot_id, plate, cam_id, attempt_num, self._OCR_ID_MAX_ATTEMPTS,
         )
+        self._evaluate_named_slot_ownership(slot_id, cam_id, plate)
 
     def _no_plate_view_slots(self) -> set:
         """Slots whose plate is never in frame (matching.slot_no_plate_view). Cached —
@@ -1721,6 +1738,7 @@ class ParkingEngineRuntimeMixin:
             "gallery; OCR may still overrule it",
             slot.id, plate, cam_id, self._OCR_ID_MAX_ATTEMPTS,
         )
+        self._evaluate_named_slot_ownership(slot.id, cam_id, plate)
 
     def _arm_ocr_for_slot(self, slot_id: str) -> None:
         """A car just parked here: give it a fresh OCR budget."""
@@ -1820,6 +1838,15 @@ class ParkingEngineRuntimeMixin:
                 event.zone_id = slot.zone_id
                 event.zone_name = slot.zone_name
 
+                if event.event_type == "slot_vacant":
+                    # Car left before identity ever resolved — drop the deferred
+                    # ownership verdict so the NEXT car to park here starts its own
+                    # clock instead of inheriting this one's elapsed time. Kept out
+                    # of the vehicle_registry-guarded branch below: the pending map
+                    # is written by the violation filter, which runs with or without
+                    # a registry, so it must be cleared unconditionally or it leaks.
+                    self._clear_pending_ownership(slot.id)
+
                 if event.event_type == "vehicle_parked":
                     # VACANT -> OCCUPIED: this is the moment, and the ONLY moment, that
                     # arms the OCR read for this slot.
@@ -1851,6 +1878,8 @@ class ParkingEngineRuntimeMixin:
                         self._ocr_id_attempts.pop(slot.id, None)
                         self._ocr_id_last_at.pop(slot.id, None)
                         self._ocr_armed.pop(slot.id, None)
+                    # Drop this occupancy's accumulated OCR consensus votes.
+                    self.vehicle_registry.clear_slot_ocr_votes(slot.id)
                     worker = getattr(self, "_ocr_worker", None)
                     if worker is not None:
                         worker.forget(slot.id)  # drop any queued read for this slot
@@ -2356,20 +2385,37 @@ class ParkingEngineRuntimeMixin:
         self, slot_id: str, plate, confidence: float, locked: bool, camera_id: str
     ) -> None:
         """Persist the plate-lock binding onto the ``parking_slots`` row so it
-        survives a restart (read back by _load_camera_db_state)."""
+        survives a restart (read back by _load_camera_db_state).
+
+        ``slot_status.plate_number`` is mirrored in the SAME commit — both
+        columns hold the slot occupant's identity and downstream consumers (the
+        Gateway prefers ``current_plate`` and falls back to
+        ``slot_status.plate_number``) must never see them disagree.
+        """
         if not self.db_manager:
             return
         session = self.db_manager.SessionLocal()
         try:
-            from src.repositories import ParkingSlotRepository
+            from src.repositories import ParkingSlotRepository, SlotStatusRepository
 
             db_slot = ParkingSlotRepository.get_by_id(session, slot_id)
             if db_slot is None:
                 return
-            db_slot.current_plate = plate or None
+            value = plate or None
+            db_slot.current_plate = value
             db_slot.plate_confidence = float(confidence or 0.0)
             db_slot.plate_locked = bool(locked)
             db_slot.plate_locked_at = datetime.now() if locked else None
+
+            # Mirror onto the slot's latest occupancy row. A cleared identity
+            # clears unconditionally (same as reset_all_slot_plates); a new
+            # identity only enriches a row that reads occupied, so the identity
+            # path can never fabricate occupancy on a vacant slot.
+            latest_status = SlotStatusRepository.get_latest_by_slot(session, slot_id)
+            if latest_status is not None:
+                if value is None or latest_status.status == "occupied":
+                    latest_status.plate_number = value
+
             session.commit()
         except Exception as exc:
             session.rollback()
@@ -2427,6 +2473,24 @@ class ParkingEngineRuntimeMixin:
                 crop = np.empty((0, 0, 3), dtype=np.uint8)
 
             now_ts = time.time()
+
+            # Classify BEFORE the duplicate-crop check. A deferred named slot is not
+            # an alert yet, so it must not be suppressed by alert de-duplication —
+            # letting it fall into the is_duplicate branch would silently drop the
+            # pending verdict and the slot would never be checked at all.
+            alert_type = self._get_slot_alert_type(
+                event.slot_id, getattr(event, "plate_number", "")
+            )
+            if alert_type == ALERT_DEFER_PENDING_IDENTITY:
+                # Named slot, occupant unknown. Park the decision — the event goes
+                # through as a plain vehicle_parked so occupancy is unaffected, and
+                # the ownership verdict is settled later by
+                # _evaluate_named_slot_ownership (identity landed) or
+                # _sweep_pending_ownership (identity never landed).
+                self._register_pending_ownership(event.slot_id, cam_id, crop, now_ts)
+                final_events.append(event)
+                continue
+
             self._recent_violators = [
                 violator
                 for violator in self._recent_violators
@@ -2442,7 +2506,6 @@ class ParkingEngineRuntimeMixin:
                         break
 
             if not is_duplicate:
-                alert_type = self._get_slot_alert_type(event.slot_id, getattr(event, "plate_number", ""))
                 if alert_type is None:
                     final_events.append(event)
                     continue
@@ -2483,10 +2546,27 @@ class ParkingEngineRuntimeMixin:
         return final_events
 
     def _get_slot_alert_type(self, slot_id: str, plate_number: str) -> str | None:
+        """Classify a vehicle_parked on a restricted slot.
+
+        Returns the alert type, ``None`` for "no alert" (the rightful owner), or
+        :data:`ALERT_DEFER_PENDING_IDENTITY` for "cannot decide yet".
+
+        Only NAMED (EMPLOYEE) slots can defer. A special-needs slot or a violation
+        zone is a violation regardless of WHO parked there, so those decide
+        immediately and are unaffected by identity latency.
+        """
         if slot_id in self._special_slots:
             return "special_needs_violation"
         named_slot_title = self._reserved_for_map.get(slot_id)
         if named_slot_title:
+            # No plate yet. On a vehicle_parked this is the normal case, not the
+            # exception: identity (OCR/ReID) deliberately runs AFTER occupancy is
+            # published, so event.plate_number is unset here essentially always.
+            # Treating that as "not the owner" made every named-slot park — the
+            # executive's own car included — an intrusion alert. Defer instead and
+            # let _evaluate_named_slot_ownership decide once identity lands.
+            if not plate_number:
+                return ALERT_DEFER_PENDING_IDENTITY
             if self._is_named_slot_vehicle_allowed(plate_number, named_slot_title):
                 return None
             return "vehicle_intrusion"
@@ -2514,6 +2594,196 @@ class ParkingEngineRuntimeMixin:
             return False
         finally:
             session.close()
+
+    # ---- Deferred named-slot ownership ------------------------------------- #
+    #
+    # A named slot's alert depends on WHO parked, and identity is not available at
+    # vehicle_parked: OCR/ReID run after occupancy is published, on purpose, so the
+    # slot flips without waiting on a ~500ms identity pass. The old code read the
+    # (always empty) event.plate_number, concluded "not the owner", and alerted on
+    # every single park — the executive's own car included.
+    #
+    # So the verdict is deferred. A parked-but-unnamed named slot is recorded here,
+    # and settled exactly once by whichever comes first:
+    #   * _evaluate_named_slot_ownership — identity landed; alert only if NOT the owner
+    #   * _sweep_pending_ownership       — identity never landed; alert as unidentified
+    #   * _clear_pending_ownership       — the car left before either
+
+    def _pending_ownership(self) -> dict:
+        pending = getattr(self, "_pending_ownership_map", None)
+        if pending is None:
+            pending = self._pending_ownership_map = {}
+        return pending
+
+    def _register_pending_ownership(self, slot_id, cam_id, crop, now_ts) -> None:
+        pending = self._pending_ownership()
+        if slot_id in pending:
+            return  # already waiting on this occupancy
+        # Keep the crop, not the frame: this is held for minutes and there are only
+        # a handful of named slots, but a full frame each would be ~6MB apiece.
+        # An empty crop is fine — report_alert falls back to the slot's rolling
+        # snapshot, which _save_slot_snapshot wrote when the car parked.
+        held_crop = crop.copy() if (crop is not None and crop.size > 0) else None
+        pipeline = (getattr(self, "pipelines", None) or {}).get(cam_id)
+        slot_obj = None
+        for candidate in (getattr(pipeline, "slots", None) or []):
+            if candidate.id == slot_id:
+                slot_obj = candidate
+                break
+        pending[slot_id] = {
+            "cam_id": cam_id,
+            "crop": held_crop,
+            "since": now_ts,
+            "owner_title": self._reserved_for_map.get(slot_id),
+            "floor": getattr(pipeline, "floor", "") or "",
+            "slot_name": getattr(slot_obj, "label", "") or slot_id,
+            "zone_id": getattr(slot_obj, "zone_id", "") or "",
+            "zone_name": getattr(slot_obj, "zone_name", "") or "",
+            "alerted": False,
+        }
+        logger.info(
+            "[named-slot] slot=%s occupied by an UNIDENTIFIED car (reserved for %r) "
+            "— ownership verdict deferred until OCR/ReID names it (cam=%s)",
+            slot_id, self._reserved_for_map.get(slot_id), cam_id,
+        )
+
+    def _clear_pending_ownership(self, slot_id: str) -> None:
+        """Car left. Drop the pending verdict so the NEXT car starts clean."""
+        self._pending_ownership().pop(slot_id, None)
+
+    def _evaluate_named_slot_ownership(self, slot_id: str, cam_id: str, plate: str) -> None:
+        """Identity landed for a parked car — settle the deferred verdict.
+
+        Called from every path that binds a plate to a slot. A no-op unless this
+        slot is a named one with a pending verdict, so bind sites can call it
+        unconditionally.
+        """
+        entry = self._pending_ownership().get(slot_id)
+        if not entry or not plate:
+            return
+        owner_title = entry.get("owner_title")
+        if self._is_named_slot_vehicle_allowed(plate, owner_title):
+            logger.info(
+                "[named-slot] slot=%s OK — %s belongs to %r, the slot's owner; "
+                "no alert",
+                slot_id, plate, owner_title,
+            )
+            self._clear_pending_ownership(slot_id)
+            return
+        logger.warning(
+            "[named-slot] slot=%s INTRUSION — %s is not %r (the slot's owner)",
+            slot_id, plate, owner_title,
+        )
+        self._raise_named_slot_alert(
+            slot_id, entry, "vehicle_intrusion", plate=plate, severity="critical"
+        )
+        self._clear_pending_ownership(slot_id)
+
+    def _sweep_pending_ownership(self, now_ts: float) -> None:
+        """Identity never landed — alert on the ones that ran out of time.
+
+        WHY THIS EXISTS. Waiting for identity forever means a named slot whose
+        identity never resolves gets NO intrusion alert, ever. That is not a corner
+        case: B1_CRO has OCR disabled outright (matching.slot_no_plate_view — the
+        plate is never in frame, 455 attempts and zero reads) and can only be named
+        by appearance, which routinely abstains. Without this sweep the CRO's slot
+        would have exactly zero intrusion coverage.
+
+        The resulting alert deliberately does NOT claim intrusion. Nobody could
+        verify ownership, so it says so, at a lower severity than a proven one.
+        """
+        # Called once per processed frame, so the empty case must be free — and it
+        # is the normal case (only named slots awaiting identity are ever in here).
+        # Checking the map before touching config also keeps this a hard no-op on
+        # engines built without alert config, e.g. test harnesses.
+        pending = getattr(self, "_pending_ownership_map", None)
+        if not pending:
+            return
+        alerts_cfg = getattr(getattr(self, "config", None), "alerts", None)
+        try:
+            timeout = float(
+                getattr(alerts_cfg, "reserved_slot_identity_timeout_s", 300.0)
+            )
+        except (TypeError, ValueError):
+            timeout = 300.0
+        if timeout <= 0:
+            return  # fallback disabled — alert only on a proven non-owner
+        for slot_id, entry in list(pending.items()):
+            if entry.get("alerted"):
+                continue
+            if now_ts - entry["since"] < timeout:
+                continue
+            entry["alerted"] = True  # latch: one alert per occupancy, not per frame
+            logger.warning(
+                "[named-slot] slot=%s UNIDENTIFIED after %.0fs — reserved for %r and "
+                "neither OCR nor ReID could name the occupant, so ownership was never "
+                "testable. Raising a lower-severity alert rather than staying silent.",
+                slot_id, now_ts - entry["since"], entry.get("owner_title"),
+            )
+            self._raise_named_slot_alert(
+                slot_id, entry, "reserved_slot_unidentified", plate=None, severity="warning"
+            )
+
+    def _raise_named_slot_alert(
+        self, slot_id: str, entry: dict, alert_type: str, plate, severity: str
+    ) -> None:
+        """Write + publish a named-slot alert outside the per-frame event flow.
+
+        The deferred verdict lands minutes after the state machine's vehicle_parked,
+        so there is no event riding the normal _persist_final_events path to carry
+        it. This does that path's two jobs directly: persist the row, then publish
+        so the UI sees it without waiting for the next state change.
+        """
+        cam_id = entry.get("cam_id") or ""
+        snapshot_path = self._save_alert_snapshot(
+            entry.get("crop"),
+            alert_type=alert_type,
+            slot_id=slot_id,
+            camera_id=cam_id,
+        )
+
+        alert_id = None
+        if self.db_manager:
+            session = self.db_manager.SessionLocal()
+            try:
+                from src.services import alert_service
+
+                alert = alert_service.report_alert(
+                    session,
+                    slot_id,
+                    plate,
+                    camera_id=cam_id,
+                    severity=severity,
+                    snapshot_path=snapshot_path,
+                    alert_type=alert_type,
+                )
+                if alert:
+                    alert_id = alert.id
+            except Exception as exc:
+                session.rollback()
+                print(f"[ERROR] Failed to persist named-slot alert for {slot_id}: {exc}")
+            finally:
+                session.close()
+
+        event = SlotEvent(
+            event_type=alert_type,
+            slot_id=slot_id,
+            track_id=None,
+            timestamp=datetime.now().isoformat(),
+            camera_id=cam_id,
+            floor=entry.get("floor", ""),
+            plate_number=plate or "",
+            is_alert=True,
+            severity=severity,
+            slot_name=entry.get("slot_name", "") or slot_id,
+            zone_id=entry.get("zone_id", ""),
+            zone_name=entry.get("zone_name", ""),
+            snapshot_url=snapshot_path or "",
+            snapshot_path=snapshot_path or "",
+            alert_id=alert_id,
+        )
+        self.event_bus.emit_batch([event])
+        print(f"[ALERT] {alert_type.replace('_', ' ').title()}! {cam_id} | Slot:{slot_id}")
 
     def _persist_final_events(self, events, trace=None) -> None:
         if not events:

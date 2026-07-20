@@ -1143,15 +1143,23 @@ def create_app(
     # ── Health Check ────────────────────────────────────────
 
     @app.get("/api/health")
-    async def health():
-        """Enriched health reporting including engine status."""
+    async def health(response: Response):
+        """Enriched health reporting including engine status.
+
+        The default ``ok`` is only a liveness signal (this API answered). When an engine
+        status callback is wired in, its COMPUTED ``status`` overrides it and an
+        ``unhealthy`` verdict is surfaced as HTTP 503 so orchestrators/monitors act on it
+        instead of seeing a green 200 over a wedged engine.
+        """
         health_data = {
-            "status": "ok", 
+            "status": "ok",
             "service": "Damanat PMS Video Analytics",
             "timestamp": datetime.now().isoformat()
         }
         if get_engine_status:
             health_data.update(get_engine_status())
+        if health_data.get("status") == "unhealthy":
+            response.status_code = 503
         return health_data
 
     return app

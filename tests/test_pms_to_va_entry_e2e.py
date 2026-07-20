@@ -70,6 +70,24 @@ class Clock:
         self.t += timedelta(seconds=seconds)
 
 
+def _fake_detect_vehicle_crop(frame):
+    """Stand in for main.py's YOLO-backed ``detect_vehicle_crop`` injection.
+
+    REQUIRED, not optional. 292d7cf (2026-07-10, "reject full-frame gallery
+    snapshots from API — require valid car crop") made every gallery-seeding
+    direction — entry, B-entry, ramp-entry — refuse the image unless a vehicle
+    crop is produced, deliberately failing CLOSED so a wide gate frame can never
+    become a matchable anchor (full-frame anchors were measured driving ReID down
+    to ~51%). ``create_app`` defaults this hook to None, which counts as "no crop
+    detected", so a client built without it silently drops every gate image.
+
+    This test is about the PMS→VA wire contract and session/folder seeding, not
+    about whether YOLO can find a car in a synthetic swatch, so the seam is
+    injected rather than the detector being run for real.
+    """
+    return frame if frame is not None and frame.size > 0 else None
+
+
 def _make_client(clock=None):
     image_dir = tempfile.mkdtemp(prefix="pms_va_e2e_")
     cfg = MatchingConfig()
@@ -77,7 +95,11 @@ def _make_client(clock=None):
     cfg.reid_openvino_model_dir = ""  # tag → "…:default"
     registry = VehicleRegistry(image_dir=image_dir, matching_config=cfg, clock=clock)
     registry._reid_matcher = FakeMatcher()
-    app = create_app(vehicle_registry=registry, snapshot_base_dir=image_dir)
+    app = create_app(
+        vehicle_registry=registry,
+        snapshot_base_dir=image_dir,
+        detect_vehicle_crop=_fake_detect_vehicle_crop,
+    )
     return TestClient(app), registry, image_dir
 
 

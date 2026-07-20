@@ -58,6 +58,22 @@ class DatabaseManager:
             bind=self.engine
         )
 
+    def ping(self) -> bool:
+        """Is the database actually reachable RIGHT NOW?
+
+        ``db_manager is not None`` only proves the object was constructed — the server
+        can be down while it stays truthy. The health check needs a live signal, so run
+        the cheapest possible round-trip (``SELECT 1``) and report whether it answered.
+        Any failure (connection refused, timeout, auth) is swallowed into ``False`` —
+        this is a health probe, never a place to raise.
+        """
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return True
+        except Exception:
+            return False
+
     def create_tables(self):
         Base.metadata.create_all(bind=self.engine)
         self._ensure_schema_updates()

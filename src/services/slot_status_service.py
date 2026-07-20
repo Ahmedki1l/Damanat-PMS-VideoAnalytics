@@ -51,9 +51,18 @@ def log_vehicle_event(
     severity: str = None,
     snapshot_path: str = None,
 ):
+    plate_value = (plate or None) if is_parked else None
+
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
     if slot:
         slot.is_available = not is_parked
+        # Identity mirror: parking_slots.current_plate and
+        # slot_status.plate_number are authoritative twins carrying the same
+        # value on the same session, so downstream consumers (the Gateway
+        # prefers current_plate and falls back to slot_status.plate_number)
+        # can read either. report_alert may flush this row marginally before
+        # the occupancy row is created — the value is identical either way.
+        slot.current_plate = plate_value
 
     is_occupied_to_empty_transition = False
     if not is_parked:
@@ -63,7 +72,7 @@ def log_vehicle_event(
 
     new_log = SlotStatus(
         slot_id=slot_id,
-        plate_number=plate if is_parked else None,
+        plate_number=plate_value,
         status="occupied" if is_parked else "available"
     )
 
@@ -133,18 +142,27 @@ def update_current_slot_plate(
     the identity slightly later. In that case we should enrich the current
     occupied record instead of creating another duplicate occupied row.
     """
+    plate_value = plate or None
+
     latest_status = SlotStatusRepository.get_latest_by_slot(db, slot_id)
     if latest_status and latest_status.status == "occupied":
         previous_plate = latest_status.plate_number
-        latest_status.plate_number = plate
+        latest_status.plate_number = plate_value
+
+        # Mirror the identity onto parking_slots.current_plate in the SAME
+        # commit. The slot row is fetched before the commit (not after) so a
+        # crash between the two writes cannot leave the columns disagreeing.
+        slot = ParkingSlotRepository.get_by_id(db, slot_id)
+        if slot:
+            slot.current_plate = plate_value
+
         db.commit()
         db.refresh(latest_status)
 
-        slot = ParkingSlotRepository.get_by_id(db, slot_id)
-        if slot and plate != previous_plate:
-            if plate:
+        if slot and plate_value != previous_plate:
+            if plate_value:
                 pms_api_client.bind_slot_session(
-                    plate_number=plate,
+                    plate_number=plate_value,
                     slot_id=slot.slot_id,
                     slot_number=slot.slot_name or slot.slot_id,
                     zone_id=slot.zone_id,

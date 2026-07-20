@@ -110,9 +110,23 @@ class TestPhase1Logic(unittest.TestCase):
         # args[0]=cam_id, args[1]=tid, args[2]=primary crop
         self.assertEqual(args[0], self.cam_id)
         self.assertEqual(args[1], track_id)
-        # The primary crop passed is the deep (largest, padded) view.
-        expected_crop = self.engine._crop_detection(
-            dummy_frame, det2, padding_ratio=0.12
+        # The primary crop passed is the deep (largest) view, cropped to the
+        # ZONE and masked to its polygon — not a plain bbox crop.
+        #
+        # This assertion used to call _crop_detection (plain bbox + padding) and
+        # broke on fbb60c2 (2026-07-09, "mask zone vehicle snapshots to ROI
+        # polygon"), which switched _process_confirmation_zone to
+        # _crop_detection_to_zone so a car outside the entrance polygon can no
+        # longer leak into the confirmation crop. The two differ in more than
+        # masking: _crop_detection enforces MINIMUM padding (max(16,...) /
+        # max(12,...)), so on this 50x50 box it padded to 72x76, while the zone
+        # path uses max(0,...) and clips to the polygon bounds, giving 62x62.
+        expected_crop = self.engine._crop_detection_to_zone(
+            dummy_frame,
+            det2,
+            self.zone,
+            padding_ratio=0.12,
+            mask_outside_zone=True,
         )
         self.assertEqual(args[2].shape, expected_crop.shape)
 
