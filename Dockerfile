@@ -101,7 +101,7 @@ ENV PYTHONUNBUFFERED=1
 #
 #   BUILD 1  Isolated b1 (uncontended `ov` floor). Runs ONLY b1 — other floors
 #            stop updating while deployed; keep it brief.
-#              PERF_TRACE=1  VA_OV_NUM_THREADS=7  SEED_GEOMETRY_ON_START=false
+#              PERF_TRACE=1  VA_OV_NUM_THREADS=7
 #              VA_CMD="python main.py --cameras CAM-04,CAM-05,CAM-06,CAM-07,CAM-08,CAM-20,CAM-21,CAM-22,CAM-24"
 #            RESULT: ov ~24ms, ~2.2 fps/cam (floor).
 #
@@ -142,7 +142,6 @@ ENV PYTHONUNBUFFERED=1
 # ============================================================================
 ENV PERF_TRACE=1
 ENV PERF_TRACE_EVERY=50
-ENV SEED_GEOMETRY_ON_START=false
 # --- Phase 2 (BUILD 4) single-process async engine -------------------------
 # One process, one AsyncInferQueue, all cameras. Bypasses the supervisor.
 # 1st prod run (8->10->9->11) showed the pool STARVED (~2/15 in flight) while the
@@ -166,9 +165,15 @@ COPY . .
 
 EXPOSE 8000
 
-# Same geometry seed as the single-process image; the only difference is the
-# final exec — the Python supervisor (`--supervise --foreground`) runs as PID 1
-# and spawns/supervises the 5 camera groups instead of one `main.py --api`. It
-# mirrors each group's logs to stdout and forwards SIGTERM on `docker stop`.
-# Extra launcher flags via RUN_ALL_ARGS, e.g. -e RUN_ALL_ARGS="--reset-plates".
-ENTRYPOINT ["sh", "-c", "if [ \"${SEED_GEOMETRY_ON_START:-true}\" = true ] && [ -f \"${GEOMETRY_FILE:-geometry.json}\" ]; then echo '[entrypoint] seeding geometry into empty tables...'; python tools/sync_geometry.py seed --in \"${GEOMETRY_FILE:-geometry.json}\" --if-empty || echo '[entrypoint] geometry seed skipped (continuing)'; fi; exec ${VA_CMD:-python main.py --supervise --foreground ${RUN_ALL_ARGS:-}}"]
+# The default exec is the Python supervisor (`--supervise --foreground`): it runs
+# as PID 1 and spawns/supervises the 5 camera groups, mirrors each group's logs to
+# stdout, and forwards SIGTERM on `docker stop`. VA_CMD overrides it (BUILD 4 runs
+# one `main.py --api` instead). Extra launcher flags via RUN_ALL_ARGS, e.g.
+# -e RUN_ALL_ARGS="--reset-plates".
+#
+# Zoning geometry is NOT seeded here. The DB `parking_slots`/`boundaries`/
+# `parking_areas` tables are authoritative and long since populated; re-seeding from
+# a checked-in dump on every boot could only ever reintroduce stale polygons. Seed a
+# fresh database by hand — `python tools/sync_geometry.py seed --in geometry.json`
+# (see README) — which is the only situation that ever needed it.
+ENTRYPOINT ["sh", "-c", "exec ${VA_CMD:-python main.py --supervise --foreground ${RUN_ALL_ARGS:-}}"]
