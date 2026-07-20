@@ -248,10 +248,19 @@ detector:
   #
   # camera_overrides:
   #   CAM-00:
-  #     model_path: "models/yolo11l.pt"   # int8/yolo11m collapse on fisheye
+  #     model_path: "models/yolo11l_openvino_model"  # int8/yolo11m collapse on fisheye
   #     max_box_area_ratio: 0.5           # drop yolo11l's whole-frame "bus"
   #     preprocessing:
   #       enabled: false                  # CLAHE erases dark cars on a SUNLIT view
+  #
+  # ALWAYS point model_path at an OpenVINO EXPORT DIRECTORY, never a .pt.
+  # OVInferCore needs an IR .xml; given a .pt it raises FileNotFoundError and the
+  # engine falls back to Ultralytics model.track() — synchronous PyTorch. Under
+  # the single-process async engine that blocking call runs on the ONE shared
+  # consumer thread, so one camera stalls the whole fleet. Measured in prod
+  # 2026-07-20 with a .pt here: wall=11635ms (ov=11449, cpu=2533, wait=9102) per
+  # frame and every camera pinned at 0.1 fps against a target of 5.
+  #   yolo export model=models/yolo11l.pt format=openvino imgsz=320
 
   # Drop any detection covering more than this fraction of the frame. 0.0 = off.
   # Guards against a model emitting a whole-frame "car"/"bus": the slot assigner
