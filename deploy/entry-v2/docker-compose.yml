@@ -1,0 +1,41 @@
+services:
+  pms-video-analytics:
+    image: ${VA_IMAGE:?Set VA_IMAGE to an immutable registry tag or digest}
+    container_name: pms-video-analytics
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ${VA_RUNTIME_ENV_FILE:?Set VA_RUNTIME_ENV_FILE to the external VA environment file}
+    ports:
+      - "${VA_BIND_IP:-127.0.0.1}:${VA_HOST_PORT:-8000}:8000"
+    volumes:
+      - type: bind
+        source: ${VA_CONFIG_FILE:?Set VA_CONFIG_FILE to the completed config.yaml}
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${VA_GALLERY_DIR:?Set VA_GALLERY_DIR to durable host storage}
+        target: /app/vehicle_images
+        bind:
+          create_host_path: false
+    networks:
+      - damanat
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+networks:
+  damanat:
+    external: true
+    name: ${DAMANAT_DOCKER_NETWORK:?Set DAMANAT_DOCKER_NETWORK to the network containing pms-ai and pms-mssql}

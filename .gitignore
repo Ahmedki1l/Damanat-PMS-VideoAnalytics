@@ -141,6 +141,16 @@ snapshot*.png
 
 # Config with real credentials (use config.example.yaml as template)
 config.yaml
+config.entry-v2.yaml
+config.production.yaml
+config.prod.yaml
+
+# Runtime environment files contain service keys and deployment-specific data.
+# Keep only the checked-in `*.env.example` templates.
+.env
+.env.*
+*.env
+!*.env.example
 
 # Temporary scripts
 capture_snapshot.py

@@ -157,6 +157,11 @@ ENV VA_INFER=async
 ENV VA_OV_NUM_THREADS=16
 ENV VA_FEED_THREADS=6
 ENV VA_CMD="python main.py --api"
+# Safe rollout defaults. Deployment-time env may promote Entry V2 from off to
+# shadow/authoritative, but credentials and site calibration are never baked.
+ENV ENTRY_V2_MODE=off
+ENV VA_MOTION_SCHEDULER_MODE=shadow
+ENV VA_SLOT_STATE_MODE=shadow
 # --- Supervisor-only knobs (ignored while VA_CMD bypasses the supervisor) ---
 ENV VA_OV_TOTAL_THREADS=""
 ENV VA_MERGE_GROUPS=""
