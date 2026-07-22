@@ -325,8 +325,9 @@ Base URL: `http://0.0.0.0:8000` (started with `--api` flag)
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/anpr/event` | Receive plate + optional base64 image (JSON body) |
-| `POST` | `/api/anpr/event/upload` | Receive plate + image file (multipart form) |
+| `POST` | `/api/anpr/event` | Legacy JSON ANPR; V2 modes require service auth, authoritative allows exits only |
+| `POST` | `/api/anpr/event/upload` | Legacy multipart ANPR; HTTP 410 in V2 modes |
+| `POST` | `/api/line-crossing` | Legacy entry image; HTTP 410 in V2 modes |
 
 **JSON body for `/api/anpr/event`:**
 ```json
@@ -415,12 +416,47 @@ All settings are in `config.yaml`:
 | `classes` | `[2]` | COCO classes to detect (2=car) |
 | `imgsz` | `640` | Inference input resolution |
 
+### Motion Scheduler (single-process mode)
+
+`shadow` and `enforce` require `VA_SINGLE_PROCESS=1`; unsupported runtime paths
+fail closed at startup. In `enforce`, `analysis_fps` must be at least
+`processing.target_fps_per_camera` for every non-bypass camera; entry cameras
+and entrance-zone cameras remain bypassed.
+
+The deployment variables `VA_MOTION_SCHEDULER_MODE` and `VA_SLOT_STATE_MODE`
+override the YAML `motion_scheduler.mode` and `state_machine.mode`
+respectively. Accepted values are `legacy|shadow|enforce` for motion and
+`legacy|shadow|time` for slot state.
+
+| Key | Default | Description |
+|---|---|---|
+| `mode` | `legacy` | `legacy` disables motion analysis; `shadow` measures; `enforce` gates quiet frames |
+| `analysis_fps` | `2.0` | Per-camera frame-difference rate; in `enforce`, must be ≥ target FPS unless bypassed |
+| `analysis_width` | `96` | Frame-difference width in pixels |
+| `pixel_delta` | `18` | Per-pixel grayscale change threshold |
+| `changed_ratio` | `0.02` | Changed-pixel ratio that marks motion active |
+| `active_hold_seconds` | `2.0` | Keep motion active after the latest changed frame |
+| `sentinel_interval_seconds` | `5.0` | Target quiet interval for mandatory YOLO checks |
+| `stale_frame_seconds` | `3.0` | Frame age after which inference output is treated as UNKNOWN |
+| `always_infer` | `false` | Bypass motion gating globally |
+| `camera_overrides` | `{}` | Per-camera overrides for the fields above except `mode` |
+
 ### State Machine
 
 | Key | Default | Description |
 |---|---|---|
 | `confirm_enter_frames` | `5` | Frames to confirm OCCUPIED |
 | `confirm_leave_frames` | `8` | Frames to confirm VACANT |
+| `mode` | `legacy` | `legacy` frame counters, `shadow` time-policy diagnostics, or authoritative `time` mode |
+| `enter_seconds` | `3.0` | Minimum PRESENT duration in `shadow`/`time` |
+| `leave_seconds` | `20.0` | Minimum ABSENT duration in `shadow`/`time` |
+| `enter_min_observations` | `2` | Minimum PRESENT observations in `shadow`/`time` |
+| `leave_min_observations` | `3` | Minimum ABSENT observations in `shadow`/`time` |
+| `enter_cancel_seconds` | `1.0` | Sustained ABSENT time required to cancel ENTERING |
+| `enter_cancel_min_observations` | `2` | ABSENT observations required to cancel ENTERING |
+| `leave_start_seconds` | `1.0` | Sustained ABSENT time before OCCUPIED enters LEAVING |
+| `leave_start_min_observations` | `2` | ABSENT observations before OCCUPIED enters LEAVING |
+| `max_known_gap_seconds` | `8.0` | Restart a timed evidence run after a longer gap |
 
 ### Slot Assigner
 

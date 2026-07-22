@@ -47,6 +47,7 @@ class CameraPipeline:
                 confirm_leave_frames=config.state_machine.confirm_leave_frames,
                 is_violation_zone=is_restricted,
                 initial_state=start_state,
+                observation_policy=config.state_machine.observation_policy,
             )
 
         self.assigner = SlotAssigner(slots=slots, config=config.assigner)

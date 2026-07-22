@@ -23,7 +23,7 @@ proves PMS emits that same shape. The wire payload is the seam both sides pin.
 import base64
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import cv2
 import numpy as np
@@ -92,6 +92,9 @@ def _make_client(clock=None):
     image_dir = tempfile.mkdtemp(prefix="pms_va_e2e_")
     cfg = MatchingConfig()
     cfg.gallery_persist_enabled = True
+    # /api/anpr/event is the legacy compatibility journey. Keep its gallery
+    # contract explicit; authoritative Entry V2 uses strict admission instead.
+    cfg.gallery_strict_admission_enabled = False
     cfg.reid_openvino_model_dir = ""  # tag → "…:default"
     registry = VehicleRegistry(image_dir=image_dir, matching_config=cfg, clock=clock)
     registry._reid_matcher = FakeMatcher()
@@ -114,14 +117,19 @@ def _jpeg_b64(value):
 
 def _pms_forward(client, plate, direction, value, camera_id="ANPR"):
     """Reproduce ``notify_pms_anpr``'s POST to VA and return the parsed body."""
+    payload = {
+        "plate": plate,
+        "direction": direction,
+        "image_base64": _jpeg_b64(value),
+        "camera_id": camera_id,
+    }
+    if direction == "exit":
+        payload["captured_at"] = datetime(
+            2026, 7, 21, 9, 0, tzinfo=timezone.utc
+        ).isoformat()
     resp = client.post(
         "/api/anpr/event",
-        json={
-            "plate": plate,
-            "direction": direction,
-            "image_base64": _jpeg_b64(value),
-            "camera_id": camera_id,
-        },
+        json=payload,
     )
     assert resp.status_code == 200, resp.text
     return resp.json()

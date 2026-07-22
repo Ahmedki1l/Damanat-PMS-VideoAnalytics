@@ -5,11 +5,14 @@ Loads config.yaml and provides typed access to all settings.
 Supports both single-camera (legacy) and multi-camera configurations.
 """
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import yaml
+
+from src.models.state_machine import SlotObservationPolicy
 
 
 def norm_camera_id(value: str) -> str:
@@ -70,6 +73,86 @@ class ProcessingConfig:
     # is not corrupted by round-robin (Ultralytics' persist=True is per-model).
     # False reverts to the legacy single shared tracker (lower RAM, worse IDs).
     per_camera_tracker: bool = True
+
+
+MOTION_CAMERA_OVERRIDE_KEYS = frozenset(
+    {
+        "analysis_fps",
+        "analysis_width",
+        "pixel_delta",
+        "changed_ratio",
+        "active_hold_seconds",
+        "sentinel_interval_seconds",
+        "stale_frame_seconds",
+        "always_infer",
+    }
+)
+
+
+def _parse_config_bool(value, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"{field_name} must be a boolean, got {value!r}")
+
+
+@dataclass
+class MotionSchedulingConfig:
+    """Low-cost motion scheduling policy for the single-process engine."""
+
+    mode: str = "legacy"
+    analysis_fps: float = 2.0
+    analysis_width: int = 96
+    pixel_delta: int = 18
+    changed_ratio: float = 0.02
+    active_hold_seconds: float = 2.0
+    sentinel_interval_seconds: float = 5.0
+    stale_frame_seconds: float = 3.0
+    always_infer: bool = False
+    camera_overrides: Dict[str, Dict] = field(default_factory=dict)
+
+
+def _parse_motion_overrides(raw: Dict) -> Dict[str, Dict]:
+    casters = {
+        "analysis_fps": float,
+        "analysis_width": int,
+        "pixel_delta": int,
+        "changed_ratio": float,
+        "active_hold_seconds": float,
+        "sentinel_interval_seconds": float,
+        "stale_frame_seconds": float,
+    }
+    parsed: Dict[str, Dict] = {}
+    for camera_id, override in (raw or {}).items():
+        fields = dict(override or {})
+        unknown = set(fields) - MOTION_CAMERA_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(
+                f"motion_scheduler.camera_overrides['{camera_id}']: unknown "
+                f"key(s) {sorted(unknown)}. Allowed: "
+                f"{sorted(MOTION_CAMERA_OVERRIDE_KEYS)}"
+            )
+        converted = {
+            key: (
+                _parse_config_bool(
+                    value,
+                    field_name=(
+                        f"motion_scheduler.camera_overrides['{camera_id}'].{key}"
+                    ),
+                )
+                if key == "always_infer"
+                else casters[key](value)
+            )
+            for key, value in fields.items()
+        }
+        parsed[norm_camera_id(camera_id)] = converted
+    return parsed
 
 
 # Fields a detector.camera_overrides entry is allowed to set. Deliberately
@@ -166,6 +249,9 @@ class StateMachineConfig:
     """State machine debounce thresholds."""
     confirm_enter_frames: int = 5
     confirm_leave_frames: int = 8
+    observation_policy: SlotObservationPolicy = field(
+        default_factory=SlotObservationPolicy
+    )
 
 
 @dataclass
@@ -296,19 +382,30 @@ class MatchingConfig:
     # --- Per-car persistent multi-shot gallery (folder per plate) --------- #
     # A growing set of quality-gated reference crops+vectors per plate, kept on
     # disk so a car's appearance profile survives restart and warm-starts a
-    # returning car. All gated by ``gallery_persist_enabled`` — off ⇒ today's
-    # in-memory-only behaviour.
+    # returning car. It remains opt-in at the library/default-object level to
+    # avoid unexpected disk writes; production config.example.yaml enables it.
     gallery_persist_enabled: bool = False
     gallery_max_refs_per_car: int = 10        # cap crops/vectors per plate folder
-    gallery_retention_days: float = 5.0       # GC folders idle longer than this
+    gallery_retention_days: float = 0.0       # 0 = never expire verified history
     gallery_min_view_quality: float = 0.9     # full-view gate (see _bbox_view_quality)
+    # Fail-closed gallery learning. A normal session may still open at Entry V2's
+    # operating thresholds, but no crop is learned unless the entry received a
+    # stricter post-PMS-ACK authorization and the parked crop independently wins
+    # ReID rank-1 with a strong margin plus a high-confidence matching OCR read.
+    gallery_strict_admission_enabled: bool = True
+    gallery_parked_ocr_min_confidence: float = 0.90
+    gallery_parked_reid_min_score: float = 0.70
+    gallery_parked_reid_min_margin: float = 0.15
+    gallery_parked_min_neighbour_clearance: float = 0.90
+    gallery_parked_require_rank_one: bool = True
     # D9 neighbour-clearance: a car parked shoulder-to-shoulder has a bbox that a
     # neighbour's box overlaps, so its ReID crop is contaminated with the wrong
     # car. When enforced, _bbox_view_quality is multiplied by the clearance
     # (1.0 unobstructed → 0.0 fully covered), so an occluded crop falls below
-    # gallery_min_view_quality and is kept out of the gallery. Default OFF
-    # (log-only): the clearance is computed and logged to collect its
-    # distribution BEFORE it is allowed to gate anything.
+    # gallery_min_view_quality and is kept out of generic legacy galleries.
+    # The strict parked-proof path always enforces its independent
+    # gallery_parked_min_neighbour_clearance threshold even when this legacy
+    # quality-weighting switch is off.
     gallery_neighbour_clearance_enforce: bool = False
     # Slot authority: a camera may only add a gallery reference for a car that is
     # inside a slot IT hosts. Owning a car was previously the only camera check on
@@ -785,6 +882,9 @@ class AppConfig:
     # the bounded matcher degrade to the legacy all-sessions behaviour then.
     areas: List[AreaEntry] = field(default_factory=list)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
+    motion_scheduler: MotionSchedulingConfig = field(
+        default_factory=MotionSchedulingConfig
+    )
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     state_machine: StateMachineConfig = field(default_factory=StateMachineConfig)
@@ -849,6 +949,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         Populated AppConfig instance.
     """
     config = AppConfig()
+    snapshot_path_override = os.environ.get("SNAPSHOT_PATH", "").strip()
+    if snapshot_path_override:
+        config.output.snapshot_base_dir = snapshot_path_override
 
 
     if not os.path.exists(config_path):
@@ -920,6 +1023,46 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             "max_grab_fps", config.processing.max_grab_fps
         ))
 
+    if "motion_scheduler" in raw:
+        motion = raw["motion_scheduler"] or {}
+        runtime = config.motion_scheduler
+        runtime.mode = str(motion.get("mode", runtime.mode)).strip().lower()
+        runtime.analysis_fps = float(
+            motion.get("analysis_fps", runtime.analysis_fps)
+        )
+        runtime.analysis_width = int(
+            motion.get("analysis_width", runtime.analysis_width)
+        )
+        runtime.pixel_delta = int(
+            motion.get("pixel_delta", runtime.pixel_delta)
+        )
+        runtime.changed_ratio = float(
+            motion.get("changed_ratio", runtime.changed_ratio)
+        )
+        runtime.active_hold_seconds = float(
+            motion.get("active_hold_seconds", runtime.active_hold_seconds)
+        )
+        runtime.sentinel_interval_seconds = float(
+            motion.get(
+                "sentinel_interval_seconds",
+                runtime.sentinel_interval_seconds,
+            )
+        )
+        runtime.stale_frame_seconds = float(
+            motion.get("stale_frame_seconds", runtime.stale_frame_seconds)
+        )
+        runtime.always_infer = _parse_config_bool(
+            motion.get("always_infer", runtime.always_infer),
+            field_name="motion_scheduler.always_infer",
+        )
+        runtime.camera_overrides = _parse_motion_overrides(
+            motion.get("camera_overrides") or {}
+        )
+
+    motion_mode = os.environ.get("VA_MOTION_SCHEDULER_MODE", "").strip().lower()
+    if motion_mode:
+        config.motion_scheduler.mode = motion_mode
+
     # --- Legacy single-camera support ---
     if "video" in raw:
         v = raw["video"]
@@ -975,6 +1118,78 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         config.state_machine.confirm_leave_frames = sm.get(
             "confirm_leave_frames", config.state_machine.confirm_leave_frames
+        )
+        current_policy = config.state_machine.observation_policy
+        config.state_machine.observation_policy = SlotObservationPolicy(
+            mode=str(sm.get("mode", current_policy.mode)).strip().lower(),
+            enter_seconds=float(
+                sm.get("enter_seconds", current_policy.enter_seconds)
+            ),
+            leave_seconds=float(
+                sm.get("leave_seconds", current_policy.leave_seconds)
+            ),
+            enter_min_observations=int(
+                sm.get(
+                    "enter_min_observations",
+                    current_policy.enter_min_observations,
+                )
+            ),
+            leave_min_observations=int(
+                sm.get(
+                    "leave_min_observations",
+                    current_policy.leave_min_observations,
+                )
+            ),
+            enter_cancel_seconds=float(
+                sm.get(
+                    "enter_cancel_seconds",
+                    current_policy.enter_cancel_seconds,
+                )
+            ),
+            enter_cancel_min_observations=int(
+                sm.get(
+                    "enter_cancel_min_observations",
+                    current_policy.enter_cancel_min_observations,
+                )
+            ),
+            leave_start_seconds=float(
+                sm.get(
+                    "leave_start_seconds",
+                    current_policy.leave_start_seconds,
+                )
+            ),
+            leave_start_min_observations=int(
+                sm.get(
+                    "leave_start_min_observations",
+                    current_policy.leave_start_min_observations,
+                )
+            ),
+            max_known_gap_seconds=float(
+                sm.get(
+                    "max_known_gap_seconds",
+                    current_policy.max_known_gap_seconds,
+                )
+            ),
+        )
+
+    slot_state_mode = os.environ.get("VA_SLOT_STATE_MODE", "").strip().lower()
+    if slot_state_mode:
+        current_policy = config.state_machine.observation_policy
+        config.state_machine.observation_policy = SlotObservationPolicy(
+            mode=slot_state_mode,
+            enter_seconds=current_policy.enter_seconds,
+            leave_seconds=current_policy.leave_seconds,
+            enter_min_observations=current_policy.enter_min_observations,
+            leave_min_observations=current_policy.leave_min_observations,
+            enter_cancel_seconds=current_policy.enter_cancel_seconds,
+            enter_cancel_min_observations=(
+                current_policy.enter_cancel_min_observations
+            ),
+            leave_start_seconds=current_policy.leave_start_seconds,
+            leave_start_min_observations=(
+                current_policy.leave_start_min_observations
+            ),
+            max_known_gap_seconds=current_policy.max_known_gap_seconds,
         )
 
     # --- Assigner ---
@@ -1120,29 +1335,70 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
 
         # Per-car persistent gallery
-        cm.gallery_persist_enabled = m.get(
-            "gallery_persist_enabled", cm.gallery_persist_enabled
+        cm.gallery_persist_enabled = _parse_config_bool(
+            m.get("gallery_persist_enabled", cm.gallery_persist_enabled),
+            field_name="matching.gallery_persist_enabled",
         )
-        cm.gallery_max_refs_per_car = m.get(
-            "gallery_max_refs_per_car", cm.gallery_max_refs_per_car
+        cm.gallery_max_refs_per_car = int(
+            m.get("gallery_max_refs_per_car", cm.gallery_max_refs_per_car)
         )
-        cm.gallery_retention_days = m.get(
-            "gallery_retention_days", cm.gallery_retention_days
+        cm.gallery_retention_days = float(
+            m.get("gallery_retention_days", cm.gallery_retention_days)
         )
-        cm.gallery_min_view_quality = m.get(
-            "gallery_min_view_quality", cm.gallery_min_view_quality
+        cm.gallery_min_view_quality = float(
+            m.get("gallery_min_view_quality", cm.gallery_min_view_quality)
         )
-        cm.gallery_neighbour_clearance_enforce = bool(
+        cm.gallery_strict_admission_enabled = _parse_config_bool(
+            m.get(
+                "gallery_strict_admission_enabled",
+                cm.gallery_strict_admission_enabled,
+            ),
+            field_name="matching.gallery_strict_admission_enabled",
+        )
+        cm.gallery_parked_ocr_min_confidence = float(
+            m.get(
+                "gallery_parked_ocr_min_confidence",
+                cm.gallery_parked_ocr_min_confidence,
+            )
+        )
+        cm.gallery_parked_reid_min_score = float(
+            m.get(
+                "gallery_parked_reid_min_score",
+                cm.gallery_parked_reid_min_score,
+            )
+        )
+        cm.gallery_parked_reid_min_margin = float(
+            m.get(
+                "gallery_parked_reid_min_margin",
+                cm.gallery_parked_reid_min_margin,
+            )
+        )
+        cm.gallery_parked_min_neighbour_clearance = float(
+            m.get(
+                "gallery_parked_min_neighbour_clearance",
+                cm.gallery_parked_min_neighbour_clearance,
+            )
+        )
+        cm.gallery_parked_require_rank_one = _parse_config_bool(
+            m.get(
+                "gallery_parked_require_rank_one",
+                cm.gallery_parked_require_rank_one,
+            ),
+            field_name="matching.gallery_parked_require_rank_one",
+        )
+        cm.gallery_neighbour_clearance_enforce = _parse_config_bool(
             m.get(
                 "gallery_neighbour_clearance_enforce",
                 cm.gallery_neighbour_clearance_enforce,
-            )
+            ),
+            field_name="matching.gallery_neighbour_clearance_enforce",
         )
-        cm.gallery_require_slot_authority = bool(
+        cm.gallery_require_slot_authority = _parse_config_bool(
             m.get(
                 "gallery_require_slot_authority",
                 cm.gallery_require_slot_authority,
-            )
+            ),
+            field_name="matching.gallery_require_slot_authority",
         )
         cm.slot_plate_requires_ocr = bool(
             m.get("slot_plate_requires_ocr", cm.slot_plate_requires_ocr)
@@ -1162,21 +1418,26 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.slot_acquire_inflight_seconds = float(
             m.get("slot_acquire_inflight_seconds", cm.slot_acquire_inflight_seconds)
         )
-        cm.gallery_min_sharpness = m.get(
-            "gallery_min_sharpness", cm.gallery_min_sharpness
+        cm.gallery_min_sharpness = float(
+            m.get("gallery_min_sharpness", cm.gallery_min_sharpness)
         )
-        cm.gallery_dedup_cosine = m.get(
-            "gallery_dedup_cosine", cm.gallery_dedup_cosine
+        cm.gallery_dedup_cosine = float(
+            m.get("gallery_dedup_cosine", cm.gallery_dedup_cosine)
         )
-        cm.gallery_accumulate_interval_s = m.get(
-            "gallery_accumulate_interval_s", cm.gallery_accumulate_interval_s
+        cm.gallery_accumulate_interval_s = float(
+            m.get(
+                "gallery_accumulate_interval_s",
+                cm.gallery_accumulate_interval_s,
+            )
         )
-        cm.gallery_accumulate_min_gt_similarity = m.get(
-            "gallery_accumulate_min_gt_similarity",
-            cm.gallery_accumulate_min_gt_similarity,
+        cm.gallery_accumulate_min_gt_similarity = float(
+            m.get(
+                "gallery_accumulate_min_gt_similarity",
+                cm.gallery_accumulate_min_gt_similarity,
+            )
         )
-        cm.gallery_min_crop_area = m.get(
-            "gallery_min_crop_area", cm.gallery_min_crop_area
+        cm.gallery_min_crop_area = float(
+            m.get("gallery_min_crop_area", cm.gallery_min_crop_area)
         )
         cm.confirmation_extra_rear_views = m.get(
             "confirmation_extra_rear_views", cm.confirmation_extra_rear_views
@@ -1262,9 +1523,15 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
 
         # LPD and OCR Preprocessing configuration
         if "slot_lpd_enabled" in m:
-            cm.slot_lpd_enabled = bool(m.get("slot_lpd_enabled"))
+            cm.slot_lpd_enabled = _parse_config_bool(
+                m.get("slot_lpd_enabled"),
+                field_name="matching.slot_lpd_enabled",
+            )
         if "slot_lpd_fallback_enabled" in m:
-            cm.slot_lpd_fallback_enabled = bool(m.get("slot_lpd_fallback_enabled"))
+            cm.slot_lpd_fallback_enabled = _parse_config_bool(
+                m.get("slot_lpd_fallback_enabled"),
+                field_name="matching.slot_lpd_fallback_enabled",
+            )
         cm.slot_lpd_model_dir = str(m.get("slot_lpd_model_dir", cm.slot_lpd_model_dir))
         cm.slot_lpd_confidence = float(m.get("slot_lpd_confidence", cm.slot_lpd_confidence))
         cm.slot_lpd_iou = float(m.get("slot_lpd_iou", cm.slot_lpd_iou))
@@ -1329,14 +1596,17 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cm.faiss_index_nlist = m.get("faiss_index_nlist", cm.faiss_index_nlist)
 
     # --- Output ---
+    # Environment-only deployments may omit the YAML output block entirely.
+    # ``SNAPSHOT_PATH`` is applied before the early missing-file return above and
+    # has final precedence over YAML so a persistent-volume mount cannot be
+    # silently redirected into container-local storage.
     if "output" in raw:
         o = raw["output"]
         config.output.log_file = o.get("log_file", config.output.log_file)
         config.output.show_video = o.get("show_video", config.output.show_video)
         config.output.show_camera = o.get("show_camera", config.output.show_camera)
-        config.output.snapshot_base_dir = o.get(
-            "snapshot_base_dir",
-            os.environ.get("SNAPSHOT_PATH", config.output.snapshot_base_dir)
+        config.output.snapshot_base_dir = snapshot_path_override or o.get(
+            "snapshot_base_dir", config.output.snapshot_base_dir
         )
         config.output.public_base_url = o.get(
             "public_base_url",
@@ -1350,5 +1620,165 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             "gateway_path_prefix",
             os.environ.get("GATEWAY_PATH_PREFIX", config.output.gateway_path_prefix),
         )
+
+    observation_policy = config.state_machine.observation_policy
+    motion_policy = config.motion_scheduler
+    matching = config.matching
+    strict_gallery_ranges = {
+        "matching.gallery_parked_ocr_min_confidence": (
+            matching.gallery_parked_ocr_min_confidence,
+            0.0,
+            1.0,
+        ),
+        "matching.gallery_parked_reid_min_score": (
+            matching.gallery_parked_reid_min_score,
+            -1.0,
+            1.0,
+        ),
+        "matching.gallery_parked_reid_min_margin": (
+            matching.gallery_parked_reid_min_margin,
+            0.0,
+            2.0,
+        ),
+        "matching.gallery_parked_min_neighbour_clearance": (
+            matching.gallery_parked_min_neighbour_clearance,
+            0.0,
+            1.0,
+        ),
+        "matching.gallery_min_view_quality": (
+            matching.gallery_min_view_quality,
+            0.0,
+            1.0,
+        ),
+        "matching.gallery_accumulate_min_gt_similarity": (
+            matching.gallery_accumulate_min_gt_similarity,
+            -1.0,
+            1.0,
+        ),
+        "matching.gallery_dedup_cosine": (
+            matching.gallery_dedup_cosine,
+            -1.0,
+            1.0,
+        ),
+        "matching.slot_lpd_confidence": (
+            matching.slot_lpd_confidence,
+            0.0,
+            1.0,
+        ),
+    }
+    for field_name, (value, minimum, maximum) in strict_gallery_ranges.items():
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(
+                f"{field_name} must be finite and between {minimum} and {maximum}"
+            )
+    nonnegative_gallery_values = {
+        "matching.gallery_retention_days": matching.gallery_retention_days,
+        "matching.gallery_min_sharpness": matching.gallery_min_sharpness,
+        "matching.gallery_min_crop_area": matching.gallery_min_crop_area,
+        "matching.gallery_accumulate_interval_s": (
+            matching.gallery_accumulate_interval_s
+        ),
+    }
+    for field_name, value in nonnegative_gallery_values.items():
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{field_name} must be finite and non-negative")
+    if matching.gallery_max_refs_per_car <= 0:
+        raise ValueError("matching.gallery_max_refs_per_car must be positive")
+    if (
+        matching.gallery_persist_enabled
+        and not matching.gallery_strict_admission_enabled
+    ):
+        raise ValueError(
+            "matching.gallery_strict_admission_enabled must be true when "
+            "gallery persistence is enabled"
+        )
+    if matching.gallery_persist_enabled:
+        if not matching.gallery_require_slot_authority:
+            raise ValueError(
+                "matching.gallery_require_slot_authority must be true when "
+                "strict gallery persistence is enabled"
+            )
+        if not matching.gallery_parked_require_rank_one:
+            raise ValueError(
+                "matching.gallery_parked_require_rank_one must be true when "
+                "strict gallery persistence is enabled"
+            )
+        if not matching.slot_lpd_enabled:
+            raise ValueError(
+                "matching.slot_lpd_enabled must be true when strict gallery "
+                "persistence is enabled"
+            )
+        if matching.slot_lpd_fallback_enabled:
+            raise ValueError(
+                "matching.slot_lpd_fallback_enabled must be false when strict "
+                "gallery persistence is enabled"
+            )
+        strict_safety_floors = {
+            "matching.gallery_parked_ocr_min_confidence": (
+                matching.gallery_parked_ocr_min_confidence,
+                0.90,
+            ),
+            "matching.gallery_parked_reid_min_score": (
+                matching.gallery_parked_reid_min_score,
+                0.70,
+            ),
+            "matching.gallery_parked_reid_min_margin": (
+                matching.gallery_parked_reid_min_margin,
+                0.15,
+            ),
+            "matching.gallery_min_view_quality": (
+                matching.gallery_min_view_quality,
+                0.90,
+            ),
+            "matching.gallery_parked_min_neighbour_clearance": (
+                matching.gallery_parked_min_neighbour_clearance,
+                0.90,
+            ),
+            "matching.gallery_accumulate_min_gt_similarity": (
+                matching.gallery_accumulate_min_gt_similarity,
+                0.45,
+            ),
+            "matching.gallery_min_sharpness": (
+                matching.gallery_min_sharpness,
+                40.0,
+            ),
+            "matching.gallery_min_crop_area": (
+                matching.gallery_min_crop_area,
+                12_000.0,
+            ),
+            "matching.slot_lpd_confidence": (
+                matching.slot_lpd_confidence,
+                0.30,
+            ),
+        }
+        for field_name, (value, minimum) in strict_safety_floors.items():
+            if value < minimum:
+                raise ValueError(
+                    f"{field_name} must be at least {minimum} when strict "
+                    "gallery persistence is enabled"
+                )
+
+    if motion_policy.mode == "enforce" and observation_policy.mode == "time":
+        sentinel_intervals = {
+            "default": motion_policy.sentinel_interval_seconds,
+            **{
+                camera_id: override.get(
+                    "sentinel_interval_seconds",
+                    motion_policy.sentinel_interval_seconds,
+                )
+                for camera_id, override in motion_policy.camera_overrides.items()
+            },
+        }
+        invalid_cameras = sorted(
+            camera_id
+            for camera_id, interval in sentinel_intervals.items()
+            if interval > observation_policy.max_known_gap_seconds
+        )
+        if invalid_cameras:
+            raise ValueError(
+                "motion sentinel_interval_seconds must be <= "
+                "state_machine.max_known_gap_seconds in enforce/time mode "
+                f"(invalid: {','.join(invalid_cameras)})"
+            )
 
     return config

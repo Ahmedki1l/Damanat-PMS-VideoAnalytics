@@ -1,9 +1,9 @@
 import json
 import os
+import re
 from typing import Iterable, Optional
 
 from fastapi import HTTPException
-from shapely.geometry import Polygon
 from sqlalchemy.orm import Session
 
 from src.model import ParkingSlot
@@ -30,7 +30,11 @@ def classify_slot_type(slot_id: str) -> str:
     lowered = normalized.lower()
     if lowered == "roi" or lowered.endswith("__roi"):
         return SLOT_TYPE_ROI
-    if "Park_Entry" in normalized or "Entrence" in normalized:
+    compact = re.sub(r"[^a-z0-9]+", "", lowered)
+    if any(
+        marker in compact
+        for marker in ("parkentry", "b1entry", "entrance", "entrence")
+    ):
         return SLOT_TYPE_SPECIAL_ZONE
     return SLOT_TYPE_PARKING
 

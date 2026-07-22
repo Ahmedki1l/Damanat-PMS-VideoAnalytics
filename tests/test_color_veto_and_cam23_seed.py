@@ -41,6 +41,8 @@ WHITE = (235, 235, 235)  # the passing car
 def _gallery_config():
     cfg = MatchingConfig()
     cfg.gallery_persist_enabled = True
+    # These regressions isolate the legacy accumulation/seed quality gates.
+    cfg.gallery_strict_admission_enabled = False
     cfg.reid_openvino_model_dir = ""  # model tag -> "…:default"
     # Open the quality/throttle gates so the colour/similarity gates are what we
     # are actually exercising (solid crops have zero sharpness).
@@ -489,7 +491,8 @@ class TestSeedPathIdentityFloor(unittest.TestCase):
         reg.gallery_store.save_ref(
             plate, dark, dark_vec, quality=999.0, camera_id="ANPR", gate_only=False
         )
-        return dark_vec
+        loaded, _, _ = reg.gallery_store.load_vectors(plate)
+        return loaded[0]
 
     def _candidate_with_crop(self, reg, crop, track_id=7):
         cand = reg.open_park_entry_candidate("CAM-23", track_id)
@@ -586,10 +589,33 @@ class TestNeighbourClearanceD9(unittest.TestCase):
             self.h._neighbour_clearance(small, [small, big]), 0.0, places=3
         )
 
-    def test_untracked_neighbour_ignored(self):
+    def test_untracked_neighbour_still_counts_as_contamination(self):
         a = self._Det((500, 200, 760, 520), track_id=1)
         ghost = self._Det((630, 200, 900, 520), track_id=-1)  # untracked detection
-        self.assertEqual(self.h._neighbour_clearance(a, [a, ghost]), 1.0)
+        self.assertAlmostEqual(
+            self.h._neighbour_clearance(a, [a, ghost]), 0.5, places=3
+        )
+
+    def test_exact_padded_crop_counts_neighbour_outside_raw_box(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        b = self._Det((770, 200, 900, 520), track_id=2)
+        self.assertEqual(self.h._neighbour_clearance(a, [a, b]), 1.0)
+        padded = self.h._neighbour_clearance(
+            a,
+            [a, b],
+            frame_shape=self.frame.shape,
+            padding_ratio=0.1,
+        )
+        self.assertGreater(padded, 0.0)
+        self.assertLess(padded, 1.0)
+
+    def test_missing_or_malformed_detection_evidence_fails_closed(self):
+        a = self._Det((500, 200, 760, 520), track_id=1)
+        malformed = self._Det((float("nan"), 200, 900, 520), track_id=2)
+        self.assertEqual(self.h._neighbour_clearance(a, None), 0.0)
+        self.assertEqual(self.h._neighbour_clearance(a, []), 0.0)
+        self.assertEqual(self.h._neighbour_clearance(a, [malformed]), 0.0)
+        self.assertEqual(self.h._neighbour_clearance(a, [a, malformed]), 0.0)
 
     def test_log_only_does_not_change_quality(self):
         # No vehicle_registry -> enforce False -> base returned even with overlap.

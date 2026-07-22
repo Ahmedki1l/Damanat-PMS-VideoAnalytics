@@ -29,17 +29,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Write runtime config from secret
-        env:
-          APP_CONFIG_YAML: ${{ secrets.APP_CONFIG_YAML }}
-        run: |
-          if [ -z "$APP_CONFIG_YAML" ]; then
-            echo "Missing required secret: APP_CONFIG_YAML"
-            exit 1
-          fi
-
-          printf '%s' "$APP_CONFIG_YAML" > config.yaml
-
       - name: Calculate image tag
         id: calc_tag
         run: |
@@ -83,10 +72,6 @@ jobs:
                      ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:latest
 
           docker push ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:latest
-
-      - name: Remove runtime config
-        if: always()
-        run: rm -f config.yaml
 
       - name: Notify docker push success
         if: always() && steps.push_image.outcome == 'success' && steps.push_latest.outcome == 'success'

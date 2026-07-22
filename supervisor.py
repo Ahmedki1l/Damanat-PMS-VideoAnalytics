@@ -629,8 +629,11 @@ def run(reset_plates: bool = False, foreground: bool = False,
 
         out_fh = out_path.open("w", encoding="utf-8")
         err_fh = err_path.open("w", encoding="utf-8")
+        child_env = _child_env(cores, pin=pin)
+        child_env["VA_GROUP"] = g["name"]
+        child_env["VA_PROCESS_COUNT"] = str(len(groups))
         proc = subprocess.Popen(
-            cli, cwd=str(ROOT), env=_child_env(cores, pin=pin),
+            cli, cwd=str(ROOT), env=child_env,
             stdout=out_fh, stderr=err_fh, **popen_kwargs,
         )
         children.append((g["name"], proc))

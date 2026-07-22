@@ -61,6 +61,9 @@ def _make_registry(gallery=False):
     cfg = MatchingConfig()
     if gallery:
         cfg.gallery_persist_enabled = True
+        # This suite pins the explicitly retained legacy writer. Entry V2's
+        # default strict writer has its own fail-closed admission suite.
+        cfg.gallery_strict_admission_enabled = False
         cfg.reid_openvino_model_dir = ""  # tag → "…:default"
     registry = VehicleRegistry(image_dir=image_dir, matching_config=cfg)
     registry._reid_matcher = FakeMatcher()
@@ -79,7 +82,7 @@ class TestAnprEventBinding(unittest.TestCase):
         not the FIFO-oldest — the core anti-swap guarantee."""
         registry, _ = _make_registry()
         now = datetime.now()
-        first = registry.register_anpr_event("AAA-111", "entry", timestamp=now)
+        registry.register_anpr_event("AAA-111", "entry", timestamp=now)
         second = registry.register_anpr_event(
             "BBB-222", "entry", timestamp=now + timedelta(seconds=1)
         )

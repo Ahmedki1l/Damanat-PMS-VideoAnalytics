@@ -14,6 +14,18 @@ pytest-cache-files-*
 *.sqlite3
 *.log
 
+# Runtime configuration and credentials must be injected by the deployment,
+# never copied into an image layer by the broad `COPY . .` in Dockerfile.
+config.yaml
+.env
+.env.*
+
+# Runtime evidence and local analysis artifacts belong on external volumes or
+# developer workstations, not in the immutable application image.
+vehicle_images
+detection_images
+scratchpad
+
 # Host virtualenv - wrong-platform binaries, must NOT enter the Linux image
 # (the image builds its own venv at /opt/venv). Keeps the build context small.
 .venv

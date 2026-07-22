@@ -22,19 +22,20 @@ Usage:
 import os
 import base64
 import asyncio
-import json
-import logging
+import hmac
 from datetime import datetime
-from typing import Any, Dict, List, Optional, AsyncIterable
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, Header, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
-from fastapi.sse import EventSourceResponse
+from starlette.concurrency import run_in_threadpool
+from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 
 from src.vehicle_registry import VehicleRegistry
 from src.events.event_bus import EventBus
+from src.entry.domain import EntryCapacityExceeded, EntryInvalid, EntryUnavailable
 from src.models.state_machine import SlotEvent
 from src.services.alert_service import get_alert_type_for_slot
 from src.services.named_slot_service import get_slot_restriction_type, is_restricted_slot  # now takes a slot ORM object
@@ -48,13 +49,59 @@ class ANPREventRequest(BaseModel):
     direction: str = "entry"  # "entry" or "exit"
     image_base64: Optional[str] = None  # Base64-encoded JPEG image
     camera_id: Optional[str] = None     # Which ANPR camera sent this
-    timestamp: Optional[str] = None     # ISO timestamp (defaults to now)
+    captured_at: Optional[str] = None   # Source event time; timezone required
+    # Backward-compatible alias accepted from older clients.  When both fields
+    # are supplied they must represent the same instant.
+    timestamp: Optional[str] = None
     # Optional per-read OCR confidence in [0,1] from the ANPR server. When
     # supplied, an entry read below matching.anpr_min_accept_confidence is HELD
     # (not registered as a pending plate) — this stops a low-confidence night
     # misread from minting a second identity for one car. Omit (None) to accept
     # every read, preserving current behaviour for servers that don't send it.
     confidence: Optional[float] = None
+
+
+def _parse_anpr_source_timestamp(event: ANPREventRequest) -> Optional[datetime]:
+    """Parse the ANPR source time without ever substituting delivery time.
+
+    Exit is destructive, so it requires an offset-aware source timestamp.
+    Legacy non-exit callers may omit one and continue to use the registry clock.
+    Any supplied value is strict: malformed or timezone-naive input is rejected,
+    and the old/new fields cannot disagree.
+    """
+
+    def _parse(raw: str, field_name: str) -> datetime:
+        value = raw.strip()
+        if not value:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field_name}_invalid_iso_timestamp",
+            )
+        if value.endswith(("Z", "z")):
+            value = value[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field_name}_invalid_iso_timestamp",
+            ) from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field_name}_requires_timezone",
+            )
+        return parsed
+
+    captured = _parse(event.captured_at, "captured_at") if event.captured_at is not None else None
+    legacy = _parse(event.timestamp, "timestamp") if event.timestamp is not None else None
+    if captured is not None and legacy is not None and captured != legacy:
+        raise HTTPException(status_code=422, detail="source_timestamp_conflict")
+
+    source_time = captured or legacy
+    if event.direction.strip().lower() == "exit" and source_time is None:
+        raise HTTPException(status_code=422, detail="exit_requires_captured_at")
+    return source_time
 
 
 class LineCrossingRequest(BaseModel):
@@ -164,6 +211,7 @@ def create_app(
     public_base_url: str = "",
     snapshot_url_prefix: str = "/pms-video-analytics/snapshots",
     gateway_path_prefix: str = "",
+    entry_coordinator=None,
 ) -> FastAPI:
     """
     Create the FastAPI application.
@@ -178,11 +226,36 @@ def create_app(
         event_bus: Optional EventBus instance for real-time alerts.
         db_manager: Optional DB manager for querying slot restriction status.
     """
+    os.makedirs(snapshot_base_dir, exist_ok=True)
+    _snapshot_base_abs = os.path.abspath(snapshot_base_dir)
+    registry = vehicle_registry or VehicleRegistry(
+        image_dir=snapshot_base_dir,
+        public_base_url=public_base_url,
+        snapshot_url_prefix=snapshot_url_prefix,
+        gateway_path_prefix=gateway_path_prefix,
+    )
+
+    # V2 entry validation is isolated from the legacy ANPR/session path and is
+    # feature-gated off by default. Tests may inject a model-free coordinator;
+    # production resolves the existing ReID/LPD/Paddle components lazily.
+    from src.entry.router import create_entry_router, install_entry_transport_guard
+    from src.entry.settings import SERVICE_KEY_HEADER
+    from src.entry.runtime import (
+        build_entry_coordinator,
+        entry_callback_retry_lifespan,
+    )
+
+    active_entry_coordinator = (
+        entry_coordinator
+        if entry_coordinator is not None
+        else build_entry_coordinator(registry)
+    )
     app = FastAPI(
         title="Damanat PMS Video Analytics API",
         description="Parking management system with ANPR integration and slot monitoring.",
         version="1.0.0",
         root_path=gateway_path_prefix,
+        lifespan=entry_callback_retry_lifespan(active_entry_coordinator),
     )
 
     @app.get("/")
@@ -214,9 +287,6 @@ def create_app(
     # because alert snapshots are written under alerts/<file>.jpg by
     # engine_runtime._save_alert_snapshot and exposed with that nested
     # shape by vehicle_registry_queries._get_snapshot_url.
-    os.makedirs(snapshot_base_dir, exist_ok=True)
-    _snapshot_base_abs = os.path.abspath(snapshot_base_dir)
-
     @app.get(
         "/pms-video-analytics/snapshots/{filepath:path}",
         summary="Serve a saved snapshot JPEG",
@@ -234,13 +304,70 @@ def create_app(
             raise HTTPException(status_code=404, detail="Snapshot not found")
         return FileResponse(requested_abs, media_type="image/jpeg")
 
-    # Use provided or create new registry
-    registry = vehicle_registry or VehicleRegistry(
-        image_dir=snapshot_base_dir,
-        public_base_url=public_base_url,
-        snapshot_url_prefix=snapshot_url_prefix,
-        gateway_path_prefix=gateway_path_prefix,
-    )
+    app.state.entry_coordinator = active_entry_coordinator
+    install_entry_transport_guard(app, active_entry_coordinator)
+    app.include_router(create_entry_router(active_entry_coordinator))
+
+    def _require_internal_anpr_auth(provided_service_key: Optional[str]) -> None:
+        """Only PMS-AI may mutate VA's ANPR registry in V2 modes."""
+        if active_entry_coordinator.settings.mode.value == "off":
+            return
+        expected = active_entry_coordinator.settings.service_key
+        supplied = provided_service_key or ""
+        if not expected or not hmac.compare_digest(expected, supplied):
+            raise HTTPException(status_code=401, detail="invalid_service_key")
+
+    def _require_legacy_anpr_exit(direction: str) -> None:
+        """Keep only the PMS exit bridge once V2 owns entry admission."""
+        if active_entry_coordinator.settings.mode.value != "authoritative":
+            return
+        if direction.strip().lower() != "exit":
+            raise HTTPException(
+                status_code=410,
+                detail="legacy_anpr_entry_disabled_in_entry_v2",
+            )
+
+    async def _close_entry_v2_journey(
+        record,
+        source_timestamp: Optional[datetime],
+    ) -> None:
+        if record.direction.strip().lower() != "exit":
+            return
+        if active_entry_coordinator.settings.mode.value == "off":
+            return
+        if source_timestamp is None:
+            raise HTTPException(status_code=422, detail="exit_requires_captured_at")
+        try:
+            closed = await run_in_threadpool(
+                active_entry_coordinator.record_exit,
+                record.plate,
+                source_timestamp,
+            )
+        except EntryInvalid as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (EntryCapacityExceeded, EntryUnavailable) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+                headers={"Retry-After": "1"},
+            ) from exc
+        if closed:
+            print(
+                f"[EntryV2] exit closed {closed} journey(s) "
+                f"plate={record.plate} captured_at={source_timestamp.isoformat()}"
+            )
+
+    def _anpr_response_timestamp(
+        record,
+        source_timestamp: Optional[datetime],
+    ) -> str:
+        """Echo the validated exit source time; keep legacy entry behavior."""
+        if (
+            record.direction.strip().lower() == "exit"
+            and source_timestamp is not None
+        ):
+            return source_timestamp.isoformat()
+        return record.timestamp.isoformat()
 
     def _build_slot_snapshot_url(slot_id: str) -> str:
         return f"/api/slots/{slot_id}/snapshot/live"
@@ -646,7 +773,7 @@ def create_app(
 
         # Register with EventBus
         event_bus.subscribe(callback)
-        print(f"[API] Client connected to alerts stream")
+        print("[API] Client connected to alerts stream")
 
         try:
             # 1. Send initial connection confirmation (handshake)
@@ -669,7 +796,7 @@ def create_app(
                 yield event.to_dict()
                 
         except asyncio.CancelledError:
-            print(f"[API] Client disconnected from alerts stream")
+            print("[API] Client disconnected from alerts stream")
             raise
         finally:
             # Always unsubscribe
@@ -755,12 +882,19 @@ def create_app(
     # ── ANPR Endpoints ──────────────────────────────────────
 
     @app.post("/api/anpr/event", response_model=ANPREventResponse)
-    async def anpr_event_json(event: ANPREventRequest):
+    async def anpr_event_json(
+        event: ANPREventRequest,
+        service_key: Optional[str] = Header(None, alias=SERVICE_KEY_HEADER),
+    ):
         """
         Receive an ANPR event via JSON body.
 
         Accepts plate number and optionally a base64-encoded vehicle image.
         """
+        _require_internal_anpr_auth(service_key)
+        _require_legacy_anpr_exit(event.direction)
+        source_timestamp = _parse_anpr_source_timestamp(event)
+
         img_status = "no"
         if event.image_base64 is None:
             img_status = "no (field is None)"
@@ -770,7 +904,7 @@ def create_app(
             img_status = f"yes ({len(event.image_base64)} base64 chars ~ {len(event.image_base64)*3//4//1024}KB)"
 
         print(f"\n{'='*60}")
-        print(f"[API] ANPR EVENT RECEIVED (JSON)")
+        print("[API] ANPR EVENT RECEIVED (JSON)")
         print(f"[API]   Plate     : {event.plate}")
         print(f"[API]   Direction : {event.direction}")
         print(f"[API]   Camera    : {event.camera_id or 'N/A'}")
@@ -815,8 +949,10 @@ def create_app(
         record = registry.register_anpr_event(
             plate=event.plate,
             direction=event.direction,
+            timestamp=source_timestamp,
             camera_id=event.camera_id,
         )
+        await _close_entry_v2_journey(record, source_timestamp)
 
         print(f"[API] [OK] Plate {record.plate} registered")
         
@@ -833,27 +969,40 @@ def create_app(
             plate=record.plate,
             direction=record.direction,
             image_saved=image_saved,
-            timestamp=record.timestamp.isoformat(),
+            timestamp=_anpr_response_timestamp(record, source_timestamp),
         )
 
     @app.post("/api/anpr/event/upload", response_model=ANPREventResponse)
     async def anpr_event_upload(
         plate: str = Form(...),
         direction: str = Form("entry"),
+        captured_at: Optional[str] = Form(None),
+        timestamp: Optional[str] = Form(None),
         image: Optional[UploadFile] = File(None),
+        service_key: Optional[str] = Header(None, alias=SERVICE_KEY_HEADER),
     ):
         """
         Receive an ANPR event via multipart form upload.
 
         Alternative to JSON endpoint — accepts image as file upload.
         """
+        _require_internal_anpr_auth(service_key)
         print(f"\n{'='*60}")
-        print(f"[API] ANPR EVENT RECEIVED (FILE UPLOAD)")
+        print("[API] ANPR EVENT RECEIVED (FILE UPLOAD)")
         print(f"[API]   Plate     : {plate}")
         print(f"[API]   Direction : {direction}")
         print(f"[API]   Image     : {image.filename if image else 'none'}")
         print(f"[API]   Time      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
+
+        source_timestamp = _parse_anpr_source_timestamp(
+            ANPREventRequest(
+                plate=plate,
+                direction=direction,
+                captured_at=captured_at,
+                timestamp=timestamp,
+            )
+        )
 
         image_bytes = None
         if image:
@@ -862,7 +1011,9 @@ def create_app(
         record = registry.register_anpr_event(
             plate=plate,
             direction=direction,
+            timestamp=source_timestamp,
         )
+        await _close_entry_v2_journey(record, source_timestamp)
 
         print(f"[API] [OK] Plate {record.plate} registered")
 
@@ -878,7 +1029,7 @@ def create_app(
             plate=record.plate,
             direction=record.direction,
             image_saved=image_saved,
-            timestamp=record.timestamp.isoformat(),
+            timestamp=_anpr_response_timestamp(record, source_timestamp),
         )
 
     @app.post("/api/line-crossing", response_model=LineCrossingResponse)
@@ -1158,6 +1309,129 @@ def create_app(
         }
         if get_engine_status:
             health_data.update(get_engine_status())
+        entry_state = active_entry_coordinator.state_summary()
+        callback_load = (
+            entry_state["pending_callback_count"]
+            + entry_state["reserved_callback_count"]
+        )
+        callback_capacity = (
+            active_entry_coordinator.settings.max_pending_callbacks
+        )
+        attempt_load = entry_state["attempt_count"]
+        attempt_capacity = active_entry_coordinator.settings.max_pending_attempts
+        crossing_load = (
+            entry_state["crossing_count"]
+            + entry_state.get("provisional_crossing_count", 0)
+        )
+        crossing_capacity = active_entry_coordinator.settings.max_pending_crossings
+        journey_load = entry_state.get("journey_capacity_load", 0)
+        journey_capacity = active_entry_coordinator.settings.journey_capacity
+        pending_exit_count = entry_state.get("pending_exit_count", 0)
+        health_data["entry_v2"] = {
+            "mode": active_entry_coordinator.settings.mode.value,
+            "available": active_entry_coordinator.available,
+            "unavailable_reason": active_entry_coordinator.unavailable_reason,
+            "attempt_count": entry_state["attempt_count"],
+            "group_count": entry_state["group_count"],
+            "crossing_count": entry_state["crossing_count"],
+            "open_journey_count": entry_state.get("open_journey_count", 0),
+            "finalized_journey_count": entry_state.get(
+                "finalized_journey_count", 0
+            ),
+            "protected_journey_count": entry_state.get(
+                "protected_journey_count", 0
+            ),
+            "journey_capacity_load": journey_load,
+            "pending_exit_count": pending_exit_count,
+            "ambiguous_exit_count": entry_state.get("ambiguous_exit_count", 0),
+            "provisional_crossing_count": entry_state.get(
+                "provisional_crossing_count", 0
+            ),
+            "pending_callback_count": entry_state["pending_callback_count"],
+            "reserved_callback_count": entry_state["reserved_callback_count"],
+            "analysis_inflight_count": entry_state["analysis_inflight_count"],
+            "late_ocr_conflict_count": entry_state.get(
+                "late_ocr_conflict_count", 0
+            ),
+            "permanent_callback_failure_count": entry_state[
+                "permanent_callback_failure_count"
+            ],
+            "max_pending_attempts": attempt_capacity,
+            "max_pending_callbacks": callback_capacity,
+            "max_pending_crossings": crossing_capacity,
+            "journey_capacity": journey_capacity,
+        }
+        if (
+            active_entry_coordinator.settings.mode.value != "off"
+            and not active_entry_coordinator.available
+        ):
+            health_data["status"] = "unhealthy"
+            reasons = list(health_data.get("health_reasons") or [])
+            reasons.append(
+                "entry_v2 unavailable: "
+                + (
+                    active_entry_coordinator.unavailable_reason
+                    or "unknown configuration/runtime error"
+                )
+            )
+            health_data["health_reasons"] = reasons
+        if callback_load > 0:
+            reasons = list(health_data.get("health_reasons") or [])
+            reasons.append(
+                "entry_v2 callback backlog: "
+                f"{callback_load}/{callback_capacity}"
+            )
+            health_data["health_reasons"] = reasons
+            if callback_load >= callback_capacity:
+                health_data["status"] = "unhealthy"
+            elif health_data.get("status") == "ok":
+                health_data["status"] = "degraded"
+        if (
+            active_entry_coordinator.settings.mode.value != "off"
+            and attempt_load >= attempt_capacity
+        ):
+            reasons = list(health_data.get("health_reasons") or [])
+            reasons.append(
+                "entry_v2 attempt capacity exhausted: "
+                f"{attempt_load}/{attempt_capacity}"
+            )
+            health_data["health_reasons"] = reasons
+            health_data["status"] = "unhealthy"
+        if (
+            active_entry_coordinator.settings.mode.value != "off"
+            and crossing_load >= crossing_capacity
+        ):
+            reasons = list(health_data.get("health_reasons") or [])
+            reasons.append(
+                "entry_v2 crossing capacity exhausted: "
+                f"{crossing_load}/{crossing_capacity}"
+            )
+            health_data["health_reasons"] = reasons
+            health_data["status"] = "unhealthy"
+        if active_entry_coordinator.settings.mode.value != "off" and (
+            journey_load >= journey_capacity
+            or pending_exit_count >= journey_capacity
+        ):
+            reasons = list(health_data.get("health_reasons") or [])
+            reasons.append(
+                "entry_v2 journey lifecycle capacity exhausted: "
+                f"journeys={journey_load}/{journey_capacity}, "
+                f"pending_exits={pending_exit_count}/{journey_capacity}"
+            )
+            health_data["health_reasons"] = reasons
+            health_data["status"] = "unhealthy"
+        elif (
+            active_entry_coordinator.settings.mode.value != "off"
+            and pending_exit_count > 0
+        ):
+            reasons = list(health_data.get("health_reasons") or [])
+            reasons.append(
+                "entry_v2 unmatched exit boundaries: "
+                f"{pending_exit_count}/{journey_capacity}"
+            )
+            health_data["health_reasons"] = reasons
+            if health_data.get("status") == "ok":
+                health_data["status"] = "degraded"
         if health_data.get("status") == "unhealthy":
             response.status_code = 503
         return health_data

@@ -8,7 +8,11 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
-from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, PendingANPREvent
+from src.utils.datetime_helper import normalize_timestamp_for_clock
+from src.vehicle_registry.vehicle_registry_models import (
+    ParkEntryCandidate,
+    PendingANPREvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +277,12 @@ class VehicleRegistryCoreMixin:
         Entry events become pending ANPR records.
         Exit events close an existing confirmed session if found.
         """
-        now = timestamp or self._clock()
+        source_timestamp = timestamp
+        now = (
+            normalize_timestamp_for_clock(timestamp, self._clock())
+            if timestamp is not None
+            else self._clock()
+        )
 
         event = PendingANPREvent(
             event_id=f"anpr_{uuid.uuid4().hex[:12]}",
@@ -368,7 +377,11 @@ class VehicleRegistryCoreMixin:
             if coalesced_event is not None:
                 return coalesced_event
         elif direction == "exit":
-            self._handle_exit(plate, now)
+            self._handle_exit(
+                plate,
+                now,
+                source_timestamp=source_timestamp,
+            )
             logger.info("[ANPR] Exit: plate=%s", plate)
         elif direction == "B-entry":
             # The B1 (CAM-03) confirmation snapshot, pushed via the ANPR API as
@@ -543,6 +556,7 @@ class VehicleRegistryCoreMixin:
                 ):
                     self._last_anpr_entry_at.pop(_plate, None)
                     self._last_anpr_exit_at.pop(_plate, None)
+                    self._last_anpr_exit_source_at.pop(_plate, None)
 
             candidates_to_delete = []
             for candidate_id, candidate in self._park_entry_candidates.items():
@@ -791,7 +805,6 @@ class VehicleRegistryCoreMixin:
             candidate.last_seen_at = now
             existing_images = [img for img in candidate.snapshot_images if img is not None and img.size > 0]
             candidate_images = existing_images + [image.copy()]
-            camera_id = candidate.camera_id
 
         # Keep up to multishot_ref_top_k sharpest references on EVERY camera
         # (was hardcoded to only give the entry camera "CAM-03" a 3-shot

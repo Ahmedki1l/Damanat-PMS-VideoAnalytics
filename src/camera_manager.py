@@ -90,6 +90,8 @@ class CameraStream:
         # counter that increments on every successfully grabbed frame.
         self._latest_ts: float = 0.0
         self._latest_seq: int = 0
+        self._stream_epoch: int = 0
+        self._stream_interrupted = True
         self._frame_lock = threading.Lock()
         self._grab_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -112,6 +114,7 @@ class CameraStream:
 
             self.is_open = self.cap.isOpened()
             if self.is_open:
+                self._mark_connected()
                 # Read actual frame dimensions from the stream
                 self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -120,6 +123,7 @@ class CameraStream:
                     f"— connected [{self.frame_width}×{self.frame_height}]"
                 )
             else:
+                self._mark_disconnected()
                 print(f"  [FAIL] {self.config.id} ({self.config.name}) — cannot open stream")
             # A failed initial connection must keep retrying; otherwise one
             # transient startup outage leaves this camera dead until restart.
@@ -128,6 +132,7 @@ class CameraStream:
         except Exception as e:
             print(f"  [FAIL] {self.config.id} ({self.config.name}) — {e}")
             self.is_open = False
+            self._mark_disconnected()
             self._start_grabber()
             return False
 
@@ -162,7 +167,7 @@ class CameraStream:
         while not self._stop_event.is_set():
             if self.cap is None or not self.cap.isOpened():
                 # Stream died — try reconnecting
-                self._invalidate_latest_frame()
+                self._mark_disconnected()
                 if perf_trace.enabled():
                     perf_trace.record_rtsp_grab(self.config.id, False, 0.0)
                 if self._stop_event.wait(self._reconnect_interval):
@@ -184,10 +189,7 @@ class CameraStream:
                 ret, frame = self._read_frame()
 
             if ret and frame is not None:
-                with self._frame_lock:
-                    self._latest_frame = frame
-                    self._latest_ts = time.time()
-                    self._latest_seq += 1
+                self._publish_frame(frame)
                 if publish_interval > 0.0:
                     now = time.perf_counter()
                     if next_publish_at <= 0.0:
@@ -198,7 +200,7 @@ class CameraStream:
             else:
                 # Read failed — reconnect
                 self.is_open = False
-                self._invalidate_latest_frame()
+                self._mark_disconnected()
                 self._reconnect()
                 continue
 
@@ -234,9 +236,31 @@ class CameraStream:
             perf_trace.record_decode(elapsed_ms)
         return result
 
-    def _invalidate_latest_frame(self) -> None:
-        """Stop readers from treating the last pre-failure image as current."""
+    def _publish_frame(self, frame: np.ndarray) -> None:
+        """Atomically mark a resumed stream connected and publish its frame."""
         with self._frame_lock:
+            if self._stream_interrupted:
+                self._stream_epoch += 1
+                self._stream_interrupted = False
+            self.is_open = True
+            self._latest_frame = frame
+            self._latest_ts = time.time()
+            self._latest_seq += 1
+
+    def _mark_connected(self) -> None:
+        """Start a new provenance epoch after a successful stream connection."""
+        with self._frame_lock:
+            if not self._stream_interrupted:
+                return
+            self._stream_epoch += 1
+            self._stream_interrupted = False
+
+    def _mark_disconnected(self) -> None:
+        """Atomically invalidate frame and epoch for one stream interruption."""
+        with self._frame_lock:
+            if not self._stream_interrupted:
+                self._stream_epoch += 1
+                self._stream_interrupted = True
             self._latest_frame = None
             self._latest_ts = 0.0
 
@@ -249,7 +273,7 @@ class CameraStream:
 
         self._last_reconnect = now
         print(f"[WARN] {self.config.id} — reconnecting...")
-        self._invalidate_latest_frame()
+        self._mark_disconnected()
 
         if self.cap is not None:
             self.cap.release()
@@ -265,10 +289,12 @@ class CameraStream:
 
         self.is_open = self.cap.isOpened()
         if self.is_open:
+            self._mark_connected()
             self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             print(f"  [OK] {self.config.id} ({self.config.name}) — reconnected")
         else:
+            self._mark_disconnected()
             print(f"  [FAIL] {self.config.id} — reconnect failed")
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
@@ -296,6 +322,26 @@ class CameraStream:
             if self._latest_frame is not None:
                 return True, self._latest_frame.copy(), self._latest_ts, self._latest_seq
         return False, None, 0.0, 0
+
+    def read_stamped_with_epoch(
+        self,
+    ) -> Tuple[bool, Optional[np.ndarray], float, int, int]:
+        """Stamped frame plus the continuous-stream epoch."""
+        with self._frame_lock:
+            if self._latest_frame is not None:
+                return (
+                    True,
+                    self._latest_frame.copy(),
+                    self._latest_ts,
+                    self._latest_seq,
+                    self._stream_epoch,
+                )
+            return False, None, 0.0, 0, self._stream_epoch
+
+    @property
+    def stream_epoch(self) -> int:
+        with self._frame_lock:
+            return self._stream_epoch
 
     @property
     def seconds_since_frame(self) -> float:
@@ -325,7 +371,7 @@ class CameraStream:
             self.cap.release()
             self.cap = None
         self.is_open = False
-        self._invalidate_latest_frame()
+        self._mark_disconnected()
 
 
 class CameraManager:
@@ -367,18 +413,25 @@ class CameraManager:
         Since frames are grabbed in background threads, this is
         essentially instant — just picks up the latest frame.
         """
+        camera_id, frame, _, _ = self.next_frame_stamped()
+        return camera_id, frame
+
+    def next_frame_stamped(
+        self,
+    ) -> Tuple[Optional[str], Optional[np.ndarray], float, int]:
+        """Round-robin frame with its host grab timestamp and sequence."""
         attempts = 0
         while attempts < len(self.camera_ids):
             cam_id = self.camera_ids[self._current_index]
             self._current_index = (self._current_index + 1) % len(self.camera_ids)
 
-            success, frame = self.cameras[cam_id].read()
+            success, frame, grabbed_at, sequence = self.cameras[cam_id].read_stamped()
             if success and frame is not None:
-                return cam_id, frame
+                return cam_id, frame, grabbed_at, sequence
 
             attempts += 1
 
-        return None, None
+        return None, None, 0.0, 0
 
     def get_resolution(self, camera_id: str) -> Tuple[int, int]:
         """
@@ -410,6 +463,17 @@ class CameraManager:
         if camera_id not in self.cameras:
             return False, None, 0.0, 0
         return self.cameras[camera_id].read_stamped()
+
+    def read_camera_stamped_with_epoch(
+        self, camera_id: str
+    ) -> Tuple[bool, Optional[np.ndarray], float, int, int]:
+        if camera_id not in self.cameras:
+            return False, None, 0.0, 0, 0
+        return self.cameras[camera_id].read_stamped_with_epoch()
+
+    def get_stream_epoch(self, camera_id: str) -> int:
+        stream = self.cameras.get(camera_id)
+        return stream.stream_epoch if stream is not None else 0
 
     def get_camera_config(self, camera_id: str) -> Optional[CameraConfig]:
         """Get config for a specific camera."""

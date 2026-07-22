@@ -1,7 +1,8 @@
 import logging
+import math
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -9,6 +10,7 @@ import numpy as np
 from shapely.geometry import Point, box
 
 from src.detection.detector import is_untracked
+from src.entry.local_zone import LocalVehicleCrop, VA_HOST_GRAB_TIMESTAMP_SOURCE
 from src.models.slot import ParkingSlot
 from src.models.state_machine import SlotState
 
@@ -58,6 +60,88 @@ _VQ_MAX_ASPECT = 2.2
 
 
 class ParkingEngineTrackingMixin:
+    def _process_entry_v2_local_zones(
+        self,
+        cam_id: str,
+        frame: np.ndarray,
+        detections: List,
+        camera_special_zones: Dict[str, ParkingSlot],
+        *,
+        capture_ts=None,
+        timestamp_source: str = VA_HOST_GRAB_TIMESTAMP_SOURCE,
+    ) -> None:
+        """Feed calibrated RTSP zone transitions to the shared Entry V2 bridge.
+
+        This is intentionally separate from the legacy ParkEntryCandidate/B1
+        confirmation paths below: Entry V2 must see every empty frame to re-arm,
+        must count all in-zone vehicles instead of selecting a winner, and must
+        never block the single post-processing thread on OCR/ReID or HTTP.
+        """
+        bridge = getattr(self, "_entry_v2_local_bridge", None)
+        if bridge is None or not camera_special_zones:
+            return
+
+        configured_zones = [
+            (zone_id, zone, policy)
+            for zone_id, zone in camera_special_zones.items()
+            if (policy := bridge.configured_policy(cam_id, zone_id)) is not None
+        ]
+        if not configured_zones:
+            return
+
+        try:
+            source_seconds = float(capture_ts)
+            if not math.isfinite(source_seconds) or source_seconds <= 0.0:
+                raise ValueError
+            captured_at = datetime.fromtimestamp(source_seconds, tz=timezone.utc)
+            observation_token = source_seconds
+        except (TypeError, ValueError, OSError, OverflowError):
+            bridge.mark_source_timestamp_invalid(cam_id)
+            return
+        bridge.mark_source_timestamp_valid(cam_id)
+
+        for zone_id, zone, _policy in configured_zones:
+            inside_track_ids = []
+            outside_track_ids = []
+            vehicle_crops = []
+            for detection in detections:
+                in_zone = self._detection_in_zone(detection, zone)
+                raw_track_id = getattr(detection, "track_id", None)
+                track_id = -1 if raw_track_id is None else int(raw_track_id)
+                if not in_zone:
+                    if not is_untracked(raw_track_id):
+                        outside_track_ids.append(track_id)
+                    continue
+
+                # Untracked detections still count toward ambiguity. They never
+                # supply evidence themselves because there is no stable visit ID.
+                inside_track_ids.append(track_id)
+                if is_untracked(raw_track_id):
+                    continue
+                if not self._bbox_is_snapshot_ready(frame, detection):
+                    continue
+                crop = self._crop_detection(frame, detection)
+                if crop is None or crop.size == 0:
+                    continue
+                vehicle_crops.append(
+                    LocalVehicleCrop(
+                        track_id=track_id,
+                        image=crop,
+                        quality=self._score_snapshot_quality(detection, crop),
+                    )
+                )
+
+            bridge.observe(
+                camera_id=cam_id,
+                zone_id=zone_id,
+                inside_track_ids=inside_track_ids,
+                outside_track_ids=outside_track_ids,
+                crops=vehicle_crops,
+                captured_at=captured_at,
+                timestamp_source=timestamp_source,
+                observation_token=observation_token,
+            )
+
     def _find_special_zone(
         self,
         cam_id: str,
@@ -180,7 +264,11 @@ class ParkingEngineTrackingMixin:
         parking = []
         special = []
         for slot in slots:
-            if "Park_Entry" in slot.id or "Entrence" in slot.id:
+            normalized = "".join(char for char in slot.id.lower() if char.isalnum())
+            if any(
+                marker in normalized
+                for marker in ("parkentry", "b1entry", "entrance", "entrence")
+            ):
                 special.append(slot)
             else:
                 parking.append(slot)
@@ -482,42 +570,96 @@ class ParkingEngineTrackingMixin:
             selected.append(secondary)
         return selected
 
-    def _neighbour_clearance(self, detection, detections) -> float:
-        """1.0 when this car's box is unobstructed; →0 as other boxes cover it.
+    def _neighbour_clearance(
+        self,
+        detection,
+        detections,
+        *,
+        frame_shape=None,
+        padding_ratio: float = 0.0,
+    ) -> float:
+        """1.0 when this car's exact crop is clear; →0 as neighbours cover it.
 
         A car parked shoulder-to-shoulder in a garage has a box that overlaps its
         neighbour's, so a crop of it contains part of the wrong car and makes a
-        contaminated ReID reference. Returns the fraction of THIS box NOT covered
-        by the single most-overlapping other detection — an asymmetric
+        contaminated ReID reference. ``frame_shape`` and ``padding_ratio`` let the
+        strict gallery path measure the same padded rectangle later sent to OCR/ReID,
+        rather than the smaller detector box. Returns the fraction of THIS crop NOT
+        covered by the single most-overlapping other detection — an asymmetric
         intersection-over-self, not IoU, so a large neighbour that swallows a
         small distant box correctly scores that small box as heavily occluded.
-        Fails open (1.0) on any error: clearance only ever WEIGHTS view quality,
-        it is never a detection decision.
+        Untracked detections still count: lack of a tracker ID does not make their
+        pixels safe. Invalid or incomplete evidence fails closed to 0.0.
         """
         try:
-            if not detections or len(detections) < 2:
-                return 1.0
+            if not detections:
+                return 0.0
             ax1, ay1, ax2, ay2 = (float(v) for v in detection.bbox)
+            if not all(math.isfinite(v) for v in (ax1, ay1, ax2, ay2)):
+                return 0.0
+            ratio = float(padding_ratio)
+            if not math.isfinite(ratio) or ratio < 0.0:
+                return 0.0
+            if frame_shape is not None:
+                frame_h, frame_w = (int(frame_shape[0]), int(frame_shape[1]))
+                if frame_h <= 0 or frame_w <= 0:
+                    return 0.0
+                # Mirror _bbox_crop exactly: integer detector coordinates, integer
+                # 10% padding, then frame clamping. This is the rectangle whose
+                # pixels become the gallery candidate.
+                crop_x1, crop_y1, crop_x2, crop_y2 = (
+                    int(ax1),
+                    int(ay1),
+                    int(ax2),
+                    int(ay2),
+                )
+                pad_x = int((crop_x2 - crop_x1) * ratio)
+                pad_y = int((crop_y2 - crop_y1) * ratio)
+                ax1 = float(crop_x1 - pad_x)
+                ay1 = float(crop_y1 - pad_y)
+                ax2 = float(crop_x2 + pad_x)
+                ay2 = float(crop_y2 + pad_y)
+                ax1 = max(0.0, min(float(frame_w), ax1))
+                ay1 = max(0.0, min(float(frame_h), ay1))
+                ax2 = max(0.0, min(float(frame_w), ax2))
+                ay2 = max(0.0, min(float(frame_h), ay2))
+            elif ratio:
+                pad_x = (ax2 - ax1) * ratio
+                pad_y = (ay2 - ay1) * ratio
+                ax1 -= pad_x
+                ay1 -= pad_y
+                ax2 += pad_x
+                ay2 += pad_y
             a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
             if a_area <= 0.0:
-                return 1.0
+                return 0.0
             self_tid = getattr(detection, "track_id", None)
             worst = 0.0
+            target_present = False
             for other in detections:
                 if other is detection:
+                    target_present = True
                     continue
                 other_tid = getattr(other, "track_id", None)
-                if is_untracked(other_tid) or (
-                    self_tid is not None and other_tid == self_tid
+                if (
+                    not is_untracked(self_tid)
+                    and not is_untracked(other_tid)
+                    and other_tid == self_tid
                 ):
+                    target_present = True
                     continue
                 bx1, by1, bx2, by2 = (float(v) for v in other.bbox)
+                if not all(math.isfinite(v) for v in (bx1, by1, bx2, by2)):
+                    return 0.0
                 ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
                 iy = max(0.0, min(ay2, by2) - max(ay1, by1))
                 worst = max(worst, (ix * iy) / a_area)
-            return max(0.0, 1.0 - worst)
+            if not target_present:
+                return 0.0
+            clearance = max(0.0, min(1.0, 1.0 - worst))
+            return clearance if math.isfinite(clearance) else 0.0
         except Exception:
-            return 1.0
+            return 0.0
 
     def _clearance_enforced(self) -> bool:
         """True when D9 neighbour-clearance should MULTIPLY view quality (gating
@@ -864,7 +1006,7 @@ class ParkingEngineTrackingMixin:
                 candidate_ids[track_id]
             )
             if cam_id == "CAM-23":
-                logger.info(
+                logger.debug(
                     "[PARK_ENTRY] Track %d bind_next_pending_anpr_to_candidate -> plate=%s",
                     track_id, bound_plate,
                 )
@@ -891,7 +1033,7 @@ class ParkingEngineTrackingMixin:
                 candidate_id, plate_for_seed
             )
             if cam_id == "CAM-23":
-                logger.info(
+                logger.debug(
                     "[PARK_ENTRY] seed_gallery_from_park_entry candidate=%s plate=%s -> %s",
                     candidate_id, plate_for_seed, seeded_ok,
                 )
@@ -1337,7 +1479,8 @@ class ParkingEngineTrackingMixin:
             "in transit) — this camera cannot read a plate, so the read one is carried",
             cam_id, tid, plate, identified_at.strftime("%H:%M:%S"),
         )
-        # The whole point: learn what this car looks like FROM THIS CAMERA.
+        # Legacy non-strict mode may learn this view. Strict persistence rejects
+        # it because transit identity has no crop-local parked OCR/ReID proof.
         registry.save_parked_reference(plate, crop, cam_id)
 
     def _process_global_tracking(
@@ -1411,11 +1554,10 @@ class ParkingEngineTrackingMixin:
                             self.update_vehicle_presence(
                                 plate, floor=pipeline.floor, camera_id=cam_id,
                             )
-                        # Grow this car's persistent gallery with a fresh full-view
-                        # crop (throttled/gated/deduped inside the registry) so its
-                        # ReID profile keeps improving and survives restart. Two
-                        # capture guards, so a reference is only ever taken from
-                        # the genuine moving entrant:
+                        # Legacy non-strict mode may grow the gallery from a
+                        # generic tracking crop. Strict persistence rejects this
+                        # path and learns only through parked OCR/ReID proof. Two
+                        # legacy capture guards limit the generic reference:
                         #   * skip a car sitting in an already-occupied slot — it
                         #     is parked, not the newly entered car (its crop must
                         #     not enter a gallery);

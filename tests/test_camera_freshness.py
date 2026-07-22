@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.camera_manager import CameraConfig, CameraStream
+from src.camera_manager import CameraConfig, CameraManager, CameraStream
 
 
 class _FakeCapture:
@@ -138,3 +138,83 @@ def test_initial_open_failure_starts_reconnect_worker(monkeypatch):
 
     assert stream.open() is False
     assert starts == [True]
+
+
+def test_stream_epoch_changes_once_per_disconnect_and_again_on_reconnect():
+    stream = _stream(max_grab_fps=8)
+
+    stream._mark_connected()
+    connected_epoch = stream.stream_epoch
+    stream._mark_disconnected()
+    disconnected_epoch = stream.stream_epoch
+    stream._mark_disconnected()
+
+    assert connected_epoch == 1
+    assert disconnected_epoch == 2
+    assert stream.stream_epoch == disconnected_epoch
+
+    stream._mark_connected()
+    assert stream.stream_epoch == 3
+
+
+def test_disconnect_atomically_hides_pre_failure_frame_and_advances_epoch():
+    stream = _stream(max_grab_fps=8)
+    stream._mark_connected()
+    stream._publish_frame(stream.cap.frame)
+    assert stream.read_stamped_with_epoch()[0] is True
+
+    stream._mark_disconnected()
+
+    ok, frame, timestamp, sequence, epoch = stream.read_stamped_with_epoch()
+    assert (ok, frame, timestamp, sequence) == (False, None, 0.0, 0)
+    assert epoch == 2
+
+
+def test_successful_frame_after_throttled_reconnect_starts_new_epoch():
+    stream = _stream(max_grab_fps=8)
+    stream._mark_connected()
+    stream._publish_frame(stream.cap.frame)
+    stream._mark_disconnected()
+    disconnected_epoch = stream.stream_epoch
+    stream.is_open = False
+
+    resumed = np.ones((2, 2, 3), dtype=np.uint8)
+    stream._publish_frame(resumed)
+
+    ok, frame, _, _, resumed_epoch = stream.read_stamped_with_epoch()
+    assert ok is True
+    assert np.array_equal(frame, resumed)
+    assert resumed_epoch == disconnected_epoch + 1
+    assert stream.is_open is True
+    stream._mark_disconnected()
+    assert stream.stream_epoch == resumed_epoch + 1
+
+
+def test_stamped_read_carries_stream_epoch():
+    stream = _stream(max_grab_fps=8)
+    stream._mark_connected()
+    stream._latest_frame = stream.cap.frame
+    stream._latest_ts = 123.0
+    stream._latest_seq = 8
+
+    ok, frame, timestamp, sequence, epoch = stream.read_stamped_with_epoch()
+
+    assert ok
+    assert np.array_equal(frame, stream.cap.frame)
+    assert (timestamp, sequence, epoch) == (123.0, 8, 1)
+
+
+def test_round_robin_stamped_read_preserves_host_grab_provenance():
+    stream = _stream(max_grab_fps=8)
+    stream._latest_frame = stream.cap.frame
+    stream._latest_ts = 123.0
+    stream._latest_seq = 8
+    manager = CameraManager([])
+    manager.cameras = {"CAM-TEST": stream}
+    manager.camera_ids = ["CAM-TEST"]
+
+    camera_id, frame, grabbed_at, sequence = manager.next_frame_stamped()
+
+    assert camera_id == "CAM-TEST"
+    assert np.array_equal(frame, stream.cap.frame)
+    assert (grabbed_at, sequence) == (123.0, 8)

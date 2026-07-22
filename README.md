@@ -118,6 +118,10 @@ Damanat-PMS-VideoAnalytics/
 
 ## Configuration
 
+For the cross-service gate admission flow, exact environment variables,
+decision invariants, restart behavior, and production gates are documented in
+[Entry V2 validation and rollout](docs/ENTRY_V2_ROLLOUT.md).
+
 All settings are in `config.yaml`. Key sections:
 
 ### Cameras
@@ -144,6 +148,20 @@ processing:
   stream_channel: 102           # 101 = main stream (4K), 102 = sub stream (720p)
 ```
 
+In single-process mode, optional low-resolution frame differencing can reduce
+YOLO scheduling on quiet cameras. `legacy` is the default and performs no
+motion analysis; `shadow` measures decisions without skipping YOLO; `enforce`
+enables quiet-frame gating. Motion never sets slot occupancy, and entry-zone
+cameras are always inferred. `shadow`/`enforce` require the single-process engine
+with `VA_SINGLE_PROCESS=1`. In `enforce`, every non-bypass camera's
+`analysis_fps` must be at least `processing.target_fps_per_camera`; startup
+fails if motion sampling would silently lower the requested inference rate. See
+`config.example.yaml` for all thresholds and per-camera overrides.
+`VA_MOTION_SCHEDULER_MODE=legacy|shadow|enforce` overrides the YAML mode at
+startup; `VA_SLOT_STATE_MODE=legacy|shadow|time` does the same for slot-state
+hysteresis. Treat these as deployment overrides and verify their effective
+values in each worker rather than assuming YAML won.
+
 ### Detector
 
 ```yaml
@@ -160,6 +178,16 @@ detector:
 state_machine:
   confirm_enter_frames: 5    # Frames with vehicle before confirming OCCUPIED
   confirm_leave_frames: 8    # Frames without vehicle before confirming VACANT
+  mode: legacy              # legacy, shadow, or time
+  enter_seconds: 3.0        # Used by shadow/time modes
+  leave_seconds: 20.0
+  enter_min_observations: 2
+  leave_min_observations: 3
+  enter_cancel_seconds: 1.0
+  enter_cancel_min_observations: 2
+  leave_start_seconds: 1.0
+  leave_start_min_observations: 2
+  max_known_gap_seconds: 8.0
 ```
 
 ---
@@ -306,7 +334,14 @@ Because the DB (not YAML) is authoritative after the first run, edit areas with
 the management tool — see [`tools/manage_areas.py`](#manage_areaspy--areaboundary-db-editor)
 below (list / push from YAML / set a field / delete / re-seed).
 
-### Entry ReID — line-crossing image (CAM-03)
+### Legacy entry ReID — line-crossing image (CAM-03, off mode only)
+
+This endpoint belongs to the legacy entry flow. When Entry V2 is `shadow` or
+`authoritative`, `/api/line-crossing` and `/api/anpr/event/upload` return HTTP
+410 before parsing the body. The authenticated JSON ANPR entry path remains
+available in shadow so the still-authoritative legacy flow can populate live
+identity; authoritative mode keeps only JSON exits. PMS sends V2
+attempts/crossings through the RAM-only multipart routes.
 
 A car enters via the ground ramp; the **ANPR server** sends the plate to
 `POST /api/anpr/event`, then an **external line-crossing detector** sends the
@@ -565,7 +600,7 @@ To ignore irrelevant areas (like street traffic), the system supports **ROI Mask
 ### Processing Pipeline (per frame)
 
 ```
-RTSP Stream → Frame Capture → YOLO Detection → ByteTrack Tracking
+RTSP Stream → Frame Capture → Optional Motion Scheduling → YOLO Detection → ByteTrack Tracking
     → Slot Assignment → State Machine Update → Event Emission
 ```
 
@@ -590,9 +625,15 @@ Each parking slot runs an independent state machine:
      └───────────────────────────────────────→┘ (back to OCCUPIED)
 ```
 
-**Debounce logic** prevents flickering:
+The default `legacy` debounce logic prevents flickering:
 - `confirm_enter_frames` (default: 5): Vehicle must be present for 5 consecutive frames
 - `confirm_leave_frames` (default: 8): Vehicle must be absent for 8 consecutive frames
+
+`shadow` also evaluates elapsed-time hysteresis while leaving the legacy result
+public. `time` makes elapsed duration plus minimum known-observation counts
+authoritative. Skipped, failed, stale, and reconnect-epoch observations are
+`UNKNOWN`; they never count as evidence that a vehicle is absent. A `LEAVING`
+slot remains publicly occupied until vacancy is confirmed.
 
 ### Slot Assignment
 
@@ -891,7 +932,7 @@ WantedBy=multi-user.target
 | RTSP stream won't open | Check IP, credentials, and port 554 reachability |
 | High CPU usage | Lower `imgsz` to 320, reduce cameras, or export to ONNX |
 | Detection misses vehicles | Lower `confidence` to 0.25, increase `imgsz` to 640 |
-| Flickering slot states | Increase `confirm_enter_frames` / `confirm_leave_frames` |
+| Flickering slot states | First run `state_machine.mode: shadow`; after validating its diagnostics, use `time` with site-calibrated durations |
 | Camera shows OFFLINE in grid | Check network, try `tests/test_cameras.py` — auto-reconnects after 10s |
 
 ---

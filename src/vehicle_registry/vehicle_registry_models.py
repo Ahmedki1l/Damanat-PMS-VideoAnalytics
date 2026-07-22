@@ -177,6 +177,19 @@ class VehicleSession:
     # the car parks, it is definitively on its way to a slot.
     ocr_identified_at: Optional[datetime] = None
 
+    # Entry V2 may open a valid live session at its normal operating threshold,
+    # while durable gallery learning is intentionally held to a stricter bar.
+    # These fields are VA-local (no database schema change): the coordinator sets
+    # them only after an authoritative PMS acknowledgement and after ANPR,
+    # CAM-23/CAM-03, ReID uniqueness, and entry OCR clear the gallery thresholds.
+    gallery_entry_authorized: bool = False
+    gallery_entry_authorization_reason: str = ""
+    gallery_entry_proof: Dict[str, object] = field(default_factory=dict)
+
+    # A later parked crop must independently clear the parked ReID + OCR gates
+    # before generic accumulation can add any more views for this visit.
+    gallery_parked_verified: bool = False
+
     @property
     def display_id(self) -> str:
         """Returns plate if available, otherwise session ID."""

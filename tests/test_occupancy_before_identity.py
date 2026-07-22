@@ -113,7 +113,14 @@ class _Harness(ParkingEngineRuntimeMixin):
         self.calls.append("EMIT")
 
     # -- identity side ----------------------------------------------------- #
-    def _process_special_zones(self, cam_id, frame, detections):
+    def _process_special_zones(
+        self,
+        cam_id,
+        frame,
+        detections,
+        *,
+        capture_ts=None,
+    ):
         self.calls.append("zones")
 
     def _build_slot_snapshot_url(self, slot_id):

@@ -13,6 +13,7 @@ import numpy as np
 sys.path.append(".")
 os.environ.setdefault("YOLO_CONFIG_DIR", os.path.abspath(".ultralytics_test"))
 
+from src.config import MatchingConfig  # noqa: E402
 from src.models.state_machine import SlotState, SlotStateMachine  # noqa: E402
 
 # Stub modules that engine_runtime.py imports at module scope but that pull
@@ -64,6 +65,16 @@ class _DummyEngine(ParkingEngineRuntimeMixin):
         # through still yields a sensible mock return.
         self.vehicle_registry.try_link_to_slot.return_value = None
         self.vehicle_registry.get_plate_for_track.return_value = None
+        matching_config = MatchingConfig()
+        matching_config.slot_ocr_async = False
+        matching_config.slot_ocr_min_gap_s = 0.0
+        matching_config.slot_reid_solo_enabled = False
+        self.vehicle_registry.matching_config = matching_config
+        self.vehicle_registry.plan_slot_ocr.return_value = SimpleNamespace(
+            allow_retry=False
+        )
+        self.vehicle_registry.read_slot_plate.return_value = ("", 0.0)
+        self.vehicle_registry.confirm_slot_ocr.return_value = None
         self.db_manager = None
 
     # Stub out the snapshot helpers so the test doesn't touch disk.

@@ -3,6 +3,7 @@ import os
 import sys
 from tempfile import NamedTemporaryFile
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -14,10 +15,19 @@ from src.services.parking_service import (
     SLOT_TYPE_PARKING,
     SLOT_TYPE_SPECIAL_ZONE,
     bootstrap_camera_slots_from_json,
+    classify_slot_type,
     load_camera_slots,
     save_camera_roi,
     sync_camera_slot_definitions,
 )
+
+
+@pytest.mark.parametrize(
+    "zone_id",
+    ["Park_Entry", "park-entry", "B1_Entrence", "B1-Entrance", "B1-entry"],
+)
+def test_entry_zone_aliases_are_stored_as_special_zones(zone_id):
+    assert classify_slot_type(zone_id) == SLOT_TYPE_SPECIAL_ZONE
 
 
 def make_session():

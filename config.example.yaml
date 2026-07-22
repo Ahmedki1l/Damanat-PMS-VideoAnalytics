@@ -8,6 +8,18 @@
 # Defaults below mirror the verified production configuration as of
 # 2026-05-17. Every model path resolves to an artifact tracked in this
 # repo — no additional downloads are required for the engine to boot.
+#
+# Entry V2 is environment-backed rather than YAML-backed. These VA deployment
+# defaults bound Hikvision/local-zone reports of one physical crossing; they are
+# not evidence-expiry or business timeouts:
+#
+#     ENTRY_V2_PRODUCER_PAIR_MAX_SKEW_SECONDS=5.0
+#     ENTRY_V2_PRODUCER_PAIR_MIN_REID_SCORE=0.95
+#     ENTRY_V2_JOURNEY_CAPACITY=4096
+#     VA_SINGLE_PROCESS=1
+#
+# Canonical CAM-23 Park_Entry or CAM-03 B1_Entrence local zones additionally
+# require an explicit VA_SINGLE_PROCESS=1 deployment attestation.
 # =============================================================================
 
 database:
@@ -220,6 +232,29 @@ processing:
                                 # stream is still drained continuously to prevent lag.
                                 # 0 publishes every source frame.
 
+# Motion is a scheduler hint only. It never changes occupancy directly.
+# legacy = no motion work; shadow = measure would-be skips; enforce = gate quiet
+# cameras while preserving transition frames and mandatory sentinels.
+# shadow/enforce require the single-process engine and VA_SINGLE_PROCESS=1.
+# Deployment overrides take precedence over YAML:
+#   VA_MOTION_SCHEDULER_MODE=legacy|shadow|enforce
+#   VA_SLOT_STATE_MODE=legacy|shadow|time
+motion_scheduler:
+  mode: legacy
+  # In enforce mode this must be >= processing.target_fps_per_camera for every
+  # non-bypass camera (including per-camera overrides), otherwise startup fails.
+  analysis_fps: 2.0
+  analysis_width: 96
+  pixel_delta: 18
+  changed_ratio: 0.02
+  active_hold_seconds: 2.0
+  sentinel_interval_seconds: 5.0
+  stale_frame_seconds: 3.0
+  always_infer: false            # Global emergency bypass for motion gating
+  # Per-camera keys may override any numeric field above or always_infer.
+  # CAM-23, CAM-03, Park_Entry, and Entrance/Entrence-zone cameras bypass gating.
+  camera_overrides: {}
+
 # --- Detector Settings ---
 # Production detector is yolo11m (better recall on oblique floor angles).
 # yolo11s_openvino_model is also committed as a rollback if yolo11m exceeds
@@ -293,6 +328,19 @@ tracker:
 state_machine:
   confirm_enter_frames: 5
   confirm_leave_frames: 8
+  # legacy keeps the frame counters above. shadow evaluates elapsed-time
+  # hysteresis without changing public state. time makes it authoritative.
+  mode: legacy
+  enter_seconds: 3.0
+  leave_seconds: 20.0
+  enter_min_observations: 2
+  leave_min_observations: 3
+  # Do not expose ENTERING→VACANT or OCCUPIED→LEAVING on one missed detection.
+  enter_cancel_seconds: 1.0
+  enter_cancel_min_observations: 2
+  leave_start_seconds: 1.0
+  leave_start_min_observations: 2
+  max_known_gap_seconds: 8.0
 
 # --- Slot Assignment Settings ---
 assigner:
@@ -352,15 +400,17 @@ matching:
   # Plugin model paths — empty string disables the plugin (NoopXxx fallback)
   color_classifier_model: "models/color_classifier_openvino/model.xml"
   type_classifier_model: "models/type_classifier_openvino/model.xml"
-  plate_ocr_model: ""          # DISABLED — see DEPLOYMENT.md to re-enable PaddleOCR
+  # Non-empty token enables the baked PaddleOCR-mobile cache. Parking-gallery
+  # admission requires this; Entry V2's OCR instance is separate.
+  plate_ocr_model: "enabled"
 
   # --- License Plate Detector (LPD) and Preprocessing ---
-  # slot_lpd_enabled: false            # Set to true to localise plate crop before OCR
-  # slot_lpd_fallback_enabled: true    # Fall back to full car crop if LPD misses the plate
-  # slot_lpd_model_dir: "models/yolo11n_lpd_openvino_model"
-  # slot_lpd_confidence: 0.30
-  # slot_lpd_iou: 0.45
-  # slot_lpd_num_threads: 2
+  slot_lpd_enabled: true               # Tight plate ROI before parked OCR
+  slot_lpd_fallback_enabled: false     # LPD miss = abstain; never OCR a full car/HUD
+  slot_lpd_model_dir: "models/yolo11n_lpd_openvino_model"
+  slot_lpd_confidence: 0.30
+  slot_lpd_iou: 0.45
+  slot_lpd_num_threads: 2
   # slot_ocr_upscale: 1.0              # Super-resolution / upscaling factor for plate crop
   # slot_ocr_preprocessing: []         # Enhancement steps, applied in the order given.
                                        # Valid: clahe, sharpen, denoise, threshold.
@@ -373,11 +423,33 @@ matching:
   faiss_index_dimension: 512
   faiss_index_nlist: 8
 
+  # Durable gallery. A valid Entry V2 session can still open at its normal
+  # thresholds, but a crop reaches disk only after the stricter post-ACK entry
+  # proof plus high-confidence parked OCR and unique rank-1 ReID proof.
+  gallery_persist_enabled: true
+  gallery_max_refs_per_car: 10
+  gallery_retention_days: 0.0        # 0 = keep verified history until explicit reset
+  gallery_strict_admission_enabled: true
+  gallery_parked_ocr_min_confidence: 0.90
+  gallery_parked_reid_min_score: 0.70
+  gallery_parked_reid_min_margin: 0.15
+  gallery_parked_min_neighbour_clearance: 0.90
+  gallery_parked_require_rank_one: true  # mandatory in strict persistent mode
+  gallery_require_slot_authority: true
+  gallery_min_view_quality: 0.90
+  gallery_min_sharpness: 40.0
+  gallery_min_crop_area: 12000.0
+  gallery_accumulate_min_gt_similarity: 0.45
+
 # --- Output Settings ---
 output:
   log_file: ""                  # Optional: path to event log file
   show_video: false             # Show annotated video (debug only)
   show_camera: ""               # Which camera to show when show_video=true (e.g., "CAM-04")
+  # Strict galleries are stored below <snapshot_base_dir>/gallery. Mount this
+  # directory on persistent storage in production; Docker's relative default is
+  # /app/vehicle_images.
+  snapshot_base_dir: "vehicle_images"
 
 
 # --- Alerting ---

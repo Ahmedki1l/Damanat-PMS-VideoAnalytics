@@ -392,6 +392,9 @@ class TrackedDetector:
             return
 
         def _scaled(dets, ud):
+            if dets is None:
+                done(None, ud)
+                return
             for d in dets:
                 x1, y1, x2, y2 = d.bbox
                 d.bbox = (x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y)

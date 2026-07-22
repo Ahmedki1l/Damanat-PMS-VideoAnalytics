@@ -68,7 +68,13 @@ from src.services.config_service import (
     sync_areas_from_db,
 )
 
-def start_api_server(engine, registry, host="0.0.0.0", port=8000):
+def start_api_server(
+    engine,
+    registry,
+    host="0.0.0.0",
+    port=8000,
+    entry_coordinator=None,
+):
     """Start the FastAPI server in a background thread."""
     import uvicorn
     from src.api import create_app
@@ -161,6 +167,7 @@ def start_api_server(engine, registry, host="0.0.0.0", port=8000):
         public_base_url=engine.config.output.public_base_url,
         snapshot_url_prefix=engine.config.output.snapshot_url_prefix,
         gateway_path_prefix=engine.config.output.gateway_path_prefix,
+        entry_coordinator=entry_coordinator,
     )
 
     # Include routers
@@ -385,6 +392,26 @@ Examples:
     if args.show_camera:
         config.output.show_camera = args.show_camera
 
+    # Motion scheduling is implemented only by the multi-camera,
+    # single-process async loop. Validate this before loading either AI model so
+    # a deployment cannot appear healthy while silently running legacy YOLO
+    # scheduling.
+    _single_process = os.environ.get("VA_SINGLE_PROCESS", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    from src.core.motion_scheduler import validate_motion_runtime
+
+    try:
+        validate_motion_runtime(
+            config.motion_scheduler.mode,
+            scheduler_available=(
+                _single_process and not bool(args.video) and not bool(args.camera)
+            ),
+        )
+    except ValueError as exc:
+        print(f"\n[ERROR] {exc}")
+        sys.exit(2)
+
     # Validate model exists
     if not os.path.exists(config.detector.model_path):
         print(f"\n[ERROR] Model file not found: '{config.detector.model_path}'")
@@ -416,9 +443,9 @@ Examples:
     registry = VehicleRegistry(
         image_dir=config.output.snapshot_base_dir,
         # Without this the registry silently falls back to MatchingConfig()
-        # DEFAULTS — ignoring every YAML-tuned threshold AND leaving
-        # gallery_persist_enabled at its False default, so no per-plate
-        # gallery folder is ever seeded. Pass the loaded matching config so
+        # DEFAULTS — ignoring every YAML-tuned threshold AND leaving the
+        # opt-in gallery persistence disabled, so no per-plate gallery folder
+        # is ever seeded. Pass the loaded matching config so
         # the tuned Youden thresholds + gallery persistence actually apply.
         matching_config=config.matching,
         public_base_url=config.output.public_base_url,
@@ -440,18 +467,31 @@ Examples:
     # serial loops. It needs the async detector core, which TrackedDetector
     # selects at construction from VA_INFER — so force it on here, before the
     # engine (and its detector) is built.
-    _single_process = os.environ.get("VA_SINGLE_PROCESS", "").strip().lower() in (
-        "1", "true", "yes", "on"
-    )
     if _single_process and os.environ.get("VA_INFER", "").strip().lower() != "async":
         os.environ["VA_INFER"] = "async"
         print("[INFO] VA_SINGLE_PROCESS=1 → forcing VA_INFER=async")
 
-    engine = ParkingEngine(config, vehicle_registry=registry, db_manager=db)
+    # Entry V2 has exactly one in-process coordinator. Both the HTTP transport
+    # and VA's RTSP zone fallback feed this same bounded state machine; building
+    # one per surface would split pending attempts from their local crossings.
+    from src.entry.runtime import build_entry_coordinator
+
+    entry_coordinator = build_entry_coordinator(registry)
+    engine = ParkingEngine(
+        config,
+        vehicle_registry=registry,
+        db_manager=db,
+        entry_coordinator=entry_coordinator,
+    )
 
     # --- Start API server if requested ---
     if args.api:
-        start_api_server(engine, registry, port=args.port)
+        start_api_server(
+            engine,
+            registry,
+            port=args.port,
+            entry_coordinator=entry_coordinator,
+        )
 
     # --- Decide which mode to run ---
     if args.video:

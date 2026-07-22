@@ -36,6 +36,19 @@ import time
 from datetime import datetime
 
 from src import perf_trace
+from src.core.fair_latest_output import (
+    FairLatestOutputQueue,
+    InferenceCompletionGate,
+    InferenceOutput,
+)
+from src.core.motion_scheduler import (
+    MotionFrame,
+    MotionScheduler,
+    motion_iteration_plan,
+    motion_bypass_cameras,
+    rotated_camera_ids,
+)
+from src.entry.settings import EntrySettings
 
 
 class ParkingEngineSingleProcessMixin:
@@ -45,6 +58,25 @@ class ParkingEngineSingleProcessMixin:
         if camera_configs is None:
             return
 
+        camera_ids = [c.id for c in camera_configs]
+        target_fps = self.config.processing.target_fps_per_camera
+        entry_settings = EntrySettings.from_env()
+        motion_bypass = motion_bypass_cameras(
+            self.special_zones,
+            entry_settings.primary_cameras | entry_settings.fallback_cameras,
+        )
+        motion_scheduler = MotionScheduler(
+            self.config.motion_scheduler,
+            bypass_cameras=motion_bypass,
+        )
+        try:
+            motion_scheduler.validate_target_rate(target_fps, camera_ids)
+        except ValueError:
+            self._stop_entry_v2_local_bridge()
+            self._stop_slot_ocr_worker()
+            self.cam_manager.close_all()
+            raise
+
         # Every camera's detector must expose the async core; the shared detector
         # serves all non-override cameras through one queue (the whole point).
         shared = self._shared_detector or self.detector
@@ -53,16 +85,18 @@ class ParkingEngineSingleProcessMixin:
                 "[ERROR] single-process mode requires the async OpenVINO core. "
                 "Set VA_INFER=async and redeploy."
             )
+            self._stop_entry_v2_local_bridge()
+            self._stop_slot_ocr_worker()
             self.cam_manager.close_all()
             return
-
-        camera_ids = [c.id for c in camera_configs]
+        # Expose read-only snapshots to diagnostics/API code without sharing the
+        # mutable per-camera state itself.
+        self._motion_scheduler = motion_scheduler
         summary_interval = max(1, len(camera_configs) * 10)
-        target_fps = self.config.processing.target_fps_per_camera
         min_interval = (1.0 / target_fps) if target_fps and target_fps > 0 else 0.0
 
         nireq = shared._ov_core.nireq
-        out_q: "queue.Queue" = queue.Queue(maxsize=max(4, 2 * nireq))
+        outputs = FairLatestOutputQueue()
         stop = threading.Event()
 
         # Feeder pool: preprocessing (frame copy + CLAHE + letterbox + tensor
@@ -82,36 +116,46 @@ class ParkingEngineSingleProcessMixin:
         # strict per-camera tracker ordering + bounded memory). Cleared in the
         # completion callback so the camera can re-submit as soon as its forward
         # pass + track update finish (~ov ms), independent of the consumer.
-        inflight: dict[str, int] = {}
+        inflight: dict[str, tuple[int, int]] = {}
         inflight_lock = threading.Lock()
-        last_applied: dict[str, int] = {}
-        last_submitted_seq: dict[str, int] = {}
+        completion_gate = InferenceCompletionGate()
         last_submitted_ts: dict[str, float] = {}
-        drops = {"out_full": 0, "stale": 0}
+        drops = {
+            "out_replaced": 0,
+            "stale": 0,
+            "stale_epoch": 0,
+            "motion_invalid": 0,
+            "infer_error": 0,
+        }
+
+        def publish_output(item: InferenceOutput) -> None:
+            """Nonblocking, per-camera newest-wins handoff."""
+            outputs.put_latest(item)
+            drops["out_replaced"] = outputs.replacements
 
         def on_infer_done(detections, ud) -> None:
             # Runs on an OV worker thread. Keep it minimal: free the camera, then
             # hand off. Never block here (would stall the OV pool).
             # sub_ts/done_ts feed the [SLOTTRACE] end-to-end breakdown so the
             # inference and queue segments are attributable, not lumped together.
-            cam_id, frame, seq, cap_ts, sub_ts = ud
+            cam_id, frame, seq, cap_ts, stream_epoch, sub_ts = ud
             done_ts = time.time()
             with inflight_lock:
-                inflight.pop(cam_id, None)
-            item = (cam_id, frame, detections, seq, cap_ts, sub_ts, done_ts)
-            try:
-                out_q.put_nowait(item)
-            except queue.Full:
-                # Frames are droppable (newest-wins): evict the oldest and retry.
-                try:
-                    out_q.get_nowait()
-                    drops["out_full"] += 1
-                except queue.Empty:
-                    pass
-                try:
-                    out_q.put_nowait(item)
-                except queue.Full:
-                    pass
+                if inflight.get(cam_id) == (stream_epoch, seq):
+                    inflight.pop(cam_id, None)
+            publish_output(
+                InferenceOutput(
+                    camera_id=cam_id,
+                    frame=frame,
+                    detections=detections,
+                    sequence=seq,
+                    capture_ts=cap_ts,
+                    stream_epoch=stream_epoch,
+                    submitted_at=sub_ts,
+                    inferred_at=done_ts,
+                    unknown_reason="infer_error" if detections is None else "",
+                )
+            )
 
         def feeder() -> None:
             # Pull a picked (camera, frame) and do the heavy preprocess + submit.
@@ -119,18 +163,29 @@ class ParkingEngineSingleProcessMixin:
             # the async-queue enqueue inside submit_async is lock-serialized.
             while not stop.is_set():
                 try:
-                    cam_id, frame, seq, cap_ts, detector = feed_q.get(timeout=0.5)
+                    (cam_id, frame, seq, cap_ts,
+                     stream_epoch, detector, reason) = feed_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 try:
+                    motion_scheduler.mark_submitted(cam_id, reason)
                     detector.submit_async(
                         frame, cam_id, on_infer_done,
-                        userdata=(cam_id, frame, seq, cap_ts, time.time()),
+                        userdata=(
+                            cam_id,
+                            frame,
+                            seq,
+                            cap_ts,
+                            stream_epoch,
+                            time.time(),
+                        ),
                     )
                 except Exception as exc:
                     print(f"[single] submit error cam={cam_id}: {exc!r}")
-                    with inflight_lock:
-                        inflight.pop(cam_id, None)
+                    on_infer_done(
+                        None,
+                        (cam_id, frame, seq, cap_ts, stream_epoch, time.time()),
+                    )
 
         def _housekeeping() -> None:
             # Registry/DB-touching maintenance — MUST stay on the consumer thread
@@ -156,29 +211,83 @@ class ParkingEngineSingleProcessMixin:
         def consumer() -> None:
             while not stop.is_set():
                 try:
-                    (cam_id, frame, detections, seq,
-                     cap_ts, sub_ts, done_ts) = out_q.get(timeout=0.5)
+                    item = outputs.get(timeout=0.5)
                 except queue.Empty:
                     _housekeeping()  # keep janitor/session-sync alive when quiet
                     continue
-                # Drop an out-of-order (older) completion for this camera.
-                if seq < last_applied.get(cam_id, -1):
-                    drops["stale"] += 1
+                cam_id = item.camera_id
+                # A completion from before a reconnect can never describe the
+                # current stream, regardless of detector confidence.
+                current_epoch = self.cam_manager.get_stream_epoch(cam_id)
+                rejection = completion_gate.rejection_reason(item, current_epoch)
+                if rejection:
+                    drops[rejection] += 1
                     continue
-                last_applied[cam_id] = seq
                 pipeline = self.pipelines.get(cam_id)
                 if pipeline is None:
+                    continue
+                frame_age = max(0.0, time.time() - item.capture_ts)
+                if not motion_scheduler.completion_is_valid(
+                    cam_id,
+                    item.stream_epoch,
+                    frame_age,
+                ):
+                    rejection = completion_gate.rejection_reason(
+                        item, self.cam_manager.get_stream_epoch(cam_id)
+                    )
+                    if rejection:
+                        drops[rejection] += 1
+                        continue
+                    completion_gate.record_acceptance(item)
+                    drops["stale"] += 1
+                    motion_scheduler.mark_unknown(
+                        cam_id,
+                        item.stream_epoch,
+                        "stale_completion",
+                    )
+                    self._mark_slot_observations_unknown(pipeline)
+                    continue
+                if item.detections is None:
+                    rejection = completion_gate.rejection_reason(
+                        item, self.cam_manager.get_stream_epoch(cam_id)
+                    )
+                    if rejection:
+                        drops[rejection] += 1
+                        continue
+                    completion_gate.record_acceptance(item)
+                    reason = item.unknown_reason or "infer_error"
+                    motion_scheduler.mark_unknown(
+                        cam_id,
+                        item.stream_epoch,
+                        reason,
+                    )
+                    drop_name = (
+                        "infer_error" if reason == "infer_error" else "motion_invalid"
+                    )
+                    drops[drop_name] += 1
+                    self._mark_slot_observations_unknown(pipeline)
                     continue
                 # Time the busy portion only (excludes the get() wait above) so
                 # consumer busy% tells inference-bound from consumer-bound.
                 _busy0 = time.perf_counter()
                 _housekeeping()
+                # Housekeeping may overlap an RTSP reconnect. Revalidate at the
+                # last safe point before this frame can mutate occupancy state.
+                rejection = completion_gate.rejection_reason(
+                    item, self.cam_manager.get_stream_epoch(cam_id)
+                )
+                if rejection:
+                    drops[rejection] += 1
+                    continue
+                completion_gate.record_acceptance(item)
                 self.last_processed_at = datetime.now()
                 try:
                     self._process_detections_and_events(
-                        cam_id, frame, pipeline, detections,
-                        capture_ts=cap_ts, submitted_at=sub_ts,
-                        inferred_at=done_ts, dequeued_at=time.time(),
+                        cam_id, item.frame, pipeline, item.detections,
+                        capture_ts=item.capture_ts,
+                        submitted_at=item.submitted_at,
+                        inferred_at=item.inferred_at,
+                        dequeued_at=time.time(),
                     )
                 except Exception as exc:  # one bad frame must not kill the loop
                     print(f"[single] pipeline error cam={cam_id}: {exc!r}")
@@ -201,10 +310,13 @@ class ParkingEngineSingleProcessMixin:
             t.start()
         print(
             f"[single] scheduler up: {len(camera_ids)} cameras, nireq={nireq}, "
-            f"feeders={n_feeders}, target_fps={target_fps}, out_q={out_q.maxsize}"
+            f"feeders={n_feeders}, target_fps={target_fps}, "
+            f"motion={motion_scheduler.mode}, "
+            f"motion_bypass={sorted(motion_bypass)}"
         )
 
         last_gauge_report = time.time()
+        camera_cursor = 0
         try:
             while not stop.is_set():
                 # Periodic queue-health line. `outstanding` = cameras picked but
@@ -218,8 +330,8 @@ class ParkingEngineSingleProcessMixin:
                     print(
                         f"[PERF] sched: outstanding={n_outstanding} "
                         f"feed_q={feed_q.qsize()}/{feed_q.maxsize} "
-                        f"out_q={out_q.qsize()}/{out_q.maxsize} "
-                        f"drops(out_full={drops['out_full']}, stale={drops['stale']})"
+                        f"ready_cameras={outputs.qsize()} "
+                        f"drops={drops} motion={motion_scheduler.metrics()}"
                     )
                     last_gauge_report = time.time()
                 # Liveness: if the consumer thread has died despite its guards,
@@ -234,46 +346,112 @@ class ParkingEngineSingleProcessMixin:
                     )
                     break
                 submitted_any = False
-                for cam_id in camera_ids:
+                for cam_id in rotated_camera_ids(camera_ids, camera_cursor):
                     now = time.time()
-                    if min_interval > 0 and (
-                        now - last_submitted_ts.get(cam_id, 0.0) < min_interval
-                    ):
+                    bypass_motion = motion_scheduler.is_bypassed(cam_id)
+                    target_due = (
+                        min_interval <= 0
+                        or now - last_submitted_ts.get(cam_id, 0.0) >= min_interval
+                    )
+                    analysis_due = motion_scheduler.analysis_due(cam_id)
+                    should_read, should_analyze = motion_iteration_plan(
+                        mode=motion_scheduler.mode,
+                        bypass=bypass_motion,
+                        target_due=target_due,
+                        analysis_due=analysis_due,
+                    )
+                    if not should_read:
                         continue
                     with inflight_lock:
                         if cam_id in inflight:
                             continue
-                    ok, frame, cap_ts, seq = self.cam_manager.read_camera_stamped(cam_id)
+                    ok, frame, cap_ts, seq, stream_epoch = (
+                        self.cam_manager.read_camera_stamped_with_epoch(cam_id)
+                    )
                     if not ok or frame is None:
                         continue
-                    if seq == last_submitted_seq.get(cam_id):
-                        continue  # no fresh frame since last submit — skip
+                    if should_analyze:
+                        decision = motion_scheduler.examine(
+                            MotionFrame(
+                                camera_id=cam_id,
+                                image=frame,
+                                sequence=seq,
+                                stream_epoch=stream_epoch,
+                                age_seconds=max(0.0, now - cap_ts),
+                            )
+                        )
+                    else:
+                        decision = motion_scheduler.shadow_passthrough(
+                            MotionFrame(
+                                camera_id=cam_id,
+                                image=frame,
+                                sequence=seq,
+                                stream_epoch=stream_epoch,
+                                age_seconds=max(0.0, now - cap_ts),
+                            )
+                        )
+                    if not decision.frame_is_valid:
+                        stamp = time.time()
+                        publish_output(
+                            InferenceOutput(
+                                camera_id=cam_id,
+                                frame=frame,
+                                detections=None,
+                                sequence=seq,
+                                capture_ts=cap_ts,
+                                stream_epoch=stream_epoch,
+                                submitted_at=stamp,
+                                inferred_at=stamp,
+                                unknown_reason=decision.reason,
+                            )
+                        )
+                        continue
+                    if not decision.should_infer or not target_due:
+                        continue
                     detector = self._detector_for(cam_id)
-                    last_submitted_seq[cam_id] = seq
                     last_submitted_ts[cam_id] = now
                     if detector.has_async_core():
                         with inflight_lock:
-                            inflight[cam_id] = seq
+                            inflight[cam_id] = (stream_epoch, seq)
                         # Hand the heavy preprocess + submit to the feeder pool.
                         # put() blocks when feeders are saturated → correct
                         # back-pressure without the picker doing the work itself.
-                        feed_q.put((cam_id, frame, seq, cap_ts, detector))
+                        feed_q.put(
+                            (
+                                cam_id,
+                                frame,
+                                seq,
+                                cap_ts,
+                                stream_epoch,
+                                detector,
+                                decision.reason,
+                            )
+                        )
                     else:
                         # Rare camera_override on a non-OpenVINO model (e.g. a .pt):
                         # no async core exists, so run one synchronous inference on
                         # the scheduler thread and feed the same consumer. Blocks the
                         # scheduler briefly but keeps the camera live.
+                        motion_scheduler.mark_submitted(cam_id, decision.reason)
                         try:
                             dets = detector.detect_and_track(frame, cam_id)
                         except Exception as exc:
                             print(f"[single] sync detect error cam={cam_id}: {exc!r}")
-                            dets = []
-                        on_infer_done(dets, (cam_id, frame, seq, cap_ts, time.time()))
+                            dets = None
+                        on_infer_done(
+                            dets,
+                            (cam_id, frame, seq, cap_ts, stream_epoch, time.time()),
+                        )
                     submitted_any = True
                     perf_trace.set_gauge("infer_inflight", float(len(inflight)))
-                    perf_trace.set_gauge("out_q", float(out_q.qsize()))
-                    perf_trace.set_gauge("drop_out_full", float(drops["out_full"]))
+                    perf_trace.set_gauge("out_q", float(outputs.qsize()))
+                    perf_trace.set_gauge(
+                        "drop_out_replaced",
+                        float(drops["out_replaced"]),
+                    )
                     perf_trace.set_gauge("drop_stale", float(drops["stale"]))
+                if camera_ids:
+                    camera_cursor = (camera_cursor + 1) % len(camera_ids)
                 if not submitted_any:
                     time.sleep(min(min_interval, 0.01) if min_interval > 0 else 0.005)
         except KeyboardInterrupt:
@@ -287,6 +465,7 @@ class ParkingEngineSingleProcessMixin:
             except Exception:
                 pass
             consumer_thread.join(timeout=3)
+            self._stop_entry_v2_local_bridge()
             self._stop_slot_ocr_worker()
             self.cam_manager.close_all()
             self.event_bus.close()

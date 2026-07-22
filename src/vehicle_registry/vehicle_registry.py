@@ -5,11 +5,13 @@ The heavy implementation is split into focused helper modules so this file can
 stay easy to navigate while preserving the existing import path.
 """
 
+import hashlib
 import logging
 import os
 import threading
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from src.config import MatchingConfig, ReIDPreprocessingConfig
@@ -25,6 +27,72 @@ from src.vehicle_registry.vehicle_registry_queries import VehicleRegistryQueryMi
 from src.zoning.trace import enabled as _area_trace_enabled, trace as _area_trace
 
 logger = logging.getLogger(__name__)
+
+_MODEL_ARTIFACT_SUFFIXES = {
+    ".bin",
+    ".json",
+    ".onnx",
+    ".pt",
+    ".pth",
+    ".safetensors",
+    ".xml",
+}
+
+
+def _gallery_model_tag(matcher: object, config: MatchingConfig) -> str:
+    """Fingerprint the complete embedding contract used by cached vectors."""
+    digest = hashlib.sha256()
+
+    def add(label: str, value: object) -> None:
+        digest.update(label.encode("utf-8"))
+        digest.update(b"=")
+        digest.update(repr(value).encode("utf-8"))
+        digest.update(b"\n")
+
+    backend = str(getattr(matcher, "backend", "unknown") or "unknown")
+    add("backend", backend)
+    add("backend_impl", type(getattr(matcher, "model", None)).__qualname__)
+    add("model_name", getattr(matcher, "model_name", None))
+    add("input_size", tuple(getattr(matcher, "input_size", ()) or ()))
+    add("norm_mean", tuple(getattr(matcher, "norm_mean", ()) or ()))
+    add("norm_std", tuple(getattr(matcher, "norm_std", ()) or ()))
+    add("use_openvino_reid", getattr(config, "use_openvino_reid", None))
+    add("configured_input_size", tuple(getattr(config, "reid_input_size", ()) or ()))
+
+    preprocessing = getattr(matcher, "preprocessing_config", None)
+    for field_name in ("enabled", "clip_limit", "grid_size"):
+        add(
+            f"preprocessing.{field_name}",
+            getattr(preprocessing, field_name, None),
+        )
+
+    configured_dir = str(getattr(config, "reid_openvino_model_dir", "") or "")
+    model_dir = Path(configured_dir).expanduser()
+    try:
+        model_dir = model_dir.resolve()
+    except OSError:
+        pass
+    add("model_dir_name", model_dir.name or "default")
+    artifacts = []
+    try:
+        artifacts = sorted(
+            path
+            for path in model_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in _MODEL_ARTIFACT_SUFFIXES
+        )
+    except OSError:
+        add("model_artifacts", "missing")
+    for artifact in artifacts:
+        add("artifact", artifact.name)
+        try:
+            with artifact.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            add("artifact_error", artifact.name)
+
+    short_digest = digest.hexdigest()[:20]
+    return f"{backend}:{model_dir.name or 'default'}:{short_digest}"
 
 
 def _session_label(session) -> str:
@@ -138,6 +206,10 @@ class VehicleRegistry(
         # by distinct plate count; pruned in _cleanup_stale_data.
         self._last_anpr_entry_at: Dict[str, datetime] = {}
         self._last_anpr_exit_at: Dict[str, datetime] = {}
+        # Same exit boundary in its original network/source clock convention.
+        # The legacy maps above remain normalized to the registry clock; Entry
+        # V2 needs the source-aware form when an exit wins an identity race.
+        self._last_anpr_exit_source_at: Dict[str, datetime] = {}
         self._park_entry_candidates: Dict[str, ParkEntryCandidate] = {}
         self._sessions: Dict[str, VehicleSession] = {}
         self._track_session_map: Dict[Tuple[str, int], str] = {}
@@ -244,8 +316,8 @@ class VehicleRegistry(
         )
 
         # Per-car persistent gallery (folder per plate). Lazily built on first
-        # use (needs the ReID backend name for the model tag); None when
-        # ``gallery_persist_enabled`` is False. ``_gallery_last_add`` throttles
+        # use (needs the ReID backend name for the model tag); None when the
+        # opt-in ``gallery_persist_enabled`` setting is false. ``_gallery_last_add`` throttles
         # accumulation to one write per (plate, camera) per configured interval.
         self._gallery_store = None
         self._gallery_last_add: Dict[Tuple[str, str], float] = {}
@@ -279,18 +351,26 @@ class VehicleRegistry(
     def gallery_store(self):
         """Lazy per-car gallery store. None when persistence is disabled.
 
-        The model tag (``backend:model-dir``) is captured at first use so a
-        later ReID model swap invalidates the cached vectors (reload re-embeds
-        from the retained crops)."""
+        The tag fingerprints model artifacts and the runtime preprocessing
+        contract, so an in-place model/config change invalidates cached vectors
+        and reload re-embeds the retained verified crops."""
         if not getattr(self._matching_config, "gallery_persist_enabled", False):
             return None
         if self._gallery_store is None:
             from src.vehicle_registry.gallery_store import VehicleGalleryStore
 
-            model_dir = (self._matching_config.reid_openvino_model_dir or "").rstrip("/\\")
-            tag = f"{getattr(self.reid_matcher, 'backend', '?')}:{os.path.basename(model_dir) or 'default'}"
+            tag = _gallery_model_tag(self.reid_matcher, self._matching_config)
             self._gallery_store = VehicleGalleryStore(
-                self._image_dir, tag, self._matching_config.gallery_max_refs_per_car
+                self._image_dir,
+                tag,
+                self._matching_config.gallery_max_refs_per_car,
+                require_verified_admission=bool(
+                    getattr(
+                        self._matching_config,
+                        "gallery_strict_admission_enabled",
+                        True,
+                    )
+                ),
             )
             logger.info("[gallery] persistent per-car gallery enabled (tag=%s)", tag)
         return self._gallery_store
@@ -510,6 +590,31 @@ class VehicleRegistry(
                 session.session_id,
                 exc,
             )
+
+    def _gallery_index_upsert_strict(self, session) -> None:
+        """Index an authoritative identity, propagating every write failure.
+
+        Legacy session enrichment is allowed to fall back to the registry's
+        linear scan when the optional FAISS index cannot be updated. Entry V2
+        delivery is different: its callback and live-registry handoff are one
+        retryable transaction, so acknowledging a session whose enabled index
+        was not updated would make behavior depend on the matching backend.
+        """
+        if not self._matching_config.use_faiss_index:
+            return
+        if session is None:
+            raise ValueError("authoritative gallery session is missing")
+        if session.status not in ("confirmed", "parked"):
+            raise ValueError("authoritative gallery session is not matchable")
+        vector = getattr(session, "feature_vector", None)
+        if vector is None:
+            raise ValueError("authoritative gallery session has no feature vector")
+        self._gallery_index.add(session.session_id, vector)
+
+    def _gallery_index_remove_strict(self, session_id: str) -> None:
+        """Remove a partially indexed authoritative identity during rollback."""
+        if self._matching_config.use_faiss_index:
+            self._gallery_index.remove(session_id)
 
     def _gallery_index_remove(self, session_id: str) -> None:
         """Drop ``session_id`` from the gallery index.

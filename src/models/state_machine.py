@@ -2,10 +2,10 @@
 state_machine.py — Per-slot state machine with debounce logic.
 
 State transitions:
-  VACANT → ENTERING    : Vehicle detected in slot (1 frame).
+  VACANT → ENTERING    : Vehicle detected in slot.
   ENTERING → OCCUPIED  : Vehicle present for confirm_enter_frames consecutive frames.
-  ENTERING → VACANT    : Vehicle disappears before confirmation.
-  OCCUPIED → LEAVING   : Vehicle not detected in slot (1 frame).
+  ENTERING → VACANT    : Absence persists through the cancellation gate.
+  OCCUPIED → LEAVING   : Absence persists through the leave-start gate.
   LEAVING → VACANT     : Vehicle absent for confirm_leave_frames consecutive frames.
   LEAVING → OCCUPIED   : Vehicle re-detected before confirmation.
 
@@ -15,9 +15,10 @@ Debounce prevents flicker from:
 """
 
 import logging
+import math
 import time
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -42,6 +43,298 @@ class SlotState(Enum):
     ENTERING = "ENTERING"
     OCCUPIED = "OCCUPIED"
     LEAVING = "LEAVING"
+
+
+class SlotObservationKind(Enum):
+    """The occupancy evidence produced by one inference opportunity."""
+
+    PRESENT = "PRESENT"
+    ABSENT = "ABSENT"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class SlotObservation:
+    """One fresh, ordered observation for a slot.
+
+    ``UNKNOWN`` is deliberately distinct from ``ABSENT``. A skipped frame,
+    inference failure, stale completion, or reconnect gap carries no occupancy
+    evidence and therefore cannot move a slot toward vacancy.
+    """
+
+    kind: SlotObservationKind
+    observed_at: float
+    timestamp: str
+    track_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class SlotObservationPolicy:
+    """Configuration for the optional elapsed-time occupancy policy."""
+
+    mode: str = "legacy"
+    enter_seconds: float = 3.0
+    leave_seconds: float = 20.0
+    enter_min_observations: int = 2
+    leave_min_observations: int = 3
+    enter_cancel_seconds: float = 1.0
+    enter_cancel_min_observations: int = 2
+    leave_start_seconds: float = 1.0
+    leave_start_min_observations: int = 2
+    max_known_gap_seconds: float = 8.0
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"legacy", "shadow", "time"}:
+            raise ValueError(
+                "slot observation mode must be legacy, shadow, or time"
+            )
+        if (
+            not math.isfinite(self.enter_seconds)
+            or not math.isfinite(self.leave_seconds)
+            or not math.isfinite(self.enter_cancel_seconds)
+            or not math.isfinite(self.leave_start_seconds)
+            or self.enter_seconds < 0
+            or self.leave_seconds < 0
+            or self.enter_cancel_seconds < 0
+            or self.leave_start_seconds < 0
+        ):
+            raise ValueError("slot hysteresis durations cannot be negative")
+        if any(
+            count < 1
+            for count in (
+                self.enter_min_observations,
+                self.leave_min_observations,
+                self.enter_cancel_min_observations,
+                self.leave_start_min_observations,
+            )
+        ):
+            raise ValueError("slot hysteresis observation counts must be positive")
+        if (
+            self.leave_start_seconds > self.leave_seconds
+            or self.leave_start_min_observations > self.leave_min_observations
+        ):
+            raise ValueError("leave-start gate cannot exceed vacancy confirmation")
+        if (
+            not math.isfinite(self.max_known_gap_seconds)
+            or self.max_known_gap_seconds <= 0
+        ):
+            raise ValueError("max_known_gap_seconds must be positive")
+
+
+class _TimedTransition(Enum):
+    ENTERING = "vehicle_entering"
+    PARKED = "vehicle_parked"
+    LEAVING = "vehicle_leaving"
+    VACANT = "slot_vacant"
+
+
+class _TimedHysteresis:
+    """Elapsed-time occupancy reducer used by shadow and authoritative modes."""
+
+    def __init__(
+        self,
+        policy: SlotObservationPolicy,
+        initial_state: SlotState,
+    ) -> None:
+        self.policy = policy
+        self.state = initial_state
+        self.assigned_track_id: Optional[int] = None
+        self._run_started_at: Optional[float] = None
+        self._last_known_at: Optional[float] = None
+        self._evidence_count = 0
+        self._opposite_run_started_at: Optional[float] = None
+        self._opposite_evidence_count = 0
+
+    def observe(self, observation: SlotObservation) -> List[_TimedTransition]:
+        if observation.kind == SlotObservationKind.UNKNOWN:
+            return []
+
+        if self._known_gap_exceeded(observation.observed_at):
+            # A long UNKNOWN interval breaks every pending proof, regardless of
+            # whether the first fresh signal agrees with the old run. Keeping a
+            # stale positive run across an intervening ABSENT would otherwise
+            # let one later PRESENT immediately park the slot.
+            self._clear_all_runs()
+        transitions = self._advance_known(observation)
+        self._last_known_at = observation.observed_at
+        return transitions
+
+    def _advance_known(
+        self, observation: SlotObservation
+    ) -> List[_TimedTransition]:
+        present = observation.kind == SlotObservationKind.PRESENT
+        if self.state == SlotState.VACANT:
+            return self._from_vacant(observation, present)
+        if self.state == SlotState.ENTERING:
+            return self._from_entering(observation, present)
+        if self.state == SlotState.OCCUPIED:
+            return self._from_occupied(observation, present)
+        return self._from_leaving(observation, present)
+
+    def _from_vacant(
+        self, observation: SlotObservation, present: bool
+    ) -> List[_TimedTransition]:
+        if not present:
+            return []
+        self.state = SlotState.ENTERING
+        self.assigned_track_id = observation.track_id
+        self._start_run(observation.observed_at)
+        transitions = [_TimedTransition.ENTERING]
+        if self._enter_ready(observation.observed_at):
+            self.state = SlotState.OCCUPIED
+            self._clear_run()
+            transitions.append(_TimedTransition.PARKED)
+        return transitions
+
+    def _from_entering(
+        self, observation: SlotObservation, present: bool
+    ) -> List[_TimedTransition]:
+        if not present:
+            self._continue_opposite_run(observation.observed_at)
+            if not self._run_values_ready(
+                self._opposite_run_started_at,
+                self._opposite_evidence_count,
+                observation.observed_at,
+                self.policy.enter_cancel_seconds,
+                self.policy.enter_cancel_min_observations,
+            ):
+                return []
+            self.state = SlotState.VACANT
+            self.assigned_track_id = None
+            self._clear_all_runs()
+            return []
+
+        self._clear_opposite_run()
+        self.assigned_track_id = observation.track_id
+        self._continue_run(observation.observed_at)
+        if not self._enter_ready(observation.observed_at):
+            return []
+        self.state = SlotState.OCCUPIED
+        self._clear_run()
+        return [_TimedTransition.PARKED]
+
+    def _from_occupied(
+        self, observation: SlotObservation, present: bool
+    ) -> List[_TimedTransition]:
+        if present:
+            self.assigned_track_id = observation.track_id
+            self._clear_run()
+            return []
+        if self._run_started_at is None:
+            self._start_run(observation.observed_at)
+        else:
+            self._continue_run(observation.observed_at)
+        if not self._run_values_ready(
+            self._run_started_at,
+            self._evidence_count,
+            observation.observed_at,
+            self.policy.leave_start_seconds,
+            self.policy.leave_start_min_observations,
+        ):
+            return []
+        self.state = SlotState.LEAVING
+        transitions = [_TimedTransition.LEAVING]
+        if self._leave_ready(observation.observed_at):
+            self.state = SlotState.VACANT
+            self.assigned_track_id = None
+            self._clear_run()
+            transitions.append(_TimedTransition.VACANT)
+        return transitions
+
+    def _from_leaving(
+        self, observation: SlotObservation, present: bool
+    ) -> List[_TimedTransition]:
+        if present:
+            self.state = SlotState.OCCUPIED
+            self.assigned_track_id = observation.track_id
+            self._clear_all_runs()
+            return []
+
+        self._continue_run(observation.observed_at)
+        if not self._leave_ready(observation.observed_at):
+            return []
+        self.state = SlotState.VACANT
+        self.assigned_track_id = None
+        self._clear_run()
+        return [_TimedTransition.VACANT]
+
+    def _start_run(self, observed_at: float) -> None:
+        self._run_started_at = observed_at
+        self._evidence_count = 1
+
+    def _continue_run(self, observed_at: float) -> None:
+        if self._run_started_at is None or self._known_gap_exceeded(observed_at):
+            self._start_run(observed_at)
+            return
+        self._evidence_count += 1
+
+    def _continue_opposite_run(self, observed_at: float) -> None:
+        if (
+            self._opposite_run_started_at is None
+            or self._known_gap_exceeded(observed_at)
+        ):
+            self._opposite_run_started_at = observed_at
+            self._opposite_evidence_count = 1
+            return
+        self._opposite_evidence_count += 1
+
+    def _known_gap_exceeded(self, observed_at: float) -> bool:
+        if self._last_known_at is None:
+            return False
+        return (
+            observed_at - self._last_known_at
+            > self.policy.max_known_gap_seconds
+        )
+
+    def _enter_ready(self, observed_at: float) -> bool:
+        return self._run_ready(
+            observed_at,
+            self.policy.enter_seconds,
+            self.policy.enter_min_observations,
+        )
+
+    def _leave_ready(self, observed_at: float) -> bool:
+        return self._run_ready(
+            observed_at,
+            self.policy.leave_seconds,
+            self.policy.leave_min_observations,
+        )
+
+    def _run_ready(
+        self, observed_at: float, required_seconds: float, required_count: int
+    ) -> bool:
+        return self._run_values_ready(
+            self._run_started_at,
+            self._evidence_count,
+            observed_at,
+            required_seconds,
+            required_count,
+        )
+
+    @staticmethod
+    def _run_values_ready(
+        run_started_at: Optional[float],
+        evidence_count: int,
+        observed_at: float,
+        required_seconds: float,
+        required_count: int,
+    ) -> bool:
+        if run_started_at is None:
+            return False
+        elapsed = observed_at - run_started_at
+        return evidence_count >= required_count and elapsed >= required_seconds
+
+    def _clear_run(self) -> None:
+        self._run_started_at = None
+        self._evidence_count = 0
+
+    def _clear_opposite_run(self) -> None:
+        self._opposite_run_started_at = None
+        self._opposite_evidence_count = 0
+
+    def _clear_all_runs(self) -> None:
+        self._clear_run()
+        self._clear_opposite_run()
 
 
 @dataclass
@@ -111,6 +404,7 @@ class SlotStateMachine:
         confirm_leave_frames: int = 8,
         is_violation_zone: bool = False,
         initial_state: SlotState = SlotState.VACANT,
+        observation_policy: Optional[SlotObservationPolicy] = None,
     ):
         """
         Args:
@@ -126,6 +420,7 @@ class SlotStateMachine:
         self.slot_id = slot_id
         self.confirm_enter_frames = confirm_enter_frames
         self.confirm_leave_frames = confirm_leave_frames
+        self.observation_policy = observation_policy or SlotObservationPolicy()
 
         # Current state
         self.state: SlotState = initial_state
@@ -160,10 +455,17 @@ class SlotStateMachine:
         self._enter_resets: int = 0
         self._leave_resets: int = 0
 
+        self._timed_hysteresis: Optional[_TimedHysteresis] = None
+        if self.observation_policy.mode in {"shadow", "time"}:
+            self._timed_hysteresis = _TimedHysteresis(
+                self.observation_policy,
+                initial_state,
+            )
+
     @property
     def is_occupied(self) -> bool:
-        """True if the slot is confirmed occupied."""
-        return self.state == SlotState.OCCUPIED
+        """True until departure is confirmed, including the LEAVING grace."""
+        return self.state in {SlotState.OCCUPIED, SlotState.LEAVING}
 
     @property
     def is_violation_zone(self) -> bool:
@@ -172,7 +474,7 @@ class SlotStateMachine:
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the slot's current status."""
-        return {
+        status = {
             "slot_id": self.slot_id,
             "state": self.state.value,
             "assigned_track_id": self.assigned_track_id,
@@ -185,6 +487,11 @@ class SlotStateMachine:
             "plate_locked": self.plate_locked,
             "plate_confidence": self.plate_confidence,
         }
+        if self._timed_hysteresis is not None:
+            shadow_state = self._timed_hysteresis.state
+            status["time_policy_state"] = shadow_state.value
+            status["time_policy_disagrees"] = shadow_state != self.state
+        return status
 
     def is_plate_locked(self) -> bool:
         """True once the bound plate has been frozen for this slot."""
@@ -232,6 +539,78 @@ class SlotStateMachine:
         vehicle_present: bool,
         track_id: Optional[int] = None,
     ) -> List[SlotEvent]:
+        """Compatibility wrapper for callers with a fresh inference result."""
+        observation = SlotObservation(
+            kind=(
+                SlotObservationKind.PRESENT
+                if vehicle_present
+                else SlotObservationKind.ABSENT
+            ),
+            observed_at=time.monotonic(),
+            timestamp=datetime.now().isoformat(),
+            track_id=track_id,
+        )
+        return self.observe(observation)
+
+    def observe(self, observation: SlotObservation) -> List[SlotEvent]:
+        """Apply known evidence or hold state for an UNKNOWN observation."""
+        mode = self.observation_policy.mode
+        if mode == "time":
+            return self._update_timed(observation)
+
+        if self._timed_hysteresis is not None:
+            self._timed_hysteresis.observe(observation)
+        if observation.kind == SlotObservationKind.UNKNOWN:
+            return []
+        return self._update_legacy(observation)
+
+    def _update_timed(self, observation: SlotObservation) -> List[SlotEvent]:
+        timed = self._timed_hysteresis
+        if timed is None:
+            raise RuntimeError("time mode requires a timed hysteresis reducer")
+
+        previous_state = self.state
+        old_track = self.assigned_track_id
+        transitions = timed.observe(observation)
+        self.state = timed.state
+        self.assigned_track_id = timed.assigned_track_id
+        if observation.kind != SlotObservationKind.UNKNOWN:
+            self.last_update_time = observation.timestamp
+
+        events = [
+            self._timed_event(transition, observation, old_track)
+            for transition in transitions
+        ]
+        if (
+            _TimedTransition.VACANT in transitions
+            or previous_state == SlotState.ENTERING
+            and self.state == SlotState.VACANT
+        ):
+            self.clear_identity()
+        return events
+
+    def _timed_event(
+        self,
+        transition: _TimedTransition,
+        observation: SlotObservation,
+        old_track: Optional[int],
+    ) -> SlotEvent:
+        track_id = self.assigned_track_id
+        if transition == _TimedTransition.LEAVING:
+            track_id = old_track
+        elif transition == _TimedTransition.VACANT:
+            track_id = old_track
+        return SlotEvent(
+            event_type=transition.value,
+            slot_id=self.slot_id,
+            track_id=track_id,
+            timestamp=observation.timestamp,
+        )
+
+    def _update_legacy(
+        self,
+        observation: SlotObservation,
+    ) -> List[SlotEvent]:
         """
         Process one frame of observation and return any triggered events.
 
@@ -243,7 +622,9 @@ class SlotStateMachine:
             List of SlotEvent objects (empty if no transition occurred).
         """
         events: List[SlotEvent] = []
-        now = datetime.now().isoformat()
+        vehicle_present = observation.kind == SlotObservationKind.PRESENT
+        track_id = observation.track_id
+        now = observation.timestamp
 
         # ----- VACANT -----
         if self.state == SlotState.VACANT:
@@ -252,7 +633,7 @@ class SlotStateMachine:
                 self.state = SlotState.ENTERING
                 self.assigned_track_id = track_id
                 self._enter_counter = 1
-                self._enter_started_at = time.monotonic()
+                self._enter_started_at = observation.observed_at
                 self.last_update_time = now
                 events.append(SlotEvent(
                     event_type="vehicle_entering",
@@ -314,7 +695,7 @@ class SlotStateMachine:
                 # Vehicle not detected — start leaving
                 self.state = SlotState.LEAVING
                 self._leave_counter = 1
-                self._leave_started_at = time.monotonic()
+                self._leave_started_at = observation.observed_at
                 self.last_update_time = now
                 events.append(SlotEvent(
                     event_type="vehicle_leaving",

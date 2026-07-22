@@ -1,21 +1,28 @@
+import hashlib
 import logging
+import math
 import os
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from collections import Counter
-
 from src.matching.match_decision import Decision
 from src.matching.plate_ocr_match import (
     confirm_plate,
     is_plausible_plate,
+    normalize as normalize_plate_text,
     read_matches_plate,
 )
-from src.vehicle_registry.vehicle_registry_models import ParkEntryCandidate, VehicleSession
+from src.utils.datetime_helper import normalize_timestamp_for_clock
+from src.vehicle_registry.errors import ValidatedEntrySupersededByExit
+from src.vehicle_registry.vehicle_registry_models import (
+    ParkEntryCandidate,
+    VehicleSession,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +66,208 @@ class SlotOcrPlan:
     rejected: List["RejectedCandidate"]
     allow_retry: bool
     decision_ctx: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class ParkedReferenceProof:
+    """Independent evidence required before a parked crop may be learned.
+
+    The entry proof lives on ``VehicleSession``. This second proof belongs to
+    the exact parked crop: OCR read the expected plate with its confidence, and
+    ReID ranked the same session against the other eligible cars.
+    """
+
+    plate: str
+    session_id: str
+    slot_id: str
+    camera_id: str
+    crop_sha256: str
+    view_quality: float
+    neighbour_clearance: float
+    ocr_text: str
+    ocr_confidence: float
+    reid_score: float
+    reid_margin: float
+    reid_rank: int
+
+
+def parked_crop_fingerprint(crop_bgr: np.ndarray) -> str:
+    """Stable digest binding scalar evidence to one exact in-memory crop."""
+    if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
+        return ""
+    try:
+        crop = np.ascontiguousarray(crop_bgr)
+        digest = hashlib.sha256()
+        digest.update(str(tuple(crop.shape)).encode("ascii"))
+        digest.update(str(crop.dtype).encode("ascii"))
+        digest.update(crop.tobytes())
+        return digest.hexdigest()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _camera_key(value: object) -> str:
+    return str(value or "").upper().replace("-", "").replace("_", "")
+
+
+def _finite_between(value: object, minimum: float, maximum: float) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and minimum <= number <= maximum
+
+
+def _entry_gallery_proof_matches_session(session: VehicleSession) -> bool:
+    """Revalidate immutable entry evidence against mutable live-session state."""
+    proof = getattr(session, "gallery_entry_proof", None)
+    if not isinstance(proof, dict) or proof.get("policy") != "entry_v2_gallery_v1":
+        return False
+    if proof.get("decision_id") != session.event_id:
+        return False
+    if proof.get("crossing_id") != session.candidate_id:
+        return False
+    if normalize_plate_text(proof.get("canonical_plate")) != normalize_plate_text(
+        session.plate
+    ):
+        return False
+    if proof.get("requires_parked_ocr") is not True:
+        return False
+
+    role = str(proof.get("crossing_role") or "")
+    source = str(proof.get("ocr_source") or "")
+    camera = _camera_key(proof.get("crossing_camera_id"))
+    if (role, source, camera) not in {
+        ("primary", "primary", "CAM23"),
+        ("fallback", "fallback", "CAM03"),
+    }:
+        return False
+    if not all(
+        (
+            _finite_between(proof.get("reid_score"), 0.85, 1.0),
+            _finite_between(proof.get("reid_row_margin"), 0.12, 2.0),
+            _finite_between(proof.get("reid_column_margin"), 0.12, 2.0),
+            _finite_between(proof.get("ocr_confidence"), 0.90, 1.0),
+        )
+    ):
+        return False
+    if normalize_plate_text(proof.get("ocr_text")) != normalize_plate_text(
+        session.plate
+    ):
+        return False
+
+    path = proof.get("authorization_path")
+    evidence_ids = proof.get("ocr_evidence_ids")
+    if not isinstance(evidence_ids, list) or not evidence_ids:
+        return False
+    if path == "exact_plate":
+        expected_reason = f"reid_and_{source}_ocr_exact"
+        return bool(
+            session.gallery_entry_authorization_reason == expected_reason
+            and proof.get("corrected") is False
+            and _finite_between(proof.get("reported_confidence"), 0.90, 1.0)
+            and normalize_plate_text(proof.get("reported_plate"))
+            == normalize_plate_text(session.plate)
+        )
+    if path == "corrected_plate":
+        return bool(
+            session.gallery_entry_authorization_reason
+            == "reid_and_independent_ocr_correction"
+            and proof.get("corrected") is True
+            and len(set(str(item) for item in evidence_ids)) >= 2
+        )
+    return False
+
+
+def _strict_parked_proof_matches_session(
+    session: VehicleSession,
+    plate: str,
+    camera_id: str,
+    crop_bgr: np.ndarray,
+    proof: object,
+    matching_config: object,
+    active_plates: List[str],
+) -> bool:
+    """Revalidate all live and crop-local authority for one gallery commit."""
+    # A strict parked OCR witness must come from a detected plate ROI. Full-car
+    # fallback can read dashboard/HUD/background text and is therefore never
+    # strong enough to authorize permanent learning.
+    if (
+        getattr(matching_config, "slot_lpd_enabled", False) is not True
+        or getattr(matching_config, "slot_lpd_fallback_enabled", True) is not False
+    ):
+        return False
+    if not isinstance(proof, ParkedReferenceProof):
+        return False
+    if (
+        not session.gallery_entry_authorized
+        or not _entry_gallery_proof_matches_session(session)
+        or not session.ocr_confirmed
+        or session.status != "parked"
+        or not session.linked_slot
+        or _camera_key(session.linked_camera) != _camera_key(camera_id)
+    ):
+        return False
+    if (
+        normalize_plate_text(session.plate) != normalize_plate_text(plate)
+        or normalize_plate_text(proof.plate) != normalize_plate_text(plate)
+        or proof.session_id != session.session_id
+        or proof.slot_id != session.linked_slot
+        or _camera_key(proof.camera_id) != _camera_key(camera_id)
+        or proof.crop_sha256 != parked_crop_fingerprint(crop_bgr)
+    ):
+        return False
+    try:
+        ocr_floor = float(
+            getattr(matching_config, "gallery_parked_ocr_min_confidence", 0.90)
+        )
+        reid_floor = float(
+            getattr(matching_config, "gallery_parked_reid_min_score", 0.70)
+        )
+        margin_floor = float(
+            getattr(matching_config, "gallery_parked_reid_min_margin", 0.15)
+        )
+        view_floor = float(
+            getattr(matching_config, "gallery_min_view_quality", 0.90)
+        )
+        clearance_floor = float(
+            getattr(
+                matching_config,
+                "gallery_parked_min_neighbour_clearance",
+                0.90,
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+    # These are policy floors, not tuning defaults. Configuration may make the
+    # admission stricter, but it cannot lower the assurance promised to the user.
+    ocr_floor = max(0.90, ocr_floor)
+    reid_floor = max(0.70, reid_floor)
+    margin_floor = max(0.15, margin_floor)
+    view_floor = max(0.90, view_floor)
+    clearance_floor = max(0.90, clearance_floor)
+    if not all(
+        (
+            _finite_between(proof.ocr_confidence, ocr_floor, 1.0),
+            _finite_between(proof.reid_score, reid_floor, 1.0),
+            _finite_between(proof.reid_margin, margin_floor, 2.0),
+            _finite_between(proof.view_quality, view_floor, 1.0),
+            _finite_between(
+                proof.neighbour_clearance,
+                clearance_floor,
+                1.0,
+            ),
+        )
+    ):
+        return False
+    if (
+        isinstance(proof.reid_rank, bool)
+        or not isinstance(proof.reid_rank, int)
+        or proof.reid_rank != 1
+    ):
+        return False
+    confirmed = confirm_plate(proof.ocr_text, active_plates)
+    return normalize_plate_text(confirmed) == normalize_plate_text(plate)
 
 
 @dataclass(frozen=True)
@@ -223,6 +432,29 @@ _REF_MIN_SIDE_PX = 24
 # the sensor: either the frame itself, or a car so close it is a poor reference
 # anyway. Re-derive if the stream resolution changes.
 _REF_MAX_SIDE_PX = 2400
+
+
+def _resolve_zoned_camera(area_registry, camera_id: str) -> Tuple[str, str]:
+    """Resolve one accepted camera spelling to its configured canonical ID."""
+    exact_area = area_registry.area_for_camera(camera_id)
+    if exact_area:
+        return camera_id, exact_area
+
+    key = "".join(character for character in camera_id.upper() if character.isalnum())
+    matches = [
+        (configured_camera, area_id)
+        for area_id in area_registry.all_area_ids()
+        for configured_camera in area_registry.cameras(area_id)
+        if "".join(
+            character
+            for character in configured_camera.upper()
+            if character.isalnum()
+        )
+        == key
+    ]
+    if len(matches) != 1:
+        return "", ""
+    return matches[0]
 
 
 def is_plausible_car_crop(crop_bgr) -> bool:
@@ -1242,7 +1474,6 @@ class VehicleRegistryIdentityMixin:
 
         best_candidate = None
         best_score = 0.0
-        best_decision = None
         hard_rejected_candidate_ids = set()
 
         for _, candidate in provisional_pairs:
@@ -1362,7 +1593,6 @@ class VehicleRegistryIdentityMixin:
             if score > best_score and (score_pass or ensemble_confirm):
                 best_score = score
                 best_candidate = candidate
-                best_decision = verdict
 
                 # Compute old score in parallel for logging (single-shot ReID)
                 if current_reid_feat is not None and candidate.feature_vector is not None:
@@ -1438,10 +1668,6 @@ class VehicleRegistryIdentityMixin:
             if current_reid_feat is not None
             else best_candidate.feature_vector
         )
-        reference_feature_vectors = [
-            feature for feature in session_reference_features if feature is not None
-        ]
-
         # Heavy half of gallery persistence (embedding + snapshot writes)
         # happens BEFORE the registry lock; only the cheap assignment runs
         # under it. Reuses the features already extracted for the match above
@@ -2223,6 +2449,296 @@ class VehicleRegistryIdentityMixin:
             )
             return session_id
 
+    def _load_persisted_gallery_references(
+        self,
+        plate: str,
+    ) -> List[Tuple[np.ndarray, str]]:
+        """Load only store-verified history, re-embedding after model changes."""
+        store = self.gallery_store
+        if store is None or not plate or not store.has(plate):
+            return []
+        try:
+            vectors, tag, cameras = store.load_vectors(plate)
+            if not vectors or tag != store._model_tag:
+                crops, crop_cameras = store.load_crops(plate)
+                vectors, cameras = [], []
+                if crops:
+                    for feature, camera_id in zip(
+                        self.reid_matcher.extract_features_batch(crops),
+                        crop_cameras,
+                    ):
+                        if feature is not None:
+                            vectors.append(feature)
+                            cameras.append(camera_id)
+            if len(cameras) < len(vectors):
+                cameras = cameras + [""] * (len(vectors) - len(cameras))
+            return list(zip(vectors, cameras))
+        except Exception as exc:
+            logger.warning(
+                "[gallery] verified history load failed for %s: %r",
+                plate,
+                exc,
+            )
+            return []
+
+    def register_validated_entry(
+        self,
+        *,
+        plate: str,
+        decision_id: str,
+        attempt_id: str,
+        crossing_id: str,
+        timestamp: datetime,
+        crossing_camera_id: str,
+        crossing_feature_vectors,
+        attempt_feature_vectors,
+        gallery_authorization=None,
+    ) -> str:
+        """Create one matchable session after strict V2 validation.
+
+        The CAM23 embedding is the primary inside-garage anchor. ANPR vehicle
+        embeddings are retained only as additional cross-view references. Entry
+        pixels are not retained. A separate high-confidence authorization is
+        carried forward so a later OCR-confirmed parked crop may be persisted.
+        ``decision_id`` is the idempotency key for camera/callback retries.
+        """
+        if not plate or not decision_id or not crossing_id:
+            raise ValueError("validated entry identity is incomplete")
+
+        timestamp = normalize_timestamp_for_clock(timestamp, self._clock())
+
+        crossing_area = ""
+        area_registry = getattr(self, "_area_registry", None)
+        if area_registry is not None and area_registry.enabled:
+            configured_camera_id, configured_area = _resolve_zoned_camera(
+                area_registry, crossing_camera_id
+            )
+            if not configured_area or not area_registry.exists(configured_area):
+                raise ValueError(
+                    "validated entry crossing camera has no configured zoning area"
+                )
+            crossing_camera_id = configured_camera_id
+            crossing_area = configured_area
+
+        def _vector(value):
+            array = np.asarray(value, dtype=np.float32).reshape(-1)
+            norm = float(np.linalg.norm(array))
+            if array.size == 0 or norm <= 0.0 or not np.isfinite(array).all():
+                return None
+            return array / norm
+
+        crossing_vectors = [
+            vector
+            for vector in (_vector(value) for value in crossing_feature_vectors)
+            if vector is not None
+        ]
+        if not crossing_vectors:
+            raise ValueError("validated entry has no CAM23 embedding")
+
+        references = list(crossing_vectors[1:])
+        reference_cameras = [crossing_camera_id] * len(references)
+        for camera_id, value in attempt_feature_vectors:
+            vector = _vector(value)
+            if vector is not None:
+                references.append(vector)
+                reference_cameras.append(camera_id or "")
+
+        # A returning car must actually benefit from its strict parked history.
+        # Keep this visit's crossing vector primary, then merge only verified
+        # durable refs from earlier visits as secondary same-/cross-view anchors.
+        dedup_cosine = float(
+            getattr(self._matching_config, "gallery_dedup_cosine", 0.97)
+        )
+        for value, camera_id in self._load_persisted_gallery_references(plate):
+            vector = _vector(value)
+            if vector is None:
+                continue
+            existing_vectors = crossing_vectors + references
+            if any(float(np.dot(vector, existing)) > dedup_cosine for existing in existing_vectors):
+                continue
+            references.append(vector)
+            reference_cameras.append(camera_id or "")
+
+        cap = max(1, int(self._matching_config.gallery_max_refs_per_car))
+        if len(references) > cap:
+            from src.vehicle_registry.gallery_store import select_diverse_indices
+
+            keep_indices = set(select_diverse_indices(references, cap, seed_index=0))
+            references = [
+                vector
+                for index, vector in enumerate(references)
+                if index in keep_indices
+            ]
+            reference_cameras = [
+                camera_id
+                for index, camera_id in enumerate(reference_cameras)
+                if index in keep_indices
+            ]
+        proof_camera_id = str(
+            getattr(gallery_authorization, "crossing_camera_id", "") or ""
+        )
+        proof_matches_handoff = bool(
+            gallery_authorization is not None
+            and getattr(gallery_authorization, "authorized", False)
+            and getattr(gallery_authorization, "decision_id", None) == decision_id
+            and getattr(gallery_authorization, "crossing_id", None) == crossing_id
+            and normalize_plate_text(
+                getattr(gallery_authorization, "canonical_plate", "")
+            )
+            == normalize_plate_text(plate)
+            and proof_camera_id.upper().replace("-", "").replace("_", "")
+            == crossing_camera_id.upper().replace("-", "").replace("_", "")
+        )
+        gallery_authorized = proof_matches_handoff
+        gallery_authorization_reason = (
+            str(getattr(gallery_authorization, "reason", "") or "")
+            if proof_matches_handoff
+            else ""
+        )
+        if gallery_authorization is not None and not proof_matches_handoff:
+            logger.warning(
+                "[EntryV2] Ignored gallery authorization that did not bind to "
+                "the registered decision/crossing/plate/camera decision=%s plate=%s",
+                decision_id,
+                plate,
+            )
+        gallery_entry_proof: Dict[str, object] = {}
+        if proof_matches_handoff:
+            crossing_role = getattr(gallery_authorization, "crossing_role", "")
+            gallery_entry_proof = {
+                "policy": "entry_v2_gallery_v1",
+                "decision_id": getattr(gallery_authorization, "decision_id", ""),
+                "authorization_path": getattr(
+                    gallery_authorization, "authorization_path", ""
+                ),
+                "canonical_plate": getattr(
+                    gallery_authorization, "canonical_plate", ""
+                ),
+                "crossing_id": getattr(gallery_authorization, "crossing_id", ""),
+                "crossing_camera_id": getattr(
+                    gallery_authorization, "crossing_camera_id", ""
+                ),
+                "crossing_role": getattr(crossing_role, "value", crossing_role),
+                "reported_plate": getattr(
+                    gallery_authorization, "reported_plate", None
+                ),
+                "reported_confidence": getattr(
+                    gallery_authorization, "reported_confidence", None
+                ),
+                "reid_score": getattr(gallery_authorization, "reid_score", None),
+                "reid_row_margin": getattr(
+                    gallery_authorization, "reid_row_margin", None
+                ),
+                "reid_column_margin": getattr(
+                    gallery_authorization, "reid_column_margin", None
+                ),
+                "ocr_source": getattr(gallery_authorization, "ocr_source", ""),
+                "ocr_text": getattr(gallery_authorization, "ocr_text", ""),
+                "ocr_confidence": getattr(
+                    gallery_authorization, "ocr_confidence", None
+                ),
+                "ocr_evidence_ids": list(
+                    getattr(gallery_authorization, "ocr_evidence_ids", ())
+                ),
+                "corrected": bool(
+                    getattr(gallery_authorization, "corrected", False)
+                ),
+                "requires_parked_ocr": bool(
+                    getattr(gallery_authorization, "requires_parked_ocr", True)
+                ),
+            }
+        session_id = f"entryv2_{uuid.uuid5(uuid.NAMESPACE_URL, decision_id).hex[:12]}"
+        session = VehicleSession(
+            session_id=session_id,
+            plate=plate,
+            feature_vector=crossing_vectors[0],
+            reference_feature_vectors=references,
+            reference_source_cameras=reference_cameras,
+            first_seen_at=timestamp,
+            last_seen_at=timestamp,
+            last_seen_camera=crossing_camera_id,
+            event_id=decision_id,
+            candidate_id=crossing_id,
+            status="confirmed",
+            gate_reference_only=False,
+            area_entered_at=timestamp if crossing_area else None,
+            gallery_entry_authorized=gallery_authorized,
+            gallery_entry_authorization_reason=gallery_authorization_reason,
+            gallery_entry_proof=gallery_entry_proof,
+        )
+        if session.gallery_entry_authorized and not _entry_gallery_proof_matches_session(
+            session
+        ):
+            logger.warning(
+                "[EntryV2] Gallery authorization failed independent scalar/role/"
+                "source validation decision=%s plate=%s",
+                decision_id,
+                plate,
+            )
+            session.gallery_entry_authorized = False
+            session.gallery_entry_authorization_reason = ""
+            session.gallery_entry_proof = {}
+
+        released_slots: List[str] = []
+        with self._lock:
+            existing = self._sessions.get(session_id)
+            if existing is not None:
+                if existing.plate != plate or existing.candidate_id != crossing_id:
+                    raise ValueError("validated entry decision reused inconsistently")
+                return existing.session_id
+
+            # PMS commits the session before VA publishes this live identity.
+            # An exit can therefore arrive through the legacy VA exit route in
+            # that narrow interval.  Serialize the exit stamp and identity
+            # insertion under the registry lock: an exit at or after this
+            # physical crossing wins, while an older exit belongs to a prior
+            # visit and must not suppress a genuine re-entry.
+            latest_exit_at = self._last_anpr_exit_at.get(plate)
+            if latest_exit_at is not None and timestamp <= latest_exit_at:
+                raise ValidatedEntrySupersededByExit(
+                    self._last_anpr_exit_source_at.get(plate, latest_exit_at)
+                )
+
+            # Insert/index first so an index failure cannot evict a usable old
+            # identity. Once this succeeds, the strict new gate admission is the
+            # authority for reclaiming stale same-plate VA state.
+            self._sessions[session_id] = session
+            try:
+                self._gallery_index_upsert_strict(session)
+            except Exception:
+                self._sessions.pop(session_id, None)
+                self._drop_session_from_area_index(session)
+                try:
+                    self._gallery_index_remove_strict(session_id)
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        "validated entry gallery rollback failed"
+                    ) from rollback_error
+                raise
+            released_slots = self._claim_plate_globally(
+                plate,
+                keep_session_id=session_id,
+                timestamp=timestamp,
+            )
+            if crossing_area:
+                self.set_session_area(session, crossing_area)
+            self._last_anpr_entry_at[plate] = timestamp
+
+        for slot_id in released_slots:
+            self._clear_slot_db_binding(slot_id)
+
+        logger.info(
+            "[EntryV2] Registered validated identity decision=%s plate=%s "
+            "crossing=%s refs=%d gallery_authorized=%s gallery_reason=%s",
+            decision_id,
+            plate,
+            crossing_id,
+            1 + len(references),
+            gallery_authorized,
+            gallery_authorization_reason,
+        )
+        return session_id
+
     def record_reference_for_track(
         self,
         camera_id: str,
@@ -2230,9 +2746,12 @@ class VehicleRegistryIdentityMixin:
         crop_bgr: np.ndarray,
         view_quality: float,
     ) -> bool:
-        """Engine-facing wrapper: resolve the (camera, track)'s session and add a
-        gallery reference for it. No-op when the track has no session or the
-        session has no plate yet. See :meth:`accumulate_reference`."""
+        """Legacy engine wrapper for generic reference accumulation.
+
+        Strict persistent mode always returns ``False`` from
+        :meth:`accumulate_reference`; only a crop-local parked OCR/ReID proof may
+        write there. This wrapper remains for explicitly non-strict legacy use.
+        """
         with self._lock:
             sid = self._track_session_map.get((camera_id, track_id))
             session = self._sessions.get(sid) if sid else None
@@ -2247,18 +2766,27 @@ class VehicleRegistryIdentityMixin:
         camera_id: str,
         view_quality: float,
     ) -> bool:
-        """Add one quality-gated reference view to a plate's growing gallery.
+        """Add one quality-gated reference view to a legacy non-strict gallery.
 
         Grows ``session.reference_feature_vectors`` (which
         ``match_global_session`` already scores against) AND persists the crop +
         embedding to the plate's on-disk folder so it survives restart. Gated:
         persistence enabled, plate known, full view, sharp enough; throttled to
         one add per (plate, camera) per interval; deduped against existing refs;
-        capped in-memory (disk cap handled by the store). No-op / False when any
-        gate fails. Poor crops are rejected so the gallery is not poisoned.
+        capped in-memory (disk cap handled by the store). Strict mode rejects
+        this generic path because it has no crop-local OCR witness. No-op / False
+        when any gate fails.
         """
         store = self.gallery_store
         if store is None or session is None or not getattr(session, "plate", None):
+            return False
+        if getattr(
+            self._matching_config, "gallery_strict_admission_enabled", True
+        ):
+            # A generic tracking crop has no crop-local OCR witness. Even after
+            # one parked reference passes, letting later tracking frames write
+            # would reopen the poisoning path. In strict mode every durable
+            # image must enter through save_parked_reference with its own proof.
             return False
         if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
             return False
@@ -4810,6 +5338,85 @@ class VehicleRegistryIdentityMixin:
         )
         return plate
 
+    def build_parked_reference_proof(
+        self,
+        plan: "SlotOcrPlan",
+        plate: str,
+        ocr_text: str,
+        ocr_confidence: float,
+        crop_bgr: np.ndarray,
+    ) -> Optional[ParkedReferenceProof]:
+        """Build crop-local gallery proof from the already-computed OCR/ReID.
+
+        Binding and learning deliberately have different bars. The slot may be
+        named by OCR consensus or another recovery path, but a crop can be
+        learned only when this exact frame also placed that plate in the ReID
+        ranking. Missing/ambiguous evidence returns ``None`` (abstain).
+        """
+        crop_sha256 = parked_crop_fingerprint(crop_bgr)
+        if not plate or not ocr_text or not crop_sha256:
+            return None
+        try:
+            confidence = float(ocr_confidence)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(confidence):
+            return None
+        decision_ctx = plan.decision_ctx or {}
+        try:
+            view_quality = float(decision_ctx.get("gallery_view_quality", 0.0))
+            neighbour_clearance = float(
+                decision_ctx.get("gallery_neighbour_clearance", 0.0)
+            )
+        except (TypeError, ValueError):
+            return None
+        if not (
+            np.isfinite(view_quality)
+            and 0.0 <= view_quality <= 1.0
+            and np.isfinite(neighbour_clearance)
+            and 0.0 <= neighbour_clearance <= 1.0
+        ):
+            return None
+
+        ranked = sorted(
+            (candidate for candidate in plan.kept if candidate.plate),
+            key=lambda candidate: candidate.score,
+            reverse=True,
+        )
+        selected_index = next(
+            (
+                index
+                for index, candidate in enumerate(ranked)
+                if candidate.plate == plate
+            ),
+            None,
+        )
+        if selected_index is None:
+            return None
+        selected = ranked[selected_index]
+        runner_score = max(
+            (
+                candidate.score
+                for candidate in ranked
+                if candidate.plate != selected.plate
+            ),
+            default=0.0,
+        )
+        return ParkedReferenceProof(
+            plate=plate,
+            session_id=selected.session_id,
+            slot_id=plan.slot_id,
+            camera_id=plan.camera_id or "",
+            crop_sha256=crop_sha256,
+            view_quality=view_quality,
+            neighbour_clearance=neighbour_clearance,
+            ocr_text=str(ocr_text),
+            ocr_confidence=confidence,
+            reid_score=float(selected.score),
+            reid_margin=float(selected.score - runner_score),
+            reid_rank=selected_index + 1,
+        )
+
     def confirm_slot_ocr_consensus(
         self, slot_id: str, ocr_text: str, *, gen_token: Any = None
     ) -> Optional[str]:
@@ -4937,8 +5544,14 @@ class VehicleRegistryIdentityMixin:
             session.last_seen_camera = camera_id
             return session.plate
 
-    def save_parked_reference(self, plate: str, crop_bgr, camera_id: str) -> bool:
-        """Teach the gallery this car's PARKED POSE, on an OCR-VERIFIED identity.
+    def save_parked_reference(
+        self,
+        plate: str,
+        crop_bgr,
+        camera_id: str,
+        proof: Optional[ParkedReferenceProof] = None,
+    ) -> bool:
+        """Teach a strictly verified parked pose to the durable gallery.
 
         This is the reference the system has never been able to get, and the reason it
         could never recognise a parked car. Every gallery reference until now came from
@@ -4958,14 +5571,57 @@ class VehicleRegistryIdentityMixin:
         one (0.736) — which is what will let a side-on slot like B1_CRO, whose camera can
         never see a plate, be recognised on the car's second visit.
 
-        Deliberately bypasses the accumulate path's occupied-slot guard: that guard exists
-        to stop a MIS-BOUND car poisoning a gallery, and there is no mis-binding here.
+        In strict mode the crop is admitted only when two independent proof
+        stages agree: (1) this visit was authorized from the post-PMS-ACK Entry
+        V2 ANPR + CAM-23/CAM-03 decision; and (2) this exact parked crop has a
+        high-confidence OCR read and a unique, high-margin ReID rank. Recovery
+        paths may still bind a slot, but they are deliberately unable to teach.
         """
         if not plate or crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
             return False
         store = getattr(self, "gallery_store", None)
         if store is None:
             return False
+        cfg = self._matching_config
+        strict = bool(getattr(cfg, "gallery_strict_admission_enabled", True))
+
+        with self._lock:
+            matching_sessions = [
+                session
+                for session in self._sessions.values()
+                if session.plate == plate
+                and session.status in ("confirmed", "parked")
+            ]
+            if len(matching_sessions) != 1:
+                return False
+            session = matching_sessions[0]
+            active_plates = sorted(
+                {
+                    candidate.plate
+                    for candidate in self._sessions.values()
+                    if candidate.plate
+                    and candidate.status in ("confirmed", "parked", "provisional")
+                }
+            )
+            if strict and (
+                self._parked.get(session.linked_slot) is not session
+                or not _strict_parked_proof_matches_session(
+                    session,
+                    plate,
+                    camera_id,
+                    crop_bgr,
+                    proof,
+                    cfg,
+                    active_plates,
+                )
+            ):
+                logger.info(
+                    "[gallery] Refused parked ref plate=%s: live entry, slot, "
+                    "OCR, ReID, crop, or camera proof is incomplete",
+                    plate,
+                )
+                return False
+
         # OCR proves WHOSE car this is. It does not prove the box contains one car —
         # a detector box spanning this car and its neighbour still reads the plate.
         if not is_plausible_car_crop(crop_bgr):
@@ -4975,35 +5631,216 @@ class VehicleRegistryIdentityMixin:
                 "x".join(str(d) for d in crop_bgr.shape[1::-1]),
             )
             return False
+
+        try:
+            crop_height, crop_width = crop_bgr.shape[:2]
+            min_crop_area = max(
+                12_000.0,
+                float(getattr(cfg, "gallery_min_crop_area", 12_000.0) or 0.0),
+            )
+            if crop_height * crop_width < min_crop_area:
+                return False
+            from src.reid_matcher.reid_burst import sharpness_score
+
+            min_sharpness = max(
+                40.0,
+                float(getattr(cfg, "gallery_min_sharpness", 40.0) or 0.0),
+            )
+            if sharpness_score(crop_bgr) < min_sharpness:
+                return False
+        except Exception:
+            return False
+
+        gt_hsv = getattr(session, "ground_truth_hsv", None)
+        if gt_hsv is not None:
+            try:
+                from src.reid_matcher import body_colour_compatible, dominant_color_hsv
+
+                crop_hsv = dominant_color_hsv(crop_bgr)
+                if crop_hsv is not None and not body_colour_compatible(
+                    crop_hsv, gt_hsv
+                ):
+                    return False
+            except Exception:
+                return False
+
         try:
             feature = self.reid_matcher.extract_feature(crop_bgr)
             if feature is None:
                 return False
-            store.save_ref(
-                plate,
-                crop_bgr,
-                feature,
-                quality=1.0,
-                camera_id=camera_id,
-                gate_only=False,
-            )
-        except Exception as exc:
-            logger.warning("[ocr-id] parked-pose save failed for %s: %r", plate, exc)
-            return False
+            with self._lock:
+                live = self._sessions.get(session.session_id)
+                if live is not session:
+                    return False
+                active_plates = sorted(
+                    {
+                        candidate.plate
+                        for candidate in self._sessions.values()
+                        if candidate.plate
+                        and candidate.status
+                        in ("confirmed", "parked", "provisional")
+                    }
+                )
+                # Re-run the complete authority gate after feature extraction and
+                # immediately before the disk commit. Exit/vacate, slot reassignment,
+                # plate correction, a newly ambiguous OCR candidate, or proof mutation
+                # while inference was running therefore causes an abstention.
+                if strict and (
+                    self._parked.get(live.linked_slot) is not live
+                    or not _strict_parked_proof_matches_session(
+                        live,
+                        plate,
+                        camera_id,
+                        crop_bgr,
+                        proof,
+                        cfg,
+                        active_plates,
+                    )
+                ):
+                    return False
+                gt_similarity = self._best_ground_truth_similarity(feature, live)
+                min_gt_similarity = max(
+                    0.45,
+                    float(
+                        getattr(
+                            cfg,
+                            "gallery_accumulate_min_gt_similarity",
+                            0.45,
+                        )
+                        or 0.0
+                    ),
+                )
+                if (
+                    gt_similarity is not None
+                    and gt_similarity < min_gt_similarity
+                ):
+                    return False
+                fresh_ranked, _ = self.reid_rank(
+                    feature,
+                    slot_id=live.linked_slot,
+                    slot_camera=camera_id,
+                    k=GLOBAL_MATCH_RANK,
+                )
+                fresh_selected = next(
+                    (
+                        candidate
+                        for candidate in fresh_ranked
+                        if candidate.session_id == live.session_id
+                        and normalize_plate_text(candidate.plate)
+                        == normalize_plate_text(plate)
+                    ),
+                    None,
+                )
+                fresh_runner = max(
+                    (
+                        candidate.score
+                        for candidate in fresh_ranked
+                        if candidate.session_id != live.session_id
+                    ),
+                    default=0.0,
+                )
+                fresh_reid_score = (
+                    float(fresh_selected.score) if fresh_selected is not None else -1.0
+                )
+                fresh_reid_margin = fresh_reid_score - float(fresh_runner)
+                if (
+                    fresh_selected is None
+                    or fresh_selected.rank != 1
+                    or not _finite_between(
+                        fresh_reid_score,
+                        max(
+                            0.70,
+                            float(
+                                getattr(
+                                    cfg,
+                                    "gallery_parked_reid_min_score",
+                                    0.70,
+                                )
+                            ),
+                        ),
+                        1.0,
+                    )
+                    or not _finite_between(
+                        fresh_reid_margin,
+                        max(
+                            0.15,
+                            float(
+                                getattr(
+                                    cfg,
+                                    "gallery_parked_reid_min_margin",
+                                    0.15,
+                                )
+                            ),
+                        ),
+                        2.0,
+                    )
+                ):
+                    return False
+                if any(
+                    reference is not None
+                    and self.reid_matcher.compute_similarity(feature, reference)
+                    > float(getattr(cfg, "gallery_dedup_cosine", 0.97))
+                    for reference in [live.feature_vector]
+                    + list(live.reference_feature_vectors)
+                ):
+                    return False
+                admission = None
+                evidence_id = None
+                quality = 1.0
+                if strict and proof is not None:
+                    evidence_id = (
+                        f"parked:{live.event_id or live.session_id}:"
+                        f"{live.linked_slot}:{camera_id}"
+                    )
+                    admission = {
+                        "verified": True,
+                        "policy": "entry_v2_parked_v1",
+                        "entry_decision_id": live.event_id,
+                        "entry_reason": live.gallery_entry_authorization_reason,
+                        "entry_proof": dict(live.gallery_entry_proof),
+                        "parked_slot": live.linked_slot,
+                        "parked_camera": camera_id,
+                        "parked_ocr_text": proof.ocr_text,
+                        "parked_ocr_confidence": proof.ocr_confidence,
+                        "parked_reid_score": fresh_reid_score,
+                        "parked_reid_margin": fresh_reid_margin,
+                        "parked_reid_rank": fresh_selected.rank,
+                        "parked_view_quality": proof.view_quality,
+                        "parked_neighbour_clearance": proof.neighbour_clearance,
+                    }
+                    quality = min(
+                        float(proof.view_quality),
+                        float(proof.neighbour_clearance),
+                    )
+                saved = store.save_ref(
+                    plate,
+                    crop_bgr,
+                    feature,
+                    quality=quality,
+                    camera_id=camera_id,
+                    gate_only=False,
+                    evidence_id=evidence_id,
+                    admission=admission,
+                )
+                if not saved:
+                    return False
 
-        with self._lock:
-            session = next(
-                (s for s in self._sessions.values() if s.plate == plate), None
-            )
-            if session is not None and feature is not None:
-                session.reference_feature_vectors.append(feature)
-                self._sync_reference_cameras(session)
+                live.reference_feature_vectors.append(feature)
+                self._sync_reference_cameras(live)
                 # _sync_reference_cameras only PADS with "", so the ref would score as
                 # an unknown (secondary) camera until a restart reloaded it from disk —
                 # where save_ref did record camera_id. The slot-pose scorer keys off this
                 # tag to recognise a same-view reference, so it must be set here.
-                session.reference_source_cameras[-1] = camera_id or ""
-                self._gallery_index_upsert(session)
+                live.reference_source_cameras[-1] = camera_id or ""
+                cap = max(1, int(cfg.gallery_max_refs_per_car))
+                if len(live.reference_feature_vectors) > cap:
+                    live.reference_feature_vectors = live.reference_feature_vectors[-cap:]
+                    live.reference_source_cameras = live.reference_source_cameras[-cap:]
+                live.gallery_parked_verified = True
+                self._gallery_index_upsert(live)
+        except Exception as exc:
+            logger.warning("[ocr-id] parked-pose save failed for %s: %r", plate, exc)
+            return False
 
         logger.info(
             "[ocr-id] gallery LEARNED the parked pose of %s from %s — next time this "
@@ -5591,42 +6428,105 @@ class VehicleRegistryIdentityMixin:
                 released.append(slot_id)
         return released
 
-    def _handle_exit(self, plate: str, timestamp: datetime) -> None:
-        """
-        Close a parked session and purge all record of a plate when it exits.
-        Ensures the system 'forgets' the vehicle completely upon exit.
-        """
-        # Retention: keep the plate's on-disk gallery for a future return
-        # (warm-start), just stamp the exit time so the TTL GC ages it from now.
-        # The in-memory purge below still runs — a car outside the facility must
-        # never match a car inside.
-        store = self.gallery_store
-        if store is not None and plate:
-            try:
-                store.stamp_exit(plate, timestamp)
-            except Exception as exc:  # pragma: no cover - disk best-effort
-                logger.debug("[gallery] stamp_exit failed for %s: %r", plate, exc)
-        # Re-entry grace: stamp the exit time for BOTH callers of _handle_exit
-        # (the ANPR exit branch AND the exit-janitor). A plain missed-exit keeps
-        # entry_at <= exit_at (predicate False -> still evicted); only a NEW ANPR
-        # entry after this stamp makes _has_fresh_reentry True.
-        if plate:
-            self._last_anpr_exit_at[plate] = timestamp
-        # Drop this plate's accumulation-throttle entries so the map doesn't
-        # grow unbounded over a long-running process.
-        for key in [k for k in self._gallery_last_add if k[0] == plate]:
-            self._gallery_last_add.pop(key, None)
+    def _handle_exit(
+        self,
+        plate: str,
+        timestamp: datetime,
+        *,
+        source_timestamp: Optional[datetime] = None,
+    ) -> None:
+        """Apply one physical exit without deleting a newer visit.
 
+        Delivery time is not event time: PMS may replay a spooled 09:00 exit
+        after the same plate has re-entered at 10:00.  The camera timestamp is
+        therefore the cutoff for every destructive mutation.  Sessions and
+        pending events newer than that cutoff belong to the later visit and are
+        preserved.  The exit tombstone is monotonic so an older replay cannot
+        replace a newer exit used by Entry V2's publication race guard.
+        """
+        # register_anpr_event already normalizes network input, while the exit
+        # janitor and a few internal callers invoke this method directly.  Keep
+        # the destructive boundary safe for both routes.
+        timestamp = normalize_timestamp_for_clock(timestamp, self._clock())
+
+        def _at_or_before(value: Optional[datetime]) -> bool:
+            if value is None:
+                return False
+            try:
+                return value <= timestamp
+            except TypeError:
+                # Unknown/mixed clock conventions must fail safe: preserving a
+                # record is recoverable, purging the wrong visit is not.
+                logger.warning(
+                    "[REGISTRY] Preserving %s state with incomparable timestamp "
+                    "%r against exit %r",
+                    plate,
+                    value,
+                    timestamp,
+                )
+                return False
+
+        def _after(value: Optional[datetime]) -> bool:
+            if value is None:
+                return False
+            try:
+                return value > timestamp
+            except TypeError:
+                return True
+
+        should_stamp_gallery = False
         with self._lock:
-            # 1. Find and close any active sessions for this plate (parked or driving).
+            # This stamp and the live-session purge are one atomic registry
+            # transition. Entry V2 publication checks the same stamp under the
+            # same lock, closing the callback-ACK -> identity-publish race.
+            # Both callers of _handle_exit (ANPR and exit janitor) participate.
+            previous_exit = self._last_anpr_exit_at.get(plate) if plate else None
+            if previous_exit is None:
+                advances_tombstone = bool(plate)
+            else:
+                try:
+                    advances_tombstone = timestamp > previous_exit
+                except TypeError:
+                    # Do not replace a tombstone whose ordering is unknowable.
+                    advances_tombstone = False
+                    logger.warning(
+                        "[REGISTRY] Refused incomparable exit tombstone update for "
+                        "%s: previous=%r incoming=%r",
+                        plate,
+                        previous_exit,
+                        timestamp,
+                    )
+            if advances_tombstone:
+                self._last_anpr_exit_at[plate] = timestamp
+                self._last_anpr_exit_source_at[plate] = (
+                    source_timestamp if source_timestamp is not None else timestamp
+                )
+            elif (
+                plate
+                and source_timestamp is not None
+                and previous_exit == timestamp
+            ):
+                # A direct/internal exit may have installed only the registry's
+                # naive clock form. An exact network replay can safely enrich
+                # that same boundary with its original aware source time.
+                self._last_anpr_exit_source_at[plate] = source_timestamp
+
+            # 1. Close only active sessions from this visit or an older one.
             sessions_to_remove = [
-                s for s in self._sessions.values() if s.plate == plate
+                session
+                for session in self._sessions.values()
+                if session.plate == plate
+                and _at_or_before(getattr(session, "first_seen_at", None))
             ]
             # Also include any parked session keyed under this plate whose object
             # has already left _sessions, so its slot still gets torn down.
             seen_ids = {s.session_id for s in sessions_to_remove}
             for sess in self._parked.values():
-                if sess.plate == plate and sess.session_id not in seen_ids:
+                if (
+                    sess.plate == plate
+                    and sess.session_id not in seen_ids
+                    and _at_or_before(getattr(sess, "first_seen_at", None))
+                ):
                     sessions_to_remove.append(sess)
                     seen_ids.add(sess.session_id)
 
@@ -5635,18 +6535,29 @@ class VehicleRegistryIdentityMixin:
                 self._close_session(session, reason="exit_event")
                 logger.info("[REGISTRY] Closed session %s for plate %s (Exit)", session.session_id, plate)
 
-            # 2. Purge any PENDING/PROVISIONAL ANPR events for this plate
-            # This prevents an old entry record from matching a future car
-            events_to_remove = []
+            # 2. Purge only pending/provisional records captured no later than
+            # this exit.  A newer event is the next visit and must survive an
+            # out-of-order spool replay.
+            events_to_remove: List[str] = []
+            preserved_newer_candidate = False
             for event_id, event in self._pending_events.items():
-                if event.plate == plate:
+                if event.plate == plate and _at_or_before(event.timestamp):
                     events_to_remove.append(event_id)
-                    # If this event was bound to a candidate, kill the candidate too
+                    # A candidate can be bound late.  Drop it only when its own
+                    # physical observation also predates the exit; otherwise
+                    # detach and reopen that newer candidate.
                     if event.candidate_id:
-                        candidate = self._park_entry_candidates.pop(event.candidate_id, None)
-                        if candidate:
+                        candidate = self._park_entry_candidates.get(event.candidate_id)
+                        if candidate and _at_or_before(candidate.entered_at):
+                            self._park_entry_candidates.pop(event.candidate_id, None)
                             candidate.status = "dropped"
                             self._clear_candidate_references(candidate)
+                        elif candidate:
+                            preserved_newer_candidate = True
+                            if candidate.bound_event_id == event_id:
+                                candidate.bound_event_id = None
+                            if candidate.status == "provisional":
+                                candidate.status = "open"
 
             for event_id in events_to_remove:
                 self._pending_events.pop(event_id, None)
@@ -5655,7 +6566,49 @@ class VehicleRegistryIdentityMixin:
                         self._pending_event_order.remove(event_id)
                     except ValueError:
                         pass
-            
+
+            removed_event_ids = set(events_to_remove)
+            for camera_id, event_id in list(self._last_anpr_entry.items()):
+                if event_id in removed_event_ids:
+                    self._last_anpr_entry.pop(camera_id, None)
+
+            # A plate-wide gallery exit marker and accumulation reset are safe
+            # only when this is the newest known exit and no newer visit remains.
+            # The identity/pending maps are inspected after selective cleanup.
+            has_newer_visit = (
+                _after(self._last_anpr_entry_at.get(plate))
+                or any(
+                    session.plate == plate
+                    for session in self._sessions.values()
+                )
+                or any(
+                    event.plate == plate
+                    for event in self._pending_events.values()
+                )
+                or preserved_newer_candidate
+            )
+            should_stamp_gallery = advances_tombstone and not has_newer_visit
+            if should_stamp_gallery:
+                for key in [key for key in self._gallery_last_add if key[0] == plate]:
+                    self._gallery_last_add.pop(key, None)
+
             if sessions_to_remove or events_to_remove:
-                logger.info("[REGISTRY] Purged %d sessions and %d events for plate %s", 
-                            len(sessions_to_remove), len(events_to_remove), plate)
+                logger.info(
+                    "[REGISTRY] Purged %d sessions and %d events for plate %s "
+                    "at/before %s",
+                    len(sessions_to_remove),
+                    len(events_to_remove),
+                    plate,
+                    timestamp.isoformat(),
+                )
+
+        # Retention: keep the plate's on-disk gallery for a future return, but
+        # stamp it only for a newest exit that did not leave a newer visit live.
+        # Keep disk I/O outside the registry lock.
+        if should_stamp_gallery:
+            store = self.gallery_store
+            if store is not None:
+                try:
+                    store.stamp_exit(plate, timestamp)
+                except Exception as exc:  # pragma: no cover - disk best-effort
+                    logger.debug("[gallery] stamp_exit failed for %s: %r", plate, exc)

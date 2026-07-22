@@ -25,7 +25,9 @@ from src.core.engine.engine_runtime import (
 from src.core.engine.engine_single_process import ParkingEngineSingleProcessMixin
 from src.core.engine.engine_tracking import ParkingEngineTrackingMixin
 from src.core.engine.engine_visualization import ParkingEngineVisualizationMixin
+from src.core.motion_scheduler import validate_motion_runtime
 from src.detection.tracker import TrackedDetector
+from src.entry.local_zone import VA_HOST_DIRECT_READ_TIMESTAMP_SOURCE
 from src.events.event_bus import EventBus
 from src.models.slot import load_slots
 from src import perf_trace
@@ -50,10 +52,22 @@ class ParkingEngine(
     Single-camera mode: processes one video source.
     """
 
-    def __init__(self, config: AppConfig, vehicle_registry=None, db_manager=None):
+    def __init__(
+        self,
+        config: AppConfig,
+        vehicle_registry=None,
+        db_manager=None,
+        entry_coordinator=None,
+    ):
         self.config = config
         self.vehicle_registry = vehicle_registry
         self.db_manager = db_manager
+        self.entry_coordinator = entry_coordinator
+        self._entry_v2_local_bridge = None
+        if entry_coordinator is not None and entry_coordinator.available:
+            from src.entry.local_zone import LocalZoneCrossingBridge
+
+            self._entry_v2_local_bridge = LocalZoneCrossingBridge(entry_coordinator)
 
         # Detection / tracking are decoupled: ONE shared detection model (one
         # set of weights / one OpenVINO compiled model → RAM stays flat at 27
@@ -120,6 +134,15 @@ class ParkingEngine(
                 f"[INFO] Zoning enabled: {len(self.area_registry.all_area_ids())} "
                 f"area(s) — per-area ownership active."
             )
+
+    def _stop_entry_v2_local_bridge(self) -> None:
+        bridge = self._entry_v2_local_bridge
+        if bridge is None:
+            return
+        self._entry_v2_local_bridge = None
+        # Drain the bounded local crossing queue during controlled shutdown so
+        # an already-observed physical entry is not cancelled mid-inference.
+        bridge.close(wait=True)
 
     def _build_tracked_detector(self) -> TrackedDetector:
         """Construct a fresh TrackedDetector using the current config."""
@@ -256,7 +279,16 @@ class ParkingEngine(
         if not self.model_loaded:
             _degrade("model not loaded")
 
-        return {
+        local_entry_metrics = None
+        if self._entry_v2_local_bridge is not None:
+            local_entry_metrics = self._entry_v2_local_bridge.metrics()
+            if not local_entry_metrics["healthy"]:
+                _degrade(
+                    "entry v2 local-zone ingestion failed "
+                    f"({local_entry_metrics['last_error']})"
+                )
+
+        result = {
             "status": status,
             "health_reasons": reasons,
             "engine_running": self.is_running,
@@ -275,6 +307,9 @@ class ParkingEngine(
             "frames_processed": self._frame_count,
             "db_ok": db_ok,
         }
+        if local_entry_metrics is not None:
+            result["entry_v2_local_zone"] = local_entry_metrics
+        return result
 
     def _bootstrap_camera_runtime(self):
         """Shared setup for both processing loops: open cameras, build pipelines,
@@ -347,6 +382,10 @@ class ParkingEngine(
 
     def run_multi_camera(self) -> None:
         """Multi-camera round-robin processing loop."""
+        validate_motion_runtime(
+            self.config.motion_scheduler.mode,
+            scheduler_available=False,
+        )
         camera_configs = self._bootstrap_camera_runtime()
         if camera_configs is None:
             return
@@ -378,7 +417,9 @@ class ParkingEngine(
                 # (main thread; each is re-validated against its slot first).
                 self._drain_slot_ocr_results()
                 with perf_trace.stage("fetch"):
-                    cam_id, frame = self.cam_manager.next_frame()
+                    cam_id, frame, capture_ts, _ = (
+                        self.cam_manager.next_frame_stamped()
+                    )
                 if cam_id is None:
                     print("[WARN] All cameras unavailable. Retrying in 5s...")
                     time.sleep(5)
@@ -426,7 +467,11 @@ class ParkingEngine(
                 # preserving the "exclude out-of-area cars" behaviour at no cost.
                 detections = self._detector_for(cam_id).detect_and_track(frame, cam_id)
                 assignment = self._process_detections_and_events(
-                    cam_id, frame, pipeline, detections
+                    cam_id,
+                    frame,
+                    pipeline,
+                    detections,
+                    capture_ts=capture_ts,
                 )
 
                 self._frame_count += 1
@@ -453,6 +498,7 @@ class ParkingEngine(
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted - shutting down.")
         finally:
+            self._stop_entry_v2_local_bridge()
             self._stop_slot_ocr_worker()
             self.cam_manager.close_all()
             if show:
@@ -536,6 +582,7 @@ class ParkingEngine(
                 if not ret:
                     print("[INFO] End of video stream.")
                     break
+                frame_read_ts = time.time()
 
                 frame_idx += 1
                 if frame_idx % frame_skip != 0:
@@ -547,7 +594,13 @@ class ParkingEngine(
                 # detector at the model's small input size).
                 detections = self._detector_for(camera_id).detect_and_track(frame, camera_id)
                 detections = pipeline.filter_detections_to_roi(detections)
-                self._process_special_zones(camera_id, frame, detections)
+                self._process_special_zones(
+                    camera_id,
+                    frame,
+                    detections,
+                    capture_ts=frame_read_ts,
+                    timestamp_source=VA_HOST_DIRECT_READ_TIMESTAMP_SOURCE,
+                )
                 assignment = pipeline.assigner.assign(detections)
 
                 all_events = []
@@ -630,6 +683,7 @@ class ParkingEngine(
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted - shutting down.")
         finally:
+            self._stop_entry_v2_local_bridge()
             cap.release()
             if show:
                 cv2.destroyAllWindows()

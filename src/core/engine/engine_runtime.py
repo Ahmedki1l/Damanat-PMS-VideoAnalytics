@@ -13,7 +13,16 @@ from src.camera_manager import CameraConfig
 from src.core.engine.camera_pipeline import CameraPipeline
 from src.detection.tracking_manager import TrackingManager
 from src.detection.detector import is_untracked
-from src.models.state_machine import SlotEvent, SlotState
+from src.entry.local_zone import (
+    VA_HOST_GRAB_TIMESTAMP_SOURCE,
+    normalized_zone_id,
+)
+from src.models.state_machine import (
+    SlotEvent,
+    SlotObservation,
+    SlotObservationKind,
+    SlotState,
+)
 from src.services.parking_service import (
     bootstrap_camera_slots_from_json,
     load_camera_slots,
@@ -26,6 +35,7 @@ from src.vehicle_registry.vehicle_registry_identity import (
 
 
 logger = logging.getLogger(__name__)
+_CAM23_DIAGNOSTIC_INTERVAL_SECONDS = 10.0
 
 # Sentinel returned by _get_slot_alert_type for a NAMED slot whose occupant is not
 # identified yet. It means "cannot decide" — distinct from None ("the owner, no
@@ -1218,9 +1228,20 @@ class ParkingEngineRuntimeMixin:
         # parking_slots.current_plate / the SlotStatus row, not via the occupancy
         # event payload, so a late answer enriches the record rather than delaying it.
         with perf_trace.stage("zones"):
-            self._process_special_zones(cam_id, frame, detections)
+            self._process_special_zones(
+                cam_id,
+                frame,
+                detections,
+                capture_ts=capture_ts,
+            )
         with perf_trace.stage("identity"):
-            self._update_slot_identity(cam_id, frame, pipeline, slot_ctx)
+            self._update_slot_identity(
+                cam_id,
+                frame,
+                pipeline,
+                slot_ctx,
+                detections=detections,
+            )
         # Deadline check on named slots still waiting for identity. Runs after the
         # identity pass so a plate that just landed settles the verdict properly
         # (owner => silent) rather than racing the timeout. Costs one dict scan over
@@ -1228,39 +1249,74 @@ class ParkingEngineRuntimeMixin:
         self._sweep_pending_ownership(time.time())
         return assignment
 
-    def _process_special_zones(self, cam_id: str, frame, detections) -> None:
-        if cam_id == "CAM-23":
-            logger.info(
-                "[PARK_ENTRY][DIAG] CAM-23 frame: registry=%s detections=%d track_ids=%s",
-                self.vehicle_registry is not None,
-                len(detections) if detections else 0,
-                [d.track_id for d in detections] if detections else [],
-            )
+    def _process_special_zones(
+        self,
+        cam_id: str,
+        frame,
+        detections,
+        *,
+        capture_ts=None,
+        timestamp_source: str = VA_HOST_GRAB_TIMESTAMP_SOURCE,
+    ) -> None:
+        if cam_id == "CAM-23" and logger.isEnabledFor(logging.DEBUG):
+            now = time.monotonic()
+            last_diagnostic_at = getattr(self, "_cam23_diagnostic_at", 0.0)
+            if now - last_diagnostic_at >= _CAM23_DIAGNOSTIC_INTERVAL_SECONDS:
+                self._cam23_diagnostic_at = now
+                logger.debug(
+                    "[PARK_ENTRY][DIAG] CAM-23 frame: registry=%s "
+                    "detections=%d track_ids=%s",
+                    self.vehicle_registry is not None,
+                    len(detections) if detections else 0,
+                    [d.track_id for d in detections] if detections else [],
+                )
+        camera_special_zones = self.special_zones.get(cam_id, {})
+        self._process_entry_v2_local_zones(
+            cam_id,
+            frame,
+            detections or [],
+            camera_special_zones,
+            capture_ts=capture_ts,
+            timestamp_source=timestamp_source,
+        )
+
         if not self.vehicle_registry or not detections:
             return
 
-        camera_special_zones = self.special_zones.get(cam_id, {})
-
-        if cam_id == "CAM-23" and "Park_Entry" in camera_special_zones:
+        park_entry_zone = next(
+            (
+                zone
+                for zone_id, zone in camera_special_zones.items()
+                if normalized_zone_id(zone_id) == "parkentry"
+            ),
+            None,
+        )
+        if cam_id == "CAM-23" and park_entry_zone is not None:
             self._process_park_entry_zone(
                 cam_id,
                 frame,
                 detections,
-                camera_special_zones["Park_Entry"],
+                park_entry_zone,
             )
 
-        if "Entrence" in "".join(camera_special_zones.keys()):
-            confirmation_zone = next(
-                (zone for zone_id, zone in camera_special_zones.items() if "Entrence" in zone_id),
-                None,
-            )
-            if confirmation_zone:
-                self._process_confirmation_zone(
-                    cam_id,
-                    frame,
-                    detections,
-                    confirmation_zone,
+        confirmation_zone = next(
+            (
+                zone
+                for zone_id, zone in camera_special_zones.items()
+                if any(
+                    marker in normalized_zone_id(zone_id)
+                    for marker in ("b1entry", "entrance", "entrence")
                 )
+            ),
+            None,
+        )
+        if confirmation_zone:
+            self._process_confirmation_zone(
+                cam_id,
+                frame,
+                detections,
+                confirmation_zone,
+            )
 
         # Ground-floor cameras run YOLO occupancy only — skip all ReID embedding
         # compute (TrackingManager feature extraction + global tracking). This
@@ -1328,7 +1384,15 @@ class ParkingEngineRuntimeMixin:
     _OCR_ID_MAX_ATTEMPTS = 12
     _OCR_ID_MIN_INTERVAL_S = 0.7
 
-    def _try_ocr_identify(self, cam_id, frame, slot, state_machine, detection) -> None:
+    def _try_ocr_identify(
+        self,
+        cam_id,
+        frame,
+        slot,
+        state_machine,
+        detection,
+        detections=None,
+    ) -> None:
         """Read the plate off a car that has just PARKED, bind it, lock it, and learn it.
 
         Armed ONLY by a VACANT -> OCCUPIED transition (see ``_arm_ocr_for_slot``), so a
@@ -1387,6 +1451,32 @@ class ParkingEngineRuntimeMixin:
         if crop is None or crop.size == 0:
             return
 
+        # Crop-local quality evidence considers every vehicle detection in the
+        # frame. Clearance is measured over the exact 10%-padded rectangle sent
+        # to OCR/ReID, so a readable but contaminated crop can bind a slot while
+        # remaining ineligible for durable teaching.
+        view_quality_fn = getattr(self, "_bbox_view_quality", None)
+        clearance_fn = getattr(self, "_neighbour_clearance", None)
+        try:
+            gallery_view_quality = float(
+                view_quality_fn(frame, detection, detections)
+                if callable(view_quality_fn)
+                else 0.0
+            )
+            gallery_neighbour_clearance = float(
+                clearance_fn(
+                    detection,
+                    detections,
+                    frame_shape=frame.shape,
+                    padding_ratio=0.1,
+                )
+                if callable(clearance_fn)
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            gallery_view_quality = 0.0
+            gallery_neighbour_clearance = 0.0
+
         self._ocr_id_attempts[slot.id] = attempts + 1
         self._ocr_id_last_at[slot.id] = now_ts
         self._ocr_group_last_at = now_ts
@@ -1408,6 +1498,8 @@ class ParkingEngineRuntimeMixin:
             # Per-occupancy token so multi-frame OCR consensus keys its votes to THIS car
             # and a re-armed slot never inherits the previous occupant's reads.
             "gen_token": (getattr(self, "_ocr_generation", {}) or {}).get(slot.id),
+            "gallery_view_quality": gallery_view_quality,
+            "gallery_neighbour_clearance": gallery_neighbour_clearance,
         }
 
         # ASYNC: plan the read here (ReID ranking is main-thread), hand the heavy
@@ -1430,17 +1522,35 @@ class ParkingEngineRuntimeMixin:
             )
             return
 
-        # SYNC (matching.slot_ocr_async = false): read inline, exactly as before.
-        plate = self.vehicle_registry.try_ocr_identify_slot(
+        # SYNC (matching.slot_ocr_async = false): keep the plan and scalar OCR
+        # evidence so the exact parked crop can later prove it is safe to learn.
+        plan = self.vehicle_registry.plan_slot_ocr(
             slot.id, crop, cam_id, decision_ctx=decision_ctx
+        )
+        if plan is None:
+            return
+        ocr_text, ocr_confidence = self.vehicle_registry.read_slot_plate(
+            crop, plan.allow_retry, slot_id=slot.id
+        )
+        plate = self.vehicle_registry.confirm_slot_ocr(
+            plan, crop, ocr_text, ocr_confidence
         )
         if not plate:
             self._maybe_bind_reid_solo(
                 cam_id, slot.id, state_machine, crop, attempts + 1, decision_ctx
             )
             return
+        proof = self.vehicle_registry.build_parked_reference_proof(
+            plan, plate, ocr_text, ocr_confidence, crop
+        )
         self._bind_ocr_identified_plate(
-            cam_id, slot.id, state_machine, plate, crop, attempts + 1
+            cam_id,
+            slot.id,
+            state_machine,
+            plate,
+            crop,
+            attempts + 1,
+            proof=proof,
         )
 
     def _ocr_worker_if_async(self):
@@ -1521,8 +1631,17 @@ class ParkingEngineRuntimeMixin:
             job.plan, job.crop, res.text, res.conf
         )
         if plate:
+            proof = self.vehicle_registry.build_parked_reference_proof(
+                job.plan, plate, res.text, res.conf, job.crop
+            )
             self._bind_ocr_identified_plate(
-                cam_id, slot_id, state_machine, plate, job.crop, job.attempts
+                cam_id,
+                slot_id,
+                state_machine,
+                plate,
+                job.crop,
+                job.attempts,
+                proof=proof,
             )
             return
         # OCR could not name it — fall through to appearance-only, same gates as sync.
@@ -1566,7 +1685,15 @@ class ParkingEngineRuntimeMixin:
         self._try_adopt_transit_identity(cam_id, tid, key, job.crop, now_ts, detection)
 
     def _bind_ocr_identified_plate(
-        self, cam_id, slot_id, state_machine, plate, crop, attempt_num
+        self,
+        cam_id,
+        slot_id,
+        state_machine,
+        plate,
+        crop,
+        attempt_num,
+        *,
+        proof=None,
     ) -> None:
         """READ, not inferred — bind it, LOCK it, stop reading this slot, learn the
         parked pose. Shared by the inline and async paths."""
@@ -1586,7 +1713,15 @@ class ParkingEngineRuntimeMixin:
         # We know who it is — settle any deferred named-slot ownership verdict.
         self._evaluate_named_slot_ownership(slot_id, cam_id, plate)
         # ...and teach the gallery this car's parked pose, now that we KNOW who it is.
-        self.vehicle_registry.save_parked_reference(plate, crop, cam_id)
+        saved = self.vehicle_registry.save_parked_reference(
+            plate, crop, cam_id, proof=proof
+        )
+        if not saved:
+            logger.info(
+                "[gallery] parked crop for %s was bound but not learned; strict "
+                "entry/OCR/ReID/quality admission did not pass",
+                plate,
+            )
 
     def _maybe_bind_reid_solo(
         self, cam_id, slot_id, state_machine, crop, attempt_num, decision_ctx
@@ -1772,8 +1907,26 @@ class ParkingEngineRuntimeMixin:
         all_events, slot_ctx = self._update_slot_occupancy(
             cam_id, frame, pipeline, assignment
         )
-        self._update_slot_identity(cam_id, frame, pipeline, slot_ctx)
+        assigned = [item[4] for item in slot_ctx if item[4] is not None]
+        all_detections = assigned + list(getattr(assignment, "unassigned", None) or [])
+        self._update_slot_identity(
+            cam_id,
+            frame,
+            pipeline,
+            slot_ctx,
+            detections=all_detections,
+        )
         return all_events
+
+    def _mark_slot_observations_unknown(self, pipeline) -> None:
+        """Hold every slot when this camera produced no trustworthy inference."""
+        observation = SlotObservation(
+            kind=SlotObservationKind.UNKNOWN,
+            observed_at=time.monotonic(),
+            timestamp=datetime.now().isoformat(),
+        )
+        for state_machine in pipeline.state_machines.values():
+            state_machine.observe(observation)
 
     def _update_slot_occupancy(self, cam_id: str, frame, pipeline, assignment):
         """PHASE 1 — is the slot occupied? Nothing here may wait on identity.
@@ -2100,7 +2253,15 @@ class ParkingEngineRuntimeMixin:
                 seq, ts, slot.id, cam_id, state_machine.state.value, had, need,
             )
 
-    def _update_slot_identity(self, cam_id: str, frame, pipeline, slot_ctx) -> None:
+    def _update_slot_identity(
+        self,
+        cam_id: str,
+        frame,
+        pipeline,
+        slot_ctx,
+        *,
+        detections=None,
+    ) -> None:
         """PHASE 2 — WHO is in the slot. Runs after occupancy has been emitted.
 
         Everything here is allowed to land a beat late: the plate reaches the UI
@@ -2110,6 +2271,11 @@ class ParkingEngineRuntimeMixin:
         Nothing in phase 1 reads what this writes, so deferring it cannot delay or
         change an occupancy decision.
         """
+        identity_detections = (
+            list(detections)
+            if detections is not None
+            else [item[4] for item in slot_ctx if item[4] is not None]
+        )
         for (
             slot, state_machine, vehicle_in_slot, track_id, detection,
             parked_events, plate_matching_enabled,
@@ -2138,7 +2304,14 @@ class ParkingEngineRuntimeMixin:
                 and state_machine.state == SlotState.OCCUPIED
                 and not state_machine.plate_number
             ):
-                self._try_ocr_identify(cam_id, frame, slot, state_machine, detection)
+                self._try_ocr_identify(
+                    cam_id,
+                    frame,
+                    slot,
+                    state_machine,
+                    detection,
+                    identity_detections,
+                )
 
             if (
                 self.vehicle_registry

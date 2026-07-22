@@ -160,11 +160,17 @@ class _Reg:
     def confirm_slot_ocr(self, plan, crop, text, conf):
         return self._confirm(plan, crop, text, conf) if self._confirm else None
 
+    def build_parked_reference_proof(self, plan, plate, text, conf, crop):
+        del plan, plate, text, conf, crop
+        return SimpleNamespace(authorized=True)
+
     def bind_plate_to_slot(self, slot_id, plate, cam_id, floor=None, source=""):
         self.bound.append((slot_id, plate, source))
 
-    def save_parked_reference(self, plate, crop, cam_id):
+    def save_parked_reference(self, plate, crop, cam_id, proof=None):
+        assert proof is not None
         self.saved.append((plate, cam_id))
+        return True
 
     def try_reid_identify_slot(self, *a, **k):
         return None

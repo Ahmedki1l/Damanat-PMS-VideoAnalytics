@@ -321,7 +321,9 @@ class OVInferCore:
         """Preprocess on the caller thread, then start an async OV forward.
 
         The completion callback (an OV worker thread) runs postprocess +
-        tracker.update and invokes ``done(detections, userdata)``. ``start_async``
+        tracker.update and invokes ``done(detections, userdata)``. A completion
+        failure passes ``None`` so downstream occupancy treats it as UNKNOWN,
+        never as an empty-scene observation. ``start_async``
         blocks when all ``nireq`` requests are busy, which is the design's natural
         back-pressure — the scheduler paces itself against the pool.
         """
@@ -346,7 +348,7 @@ class OVInferCore:
             detections = self._tracks_to_detections(tracks, frame_bgr.shape, results)
         except Exception as exc:  # never let one bad frame kill the OV worker
             print(f"[OVInferCore] completion error: {exc!r}")
-            detections = []
+            detections = None
         done(detections, ud)
 
     def wait_all(self) -> None:

@@ -40,6 +40,18 @@ class _FakeDB:
         return self._ok
 
 
+class _FakeLocalEntryBridge:
+    def __init__(self, *, healthy, last_error):
+        self._metrics = {
+            "healthy": healthy,
+            "last_error": last_error,
+            "queue_saturated": not healthy,
+        }
+
+    def metrics(self):
+        return dict(self._metrics)
+
+
 def _engine(*, running=True, age_s=1.0, cam=None, db=True, model=True):
     e = ParkingEngine.__new__(ParkingEngine)  # bypass heavy __init__
     e.is_running = running
@@ -52,6 +64,7 @@ def _engine(*, running=True, age_s=1.0, cam=None, db=True, model=True):
     e.start_time = time.time() - 100
     e._frame_count = 1234
     e.db_manager = _FakeDB(db) if db is not None else None
+    e._entry_v2_local_bridge = None
     return e
 
 
@@ -107,6 +120,23 @@ def test_no_db_configured_is_degraded_not_failed():
 
 def test_model_not_loaded_is_degraded():
     assert _status(cam=_FakeCam(20, [], [], 20), model=False) == "degraded"
+
+
+def test_local_entry_queue_saturation_degrades_engine_health():
+    engine = _engine(cam=_FakeCam(20, [], [], 20))
+    engine._entry_v2_local_bridge = _FakeLocalEntryBridge(
+        healthy=False,
+        last_error="local_zone_queue_capacity_exceeded",
+    )
+
+    status = engine.get_engine_status()
+
+    assert status["status"] == "degraded"
+    assert status["entry_v2_local_zone"]["queue_saturated"] is True
+    assert any(
+        "local_zone_queue_capacity_exceeded" in reason
+        for reason in status["health_reasons"]
+    )
 
 
 # --- HTTP contract --------------------------------------------------------- #

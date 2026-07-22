@@ -39,6 +39,19 @@ class _FakeRegistry:
         self.ocr_calls += 1
         return None
 
+    def plan_slot_ocr(self, slot_id, crop, cam_id, *, decision_ctx=None):
+        del slot_id, crop, cam_id, decision_ctx
+        return SimpleNamespace(allow_retry=False)
+
+    def read_slot_plate(self, crop, allow_retry, *, slot_id=None):
+        del crop, allow_retry, slot_id
+        self.ocr_calls += 1
+        return "", 0.0
+
+    def confirm_slot_ocr(self, plan, crop, text, confidence):
+        del plan, crop, text, confidence
+        return None
+
     def try_reid_identify_slot(self, slot_id, crop, cam_id, *, is_reserved=False,
                                decision_ctx=None):
         self.reid_calls += 1
