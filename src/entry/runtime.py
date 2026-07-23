@@ -28,7 +28,11 @@ class _DisabledSink:
         return DeliveryResult(False, 0, "entry_v2_unavailable")
 
 
-def build_entry_coordinator(registry) -> EntryCoordinator:
+def build_entry_coordinator(
+    registry,
+    *,
+    image_dir: str | None = None,
+) -> EntryCoordinator:
     settings = EntrySettings.from_env()
     errors = settings.configuration_errors()
     if errors:
@@ -45,7 +49,11 @@ def build_entry_coordinator(registry) -> EntryCoordinator:
             _DisabledSink(),
         )
 
-    processor = ExistingModelsEvidenceProcessor(registry, settings)
+    processor = ExistingModelsEvidenceProcessor(
+        registry,
+        settings,
+        image_dir=image_dir,
+    )
     client = HttpConfirmationClient(
         settings.callback_url,
         settings.service_key,

@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import math
+import os
+import re
+import tempfile
 import threading
+from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple
 
 from .domain import (
@@ -14,6 +21,9 @@ from .domain import (
 from .settings import EntrySettings
 
 
+logger = logging.getLogger(__name__)
+PLATE_CROP_SUBDIRECTORY = "entry_plate_crops"
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _JPEG_START_OF_FRAME_MARKERS = frozenset(
     {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 )
@@ -86,12 +96,23 @@ class ExistingModelsEvidenceProcessor:
     Every multipart image is contractually a vehicle crop (burst crops are
     allowed; Hikvision plate-only/OSD parts are not). Plate OCR is run only on a plate ROI
     produced by the local detector; it never OCRs a raw/full camera frame.  No
-    image is retained on this object or in the returned evidence.
+    image is retained on this object or in the returned evidence. When an image
+    directory is supplied, each LPD plate crop is also written to the dedicated
+    ``entry_plate_crops`` diagnostics folder after OCR scores it.
     """
 
-    def __init__(self, registry, settings: EntrySettings):
+    def __init__(
+        self,
+        registry,
+        settings: EntrySettings,
+        *,
+        image_dir: Optional[str] = None,
+    ):
         self._registry = registry
         self._settings = settings
+        self._plate_crop_dir = (
+            Path(image_dir) / PLATE_CROP_SUBDIRECTORY if image_dir else None
+        )
         self._lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self._reid = None
@@ -173,6 +194,14 @@ class ExistingModelsEvidenceProcessor:
                         text=str(text or ""),
                         confidence=float(confidence or 0.0),
                     )
+                    self._save_plate_crop(
+                        plate_crop,
+                        event_id=event_id,
+                        camera_id=camera_id,
+                        source_role=source_role,
+                        frame_index=index,
+                        plate=plate,
+                    )
                 evidence.append(
                     FrameEvidence(
                         evidence_id=frame_id,
@@ -186,6 +215,94 @@ class ExistingModelsEvidenceProcessor:
         if not any(item.embedding for item in evidence):
             raise EvidenceUnavailable("reid_embedding_unavailable")
         return tuple(evidence)
+
+    def _save_plate_crop(
+        self,
+        crop,
+        *,
+        event_id: str,
+        camera_id: str,
+        source_role: str,
+        frame_index: int,
+        plate: PlateEvidence,
+    ) -> None:
+        """Persist diagnostic plate evidence without affecting entry decisions."""
+        if self._plate_crop_dir is None:
+            return
+
+        confidence = (
+            f"{plate.confidence:.4f}"
+            if math.isfinite(plate.confidence)
+            and 0.0 <= plate.confidence <= 1.0
+            else "invalid"
+        )
+        filename = (
+            f"event-{self._event_filename_part(event_id)}"
+            f"__camera-{self._safe_filename_part(camera_id, max_length=32)}"
+            f"__role-{self._safe_filename_part(source_role, max_length=24)}"
+            f"__frame-{frame_index:02d}"
+            f"__ocr-confidence-{confidence}"
+            f"__{plate.state.value}.jpg"
+        )
+        target = self._plate_crop_dir / filename
+        temporary_path: Optional[str] = None
+        try:
+            import cv2
+
+            encoded_ok, encoded = cv2.imencode(
+                ".jpg",
+                crop,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+            )
+            if not encoded_ok:
+                raise OSError("OpenCV could not encode the plate crop")
+
+            self._plate_crop_dir.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{filename}.",
+                suffix=".tmp",
+                dir=self._plate_crop_dir,
+            )
+            with os.fdopen(descriptor, "wb") as temporary_file:
+                temporary_file.write(encoded.tobytes())
+            os.replace(temporary_path, target)
+            temporary_path = None
+            logger.info(
+                "[EntryV2][plate-crop] saved path=%s ocr_confidence=%.4f state=%s",
+                target,
+                plate.confidence,
+                plate.state.value,
+            )
+        except Exception:
+            logger.warning(
+                "[EntryV2][plate-crop] save failed path=%s; entry analysis continues",
+                target,
+                exc_info=True,
+            )
+        finally:
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.debug(
+                        "[EntryV2][plate-crop] temporary cleanup failed path=%s",
+                        temporary_path,
+                        exc_info=True,
+                    )
+
+    @staticmethod
+    def _safe_filename_part(value: str, *, max_length: int) -> str:
+        cleaned = _UNSAFE_FILENAME_CHARS.sub("-", str(value or "")).strip("._-")
+        return (cleaned or "unknown")[:max_length]
+
+    @classmethod
+    def _event_filename_part(cls, event_id: str) -> str:
+        raw = str(event_id or "")
+        readable = cls._safe_filename_part(raw, max_length=64)
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        return f"{readable}-{digest}"
 
     def _models(self):
         with self._lock:

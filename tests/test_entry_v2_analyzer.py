@@ -24,13 +24,15 @@ class FakePlateDetector:
 
 
 class FakeOCR:
-    def __init__(self):
+    def __init__(self, text="1234ABC", confidence=0.94):
         self.kwargs = None
+        self.text = text
+        self.confidence = confidence
 
     def read(self, crop, **kwargs):
         assert crop.shape == (8, 14, 3)
         self.kwargs = kwargs
-        return "1234ABC", 0.94
+        return self.text, self.confidence
 
 
 class MatchDecision:
@@ -94,6 +96,107 @@ def test_existing_model_adapter_marks_no_lpd_box_as_no_plate_without_ocr():
     )
     assert result[0].plate.state == PlateReadState.NO_PLATE
     assert ocr.kwargs is None
+
+
+@pytest.mark.parametrize(
+    ("text", "confidence", "expected_state", "confidence_token"),
+    [
+        ("1234ABC", 0.94, PlateReadState.READABLE, "0.9400"),
+        ("", 0.27, PlateReadState.UNREADABLE, "0.2700"),
+        ("", float("nan"), PlateReadState.UNREADABLE, "invalid"),
+    ],
+)
+def test_existing_model_adapter_saves_lpd_crop_with_ocr_confidence_in_filename(
+    tmp_path, text, confidence, expected_state, confidence_token
+):
+    image_dir = tmp_path / "vehicle_images"
+    processor = ExistingModelsEvidenceProcessor(
+        Registry(FakePlateDetector(), FakeOCR(text=text, confidence=confidence)),
+        EntrySettings(),
+        image_dir=str(image_dir),
+    )
+
+    result = processor.analyze(
+        event_id="event/unsafe 1",
+        camera_id="CAM-23",
+        source_role="primary",
+        images=(jpeg_bytes(),),
+        metadata={},
+    )
+
+    saved = list((image_dir / "entry_plate_crops").glob("*.jpg"))
+    assert result[0].plate.state == expected_state
+    assert len(saved) == 1
+    assert f"ocr-confidence-{confidence_token}" in saved[0].name
+    assert expected_state.value in saved[0].name
+    assert "event-unsafe-1" in saved[0].name
+    assert cv2.imread(str(saved[0])).shape == (8, 14, 3)
+
+
+def test_existing_model_adapter_does_not_create_crop_folder_without_lpd_box(
+    tmp_path,
+):
+    image_dir = tmp_path / "vehicle_images"
+    processor = ExistingModelsEvidenceProcessor(
+        Registry(FakePlateDetector(present=False), FakeOCR()),
+        EntrySettings(),
+        image_dir=str(image_dir),
+    )
+
+    processor.analyze(
+        event_id="event-1",
+        camera_id="CAM-23",
+        source_role="primary",
+        images=(jpeg_bytes(),),
+        metadata={},
+    )
+
+    assert not (image_dir / "entry_plate_crops").exists()
+
+
+def test_existing_model_adapter_saves_each_lpd_crop_in_a_burst(tmp_path):
+    image_dir = tmp_path / "vehicle_images"
+    processor = ExistingModelsEvidenceProcessor(
+        Registry(FakePlateDetector(), FakeOCR()),
+        EntrySettings(),
+        image_dir=str(image_dir),
+    )
+
+    processor.analyze(
+        event_id="event-burst",
+        camera_id="CAM-23",
+        source_role="primary",
+        images=(jpeg_bytes(), jpeg_bytes()),
+        metadata={},
+    )
+
+    names = sorted(
+        path.name for path in (image_dir / "entry_plate_crops").glob("*.jpg")
+    )
+    assert len(names) == 2
+    assert any("__frame-00__" in name for name in names)
+    assert any("__frame-01__" in name for name in names)
+
+
+def test_existing_model_adapter_continues_when_crop_cannot_be_saved(tmp_path):
+    image_dir = tmp_path / "vehicle_images"
+    image_dir.write_bytes(b"not-a-directory")
+    processor = ExistingModelsEvidenceProcessor(
+        Registry(FakePlateDetector(), FakeOCR()),
+        EntrySettings(),
+        image_dir=str(image_dir),
+    )
+
+    result = processor.analyze(
+        event_id="event-1",
+        camera_id="CAM-23",
+        source_role="primary",
+        images=(jpeg_bytes(),),
+        metadata={},
+    )
+
+    assert result[0].plate.state == PlateReadState.READABLE
+    assert result[0].plate.confidence == pytest.approx(0.94)
 
 
 def test_existing_model_adapter_rejects_undecodable_image():

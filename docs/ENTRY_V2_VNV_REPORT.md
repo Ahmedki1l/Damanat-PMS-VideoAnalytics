@@ -66,8 +66,10 @@ The latest explicit user decisions take precedence over the earlier provisional 
   selected ANPR-exit-bounded open-journey policy. PMS's authenticated,
   offset-aware ANPR exit timestamp is the ordering boundary; missing exits
   backpressure at bounded capacity instead of causing eviction or a guess.
-- Entry request images remain transient. A later parked crop may persist only
-  through the strict, auditable gallery-admission exception described above.
+- Full entry request images remain transient. LPD plate ROIs passed to OCR may
+  persist only in the private diagnostic folder requested by the operator; a
+  later parked crop may persist separately through the strict, auditable
+  gallery-admission exception described above.
 - Motion is per camera and schedules inference only. Motion must never declare occupancy or vacancy.
 - Gate-open/barrier state is out of scope.
 
@@ -97,7 +99,7 @@ Status meanings: **PASS** = sufficient evidence at the stated level; **PARTIAL**
 | R05 | CAM-23 OCR is primary; ANPR-crop OCR is used only for absent/unreadable/low-confidence primary OCR. Reliable disagreement must abstain. | VA `src/entry/analyzer.py`; `src/entry/decision.py::resolve_plate`, `_resolve_primary`, `_resolve_fallback`, `_select_ocr`. | Primary exact-confirm, cached-fallback, low-confidence replacement, readable-conflict, and primary-before-fallback tests. | **PASS L2** |
 | R06 | A later exact reading may correct the same car; wrong hypotheses are superseded; an unrelated earlier car remains pending. Source-causal stage chronology must prevent a much-later primary from stealing an earlier fallback. | VA attempt grouping, causal projection/partition, unique assignment, correction evidence, and compaction in `src/entry/coordinator.py` and `src/entry/decision.py`. PMS commits only `canonical_plate`. | Same-car merge/correction, late-correct supersession, unrelated-earlier-preservation, producer-pair, future-attempt, and adversarial stage-order tests. | **PASS L2** |
 | R07 | No business TTL/FIFO/last-wins; long barrier waits remain eligible; capacity backpressures and false attempts are explicitly cancelled. Sequential post-confirm evidence is bounded by the authoritative ANPR exit source time. | VA `src/entry/coordinator.py::record_exit`, `_apply_exit_boundary_locked`, `_finalized_evidence_match_kind`, strict producer-pair deduplication, provisional crossing handling, exact pending-exit `cancel_pending`, and single-count capacity reservations; PMS source-time exit forwarding and non-ageing active-V2 exit spool. | Long-wait entry-time, no-eviction capacity, materialized-inflight single-count, strict producer-pair, pre-exit compaction, re-entry-before-exit-delivery release, late conflict, source-time, spool, and authenticated exact-key cancellation tests. | **PASS L2** for the selected ANPR-exit-bounded open-journey policy; effective exit delivery, NTP, and capacity under production failure remain L3/L4-unverified. |
-| R08 | Entry request images are RAM-only and are not saved as files/blobs/paths. | PMS transient vehicle cropping in `app/services/event_parser.py`; VA capability-checked in-memory multipart parsing and compact `FrameEvidence`. Unknown Starlette spool contracts fail closed. PMS `_save_legacy_multipart_image` remains for off/shadow compatibility. | Authoritative bounded-crop, decoded-pixel, large-file no-rollover, supported/unsupported spool-contract, no-file, no-image callback, and coordinator-no-bytes tests. | **PARTIAL**: authoritative Entry V2 complies. Off/shadow intentionally preserves legacy multipart snapshots and therefore does not satisfy a literal all-modes no-entry-image-storage rule. |
+| R08 | Full entry request images remain RAM-only. Only the LPD plate ROI actually passed to OCR may be written to the private `<snapshot_base_dir>/entry_plate_crops` diagnostic folder; it must not affect entry decisions, enter the database, or be exposed by the public snapshot route. | PMS transient vehicle cropping in `app/services/event_parser.py`; VA capability-checked in-memory multipart parsing, compact `FrameEvidence`, diagnostic persistence in `src/entry/analyzer.py`, resolved image-root wiring in `src/entry/runtime.py`, and the private-folder block in `src/api.py`. Unknown Starlette spool contracts fail closed. PMS `_save_legacy_multipart_image` remains for off/shadow compatibility. | Authoritative envelope/no-rollover/coordinator-no-bytes tests plus readable/unreadable diagnostic crop, no-LPD, filename/path safety, disk-failure continuation, runtime image-root, and private-route tests. | **PASS L2** for the V2 diagnostic exception; off/shadow still intentionally preserves additional legacy multipart snapshots and therefore does not satisfy a literal all-modes full-image no-file rule. Persistent-volume and retention operations remain L3-unverified. |
 | R09 | Confirmation/session work is atomic, idempotent, source-time ordered, and serialized against exits without new tables. | PMS `app/services/entry_state_lock.py`; `entry_confirmation_service.py`; `parking_session_service.py`; `entry_exit_service.py`. | Duplicate/lost-ACK, rollback, stale-after-exit, superseded-entry, re-entry, and mocked app-lock tests. | **PASS L2**; real two-connection SQL Server contention is **UNVERIFIED L3**. |
 | R10 | Exit delivery preserves the exact aware camera timestamp, closes the matching VA open journey, and survives transient delivery failures without repeating PMS mutations. | PMS `entry_exit_service.py` and `app/utils/core_backend_client.py`; VA `src/api.py`, `EntryCoordinator.record_exit`, reserved-callback exit reconciliation, and registry exit ordering. | Missing-source-time fail-closed, exact aware VA response echo despite a naive internal registry clock, duplicate replay, spool, non-age-out, unique-latest multi-callback race, journey closure/release, delayed-exit, and entry/publication race tests. | **PASS L2**; real process-kill/container recovery is **UNVERIFIED L3**. |
 | R11 | Occupancy counts derive from existing open sessions; line events never apply deltas. | PMS `app/services/occupancy_service.py::reconcile_zone_counts_from_open_sessions`. | Session-derived journey, drift reconciliation, duplicate, rollback, and non-negative-count tests. | **PASS L2** |
@@ -121,6 +123,10 @@ The following known gaps remain:
   off/shadow compatibility. Authoritative Entry V2 does not use it, but shadow
   must not be represented as satisfying a literal all-modes no-entry-image-file
   rule.
+- Entry V2 now retains only the LPD plate ROI used for OCR in the private
+  `entry_plate_crops` diagnostics directory. This is an explicit owner-requested
+  exception, not gallery evidence; disk retention/monitoring remains an
+  operational requirement.
 - Motion mode and per-camera motion metrics are present in performance logs but not exposed in `/api/health`; this limits rollout observability but does not invalidate the core decision logic.
 
 ## 3. Verification results
@@ -132,6 +138,7 @@ The following known gaps remain:
 | PMS full local suite | **347 passed**; includes authoritative CAM-23 empty/configured/mismatch and explicit vehicle-crop bypass coverage |
 | VA named Entry V2 suite | **309 passed** on the existing compatible stack |
 | VA Entry V2 plus affected API/integration subset | **328 passed** on the existing compatible stack |
+| VA plate-crop diagnostic Entry V2/API regression slice | **336 passed** on the existing compatible stack |
 | VA clean resolved web stack: FastAPI 0.139.2, Starlette 1.3.1, python-multipart 0.0.32, sse-starlette 3.4.6 | **102 passed** across affected API/integration tests |
 | VA Starlette multipart compatibility probes | **PASS** on 0.40.0, 0.45.3, 0.46.0, 0.47.2, and 1.0.0; unknown spool contracts fail closed |
 | VA broader changed-feature integration slice before this compatibility follow-up | **565 passed**; Ultralytics and Torch were import-stubbed because the local VA environment lacks them |

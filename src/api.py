@@ -35,6 +35,7 @@ from pydantic import BaseModel
 
 from src.vehicle_registry import VehicleRegistry
 from src.events.event_bus import EventBus
+from src.entry.analyzer import PLATE_CROP_SUBDIRECTORY
 from src.entry.domain import EntryCapacityExceeded, EntryInvalid, EntryUnavailable
 from src.models.state_machine import SlotEvent
 from src.services.alert_service import get_alert_type_for_slot
@@ -248,7 +249,10 @@ def create_app(
     active_entry_coordinator = (
         entry_coordinator
         if entry_coordinator is not None
-        else build_entry_coordinator(registry)
+        else build_entry_coordinator(
+            registry,
+            image_dir=snapshot_base_dir,
+        )
     )
     app = FastAPI(
         title="Damanat PMS Video Analytics API",
@@ -299,6 +303,13 @@ def create_app(
         # in one check, and still allows legitimate subfolders like alerts/.
         requested_abs = os.path.abspath(os.path.join(_snapshot_base_abs, filepath))
         if not requested_abs.startswith(_snapshot_base_abs + os.sep):
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        relative_path = os.path.relpath(requested_abs, _snapshot_base_abs)
+        if relative_path == PLATE_CROP_SUBDIRECTORY or relative_path.startswith(
+            PLATE_CROP_SUBDIRECTORY + os.sep
+        ):
+            # OCR diagnostics may contain license plates and are intentionally
+            # filesystem-only; the general snapshot route must not expose them.
             raise HTTPException(status_code=404, detail="Snapshot not found")
         if not os.path.isfile(requested_abs):
             raise HTTPException(status_code=404, detail="Snapshot not found")

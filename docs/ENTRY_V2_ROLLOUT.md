@@ -20,10 +20,13 @@ nor the database schema. Cameras continue to post only to PMS-AI.
   "last reading wins" are not identity rules.
 - The physical crossing that confirms the journey supplies the entry time. The
   trusted ANPR camera remains the gate-source provenance.
-- Request images are decoded and discarded in RAM. Entry V2 stores only compact
-  OCR/ReID metadata and embeddings from those requests. A later parked-car crop
-  is the sole image-persistence exception and is admitted only by the strict
-  two-stage gallery policy below.
+- Full request images are decoded and discarded in RAM. The exact plate ROI
+  produced by LPD and passed to OCR is retained as an operator-requested
+  diagnostic under `<snapshot_base_dir>/entry_plate_crops`; its filename
+  records camera, source role, frame index, OCR confidence, and read state.
+  These diagnostics are not decision inputs, database records, or public
+  snapshots. A later parked-car crop remains the separate strict-gallery
+  persistence path described below.
 - There is no attempt/crossing business TTL. Bounded capacity returns `503`
   instead of evicting evidence. False or retreated evidence is removed through
   the authenticated cancellation endpoint.
@@ -49,7 +52,10 @@ nor the database schema. Cameras continue to post only to PMS-AI.
 3. VA extracts OSNet ReID embeddings. It also runs the local OpenVINO plate
    detector and PaddleOCR on the plate ROI from the cached ANPR vehicle crop.
    Every image in one multipart burst must pass the same-car consistency gate;
-   mixed/tailgating bursts fail closed. The original bytes are then released.
+   mixed/tailgating bursts fail closed. After OCR scores an LPD crop, VA saves
+   that crop atomically to `entry_plate_crops` for offline diagnosis. A save
+   failure is logged but never changes the entry decision. The original request
+   bytes and full vehicle frame are then released.
 4. CAM-23 may produce either or both independent physical signals:
    - Hikvision posts the line event to PMS-AI. PMS-AI requires an active vehicle
      event and a real inward direction, or an explicitly calibrated one-way
@@ -64,8 +70,9 @@ nor the database schema. Cameras continue to post only to PMS-AI.
      the Hikvision target rectangle/crop configuration first.
    - VA observes the RTSP `Park_Entry` polygon directly. After the zone was seen
      empty, exactly one stable tracked vehicle crossing it produces an in-process
-     primary crossing with bounded JPEG crops. No HTTP loopback or image file is
-     used.
+     primary crossing with bounded JPEG crops. No HTTP loopback is used and the
+     source vehicle frames are not retained; only any smaller LPD ROI later
+     passed to OCR is written to the diagnostic folder described above.
 5. VA applies the same transition state machine to CAM-03's downstream
    `B1_Entrence` polygon and submits it as fallback evidence. If no blocking
    primary evidence has arrived, CAM-03 may confirm the journey. Arrival at
@@ -384,8 +391,9 @@ crop is written only after both evidence stages pass:
 
 These values are hard safety floors when strict persistence is enabled. YAML may
 raise them but configuration loading rejects lower values or unsafe LPD/rank
-modes. The admitted parked crop is the only image retained; ANPR and crossing
-request images remain transient.
+modes. The admitted parked crop is the only image retained as ReID/gallery
+history. Full ANPR and crossing request images remain transient; their LPD
+plate ROIs are the separate diagnostic-only exception described above.
 
 Abstained, shadow, pre-ACK, cached-ANPR-only, OCR-consensus-only, ReID-only,
 transit, ambiguous, low-confidence, and generic tracking paths cannot write.
@@ -446,13 +454,22 @@ expiry, so verified history survives future return visits until an explicit
 plate reset. Monitor disk capacity and change this only when the facility has an
 approved retention policy.
 
+Entry V2 creates `entry_plate_crops/` beneath that same resolved image root on
+the first successful LPD crop. No additional path variable is required. Each
+JPEG filename contains `ocr-confidence-<0.0000>` and `readable` or `unreadable`.
+The general snapshot HTTP route explicitly refuses this directory. There is no
+automatic retention policy for these diagnostics, so production must monitor
+and manage its disk usage.
+
 In V2 modes, legacy VA ingress is authenticated before its body is read and
 capped by the ASGI transport guard. PMS uses the same service key. The legacy
 multipart upload and `/api/line-crossing` routes return HTTP 410 before body
 parsing. Shadow retains the authenticated JSON legacy entry path because the
 legacy flow remains authoritative and must keep VA's live identity populated;
-V2 evidence itself stays RAM-only. In authoritative mode the same JSON route
-returns HTTP 410 for every non-exit direction before registry or image work.
+V2 full-frame and coordination evidence stays RAM-only; OCR plate-ROI
+diagnostics follow the explicit filesystem exception above. In authoritative
+mode the same JSON route returns HTTP 410 for every non-exit direction before
+registry or image work.
 Only the bounded JSON exit bridge remains once V2 owns entry admission.
 PMS authenticates that bridge with the same service key. In active V2 modes,
 the exit bridge remains available when entry admission itself is unhealthy, so

@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from src.api import create_app
+from src.entry.analyzer import PLATE_CROP_SUBDIRECTORY
 from src.entry.coordinator import EntryCoordinator
 from src.entry.domain import EntryMode
 from src.entry.settings import EntrySettings
@@ -79,6 +80,28 @@ def test_entry_v2_off_is_healthy_and_explicit_in_health(tmp_path) -> None:
     assert response.json()["status"] == "ok"
     assert response.json()["entry_v2"]["mode"] == "off"
     assert response.json()["entry_v2"]["available"] is False
+
+
+def test_entry_plate_crop_diagnostics_are_not_public_snapshots(tmp_path) -> None:
+    private_dir = tmp_path / PLATE_CROP_SUBDIRECTORY
+    private_dir.mkdir()
+    (private_dir / "plate.jpg").write_bytes(b"private-plate")
+    public_image = tmp_path / "slot.jpg"
+    public_image.write_bytes(b"public-snapshot")
+    app = create_app(
+        entry_coordinator=_entry_coordinator(EntryMode.OFF),
+        snapshot_base_dir=str(tmp_path),
+    )
+    client = TestClient(app)
+
+    private_response = client.get(
+        f"/pms-video-analytics/snapshots/{PLATE_CROP_SUBDIRECTORY}/plate.jpg"
+    )
+    public_response = client.get("/pms-video-analytics/snapshots/slot.jpg")
+
+    assert private_response.status_code == 404
+    assert public_response.status_code == 200
+    assert public_response.content == b"public-snapshot"
 
 
 def test_full_callback_backlog_is_unhealthy_and_returns_503(tmp_path) -> None:

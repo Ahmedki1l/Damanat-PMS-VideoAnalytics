@@ -476,7 +476,10 @@ Examples:
     # one per surface would split pending attempts from their local crossings.
     from src.entry.runtime import build_entry_coordinator
 
-    entry_coordinator = build_entry_coordinator(registry)
+    entry_coordinator = build_entry_coordinator(
+        registry,
+        image_dir=config.output.snapshot_base_dir,
+    )
     engine = ParkingEngine(
         config,
         vehicle_registry=registry,
