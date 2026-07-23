@@ -16,13 +16,8 @@ pytest-cache-files-*
 
 # Runtime configuration and credentials must be injected by the deployment,
 # never copied into an image layer by the broad `COPY . .` in Dockerfile.
-config.yaml
-config.entry-v2.yaml
 config.production.yaml
 config.prod.yaml
-.env
-.env.*
-*.env
 
 # Runtime evidence and local analysis artifacts belong on external volumes or
 # developer workstations, not in the immutable application image.
