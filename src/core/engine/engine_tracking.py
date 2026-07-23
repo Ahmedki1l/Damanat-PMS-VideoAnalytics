@@ -120,6 +120,12 @@ class ParkingEngineTrackingMixin:
                     continue
                 if not self._bbox_is_snapshot_ready(frame, detection):
                     continue
+                # Entry evidence becomes a durable identity input, so a large
+                # fragment is not good enough. Reuse the calibrated whole-car
+                # gate that rejects border-truncated and implausibly wide boxes
+                # while still counting that track as physically in the zone.
+                if self._bbox_view_quality(frame, detection) <= 0.0:
+                    continue
                 crop = self._crop_detection(frame, detection)
                 if crop is None or crop.size == 0:
                     continue

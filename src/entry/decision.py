@@ -30,6 +30,25 @@ class OCRSelection:
     evidence_ids: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ReIDMatchEvaluation:
+    """Observable result of the ReID mutual-uniqueness gate."""
+
+    group_id: str
+    score: float
+    row_runner: float
+    row_margin: float
+    column_runner: float
+    column_margin: float
+    reason: str
+    match: Optional[ReIDMatch] = None
+
+    @property
+    def accepted(self) -> bool:
+        """Whether ReID uniqueness passed; OCR/final confirmation is separate."""
+        return self.match is not None
+
+
 def cosine(left: Sequence[float], right: Sequence[float]) -> float:
     if not left or not right or len(left) != len(right):
         return -1.0
@@ -106,11 +125,22 @@ class EntryDecisionEngine:
         groups: Mapping[str, AttemptGroup],
         crossings: Iterable[CrossingRecord],
     ) -> Optional[ReIDMatch]:
+        """Return the match only when all ReID uniqueness gates pass."""
+        evaluation = self.evaluate_unique_match(crossing, groups, crossings)
+        return evaluation.match if evaluation is not None else None
+
+    def evaluate_unique_match(
+        self,
+        crossing: CrossingRecord,
+        groups: Mapping[str, AttemptGroup],
+        crossings: Iterable[CrossingRecord],
+    ) -> Optional[ReIDMatchEvaluation]:
         """Mutual-unique assignment with absolute, row, and column gates.
 
         Rows are crossings competing for attempt groups. Columns are attempt
         groups competing for crossings of the same physical role. Primary and
         fallback crossings are separate stages and therefore not competitors.
+        ``None`` means there was no causally eligible candidate to evaluate.
         """
         ranked = []
         for group in groups.values():
@@ -150,16 +180,31 @@ class EntryDecisionEngine:
         column_margin = score - column_runner
 
         if score < self.settings.reid_min_score:
-            return None
-        if row_margin < self.settings.reid_row_margin:
-            return None
-        if column_margin < self.settings.reid_column_margin:
-            return None
-        return ReIDMatch(
+            reason = "score_below_minimum"
+            match = None
+        elif row_margin < self.settings.reid_row_margin:
+            reason = "row_margin_below_minimum"
+            match = None
+        elif column_margin < self.settings.reid_column_margin:
+            reason = "column_margin_below_minimum"
+            match = None
+        else:
+            reason = "accepted"
+            match = ReIDMatch(
+                group_id=group_id,
+                score=score,
+                row_margin=row_margin,
+                column_margin=column_margin,
+            )
+        return ReIDMatchEvaluation(
             group_id=group_id,
             score=score,
+            row_runner=row_runner,
             row_margin=row_margin,
+            column_runner=column_runner,
             column_margin=column_margin,
+            reason=reason,
+            match=match,
         )
 
     def resolve_plate(

@@ -145,10 +145,12 @@ def _observe(
     zone_id: str,
     captured_at: datetime,
     track_id: int | None = None,
+    outside_track_id: int | None = None,
     pixel_value: int = 120,
 ) -> None:
     crops = ()
     tracks = ()
+    outside_tracks = ()
     if track_id is not None:
         tracks = (track_id,)
         crops = (
@@ -158,10 +160,13 @@ def _observe(
                 quality=float(pixel_value),
             ),
         )
+    if outside_track_id is not None:
+        outside_tracks = (outside_track_id,)
     bridge.observe(
         camera_id=camera_id,
         zone_id=zone_id,
         inside_track_ids=tracks,
+        outside_track_ids=outside_tracks,
         crops=crops,
         captured_at=captured_at,
         timestamp_source=VA_HOST_GRAB_TIMESTAMP_SOURCE,
@@ -176,6 +181,7 @@ def _emit_local_crossing(
     captured_at: datetime,
     track_id: int,
 ) -> None:
+    queued_before = bridge.metrics()["submissions_queued"]
     _observe(
         bridge,
         camera_id=camera_id,
@@ -204,6 +210,32 @@ def _emit_local_crossing(
         track_id=track_id,
         pixel_value=180,
     )
+    _observe(
+        bridge,
+        camera_id=camera_id,
+        zone_id=zone_id,
+        captured_at=captured_at + timedelta(milliseconds=500),
+        track_id=track_id,
+        pixel_value=160,
+    )
+    assert bridge.metrics()["submissions_queued"] == queued_before
+
+    _observe(
+        bridge,
+        camera_id=camera_id,
+        zone_id=zone_id,
+        captured_at=captured_at + timedelta(milliseconds=750),
+        outside_track_id=track_id,
+    )
+    assert bridge.metrics()["submissions_queued"] == queued_before
+    _observe(
+        bridge,
+        camera_id=camera_id,
+        zone_id=zone_id,
+        captured_at=captured_at + timedelta(seconds=1),
+        outside_track_id=track_id,
+    )
+    assert bridge.metrics()["submissions_queued"] == queued_before + 1
     assert bridge.wait_for_idle()
 
 

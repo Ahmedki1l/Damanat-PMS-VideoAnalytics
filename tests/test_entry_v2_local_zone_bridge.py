@@ -130,6 +130,23 @@ def _arm(bridge, camera, zone):
     _observe(bridge, camera, zone)
 
 
+def _exit(bridge, camera, zone, track_id, captured_at=NOW):
+    _observe(
+        bridge,
+        camera,
+        zone,
+        outside_tracks=[track_id],
+        captured_at=captured_at,
+    )
+    _observe(
+        bridge,
+        camera,
+        zone,
+        outside_tracks=[track_id],
+        captured_at=captured_at + timedelta(milliseconds=500),
+    )
+
+
 def _clear_after_uncertain_episode(bridge, camera, zone):
     for _ in range(PRODUCTION_EMPTY_REARM_FRAMES):
         _observe(bridge, camera, zone)
@@ -151,24 +168,32 @@ def test_zone_aliases_resolve_to_canonical_one_way_policies():
 
 def test_cam23_stable_entry_emits_one_primary_crossing(bridge, coordinator):
     _arm(bridge, "CAM-23", "Park_Entry")
-    _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7, 100)])
-    _observe(
-        bridge,
-        "CAM-23",
-        "Park_Entry",
-        [7],
-        [_crop(7, 140)],
-        NOW + timedelta(milliseconds=500),
-    )
-    for index in range(4):
+    qualities = [
+        100,
+        240,
+        110,
+        220,
+        120,
+        250,
+        130,
+        230,
+        *range(80, 92),
+    ]
+    for index, quality in enumerate(qualities):
         _observe(
             bridge,
             "CAM-23",
             "Park_Entry",
             [7],
-            [_crop(7, 160 + index)],
-            NOW + timedelta(seconds=index + 1),
+            [_crop(7, quality)],
+            NOW + timedelta(seconds=index),
         )
+
+    # The bridge considers every in-zone frame but cannot declare a physical
+    # crossing until it sees the same track beyond the polygon twice.
+    assert bridge.wait_for_idle()
+    assert coordinator.calls == []
+    _exit(bridge, "CAM-23", "Park_Entry", 7, NOW + timedelta(seconds=21))
 
     assert bridge.wait_for_idle()
     assert len(coordinator.calls) == 1
@@ -183,10 +208,54 @@ def test_cam23_stable_entry_emits_one_primary_crossing(bridge, coordinator):
     assert request.metadata["direction_evidence"] == (
         "deployment_calibrated_one_way_polygon"
     )
+    assert request.metadata["finalization_evidence"] == "tracked_outside_zone"
+    assert request.metadata["frames_seen"] == 20
+    assert request.metadata["candidate_crops_seen"] == 20
+    assert request.metadata["selected_images"] == 4
+    assert request.metadata["best_crop_quality"] == 250.0
     assert request.metadata["track_id"] == 7
-    assert len(images) == 2
-    decoded = cv2.imdecode(np.frombuffer(images[0], dtype=np.uint8), cv2.IMREAD_COLOR)
-    assert decoded.shape[:2] == (96, 160)
+    assert len(images) == 4
+    decoded = [
+        cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR)
+        for image in images
+    ]
+    assert all(image.shape[:2] == (96, 160) for image in decoded)
+    assert [round(float(image.mean())) for image in decoded] == [240, 220, 250, 230]
+    metrics = bridge.metrics()
+    assert metrics["candidate_crops_observed"] == 20
+    assert metrics["snapshots_selected"] == 4
+    assert metrics["visits_finalized"] == 1
+
+
+def test_duplicate_track_rows_keep_the_best_crop_from_each_frame(
+    bridge,
+    coordinator,
+):
+    _arm(bridge, "CAM-23", "Park_Entry")
+    _observe(
+        bridge,
+        "CAM-23",
+        "Park_Entry",
+        [7],
+        [_crop(7, 200), _crop(7, 80)],
+    )
+    _observe(
+        bridge,
+        "CAM-23",
+        "Park_Entry",
+        [7],
+        [_crop(7, 150)],
+        NOW + timedelta(seconds=1),
+    )
+    _exit(bridge, "CAM-23", "Park_Entry", 7, NOW + timedelta(seconds=2))
+
+    assert bridge.wait_for_idle()
+    _, images = coordinator.calls[0]
+    decoded = [
+        cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR)
+        for image in images
+    ]
+    assert [round(float(image.mean())) for image in decoded] == [200, 150]
 
 
 def test_cam03_fallback_emits_on_physical_transition_without_timer(bridge, coordinator):
@@ -201,6 +270,7 @@ def test_cam03_fallback_emits_on_physical_transition_without_timer(bridge, coord
         [_crop(19, 180)],
         late + timedelta(seconds=1),
     )
+    _exit(bridge, "CAM-03", "B1-entry", 19, late + timedelta(seconds=2))
 
     assert bridge.wait_for_idle()
     request, _ = coordinator.calls[0]
@@ -219,6 +289,7 @@ def test_startup_with_vehicle_inside_never_fabricates_crossing(bridge, coordinat
     _clear_after_uncertain_episode(bridge, "CAM-23", "Park_Entry")
     _observe(bridge, "CAM-23", "Park_Entry", [8], [_crop(8)])
     _observe(bridge, "CAM-23", "Park_Entry", [8], [_crop(8)])
+    _exit(bridge, "CAM-23", "Park_Entry", 8)
     assert bridge.wait_for_idle()
     assert len(coordinator.calls) == 1
 
@@ -242,6 +313,7 @@ def test_multiple_vehicle_episode_fails_closed_until_zone_clears(bridge, coordin
     _clear_after_uncertain_episode(bridge, "CAM-03", "B1_Entrence")
     _observe(bridge, "CAM-03", "B1_Entrence", [3], [_crop(3)])
     _observe(bridge, "CAM-03", "B1_Entrence", [3], [_crop(3)])
+    _exit(bridge, "CAM-03", "B1_Entrence", 3)
     assert bridge.wait_for_idle()
     assert len(coordinator.calls) == 1
     assert bridge.metrics()["visits_ambiguous"] == 1
@@ -268,6 +340,7 @@ def test_one_frame_tracker_dropout_does_not_create_second_visit(bridge, coordina
     _observe(bridge, "CAM-23", "Park_Entry")
     _observe(bridge, "CAM-23", "Park_Entry", [5], [_crop(5, 180)])
     _observe(bridge, "CAM-23", "Park_Entry", [5], [_crop(5, 190)])
+    _exit(bridge, "CAM-23", "Park_Entry", 5)
 
     assert bridge.wait_for_idle()
     assert len(coordinator.calls) == 1
@@ -287,6 +360,9 @@ def test_two_detector_misses_do_not_rearm_a_stationary_visit(bridge, coordinator
     _observe(bridge, "CAM-23", "Park_Entry", [5], [_crop(5, 190)])
     _observe(bridge, "CAM-23", "Park_Entry", [5], [_crop(5, 200)])
 
+    assert bridge.wait_for_idle()
+    assert coordinator.calls == []
+    _exit(bridge, "CAM-23", "Park_Entry", 5)
     assert bridge.wait_for_idle()
     assert len(coordinator.calls) == 1
     assert bridge.metrics()["visits_started"] == 1
@@ -335,6 +411,9 @@ def test_duplicate_zone_aliases_cannot_count_one_frame_twice(bridge, coordinator
         observation_token="vehicle-frame-2",
     )
     assert bridge.wait_for_idle()
+    assert coordinator.calls == []
+    _exit(bridge, "CAM-23", "Park_Entry", 7)
+    assert bridge.wait_for_idle()
     assert len(coordinator.calls) == 1
 
 
@@ -342,25 +421,14 @@ def test_clean_rearm_creates_new_event_even_if_track_id_is_reused(bridge, coordi
     _arm(bridge, "CAM-23", "Park_Entry")
     _observe(bridge, "CAM-23", "Park_Entry", [9], [_crop(9)])
     _observe(bridge, "CAM-23", "Park_Entry", [9], [_crop(9)])
-    assert bridge.wait_for_idle()
 
     # Seeing the same track outside the polygon is positive exit evidence, so
-    # the bridge can re-arm promptly without waiting for the missing-detection
-    # escape hatch.
-    _observe(
-        bridge,
-        "CAM-23",
-        "Park_Entry",
-        outside_tracks=[9],
-    )
-    _observe(
-        bridge,
-        "CAM-23",
-        "Park_Entry",
-        outside_tracks=[9],
-    )
+    # the bridge can finalize and re-arm promptly without treating YOLO misses
+    # as proof of movement.
+    _exit(bridge, "CAM-23", "Park_Entry", 9)
     _observe(bridge, "CAM-23", "Park_Entry", [9], [_crop(9)])
     _observe(bridge, "CAM-23", "Park_Entry", [9], [_crop(9)])
+    _exit(bridge, "CAM-23", "Park_Entry", 9)
     assert bridge.wait_for_idle()
 
     assert len(coordinator.calls) == 2
@@ -372,8 +440,46 @@ def test_invalid_crops_fail_closed_without_queuing(bridge, coordinator):
     _observe(bridge, "CAM-03", "B1_Entrence", [4])
     _observe(bridge, "CAM-03", "B1_Entrence", [4])
     _observe(bridge, "CAM-03", "B1_Entrence", [4])
+    _exit(bridge, "CAM-03", "B1_Entrence", 4)
     assert bridge.wait_for_idle()
     assert coordinator.calls == []
+    assert bridge.metrics()["visits_discarded_insufficient"] == 1
+
+
+def test_one_outside_observation_then_reentry_keeps_collecting_same_visit(
+    bridge,
+    coordinator,
+):
+    _arm(bridge, "CAM-23", "Park_Entry")
+    _observe(bridge, "CAM-23", "Park_Entry", [31], [_crop(31, 100)])
+    _observe(bridge, "CAM-23", "Park_Entry", [31], [_crop(31, 110)])
+    _observe(bridge, "CAM-23", "Park_Entry", outside_tracks=[31])
+    _observe(bridge, "CAM-23", "Park_Entry", [31], [_crop(31, 200)])
+    _observe(bridge, "CAM-23", "Park_Entry", outside_tracks=[31])
+
+    assert bridge.wait_for_idle()
+    assert coordinator.calls == []
+
+    _observe(bridge, "CAM-23", "Park_Entry", outside_tracks=[31])
+    assert bridge.wait_for_idle()
+    assert len(coordinator.calls) == 1
+    request, images = coordinator.calls[0]
+    assert request.metadata["frames_seen"] == 3
+    assert request.metadata["candidate_crops_seen"] == 3
+    assert len(images) == 3
+
+
+def test_tracker_loss_discards_visit_without_submitting(bridge, coordinator):
+    _arm(bridge, "CAM-23", "Park_Entry")
+    _observe(bridge, "CAM-23", "Park_Entry", [41], [_crop(41, 120)])
+    _observe(bridge, "CAM-23", "Park_Entry", [41], [_crop(41, 180)])
+
+    for _ in range(PRODUCTION_EMPTY_REARM_FRAMES):
+        _observe(bridge, "CAM-23", "Park_Entry")
+
+    assert bridge.wait_for_idle()
+    assert coordinator.calls == []
+    assert bridge.metrics()["visits_discarded_tracker_loss"] == 1
 
 
 def test_policy_must_be_explicitly_enabled_in_entry_settings():
@@ -385,6 +491,7 @@ def test_policy_must_be_explicitly_enabled_in_entry_settings():
         _arm(bridge, "CAM-23", "Park_Entry")
         _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7)])
         _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7)])
+        _exit(bridge, "CAM-23", "Park_Entry", 7)
         assert bridge.wait_for_idle()
         assert coordinator.calls == []
     finally:
@@ -413,6 +520,7 @@ def test_worker_failure_is_visible_in_health_metrics():
         _arm(bridge, "CAM-23", "Park_Entry")
         _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7)])
         _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7)])
+        _exit(bridge, "CAM-23", "Park_Entry", 7)
         assert bridge.wait_for_idle()
         metrics = bridge.metrics()
         assert metrics["healthy"] is False
@@ -429,6 +537,7 @@ def test_transient_worker_failure_retries_same_crossing_and_stays_degraded():
         _arm(bridge, "CAM-23", "Park_Entry")
         _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7)])
         _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7, 180)])
+        _exit(bridge, "CAM-23", "Park_Entry", 7)
         assert bridge.wait_for_idle()
 
         assert len(coordinator.calls) == 2
@@ -447,7 +556,7 @@ def test_transient_worker_failure_retries_same_crossing_and_stays_degraded():
         bridge.close(wait=True)
 
 
-def test_capacity_rejection_degrades_then_retries_while_visit_remains_inside():
+def test_capacity_rejection_retries_same_confirmed_exit_without_overwrite():
     coordinator = BlockingCoordinator()
     bridge = LocalZoneCrossingBridge(
         coordinator,
@@ -458,11 +567,13 @@ def test_capacity_rejection_degrades_then_retries_while_visit_remains_inside():
         _arm(bridge, "CAM-23", "Park_Entry")
         _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7)])
         _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7, 180)])
+        _exit(bridge, "CAM-23", "Park_Entry", 7)
         assert coordinator.started.wait(timeout=1.0)
 
         _arm(bridge, "CAM-03", "B1_Entrence")
         _observe(bridge, "CAM-03", "B1_Entrence", [19], [_crop(19)])
         _observe(bridge, "CAM-03", "B1_Entrence", [19], [_crop(19, 180)])
+        _exit(bridge, "CAM-03", "B1_Entrence", 19)
 
         saturated = bridge.metrics()
         assert saturated["healthy"] is False
@@ -472,16 +583,54 @@ def test_capacity_rejection_degrades_then_retries_while_visit_remains_inside():
 
         coordinator.release.set()
         assert bridge.wait_for_idle()
-        # The same physical visit is still inside. Its next frame retries the
-        # retained evidence instead of needing a fabricated second transition.
-        _observe(bridge, "CAM-03", "B1_Entrence", [19], [_crop(19, 200)])
+        # The same completed physical visit remains pending. Its next frame
+        # retries prepared evidence instead of allowing a new track to replace
+        # it or requiring a fabricated second transition.
+        _observe(
+            bridge,
+            "CAM-03",
+            "B1_Entrence",
+            [88],
+            [_crop(88, 250)],
+        )
         assert bridge.wait_for_idle()
 
         recovered = bridge.metrics()
         assert len(coordinator.calls) == 2
+        assert coordinator.calls[1][0].metadata["track_id"] == 19
         assert recovered["healthy"] is True
         assert recovered["queue_saturated"] is False
         assert recovered["last_error"] is None
+    finally:
+        coordinator.release.set()
+        bridge.close(wait=True)
+
+
+def test_graceful_close_flushes_capacity_blocked_confirmed_exit():
+    coordinator = BlockingCoordinator()
+    bridge = LocalZoneCrossingBridge(
+        coordinator,
+        max_ingest_retries=0,
+        max_queued=1,
+    )
+    try:
+        _arm(bridge, "CAM-23", "Park_Entry")
+        _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7)])
+        _observe(bridge, "CAM-23", "Park_Entry", [7], [_crop(7, 180)])
+        _exit(bridge, "CAM-23", "Park_Entry", 7)
+        assert coordinator.started.wait(timeout=1.0)
+
+        _arm(bridge, "CAM-03", "B1_Entrence")
+        _observe(bridge, "CAM-03", "B1_Entrence", [19], [_crop(19)])
+        _observe(bridge, "CAM-03", "B1_Entrence", [19], [_crop(19, 180)])
+        _exit(bridge, "CAM-03", "B1_Entrence", 19)
+        assert bridge.metrics()["queue_saturated"] is True
+
+        coordinator.release.set()
+        bridge.close(wait=True)
+
+        assert len(coordinator.calls) == 2
+        assert coordinator.calls[1][0].metadata["track_id"] == 19
     finally:
         coordinator.release.set()
         bridge.close(wait=True)
@@ -592,6 +741,81 @@ def test_engine_feeds_empty_and_vehicle_frames_with_capture_timestamp():
     assert observed["crops"][0].image.shape[:2] == (340, 240)
     assert engine._entry_v2_local_bridge.calls[2]["inside_track_ids"] == []
     assert engine._entry_v2_local_bridge.calls[2]["outside_track_ids"] == [11]
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    [
+        (0.0, 180.0, 240.0, 520.0),       # border-truncated fragment
+        (180.0, 180.0, 880.0, 430.0),     # implausible 2.8:1 sliver
+    ],
+)
+def test_engine_tracks_invalid_whole_car_boxes_without_using_their_crops(bbox):
+    from shapely.geometry import Polygon
+
+    from src.models.slot import ParkingSlot
+
+    engine = _tracking_engine_harness()
+    zone = ParkingSlot(
+        id="park-entry",
+        polygon=Polygon([(0, 0), (1000, 0), (1000, 700), (0, 700)]),
+    )
+    frame = np.full((720, 1280, 3), 100, dtype=np.uint8)
+    detection = type("DetectionStub", (), {})()
+    detection.track_id = 11
+    detection.bbox = bbox
+    detection.bottom_center = (
+        (bbox[0] + bbox[2]) / 2.0,
+        bbox[3],
+    )
+
+    engine._process_entry_v2_local_zones(
+        "CAM-23",
+        frame,
+        [detection],
+        {zone.id: zone},
+        capture_ts=NOW.timestamp(),
+    )
+
+    observed = engine._entry_v2_local_bridge.calls[0]
+    assert observed["inside_track_ids"] == [11]
+    assert observed["crops"] == []
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(264, 293), (566, 585), (432, 523)],
+)
+def test_realistic_cam23_whole_car_shapes_remain_snapshot_ready(width, height):
+    from shapely.geometry import Polygon
+
+    from src.models.slot import ParkingSlot
+
+    engine = _tracking_engine_harness()
+    zone = ParkingSlot(
+        id="park-entry",
+        polygon=Polygon([(100, 100), (1000, 100), (1000, 900), (100, 900)]),
+    )
+    frame = np.full((1080, 1920, 3), 100, dtype=np.uint8)
+    detection = type("DetectionStub", (), {})()
+    detection.track_id = 11
+    detection.bbox = (300.0, 200.0, 300.0 + width, 200.0 + height)
+    detection.bottom_center = (
+        300.0 + width / 2.0,
+        200.0 + height,
+    )
+
+    engine._process_entry_v2_local_zones(
+        "CAM-23",
+        frame,
+        [detection],
+        {zone.id: zone},
+        capture_ts=NOW.timestamp(),
+    )
+
+    observed = engine._entry_v2_local_bridge.calls[0]
+    assert observed["inside_track_ids"] == [11]
+    assert len(observed["crops"]) == 1
 
 
 @pytest.mark.parametrize(

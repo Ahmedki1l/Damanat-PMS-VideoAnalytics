@@ -1259,15 +1259,33 @@ def test_later_no_plate_crossing_cannot_weaken_prior_readable_conflict():
     ("score", "expected"),
     [(0.75, "confirmed"), (0.749, None)],
 )
-def test_reid_absolute_score_boundary(score, expected):
+def test_reid_absolute_score_boundary_is_observable(score, expected, caplog):
     evidence = {
         "a1": [frame("a1", "ANPR", (1.0, 0.0), PlateReadState.NO_PLATE)],
         "c1": [frame("c1", "CAM-23", (score, 0.0), PlateReadState.READABLE, "AAA1111", 0.99, "primary")],
     }
     coord, _ = coordinator(evidence)
+    caplog.set_level("INFO", logger="src.entry.coordinator")
     coord.ingest_attempt(attempt("a1", "AAA-1111"), [b"a"])
     result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
     assert result.decision_status == expected
+    reid_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "[EntryV2][ReID]" in record.getMessage()
+    ]
+    assert len(reid_logs) == 1
+    assert "stage=uniqueness_only" in reid_logs[0]
+    assert f"score={score:.4f}" in reid_logs[0]
+    assert "min_score=0.7500" in reid_logs[0]
+    if expected == "confirmed":
+        assert "result=accepted reason=accepted" in reid_logs[0]
+    else:
+        assert (
+            "result=rejected reason=score_below_minimum"
+            in reid_logs[0]
+        )
 
 
 def test_same_car_wrong_and_correct_attempts_merge_then_supersede_wrong_plate():
@@ -1308,30 +1326,47 @@ def test_matching_later_car_does_not_drop_unrelated_earlier_attempt():
     assert sink.payloads[0]["attempt_id"] == "later"
 
 
-def test_row_margin_ambiguity_leaves_everything_pending():
+def test_row_margin_ambiguity_leaves_everything_pending_and_is_logged_once(caplog):
     evidence = {
         "a1": [frame("a1", "ANPR", (1.0, 0.0), PlateReadState.NO_PLATE)],
         "a2": [frame("a2", "ANPR", (0.99, 0.1), PlateReadState.NO_PLATE)],
         "c1": [frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.READABLE, "AAA1111", 0.99, "primary")],
     }
     coord, sink = coordinator(evidence, cfg=settings(merge_min_score=1.1))
+    caplog.set_level("INFO", logger="src.entry.coordinator")
     coord.ingest_attempt(attempt("a1", "AAA-1111"), [b"a"])
     coord.ingest_attempt(attempt("a2", "BBB-2222"), [b"b"])
     result = coord.ingest_crossing(crossing("c1"), [b"c"])
+    with coord._lock:
+        coord._rank_pending_matches_locked()
+        coord._rank_pending_matches_locked()
 
     assert result.decision_id is None
     assert sink.payloads == []
     assert coord.state_summary()["attempt_count"] == 2
     assert coord.state_summary()["crossing_count"] == 1
+    reid_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "[EntryV2][ReID]" in record.getMessage()
+    ]
+    assert len(reid_logs) == 1
+    assert "row_runner=" in reid_logs[0]
+    assert "row_margin=" in reid_logs[0]
+    assert "row_min_margin=0.0800" in reid_logs[0]
+    assert "result=rejected reason=row_margin_below_minimum" in reid_logs[0]
 
 
-def test_column_margin_ambiguity_is_checked_when_crossings_arrive_first():
+def test_column_margin_ambiguity_is_checked_and_logged_when_crossings_arrive_first(
+    caplog,
+):
     evidence = {
         "c1": [frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.READABLE, "AAA1111", 0.99, "primary")],
         "c2": [frame("c2", "CAM-23", (0.99, 0.1), PlateReadState.READABLE, "AAA1111", 0.99, "primary")],
         "a1": [frame("a1", "ANPR", (1.0, 0.0), PlateReadState.NO_PLATE)],
     }
     coord, sink = coordinator(evidence)
+    caplog.set_level("INFO", logger="src.entry.coordinator")
     coord.ingest_crossing(crossing("c1"), [b"c1"])
     coord.ingest_crossing(crossing("c2"), [b"c2"])
     result = coord.ingest_attempt(attempt("a1", "AAA-1111"), [b"a"])
@@ -1339,6 +1374,19 @@ def test_column_margin_ambiguity_is_checked_when_crossings_arrive_first():
     assert result.decision_id is None
     assert sink.payloads == []
     assert coord.state_summary()["crossing_count"] == 2
+    reid_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "[EntryV2][ReID]" in record.getMessage()
+    ]
+    assert len(reid_logs) == 2
+    assert all("column_runner=" in message for message in reid_logs)
+    assert all("column_margin=" in message for message in reid_logs)
+    assert all("column_min_margin=0.0800" in message for message in reid_logs)
+    assert all(
+        "result=rejected reason=column_margin_below_minimum" in message
+        for message in reid_logs
+    )
 
 
 def test_concurrent_crossings_are_all_inserted_before_uniqueness_decision():

@@ -16,6 +16,7 @@ from .analyzer import EvidenceProcessor
 from .callback import ConfirmationSink, DeliveryResult
 from .decision import (
     EntryDecisionEngine,
+    ReIDMatchEvaluation,
     causal_group_embeddings,
     causally_eligible_attempts,
     max_similarity,
@@ -47,6 +48,7 @@ from .domain import (
     HypothesisStatus,
     IngestResult,
     PlateHypothesis,
+    ReIDMatch,
     RecordStatus,
     canonical_plate,
     norm_camera_id,
@@ -133,6 +135,9 @@ class EntryCoordinator:
         self._late_ocr_conflict_count = 0
         self._late_ocr_conflict_ids: "OrderedDict[str, None]" = OrderedDict()
         self._ambiguous_exit_count = 0
+        self._reid_evaluation_log_cache: "OrderedDict[str, Tuple[Any, ...]]" = (
+            OrderedDict()
+        )
 
     @property
     def available(self) -> bool:
@@ -1434,7 +1439,7 @@ class EntryCoordinator:
                 # resolve two trusted producers reading different plates. Keep
                 # the family pending for explicit correction/cancellation.
                 continue
-            match = self._engine.find_unique_match(
+            match = self._find_unique_match_with_observability_locked(
                 family_row,
                 self._groups,
                 family_rows,
@@ -1479,6 +1484,72 @@ class EntryCoordinator:
             )
         candidates.sort(reverse=True)
         return candidates
+
+    def _find_unique_match_with_observability_locked(
+        self,
+        crossing: CrossingRecord,
+        groups: Mapping[str, AttemptGroup],
+        crossings: Iterable[CrossingRecord],
+    ) -> Optional[ReIDMatch]:
+        """Evaluate and log the ReID uniqueness gate without log flooding."""
+        evaluation = self._engine.evaluate_unique_match(
+            crossing,
+            groups,
+            crossings,
+        )
+        if evaluation is None:
+            return None
+        self._log_reid_evaluation_locked(crossing, evaluation)
+        return evaluation.match
+
+    def _log_reid_evaluation_locked(
+        self,
+        crossing: CrossingRecord,
+        evaluation: ReIDMatchEvaluation,
+    ) -> None:
+        crossing_id = crossing.request.crossing_id
+        fingerprint = (
+            evaluation.group_id,
+            evaluation.score,
+            evaluation.row_runner,
+            evaluation.row_margin,
+            evaluation.column_runner,
+            evaluation.column_margin,
+            evaluation.reason,
+            evaluation.accepted,
+        )
+        if self._reid_evaluation_log_cache.get(crossing_id) == fingerprint:
+            self._reid_evaluation_log_cache.move_to_end(crossing_id)
+            return
+        self._reid_evaluation_log_cache[crossing_id] = fingerprint
+        self._reid_evaluation_log_cache.move_to_end(crossing_id)
+        while (
+            len(self._reid_evaluation_log_cache)
+            > max(1, self.settings.max_pending_crossings)
+        ):
+            self._reid_evaluation_log_cache.popitem(last=False)
+
+        logger.info(
+            "[EntryV2][ReID] stage=uniqueness_only crossing=%s camera=%s "
+            "role=%s best_group=%s score=%.4f min_score=%.4f "
+            "row_runner=%.4f row_margin=%.4f row_min_margin=%.4f "
+            "column_runner=%.4f column_margin=%.4f column_min_margin=%.4f "
+            "result=%s reason=%s",
+            crossing_id,
+            crossing.request.camera_id,
+            crossing.request.role.value,
+            evaluation.group_id,
+            evaluation.score,
+            self.settings.reid_min_score,
+            evaluation.row_runner,
+            evaluation.row_margin,
+            self.settings.reid_row_margin,
+            evaluation.column_runner,
+            evaluation.column_margin,
+            self.settings.reid_column_margin,
+            "accepted" if evaluation.accepted else "rejected",
+            evaluation.reason,
+        )
 
     def _pending_crossing_families_locked(
         self,
@@ -2308,7 +2379,7 @@ class EntryCoordinator:
             for crossing_id, (record, _) in self._provisional_crossings.items()
             if crossing_id != request.crossing_id
         ]
-        match = self._engine.find_unique_match(
+        match = self._find_unique_match_with_observability_locked(
             candidate,
             self._groups,
             competitors,

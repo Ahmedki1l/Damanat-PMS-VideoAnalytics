@@ -65,11 +65,17 @@ class _Visit:
     captured_at: datetime
     timestamp_source: str
     frames_seen: int = 0
+    crops_seen: int = 0
     missed_frames: int = 0
     outside_frames: int = 0
+    exit_confirmed: bool = False
     ambiguous: bool = False
     submitted: bool = False
     crops: list[Tuple[float, int, np.ndarray]] = field(default_factory=list)
+    prepared_request: Optional[CrossingInput] = None
+    prepared_images: Tuple[bytes, ...] = ()
+    selected_count: int = 0
+    best_selected_quality: float = 0.0
 
 
 @dataclass
@@ -173,6 +179,13 @@ class LocalZoneCrossingBridge:
         self._metrics = {
             "visits_started": 0,
             "visits_ambiguous": 0,
+            "visits_exit_confirmed": 0,
+            "visits_finalized": 0,
+            "visits_discarded_ambiguous": 0,
+            "visits_discarded_insufficient": 0,
+            "visits_discarded_tracker_loss": 0,
+            "candidate_crops_observed": 0,
+            "snapshots_selected": 0,
             "submissions_queued": 0,
             "submissions_completed": 0,
             "submissions_failed": 0,
@@ -230,11 +243,16 @@ class LocalZoneCrossingBridge:
 
         tracks = {int(track_id) for track_id in inside_track_ids}
         outside_tracks = {int(track_id) for track_id in outside_track_ids}
-        usable = {
-            int(item.track_id): item
-            for item in crops
-            if item.image is not None and getattr(item.image, "size", 0) > 0
-        }
+        usable: Dict[int, LocalVehicleCrop] = {}
+        for item in crops:
+            if item.image is None or getattr(item.image, "size", 0) <= 0:
+                continue
+            track_id = int(item.track_id)
+            current = usable.get(track_id)
+            if current is None or float(item.quality) > float(current.quality):
+                # Defensive against duplicate detector rows for one track in a
+                # frame: keep the best crop, not whichever row was seen last.
+                usable[track_id] = item
         state_key = (
             norm_camera_id(policy.camera_id),
             normalized_zone_id(policy.canonical_zone_id),
@@ -262,26 +280,51 @@ class LocalZoneCrossingBridge:
 
         visit = state.active
         if visit is not None:
+            if visit.exit_confirmed:
+                # A confirmed physical exit owns this state until its prepared
+                # evidence is queued. In particular, queue saturation must not
+                # let a following vehicle overwrite the completed visit.
+                if self._finalize_exited_visit(policy, zone_id, visit):
+                    self._rearm_after_visit(state)
+                return
+
             if not tracks:
                 if visit.track_id in outside_tracks:
                     # Seeing the same stable track beyond the polygon is much
-                    # stronger exit evidence than YOLO simply omitting it. Two
-                    # consecutive outside observations re-arm promptly.
+                    # stronger exit evidence than YOLO simply omitting it.
+                    # Collect throughout the zone and finalize only after two
+                    # consecutive explicit same-track outside observations.
                     visit.outside_frames += 1
                     visit.missed_frames = 0
                     if visit.outside_frames >= self._outside_frames_to_rearm:
-                        self._rearm_after_visit(state)
+                        visit.exit_confirmed = True
+                        self._increment("visits_exit_confirmed")
+                        if self._finalize_exited_visit(policy, zone_id, visit):
+                            self._rearm_after_visit(state)
                 else:
                     # A missing detection is UNKNOWN, not proof that a waiting
                     # car moved. Hold across short detector flicker and use a
-                    # longer consecutive-empty escape hatch for tracker loss.
+                    # longer consecutive-empty escape hatch to discard a visit
+                    # whose track was lost. Never turn that loss into an entry.
                     visit.outside_frames = 0
                     visit.missed_frames += 1
                     if visit.missed_frames >= self._empty_frames_to_rearm:
+                        self._discard_visit(
+                            policy,
+                            zone_id,
+                            visit,
+                            reason=(
+                                "ambiguous"
+                                if visit.ambiguous
+                                else "tracker_loss"
+                            ),
+                        )
                         self._rearm_after_visit(state)
                 return
 
             visit.missed_frames = 0
+            # Re-entering after one outside observation proves there was no
+            # completed exit; the two outside observations must be consecutive.
             visit.outside_frames = 0
             if len(tracks) != 1 or visit.track_id not in tracks:
                 self._mark_ambiguous(state, visit)
@@ -290,7 +333,6 @@ class LocalZoneCrossingBridge:
             observation = usable.get(visit.track_id)
             if observation is not None and not visit.ambiguous and not visit.submitted:
                 self._retain_crop(visit, observation)
-            self._submit_if_ready(policy, zone_id, visit)
             return
 
         if not tracks:
@@ -330,7 +372,6 @@ class LocalZoneCrossingBridge:
         observation = usable.get(track_id)
         if observation is not None:
             self._retain_crop(visit, observation)
-        self._submit_if_ready(policy, zone_id, visit)
 
     def _observe_empty(self, state: _ZoneState, threshold: int) -> None:
         state.empty_frames += 1
@@ -353,51 +394,154 @@ class LocalZoneCrossingBridge:
         state.blocked_until_empty = True
 
     def _retain_crop(self, visit: _Visit, observation: LocalVehicleCrop) -> None:
+        visit.crops_seen += 1
+        self._increment("candidate_crops_observed")
+
+        candidate = (
+            float(observation.quality),
+            visit.frames_seen,
+            observation.image,
+        )
+        # Every usable frame is ranked, but only a bounded top-quality reservoir
+        # owns image copies. This stays memory-bounded even if a car waits in the
+        # zone for minutes before the barrier opens.
+        reservoir = max(4, self._coordinator.settings.max_images_per_event * 2)
+        if len(visit.crops) >= reservoir:
+            weakest_index = min(
+                range(len(visit.crops)),
+                key=lambda index: (
+                    visit.crops[index][0],
+                    visit.crops[index][1],
+                ),
+            )
+            weakest = visit.crops[weakest_index]
+            if (candidate[0], candidate[1]) <= (weakest[0], weakest[1]):
+                return
+            del visit.crops[weakest_index]
         visit.crops.append(
             (
-                float(observation.quality),
-                visit.frames_seen,
-                observation.image.copy(),
+                candidate[0],
+                candidate[1],
+                candidate[2].copy(),
             )
         )
-        # Keep a small quality reservoir while waiting for the stable edge.
-        reservoir = max(4, self._coordinator.settings.max_images_per_event * 2)
-        if len(visit.crops) > reservoir:
-            visit.crops.sort(key=lambda item: (item[0], item[1]), reverse=True)
-            del visit.crops[reservoir:]
 
-    def _submit_if_ready(
+    def _finalize_exited_visit(
         self,
         policy: LocalZonePolicy,
         observed_zone_id: str,
         visit: _Visit,
-    ) -> None:
-        if (
-            visit.submitted
-            or visit.ambiguous
-            or visit.frames_seen < self._stable_frames
-            or len(visit.crops) < self._stable_frames
-        ):
-            return
+    ) -> bool:
+        """Queue one completed visit.
 
-        selected = sorted(
-            visit.crops,
-            key=lambda item: (item[0], item[1]),
-            reverse=True,
-        )[: self._coordinator.settings.max_images_per_event]
-        selected.sort(key=lambda item: item[1])
-        encoded = self._encode_crops(item[2] for item in selected)
-        if len(encoded) < self._stable_frames:
-            self._increment("submissions_failed")
-            logger.warning(
-                "[EntryV2Local] insufficient encodable crops camera=%s zone=%s "
-                "track=%s",
-                policy.camera_id,
+        Returns ``False`` only for a transient queue failure, in which case the
+        confirmed-exit visit and its encoded evidence remain available for the
+        next observation to retry. All deterministic rejection paths return
+        ``True`` so the zone can safely re-arm.
+        """
+        if visit.submitted:
+            return True
+        if visit.ambiguous:
+            self._discard_visit(
+                policy,
                 observed_zone_id,
-                visit.track_id,
+                visit,
+                reason="ambiguous",
             )
-            return
+            return True
 
+        if visit.prepared_request is None:
+            if (
+                visit.frames_seen < self._stable_frames
+                or visit.crops_seen < self._stable_frames
+                or len(visit.crops) < self._stable_frames
+            ):
+                self._discard_visit(
+                    policy,
+                    observed_zone_id,
+                    visit,
+                    reason="insufficient",
+                )
+                return True
+
+            # Rank every retained candidate by quality. If a top crop cannot be
+            # encoded, continue down the reservoir instead of losing a useful
+            # lower-ranked view. The chosen payloads are restored to capture
+            # order before they enter the multi-image evidence pipeline.
+            selected = []
+            for quality, frame_no, crop in sorted(
+                visit.crops,
+                key=lambda item: (item[0], item[1]),
+                reverse=True,
+            ):
+                encoded = self._encode_crops((crop,))
+                if not encoded:
+                    continue
+                selected.append((frame_no, quality, encoded[0]))
+                if (
+                    len(selected)
+                    >= self._coordinator.settings.max_images_per_event
+                ):
+                    break
+            selected.sort(key=lambda item: item[0])
+
+            # Encoding is complete. Release the substantially larger raw arrays
+            # even if queue capacity is temporarily unavailable.
+            visit.crops.clear()
+            if len(selected) < self._stable_frames:
+                self._increment("submissions_failed")
+                self._discard_visit(
+                    policy,
+                    observed_zone_id,
+                    visit,
+                    reason="insufficient",
+                    detail="insufficient_encodable_crops",
+                )
+                return True
+
+            visit.prepared_images = tuple(item[2] for item in selected)
+            visit.selected_count = len(selected)
+            visit.best_selected_quality = max(item[1] for item in selected)
+            visit.prepared_request = self._build_request(
+                policy,
+                observed_zone_id,
+                visit,
+            )
+
+        if not self._queue(
+            visit.prepared_request,
+            visit.prepared_images,
+            retry_attempt=0,
+        ):
+            return False
+
+        visit.submitted = True
+        self._increment("visits_finalized")
+        with self._lock:
+            self._metrics["snapshots_selected"] += visit.selected_count
+        logger.info(
+            "[EntryV2Local] finalized crossing=%s camera=%s zone=%s track=%s "
+            "frames_seen=%s candidates_seen=%s selected=%s best_quality=%.3f "
+            "captured_at=%s evidence=tracked_outside_zone",
+            visit.prepared_request.crossing_id,
+            policy.camera_id,
+            observed_zone_id,
+            visit.track_id,
+            visit.frames_seen,
+            visit.crops_seen,
+            visit.selected_count,
+            visit.best_selected_quality,
+            visit.captured_at.isoformat(),
+        )
+        visit.prepared_images = ()
+        return True
+
+    def _build_request(
+        self,
+        policy: LocalZonePolicy,
+        observed_zone_id: str,
+        visit: _Visit,
+    ) -> CrossingInput:
         seed = "|".join(
             (
                 norm_camera_id(policy.camera_id),
@@ -409,7 +553,7 @@ class LocalZoneCrossingBridge:
         )
         event_hash = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
         crossing_id = f"va-zone-{event_hash}"
-        request = CrossingInput(
+        return CrossingInput(
             crossing_id=crossing_id,
             source_event_id=crossing_id,
             camera_id=policy.camera_id,
@@ -426,12 +570,42 @@ class LocalZoneCrossingBridge:
                 "visit_sequence": visit.sequence,
                 "timestamp_source": visit.timestamp_source,
                 "direction_evidence": "deployment_calibrated_one_way_polygon",
+                "finalization_evidence": "tracked_outside_zone",
+                "frames_seen": visit.frames_seen,
+                "candidate_crops_seen": visit.crops_seen,
+                "selected_images": visit.selected_count,
+                "best_crop_quality": visit.best_selected_quality,
             },
         )
-        if not self._queue(request, encoded, retry_attempt=0):
-            return
-        visit.submitted = True
+
+    def _discard_visit(
+        self,
+        policy: LocalZonePolicy,
+        observed_zone_id: str,
+        visit: _Visit,
+        *,
+        reason: str,
+        detail: str = "",
+    ) -> None:
+        metric = {
+            "ambiguous": "visits_discarded_ambiguous",
+            "insufficient": "visits_discarded_insufficient",
+            "tracker_loss": "visits_discarded_tracker_loss",
+        }[reason]
+        self._increment(metric)
+        logger.warning(
+            "[EntryV2Local] discarded visit camera=%s zone=%s track=%s "
+            "reason=%s detail=%s frames_seen=%s candidates_seen=%s",
+            policy.camera_id,
+            observed_zone_id,
+            visit.track_id,
+            reason,
+            detail or "-",
+            visit.frames_seen,
+            visit.crops_seen,
+        )
         visit.crops.clear()
+        visit.prepared_images = ()
 
     def _encode_crops(self, crops: Iterable[np.ndarray]) -> Tuple[bytes, ...]:
         encoded = []
@@ -663,6 +837,37 @@ class LocalZoneCrossingBridge:
             self._metrics[name] += 1
 
     def close(self, *, wait: bool = False) -> None:
+        if wait and not self._closed:
+            # A completed visit can be holding prepared evidence only because
+            # the single ingest slot was busy. Drain that work, then give each
+            # spatially confirmed visit one final chance to queue before the
+            # executor is shut down. Active visits without a proven exit remain
+            # unsubmitted; shutdown must never fabricate movement.
+            self.wait_for_idle()
+            for state_key, state in tuple(self._states.items()):
+                visit = state.active
+                if visit is None or not visit.exit_confirmed or visit.submitted:
+                    continue
+                policy = next(
+                    (
+                        candidate
+                        for candidate in _POLICIES
+                        if (
+                            norm_camera_id(candidate.camera_id),
+                            normalized_zone_id(candidate.canonical_zone_id),
+                        )
+                        == state_key
+                    ),
+                    None,
+                )
+                if policy is not None and self._finalize_exited_visit(
+                    policy,
+                    policy.canonical_zone_id,
+                    visit,
+                ):
+                    self._rearm_after_visit(state)
+            self.wait_for_idle()
+
         with self._lock:
             self._closed = True
             executor = self._executor
