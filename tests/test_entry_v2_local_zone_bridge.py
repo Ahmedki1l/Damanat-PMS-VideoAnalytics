@@ -738,7 +738,13 @@ def test_engine_feeds_empty_and_vehicle_frames_with_capture_timestamp():
     assert observed["captured_at"] == NOW
     assert observed["timestamp_source"] == VA_HOST_GRAB_TIMESTAMP_SOURCE
     assert len(observed["crops"]) == 1
-    assert observed["crops"][0].image.shape[:2] == (340, 240)
+    # The zone crop is PADDED beyond the detection box. YOLO's box stops at the
+    # grille on the ramp's top-down view, leaving the number plate outside it —
+    # and this is the fallback identity path for cars the gate ANPR never
+    # reports, so the plate must be inside the crop. bbox is 240x340, padded by
+    # ENTRY_V2_LOCAL_CROP_PADDING_RATIO (0.18) on every side and clamped to the
+    # 1280x720 frame: 240 + 2*43 = 326, 340 + 2*61 = 462.
+    assert observed["crops"][0].image.shape[:2] == (462, 326)
     assert engine._entry_v2_local_bridge.calls[2]["inside_track_ids"] == []
     assert engine._entry_v2_local_bridge.calls[2]["outside_track_ids"] == [11]
 

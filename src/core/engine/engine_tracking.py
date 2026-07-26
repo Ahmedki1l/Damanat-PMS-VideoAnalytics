@@ -16,6 +16,43 @@ from src.models.state_machine import SlotState
 
 logger = logging.getLogger(__name__)
 
+
+def _local_zone_crop_padding() -> float:
+    """Padding applied to the vehicle box for Entry V2 local-zone crops only.
+
+    The ramp camera looks steeply DOWN, so YOLO's car box stops at the grille and
+    the number plate sits just below it — captured frames ended exactly at the
+    badge and the plate detector found nothing. Growing the box recovers the
+    bumper without touching the detector.
+
+    Tunable from the environment because the right value is a function of camera
+    pitch, and getting it wrong silently costs the plate: too small keeps
+    clipping it, too large drags in road and the neighbouring lane. 0.18 covers
+    the bumper on the deployed ramp geometry.
+    """
+    raw = os.environ.get("ENTRY_V2_LOCAL_CROP_PADDING_RATIO", "").strip()
+    if not raw:
+        return 0.18
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "[EntryV2Local] invalid ENTRY_V2_LOCAL_CROP_PADDING_RATIO=%r; using 0.18",
+            raw,
+        )
+        return 0.18
+    if not math.isfinite(value) or value < 0.0 or value > 1.0:
+        logger.warning(
+            "[EntryV2Local] ENTRY_V2_LOCAL_CROP_PADDING_RATIO=%s out of range "
+            "[0,1]; using 0.18",
+            value,
+        )
+        return 0.18
+    return value
+
+
+_LOCAL_ZONE_CROP_PADDING = _local_zone_crop_padding()
+
 # Apparent-size ramp for _bbox_view_quality: a car whose on-screen HEIGHT is at
 # or below _VQ_MIN_H px yields a useless upscaled crop for ReID and scores 0 on
 # size; at or above _VQ_GOOD_H px it is well-resolved and scores 1.0. This makes
@@ -137,7 +174,21 @@ class ParkingEngineTrackingMixin:
                     # wide boxes while still counting the track as in the zone.
                     reject = "view_quality_zero"
                 else:
-                    crop = self._crop_detection(frame, detection)
+                    # Pad the detection box before cropping. YOLO fits its box to
+                    # what it scores as "car", and on the ramp's steep top-down
+                    # view that box ends at the grille — the front bumper, and
+                    # with it the LICENSE PLATE, fall outside. Captured frames
+                    # showed a sharp, well-exposed car front cut off exactly at
+                    # the badge, and the plate detector found nothing in them.
+                    #
+                    # This is the fallback identity path for the ~22% of cars the
+                    # gate ANPR never reports, so losing the plate to a crop
+                    # boundary defeats the purpose of the zone capture. Pad only
+                    # here: the other _crop_detection callers feed slot occupancy
+                    # and ReID, where a tighter box is correct.
+                    crop = self._crop_detection(
+                        frame, detection, padding_ratio=_LOCAL_ZONE_CROP_PADDING
+                    )
                     if crop is None or crop.size == 0:
                         reject = "crop_empty"
                 if reject is not None:
