@@ -373,6 +373,28 @@ class LocalZoneCrossingBridge:
         if observation is not None:
             self._retain_crop(visit, observation)
 
+        # The snapshot IS taken the instant the car is first seen in the zone —
+        # what waits is the submission, which needs a confirmed spatial exit and
+        # >= stable_frames crops. On a transit ramp at ~0.1 fps that second frame
+        # never arrives, so the entry frame was being captured and then thrown
+        # away with no trace. Log the capture itself so "did we get a snapshot"
+        # stops depending on whether the visit later completed.
+        image = getattr(observation, "image", None) if observation else None
+        shape = getattr(image, "shape", None)
+        logger.info(
+            "[EntryV2Local][entry-capture] camera=%s zone=%s track=%s seq=%s "
+            "captured=%s crop=%s quality=%.3f",
+            policy.camera_id,
+            zone_id,
+            track_id,
+            visit.sequence,
+            observation is not None,
+            f"{shape[1]}x{shape[0]}" if shape and len(shape) >= 2 else "none",
+            float(getattr(observation, "quality", 0.0) or 0.0)
+            if observation
+            else 0.0,
+        )
+
     def _observe_empty(self, state: _ZoneState, threshold: int) -> None:
         state.empty_frames += 1
         if state.empty_frames >= threshold:

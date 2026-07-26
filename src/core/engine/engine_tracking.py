@@ -117,17 +117,39 @@ class ParkingEngineTrackingMixin:
                 # supply evidence themselves because there is no stable visit ID.
                 inside_track_ids.append(track_id)
                 if is_untracked(raw_track_id):
+                    # Not logged as a crop rejection: an untracked box is an
+                    # ambiguity signal, never an evidence candidate.
                     continue
+
+                # Every `continue` below silently costs a snapshot. A visit can
+                # end with frames_seen=204 candidates_seen=0 — the car tracked
+                # for minutes and not one crop kept — and until now the reason
+                # was invisible, indistinguishable from the zone never firing.
+                # Name the gate that dropped it so a mis-calibrated polygon or a
+                # too-strict whole-car threshold is a log line, not a guess.
+                reject = None
                 if not self._bbox_is_snapshot_ready(frame, detection):
-                    continue
-                # Entry evidence becomes a durable identity input, so a large
-                # fragment is not good enough. Reuse the calibrated whole-car
-                # gate that rejects border-truncated and implausibly wide boxes
-                # while still counting that track as physically in the zone.
-                if self._bbox_view_quality(frame, detection) <= 0.0:
-                    continue
-                crop = self._crop_detection(frame, detection)
-                if crop is None or crop.size == 0:
+                    reject = "not_snapshot_ready"
+                elif self._bbox_view_quality(frame, detection) <= 0.0:
+                    # Entry evidence becomes a durable identity input, so a large
+                    # fragment is not good enough. This is the calibrated
+                    # whole-car gate: it rejects border-truncated and implausibly
+                    # wide boxes while still counting the track as in the zone.
+                    reject = "view_quality_zero"
+                else:
+                    crop = self._crop_detection(frame, detection)
+                    if crop is None or crop.size == 0:
+                        reject = "crop_empty"
+                if reject is not None:
+                    bbox = tuple(
+                        round(float(v), 1) for v in getattr(detection, "bbox", ())
+                    )
+                    logger.info(
+                        "[EntryV2Local][crop-reject] cam=%s zone=%s track=%s "
+                        "reason=%s bbox=%s frame=%dx%d",
+                        cam_id, zone_id, track_id, reject, bbox,
+                        frame.shape[1], frame.shape[0],
+                    )
                     continue
                 vehicle_crops.append(
                     LocalVehicleCrop(
