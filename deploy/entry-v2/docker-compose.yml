@@ -6,6 +6,22 @@ services:
     init: true
     env_file:
       - ${VA_RUNTIME_ENV_FILE:?Set VA_RUNTIME_ENV_FILE to the external VA environment file}
+    environment:
+      # Field-calibration diagnostic. Zone entry crops are RAM-only, and a visit
+      # discarded for tracker_loss/ambiguity never reaches the analyzer — so no
+      # image is written anywhere and "was the car captured, and is the plate
+      # legible?" cannot be answered from disk. This writes the entry frame as
+      # captured to /app/vehicle_images/entry_zone_captures/, which is the
+      # durable VA_GALLERY_DIR bind mount below, so the files are readable from
+      # the host and survive restarts.
+      #
+      # `environment:` overrides env_file, so this wins over va.env by design:
+      # the value is meant to be flipped per drive from compose.env, not edited
+      # into the runtime secrets file. Set it EMPTY in compose.env to disable:
+      #   ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR=
+      # Leave it disabled outside calibration windows — it persists transit
+      # imagery of every vehicle entering the zone.
+      ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR: ${ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR-/app/vehicle_images}
     ports:
       - "${VA_BIND_IP:-127.0.0.1}:${VA_HOST_PORT:-8000}:8000"
     volumes:
