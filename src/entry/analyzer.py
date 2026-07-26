@@ -202,6 +202,14 @@ class ExistingModelsEvidenceProcessor:
                         frame_index=index,
                         plate=plate,
                     )
+                self._log_plate_read(
+                    event_id=event_id,
+                    camera_id=camera_id,
+                    source_role=source_role,
+                    frame_index=index,
+                    plate=plate,
+                    crop=plate_crop,
+                )
                 evidence.append(
                     FrameEvidence(
                         evidence_id=frame_id,
@@ -215,6 +223,65 @@ class ExistingModelsEvidenceProcessor:
         if not any(item.embedding for item in evidence):
             raise EvidenceUnavailable("reid_embedding_unavailable")
         return tuple(evidence)
+
+    def _log_plate_read(
+        self,
+        *,
+        event_id: str,
+        camera_id: str,
+        source_role: str,
+        frame_index: int,
+        plate: PlateEvidence,
+        crop,
+    ) -> None:
+        """Record every OCR attempt so plate legibility per camera is greppable.
+
+        Diagnostic only — never influences an entry decision. Complements the
+        crop files, which only exist when an image directory is configured AND
+        the detector found a plate: a `no_plate` frame used to leave no trace at
+        all, which reads identically to "OCR was never attempted" in the logs.
+
+        The crop's pixel width is logged beside the confidence because that is
+        the number that actually moves when camera exposure/bitrate/shutter are
+        retuned; confidence alone cannot distinguish "plate too small" from
+        "plate blurred". Threshold is echoed so a rejected read is legible
+        without cross-referencing ENTRY_V2_OCR_MIN_CONFIDENCE.
+        """
+        minimum = float(self._settings.ocr_min_confidence)
+        if plate.state is PlateReadState.NO_PLATE:
+            result = "no_plate"
+        elif plate.state is PlateReadState.UNREADABLE:
+            result = "unreadable"
+        elif plate.confidence >= minimum:
+            result = "reliable"
+        else:
+            result = "below_min_confidence"
+
+        crop_height, crop_width = 0, 0
+        shape = getattr(crop, "shape", None)
+        if isinstance(shape, tuple) and len(shape) >= 2:
+            try:
+                crop_height, crop_width = int(shape[0]), int(shape[1])
+            except (TypeError, ValueError):
+                crop_height, crop_width = 0, 0
+
+        logger.info(
+            "[EntryV2][OCR] event=%s camera=%s role=%s frame=%02d state=%s "
+            "plate=%r key=%s confidence=%.4f min_confidence=%.4f "
+            "crop=%dx%d result=%s",
+            event_id,
+            camera_id,
+            source_role,
+            frame_index,
+            plate.state.value,
+            plate.text,
+            plate.key or "-",
+            plate.confidence,
+            minimum,
+            crop_width,
+            crop_height,
+            result,
+        )
 
     def _save_plate_crop(
         self,

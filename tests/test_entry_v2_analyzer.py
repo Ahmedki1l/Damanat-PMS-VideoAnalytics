@@ -239,3 +239,64 @@ def test_existing_model_adapter_rejects_decompression_bomb_before_decode(monkeyp
         )
 
     assert decode_calls == []
+
+
+@pytest.mark.parametrize(
+    "text, confidence, expected_state, expected_result",
+    [
+        ("1234ABC", 0.94, "readable", "reliable"),
+        # 0.6607 is the real CAM-23 read observed in production on 2026-07-26,
+        # against the shipped ENTRY_V2_OCR_MIN_CONFIDENCE=0.75 floor.
+        ("1234ABC", 0.6607, "readable", "below_min_confidence"),
+        ("", 0.27, "unreadable", "unreadable"),
+    ],
+)
+def test_plate_read_is_logged_with_threshold_and_crop_size(
+    caplog, text, confidence, expected_state, expected_result
+):
+    processor = ExistingModelsEvidenceProcessor(
+        Registry(FakePlateDetector(), FakeOCR(text=text, confidence=confidence)),
+        EntrySettings(ocr_min_confidence=0.75),
+    )
+
+    with caplog.at_level("INFO", logger="src.entry.analyzer"):
+        processor.analyze(
+            event_id="event-ocr",
+            camera_id="CAM-23",
+            source_role="primary",
+            images=(jpeg_bytes(),),
+            metadata={},
+        )
+
+    line = next(m for m in caplog.messages if m.startswith("[EntryV2][OCR]"))
+    assert "camera=CAM-23" in line
+    assert "role=primary" in line
+    assert f"state={expected_state}" in line
+    assert f"result={expected_result}" in line
+    assert "min_confidence=0.7500" in line
+    # FakePlateDetector crops frame[10:18, 8:22] -> 14 wide x 8 high.
+    assert "crop=14x8" in line
+
+
+def test_plate_read_without_lpd_box_still_logs_no_plate(caplog):
+    processor = ExistingModelsEvidenceProcessor(
+        Registry(FakePlateDetector(present=False), FakeOCR()),
+        EntrySettings(ocr_min_confidence=0.75),
+    )
+
+    with caplog.at_level("INFO", logger="src.entry.analyzer"):
+        processor.analyze(
+            event_id="event-noplate",
+            camera_id="CAM-ENTRY",
+            source_role="anpr",
+            images=(jpeg_bytes(),),
+            metadata={},
+        )
+
+    # A missing plate box writes no crop file, so the log line is the only
+    # evidence that OCR was attempted and found nothing to read.
+    line = next(m for m in caplog.messages if m.startswith("[EntryV2][OCR]"))
+    assert "camera=CAM-ENTRY" in line
+    assert "state=no_plate" in line
+    assert "result=no_plate" in line
+    assert "crop=0x0" in line
