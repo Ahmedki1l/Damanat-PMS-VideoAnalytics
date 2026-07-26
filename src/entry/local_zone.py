@@ -172,7 +172,11 @@ class _Visit:
     exit_confirmed: bool = False
     ambiguous: bool = False
     submitted: bool = False
-    crops: list[Tuple[float, int, np.ndarray]] = field(default_factory=list)
+    # (quality, frame_no, reid_crop, plate_view) — the plate view is the
+    # zone-union crop; None when the union path is disabled.
+    crops: list[Tuple[float, int, np.ndarray, Optional[np.ndarray]]] = field(
+        default_factory=list
+    )
     prepared_request: Optional[CrossingInput] = None
     prepared_images: Tuple[bytes, ...] = ()
     selected_count: int = 0
@@ -559,11 +563,17 @@ class LocalZoneCrossingBridge:
             if (candidate[0], candidate[1]) <= (weakest[0], weakest[1]):
                 return
             del visit.crops[weakest_index]
+        # Carry the wider plate view alongside the tight ReID crop. The reservoir
+        # is what survives to flush, so a plate view that is not retained here
+        # cannot be inspected later — and the entry frame, which is the one we
+        # were saving, is by definition the FARTHEST the car ever is.
+        wide = getattr(observation, "plate_image", None)
         visit.crops.append(
             (
                 candidate[0],
                 candidate[1],
                 candidate[2].copy(),
+                wide.copy() if wide is not None and getattr(wide, "size", 0) else None,
             )
         )
 
@@ -610,7 +620,7 @@ class LocalZoneCrossingBridge:
             # lower-ranked view. The chosen payloads are restored to capture
             # order before they enter the multi-image evidence pipeline.
             selected = []
-            for quality, frame_no, crop in sorted(
+            for quality, frame_no, crop, _wide in sorted(
                 visit.crops,
                 key=lambda item: (item[0], item[1]),
                 reverse=True,
@@ -628,6 +638,7 @@ class LocalZoneCrossingBridge:
 
             # Encoding is complete. Release the substantially larger raw arrays
             # even if queue capacity is temporarily unavailable.
+            self._save_best_plate_view(policy, observed_zone_id, visit)
             visit.crops.clear()
             if len(selected) < self._stable_frames:
                 self._increment("submissions_failed")
@@ -719,6 +730,60 @@ class LocalZoneCrossingBridge:
             },
         )
 
+    def _save_best_plate_view(
+        self,
+        policy: LocalZonePolicy,
+        observed_zone_id: str,
+        visit: _Visit,
+    ) -> None:
+        """Write the highest-quality plate view the visit collected.
+
+        The entry-capture file is the FIRST frame, which is by definition the
+        farthest the car ever is — measured at ~65px of plate whether the stream
+        ran at 1080p or 2688x1520, because distance, not sensor, sets that
+        number. The reservoir already ranks every later frame by
+        _score_snapshot_quality, so the best one is the closest usable view of
+        the plate this camera position can produce. Saving it is the only way to
+        learn the real ceiling before deciding whether CAM-23 can carry plate
+        reading at all.
+
+        Called from BOTH flush paths: visits on a transit ramp end in
+        tracker_loss far more often than they finalize, so saving only on success
+        would almost never produce a file.
+        """
+        best = None
+        for entry in visit.crops:
+            wide = entry[3] if len(entry) > 3 else None
+            if wide is None or getattr(wide, "size", 0) == 0:
+                continue
+            if best is None or entry[0] > best[0]:
+                best = (entry[0], entry[1], wide)
+        if best is None:
+            return
+        quality, frame_no, image = best
+        saved = _save_zone_capture_for_debug(
+            image,
+            camera_id=policy.camera_id,
+            zone_id=observed_zone_id,
+            track_id=visit.track_id,
+            sequence=f"{visit.sequence}best{frame_no}",
+            quality=quality,
+        )
+        if saved:
+            shape = getattr(image, "shape", None)
+            logger.info(
+                "[EntryV2Local][best-plate-view] camera=%s zone=%s track=%s "
+                "frame=%s of %s crop=%s quality=%.3f saved=%s",
+                policy.camera_id,
+                observed_zone_id,
+                visit.track_id,
+                frame_no,
+                visit.frames_seen,
+                f"{shape[1]}x{shape[0]}" if shape and len(shape) >= 2 else "?",
+                quality,
+                saved,
+            )
+
     def _discard_visit(
         self,
         policy: LocalZonePolicy,
@@ -745,6 +810,9 @@ class LocalZoneCrossingBridge:
             visit.frames_seen,
             visit.crops_seen,
         )
+        # Before the reservoir is freed: this is the only chance to see the
+        # closest view of the plate the visit ever held.
+        self._save_best_plate_view(policy, observed_zone_id, visit)
         visit.crops.clear()
         visit.prepared_images = ()
 
