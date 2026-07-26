@@ -160,8 +160,26 @@ ENV VA_CMD="python main.py --api"
 # Safe rollout defaults. Deployment-time env may promote Entry V2 from off to
 # shadow/authoritative, but credentials and site calibration are never baked.
 ENV ENTRY_V2_MODE=off
+# NOTE: this pins the variable that OVERRIDES config.yaml's motion_scheduler.mode
+# (config.py reads VA_MOTION_SCHEDULER_MODE last and it wins). Leaving it baked at
+# shadow means a deployment that does not override it gets no motion gating at
+# all — which measured as ~0.10 fps on CAM-23, far too slow for the local entry
+# zone to ever see a car twice. Promoting to enforce (with CAM-23/CAM-03 bypassed
+# in motion_scheduler.camera_overrides) took CAM-23 to ~2.1 fps. Keep the safe
+# default here, but override it in the deployment env, not by relying on YAML.
 ENV VA_MOTION_SCHEDULER_MODE=shadow
 ENV VA_SLOT_STATE_MODE=shadow
+# Field-calibration diagnostic: persist each zone ENTRY frame to
+# /app/vehicle_images/entry_zone_captures/. Zone crops are RAM-only, and a visit
+# discarded for tracker_loss/ambiguity never reaches the analyzer, so no image is
+# written anywhere and "was the car captured, and is the plate legible?" cannot be
+# answered from disk. /app/vehicle_images is the durable gallery mount, so the
+# files are readable from the host and survive restarts.
+#
+# Set EMPTY to disable — it persists transit imagery of every vehicle entering
+# the zone, so it belongs on for a calibration drive and off afterwards:
+#   docker run -e ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR= ...
+ENV ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR=/app/vehicle_images
 # --- Supervisor-only knobs (ignored while VA_CMD bypasses the supervisor) ---
 ENV VA_OV_TOTAL_THREADS=""
 ENV VA_MERGE_GROUPS=""
