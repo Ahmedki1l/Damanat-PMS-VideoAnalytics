@@ -143,6 +143,20 @@ class LocalVehicleCrop:
     track_id: int
     image: np.ndarray
     quality: float
+    # A SECOND, wider view of the same vehicle: the union of the car box and the
+    # zone bounds, which reaches past the grille to include the bumper and number
+    # plate. `image` stays tight to the car because that is what ReID wants —
+    # background dilutes an appearance embedding — while plate reading needs the
+    # part of the car that the detector's box excludes.
+    #
+    # Not submitted as evidence yet. The analyzer runs ReID on EVERY image, and
+    # coordinator._require_single_vehicle_event compares all embeddings pairwise
+    # against event_consistency_min_score (0.82); two zoom levels of one car
+    # could fall under that and be rejected as mixed_vehicle_evidence, killing
+    # the whole event. Using it for real needs a per-image role so LPD reads it
+    # while ReID ignores it. Until then it is captured for inspection so plate
+    # legibility can be judged before that plumbing is written.
+    plate_image: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -466,7 +480,13 @@ class LocalZoneCrossingBridge:
         # never arrives, so the entry frame was being captured and then thrown
         # away with no trace. Log the capture itself so "did we get a snapshot"
         # stops depending on whether the visit later completed.
+        # Save the WIDER zone-union view when there is one: the tight ReID crop
+        # stops at the grille, so it cannot answer whether the plate was captured
+        # or is legible — which is the whole reason the file is written.
         image = getattr(observation, "image", None) if observation else None
+        wide = getattr(observation, "plate_image", None) if observation else None
+        if wide is not None and getattr(wide, "size", 0) > 0:
+            image = wide
         shape = getattr(image, "shape", None)
         quality = (
             float(getattr(observation, "quality", 0.0) or 0.0)

@@ -53,6 +53,27 @@ def _local_zone_crop_padding() -> float:
 
 _LOCAL_ZONE_CROP_PADDING = _local_zone_crop_padding()
 
+
+def _local_zone_crop_union_enabled() -> bool:
+    """Whether the zone-entry crop is the UNION of the car box and the zone.
+
+    Padding the detection box is a guess calibrated to camera pitch: 0.18 left
+    the plate's Latin row still clipped, and the correct value drifts the moment
+    the camera is re-aimed. The zone polygon is surveyed ground truth for where
+    vehicles actually sit, so unioning the box with the zone bounds captures the
+    car's full front — bumper and plate — without anyone tuning a constant.
+
+    Note this is the opposite of _crop_detection_to_zone, which INTERSECTS the
+    box with the zone and would clip the plate further.
+    """
+    raw = os.environ.get("ENTRY_V2_LOCAL_CROP_ZONE_UNION", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+_LOCAL_ZONE_CROP_UNION = _local_zone_crop_union_enabled()
+
 # Apparent-size ramp for _bbox_view_quality: a car whose on-screen HEIGHT is at
 # or below _VQ_MIN_H px yields a useless upscaled crop for ReID and scores 0 on
 # size; at or above _VQ_GOOD_H px it is well-resolved and scores 1.0. This makes
@@ -165,6 +186,7 @@ class ParkingEngineTrackingMixin:
                 # Name the gate that dropped it so a mis-calibrated polygon or a
                 # too-strict whole-car threshold is a log line, not a guess.
                 reject = None
+                plate_crop = None
                 if not self._bbox_is_snapshot_ready(frame, detection):
                     reject = "not_snapshot_ready"
                 elif self._bbox_view_quality(frame, detection) <= 0.0:
@@ -191,6 +213,16 @@ class ParkingEngineTrackingMixin:
                     )
                     if crop is None or crop.size == 0:
                         reject = "crop_empty"
+                    elif _LOCAL_ZONE_CROP_UNION:
+                        # Second, wider view for plate reading only. `crop` stays
+                        # tight so the ReID embedding is not diluted by road and
+                        # wall; this one reaches past the grille to the bumper.
+                        plate_crop = self._crop_detection_union_zone(
+                            frame,
+                            detection,
+                            zone,
+                            padding_ratio=_LOCAL_ZONE_CROP_PADDING,
+                        )
                 if reject is not None:
                     bbox = tuple(
                         round(float(v), 1) for v in getattr(detection, "bbox", ())
@@ -206,6 +238,7 @@ class ParkingEngineTrackingMixin:
                     LocalVehicleCrop(
                         track_id=track_id,
                         image=crop,
+                        plate_image=plate_crop,
                         quality=self._score_snapshot_quality(detection, crop),
                     )
                 )
@@ -850,6 +883,56 @@ class ParkingEngineTrackingMixin:
             x2 += pad_x
             y2 += pad_y
         x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        crop = frame[y1:y2, x1:x2]
+        return crop if crop.size > 0 else None
+
+    def _crop_detection_union_zone(
+        self,
+        frame: np.ndarray,
+        detection,
+        zone: ParkingSlot,
+        padding_ratio: float = 0.0,
+    ) -> Optional[np.ndarray]:
+        """Crop the UNION of the (padded) vehicle box and the zone bounds.
+
+        The ramp camera looks steeply down, so YOLO's car box ends at the grille
+        and the number plate falls below it. Padding the box recovers some of
+        that, but the right ratio follows camera pitch and 0.18 still left the
+        plate's Latin row clipped. The zone polygon is surveyed for exactly where
+        vehicles are, so growing the crop to cover it captures the car's full
+        front without tuning a constant against a moving target.
+
+        Contrast :meth:`_crop_detection_to_zone`, which INTERSECTS box and zone —
+        correct when the zone is a parking slot to be isolated, wrong here, where
+        it would clip the plate further.
+        """
+        if frame is None or frame.size == 0 or zone is None:
+            return None
+        h, w = frame.shape[:2]
+        try:
+            x1, y1, x2, y2 = [int(v) for v in detection.bbox]
+        except (TypeError, ValueError):
+            return None
+
+        if padding_ratio > 0.0:
+            pad_x = max(16, int((x2 - x1) * padding_ratio))
+            pad_y = max(12, int((y2 - y1) * padding_ratio))
+            x1, y1, x2, y2 = x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y
+
+        try:
+            minx, miny, maxx, maxy = zone.polygon.bounds
+        except Exception:
+            # A zone without usable bounds must not lose the detection; fall
+            # back to the padded box rather than returning nothing.
+            minx = miny = maxx = maxy = None
+        if None not in (minx, miny, maxx, maxy):
+            x1, y1 = min(x1, int(minx)), min(y1, int(miny))
+            x2, y2 = max(x2, int(maxx)), max(y2, int(maxy))
+
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
         crop = frame[y1:y2, x1:x2]
         return crop if crop.size > 0 else None
 

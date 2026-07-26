@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cv2
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from src.entry.domain import CrossingRole, EntryMode, IngestResult
@@ -882,3 +884,51 @@ def test_cam03_v2_uses_strict_polygon_membership_not_bbox_overlap():
     observed = engine._entry_v2_local_bridge.calls[0]
     assert observed["inside_track_ids"] == []
     assert observed["outside_track_ids"] == [11]
+
+
+def test_zone_union_crop_reaches_past_the_car_box_for_the_plate():
+    """The OCR view must cover the bumper the detector's box excludes.
+
+    On the ramp's top-down view YOLO's box stops at the grille, so the tight
+    ReID crop cannot contain the plate. The union with the zone bounds must
+    extend past the box; the tight crop must stay tight.
+    """
+    from shapely.geometry import Polygon
+    from src.core.engine.engine_tracking import ParkingEngineTrackingMixin
+
+    frame = np.full((720, 1280, 3), 100, dtype=np.uint8)
+    detection = SimpleNamespace(bbox=(400.0, 200.0, 700.0, 480.0), track_id=7)
+    zone = SimpleNamespace(
+        polygon=Polygon([(300, 150), (900, 150), (900, 620), (300, 620)])
+    )
+
+    engine = ParkingEngineTrackingMixin.__new__(ParkingEngineTrackingMixin)
+    union = ParkingEngineTrackingMixin._crop_detection_union_zone(
+        engine, frame, detection, zone, padding_ratio=0.0
+    )
+    tight = ParkingEngineTrackingMixin._crop_detection(engine, frame, detection)
+
+    assert tight.shape[:2] == (280, 300)          # exactly the detection box
+    # Union spans zone bounds where they exceed the box: x 300..900, y 150..620.
+    assert union.shape[:2] == (470, 600)
+    assert union.shape[0] > tight.shape[0]        # reaches BELOW the grille cut
+    assert union.shape[1] > tight.shape[1]
+
+
+def test_zone_union_falls_back_to_the_box_when_zone_bounds_are_unusable():
+    """A broken zone must not cost the detection its crop entirely."""
+    from src.core.engine.engine_tracking import ParkingEngineTrackingMixin
+
+    frame = np.full((720, 1280, 3), 100, dtype=np.uint8)
+    detection = SimpleNamespace(bbox=(400.0, 200.0, 700.0, 480.0), track_id=7)
+
+    class _BadZone:
+        @property
+        def polygon(self):
+            raise RuntimeError("no geometry")
+
+    engine = ParkingEngineTrackingMixin.__new__(ParkingEngineTrackingMixin)
+    crop = ParkingEngineTrackingMixin._crop_detection_union_zone(
+        engine, frame, detection, _BadZone(), padding_ratio=0.0
+    )
+    assert crop is not None and crop.shape[:2] == (280, 300)
