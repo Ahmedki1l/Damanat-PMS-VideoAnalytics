@@ -31,7 +31,6 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 # Copy requirements
 COPY requirements.txt .
 
-# 🔥 IMPORTANT: استخدم نسخة stable بدل Git
 RUN pip install --no-cache-dir torchreid==0.2.5
 
 # Install build-heavy dependencies separately to cache layers
@@ -136,27 +135,57 @@ ENV PYTHONUNBUFFERED=1
 #
 #   PROD     PERF_TRACE=0, all overrides empty (multi-process supervisor).
 #
-# Currently set to: BUILD 4 (Phase 2 single-process async).
-# To revert to prod multi-process: set VA_SINGLE_PROCESS/VA_INFER/VA_CMD empty,
-# PERF_TRACE=0, and restore VA_OV_TOTAL_THREADS/VA_MERGE_GROUPS as needed.
+# Currently set to: BUILD 5 (gate-camera capacity isolation, multi-process
+# supervisor). BUILD 4's single-process overrides are cleared below.
+# To go back to BUILD 4: restore the VA_SINGLE_PROCESS/VA_INFER/VA_CMD/
+# VA_OV_NUM_THREADS/VA_FEED_THREADS/VA_INFER_NIREQ values listed there.
+# To reach true PROD: PERF_TRACE=0 as well.
 # ============================================================================
 ENV PERF_TRACE=1
 ENV PERF_TRACE_EVERY=50
-# --- Phase 2 (BUILD 4) single-process async engine -------------------------
-# One process, one AsyncInferQueue, all cameras. Bypasses the supervisor.
-# 1st prod run (8->10->9->11) showed the pool STARVED (~2/15 in flight) while the
-# consumer + decode were idle: the single scheduler thread doing all preprocess
-# was the ceiling (~20 inf/s). VA_FEED_THREADS spreads preprocess across N feeder
-# threads (OpenCV/numpy release the GIL) so the pool fills. Watch [PERF] async-infer
-# `~in flight` rise from ~2 toward nireq, and inf/s climb from ~20. If req_wall
-# INFLATES and concurrency stays low, feeders+15 threads oversubscribe → next build
-# lowers VA_OV_NUM_THREADS (~10) to give feeders CPU.
-ENV VA_INFER_NIREQ=16
-ENV VA_SINGLE_PROCESS=1
-ENV VA_INFER=async
-ENV VA_OV_NUM_THREADS=16
-ENV VA_FEED_THREADS=6
-ENV VA_CMD="python main.py --api"
+#
+#   BUILD 5  *** CURRENT — gate-camera capacity ISOLATION. ***
+#            BUILD 4 put all 27 cameras on ONE AsyncInferQueue, which makes the
+#            entry ramp's frame rate a RESIDUAL of whatever the parking cameras
+#            leave behind. Measured: CAM-23 ran 0.10 fps until motion gating was
+#            promoted to enforce, then 1.26 — but that entire gain came from
+#            SUPPRESSING QUIET cameras, so it evaporates exactly when the garage
+#            is busy and entries are most frequent. Raising CAM-23 to 2688x1520
+#            alone dropped it to 0.90 and total inference 14.6 -> 8.0 inf/s.
+#            A shared queue cannot give the entry path a floor.
+#
+#            The supervisor already models the fix: _groups_from_db() pulls
+#            VA_GATE_CAMERAS (CAM-23, CAM-03) OUT of their area buckets into a
+#            dedicated "gate" group, so they get their own process and their own
+#            OpenVINO pool. Parking activity can no longer starve them.
+#
+#            So BUILD 4's overrides are cleared and the default supervisor
+#            ENTRYPOINT runs. VA_MERGE_GROUPS stays EMPTY on purpose: merging to
+#            2 groups folds gate together with b2 (see BUILD 3) and destroys the
+#            isolation this build exists to create.
+#
+#            HARD GATE: compare gate-group fps QUIET vs BUSY. Holding its rate
+#            under load is the whole point. Watch for the 2026-07-15 regression
+#            in supervisor.py (~line 311) — too many groups apportioned gate ONE
+#            thread and single-threaded HEVC decode floored it at 0.40 fps;
+#            _MIN_THREADS_PER_GROUP=2 guards that, but 2 threads may still be
+#            thin for a 2688x1520 stream. If gate sits near 0.4, that is thread
+#            starvation, not the queue. Revert = restore the BUILD 4 block below.
+# ---------------------------------------------------------------------------
+# BUILD 4 (single-process async) — kept for one-line revert:
+#   VA_INFER_NIREQ=16  VA_SINGLE_PROCESS=1  VA_INFER=async
+#   VA_OV_NUM_THREADS=16  VA_FEED_THREADS=6  VA_CMD="python main.py --api"
+ENV VA_INFER_NIREQ=""
+ENV VA_SINGLE_PROCESS=""
+ENV VA_INFER=""
+ENV VA_OV_NUM_THREADS=""
+ENV VA_FEED_THREADS=""
+ENV VA_CMD=""
+# The two cameras that must not compete with parking for inference: the ramp-top
+# line crossing and the B1 entrance backstop. supervisor.py forces them into the
+# single --api group, which it must be anyway — the ANPR handler reads their live
+# frames through a PROCESS-LOCAL buffer, so co-location is required, not optional.
+ENV VA_GATE_CAMERAS="CAM-23,CAM-03"
 # Safe rollout defaults. Deployment-time env may promote Entry V2 from off to
 # shadow/authoritative, but credentials and site calibration are never baked.
 ENV ENTRY_V2_MODE=off
