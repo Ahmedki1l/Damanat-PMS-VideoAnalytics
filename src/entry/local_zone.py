@@ -27,8 +27,95 @@ from .domain import CrossingInput, CrossingRole, norm_camera_id
 
 logger = logging.getLogger(__name__)
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 VA_HOST_GRAB_TIMESTAMP_SOURCE = "va_host_grab"
 VA_HOST_DIRECT_READ_TIMESTAMP_SOURCE = "va_host_direct_read"
+
+# Zone crops are RAM-only by contract, and a visit that never reaches the
+# coordinator (tracker_loss, ambiguity, queue saturation) is freed without ever
+# passing through the analyzer — so nothing lands in entry_plate_crops and there
+# is no artefact to inspect. That makes "did we actually capture the car?"
+# unanswerable from disk, which is exactly what field calibration needs.
+#
+# Setting ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR writes the entry frame as it was
+# captured, before any submission decision. Deliberately OFF by default: this
+# persists transit imagery, so it is a diagnostic you switch on for a drive and
+# switch off again, not a production default.
+LOCAL_CAPTURE_DEBUG_DIR_ENV = "ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR"
+ZONE_CAPTURE_SUBDIRECTORY = "entry_zone_captures"
+
+
+def _safe_part(value, *, max_length: int = 32) -> str:
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("-", str(value or "")).strip("._-")
+    return (cleaned or "unknown")[:max_length]
+
+
+def _save_zone_capture_for_debug(
+    image,
+    *,
+    camera_id: str,
+    zone_id: str,
+    track_id,
+    sequence,
+    quality: float,
+) -> Optional[str]:
+    """Persist one entry-zone crop when the debug dir is configured.
+
+    Returns the written path, or None when disabled or on any failure. Never
+    raises: this runs on the engine's single post-processing thread, and a full
+    disk must not stall slot occupancy.
+    """
+    import os
+    import tempfile
+
+    base = os.environ.get(LOCAL_CAPTURE_DEBUG_DIR_ENV, "").strip()
+    if not base or image is None or getattr(image, "size", 0) == 0:
+        return None
+
+    target_dir = os.path.join(base, ZONE_CAPTURE_SUBDIRECTORY)
+    shape = getattr(image, "shape", None)
+    dimensions = (
+        f"{shape[1]}x{shape[0]}" if shape and len(shape) >= 2 else "unknown"
+    )
+    filename = (
+        f"{time.strftime('%Y%m%d_%H%M%S')}"
+        f"__camera-{_safe_part(camera_id)}"
+        f"__zone-{_safe_part(zone_id)}"
+        f"__track-{_safe_part(track_id, max_length=16)}"
+        f"__seq-{_safe_part(sequence, max_length=8)}"
+        f"__{dimensions}"
+        f"__quality-{quality:.3f}.jpg"
+    )
+    target = os.path.join(target_dir, filename)
+    temporary_path = None
+    try:
+        ok, encoded = cv2.imencode(
+            ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+        )
+        if not ok:
+            raise OSError("OpenCV could not encode the zone capture")
+        os.makedirs(target_dir, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{filename}.", suffix=".tmp", dir=target_dir
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded.tobytes())
+        os.replace(temporary_path, target)
+        temporary_path = None
+        return target
+    except Exception:
+        logger.warning(
+            "[EntryV2Local][zone-capture] save failed dir=%s; capture continues",
+            target_dir,
+            exc_info=True,
+        )
+        return None
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True)
@@ -381,18 +468,30 @@ class LocalZoneCrossingBridge:
         # stops depending on whether the visit later completed.
         image = getattr(observation, "image", None) if observation else None
         shape = getattr(image, "shape", None)
+        quality = (
+            float(getattr(observation, "quality", 0.0) or 0.0)
+            if observation
+            else 0.0
+        )
+        saved = _save_zone_capture_for_debug(
+            image,
+            camera_id=policy.camera_id,
+            zone_id=zone_id,
+            track_id=track_id,
+            sequence=visit.sequence,
+            quality=quality,
+        )
         logger.info(
             "[EntryV2Local][entry-capture] camera=%s zone=%s track=%s seq=%s "
-            "captured=%s crop=%s quality=%.3f",
+            "captured=%s crop=%s quality=%.3f saved=%s",
             policy.camera_id,
             zone_id,
             track_id,
             visit.sequence,
             observation is not None,
             f"{shape[1]}x{shape[0]}" if shape and len(shape) >= 2 else "none",
-            float(getattr(observation, "quality", 0.0) or 0.0)
-            if observation
-            else 0.0,
+            quality,
+            saved or "-",
         )
 
     def _observe_empty(self, state: _ZoneState, threshold: int) -> None:
