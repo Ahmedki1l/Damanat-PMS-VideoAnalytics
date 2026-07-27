@@ -1411,7 +1411,9 @@ def test_strict_gallery_yaml_rejects_out_of_range_thresholds(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("gallery_strict_admission_enabled", "false"),
+        # gallery_strict_admission_enabled is deliberately NOT here — it is
+        # opt-out while Entry V2 is off. See
+        # test_persistent_gallery_allows_strict_admission_opt_out below.
         ("gallery_require_slot_authority", "false"),
         ("gallery_parked_require_rank_one", "false"),
         ("slot_lpd_enabled", "false"),
@@ -1437,6 +1439,49 @@ def test_strict_persistent_gallery_rejects_unsafe_ocr_or_rank_mode(
 
     with pytest.raises(ValueError, match=field):
         load_config(str(config_path))
+
+
+def test_persistent_gallery_allows_strict_admission_opt_out(tmp_path):
+    """Strict admission may be turned OFF while Entry V2 is not minting proofs.
+
+    Strict admission only accepts a reference carrying an ``entry_v2_parked_v1``
+    proof. Nothing but Entry V2 mints one, so with ENTRY_V2_MODE=off a mandatory
+    flag closed the gallery in BOTH directions — ``save_ref`` refused the ANPR
+    seed, the CAM-23 top view, the CAM-03 B-entry reference and the learned
+    parked pose (all pass admission=None), while ``_active_refs`` hid every
+    folder already on disk. Non-gate workers then held no plated session at all,
+    so a CORRECT slot OCR read had nothing to confirm against and current_plate
+    stayed NULL facility-wide (B1, 2026-07-27).
+
+    Opting out must stay possible, and must NOT silently relax the gates that
+    live outside the strict branch.
+    """
+    values = {
+        "gallery_persist_enabled": "true",
+        "gallery_strict_admission_enabled": "false",
+        "gallery_parked_require_rank_one": "true",
+        "slot_lpd_enabled": "true",
+        "slot_lpd_fallback_enabled": "false",
+        # Production sets this (config.yaml); the dataclass default is False.
+        # Pinned here so the assertion below proves the opt-out does not
+        # disturb it, rather than re-testing the default.
+        "slot_plate_requires_ocr": "true",
+    }
+    config_path = tmp_path / "config.yaml"
+    body = "\n".join(f'  {key}: "{item}"' for key, item in values.items())
+    config_path.write_text(f"matching:\n{body}\n", encoding="utf-8")
+
+    matching = load_config(str(config_path)).matching
+
+    assert matching.gallery_persist_enabled is True
+    assert matching.gallery_strict_admission_enabled is False
+    # Everything the strict branch does NOT own stays enforced.
+    assert matching.gallery_require_slot_authority is True
+    assert matching.gallery_parked_require_rank_one is True
+    assert matching.gallery_parked_reid_min_score >= 0.70
+    assert matching.gallery_parked_reid_min_margin >= 0.15
+    # Appearance alone still cannot write current_plate.
+    assert matching.slot_plate_requires_ocr is True
 
 
 @pytest.mark.parametrize(

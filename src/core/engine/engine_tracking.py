@@ -116,6 +116,48 @@ _VQ_BORDER_PX = 2.0
 # touching a border.
 _VQ_MAX_ASPECT = 2.2
 
+# --- snapshot quality ------------------------------------------------------ #
+# _score_snapshot_quality used to return `area * (1 + 0.5 * sharpness_factor)`,
+# which is area in all but name. Two measurements over 29 real CAM-23 captures:
+#
+#   * The sharpness term never varied. Real whole-crop Laplacian variance ran
+#     1075-3746 against a cap of 250, so min(sharp, 250)/250 was pinned at 1.0
+#     for every frame and the formula was exactly `area * 1.5`.
+#   * Raising that cap would make things WORSE, not better. The dark captures
+#     with headlight glare scored HIGHEST (2410-3746) while the readable ones sat
+#     at 1388-1723 — on a whole-vehicle crop the statistic tracks glare and
+#     background texture, not how well the car is imaged. The cap stays where it
+#     is deliberately; the term survives only to discount genuinely flat crops.
+#
+# So the defect is unbounded area. Area now saturates: pixels help until there
+# are enough of them, then they nearly stop helping. Expressed at _VQ_REF_H and
+# scaled by frame height squared, for the reason given above about fixed pixel
+# gates silently changing meaning with stream resolution.
+#
+# 150k px^2 at 720p: the readable CAM-23 frames measured 32k-199k once scaled
+# back to 720p, and the frames where the car had swallowed the lens measured
+# 281k-343k. The reference sits at the top of the readable band, so "readable"
+# is still rising and "too close" is already flat.
+_SNAPSHOT_AREA_REF_720 = 150_000.0
+# How much a frame may still gain past the reference. An 8.75x area ratio — the
+# worst real case — becomes 1.11x, enough to keep ordering deterministic without
+# letting size steamroll every other signal.
+_SNAPSHOT_AREA_OVERSHOOT_WEIGHT = 0.05
+# A box clamped by the frame edge holds a fragment of a car; see _VQ_BORDER_PX.
+# The ReID-reference path already refuses these outright. This path cannot refuse
+# — it must still rank something — so it discounts hard instead.
+_SNAPSHOT_CLAMPED_PENALTY = 0.25
+
+
+def _snapshot_area_score(area: float, frame_h: Optional[float]) -> float:
+    """Bounded stand-in for raw bbox area. See _SNAPSHOT_AREA_REF_720."""
+    scale = (max(1e-6, float(frame_h)) / _VQ_REF_H) ** 2 if frame_h else 1.0
+    reference = _SNAPSHOT_AREA_REF_720 * scale
+    if area <= reference:
+        return area / reference
+    overshoot = (area - reference) / reference
+    return 1.0 + _SNAPSHOT_AREA_OVERSHOOT_WEIGHT * math.log1p(overshoot)
+
 
 class ParkingEngineTrackingMixin:
     def _process_entry_v2_local_zones(
@@ -239,7 +281,7 @@ class ParkingEngineTrackingMixin:
                         track_id=track_id,
                         image=crop,
                         plate_image=plate_crop,
-                        quality=self._score_snapshot_quality(detection, crop),
+                        quality=self._score_snapshot_quality(detection, crop, frame),
                     )
                 )
 
@@ -997,17 +1039,46 @@ class ParkingEngineTrackingMixin:
         bottom_margin = max(0.0, h - y2) / box_h
         return min(left_margin, top_margin, right_margin, bottom_margin)
 
-    def _score_snapshot_quality(self, detection, crop: Optional[np.ndarray]) -> float:
-        """Score snapshot quality using both size and clarity."""
-        x1, y1, x2, y2 = detection.bbox
-        area_score = max(0.0, float((x2 - x1) * (y2 - y1)))
+    def _score_snapshot_quality(
+        self,
+        detection,
+        crop: Optional[np.ndarray],
+        frame: Optional[np.ndarray] = None,
+    ) -> float:
+        """Score snapshot quality from size, clarity, and whether the car is whole.
+
+        ``frame`` is optional so existing callers keep working, but pass it where
+        it is available: without it neither the resolution scaling nor the
+        clamped-box check can run, and the score degrades to bounded area alone.
+
+        This is deliberately NOT plate-aware. It runs per detection per frame, and
+        localising a plate costs ~19 ms — far too much for that path. Choosing the
+        frame whose plate is legible is done once per visit at flush, in
+        ``LocalZoneCrossingBridge._save_best_plate_view``.
+        """
+        x1, y1, x2, y2 = [float(value) for value in detection.bbox]
+        area = max(0.0, (x2 - x1) * (y2 - y1))
+        frame_h = float(frame.shape[0]) if frame is not None else None
+        score = _snapshot_area_score(area, frame_h)
+
+        if frame is not None:
+            height, width = frame.shape[:2]
+            clamped = (
+                x1 <= _VQ_BORDER_PX
+                or y1 <= _VQ_BORDER_PX
+                or x2 >= width - _VQ_BORDER_PX
+                or y2 >= height - _VQ_BORDER_PX
+            )
+            if clamped:
+                score *= _SNAPSHOT_CLAMPED_PENALTY
+
         if crop is None or crop.size == 0:
-            return area_score
+            return score
 
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         sharpness_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         sharpness_factor = min(sharpness_score, 250.0) / 250.0
-        return area_score * (1.0 + 0.5 * sharpness_factor)
+        return score * (1.0 + 0.5 * sharpness_factor)
 
     def _bbox_is_snapshot_ready(
         self,
@@ -1136,7 +1207,7 @@ class ParkingEngineTrackingMixin:
 
             crop = self._crop_detection(frame, detection)
             if crop is not None:
-                quality = self._score_snapshot_quality(detection, crop)
+                quality = self._score_snapshot_quality(detection, crop, frame)
                 self.vehicle_registry.update_park_entry_candidate_snapshot(
                     candidate_id,
                     crop,
@@ -1258,7 +1329,7 @@ class ParkingEngineTrackingMixin:
                 if crop is None:
                     continue
 
-                quality = self._score_snapshot_quality(detection, crop)
+                quality = self._score_snapshot_quality(detection, crop, frame)
                 depth = self._zone_depth_score(detection, zone)
                 visibility = self._visibility_score(frame, detection)
 

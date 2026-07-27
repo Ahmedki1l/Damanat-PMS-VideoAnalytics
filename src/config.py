@@ -873,6 +873,18 @@ class AlertsConfig:
     # PROVEN non-owner.
     reserved_slot_identity_timeout_s: float = 300.0
 
+    # Alert types kept OUT of the real-time SSE stream (/api/alerts/stream).
+    # Notification-only: report_alert still writes the row and the REST alert
+    # endpoints still serve it, so history and auditing are unaffected — the
+    # dashboard just stops popping a live alert for these types.
+    #
+    # reserved_slot_unidentified is suppressed by default because it is the
+    # "nobody could name this car" fallback above, not a proven intrusion. On
+    # slots that can never be identified (B1_CRO has OCR disabled outright) it
+    # fires on essentially every occupancy, which trains operators to dismiss
+    # the alert panel. Set to () to notify on every alert type.
+    suppressed_notification_types: tuple[str, ...] = ("reserved_slot_unidentified",)
+
 
 @dataclass
 class AppConfig:
@@ -1273,6 +1285,14 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             )
         except (TypeError, ValueError):
             pass
+        _suppressed = a.get("suppressed_notification_types")
+        if _suppressed is not None:
+            # A YAML list, or a comma-separated string for one-line overrides.
+            if isinstance(_suppressed, str):
+                _suppressed = _suppressed.split(",")
+            config.alerts.suppressed_notification_types = tuple(
+                str(t).strip() for t in _suppressed if str(t).strip()
+            )
     _env_restricted_alerts = os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS")
     if _env_restricted_alerts is not None:
         config.alerts.enable_restricted_zone_alerts = (
@@ -1290,7 +1310,8 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         from src.services import alert_service as _alert_service
 
         _alert_service.configure_alerts(
-            enable_restricted_zone_alerts=config.alerts.enable_restricted_zone_alerts
+            enable_restricted_zone_alerts=config.alerts.enable_restricted_zone_alerts,
+            suppressed_notification_types=config.alerts.suppressed_notification_types,
         )
     except ImportError as exc:  # pragma: no cover - only in cut-down environments
         print(f"[WARN] Could not push alert config to alert_service: {exc}")
@@ -1684,14 +1705,30 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             raise ValueError(f"{field_name} must be finite and non-negative")
     if matching.gallery_max_refs_per_car <= 0:
         raise ValueError("matching.gallery_max_refs_per_car must be positive")
-    if (
-        matching.gallery_persist_enabled
-        and not matching.gallery_strict_admission_enabled
-    ):
-        raise ValueError(
-            "matching.gallery_strict_admission_enabled must be true when "
-            "gallery persistence is enabled"
-        )
+    # STRICT ADMISSION IS OPT-OUT, NOT MANDATORY, WHILE ENTRY V2 IS OFF.
+    #
+    # Strict admission (736a35c, 2026-07-22) only accepts a gallery reference
+    # carrying an ``entry_v2_parked_v1`` proof. Nothing but Entry V2 can mint one,
+    # and the deploy runs ENTRY_V2_MODE=off — so with this raise in place the flag
+    # could not be turned off and every gallery path was dead in BOTH directions:
+    # ``save_ref`` refused the ANPR seed, the CAM-23 top view, the CAM-03 B-entry
+    # reference and the learned parked pose (all call it with admission=None),
+    # while ``_active_refs`` hid the 45 folders already on disk. The result was an
+    # empty session pool in every non-gate worker: measured 2026-07-27, slot
+    # B13 COO read '9990BHD' correctly 32 times and discarded every read against
+    # "ReID's top-0 []", and current_plate was NULL for the whole B1 floor.
+    #
+    # Turning the flag off restores the 2026-07-13 posture, which was naming cars
+    # on B1 correctly. It drops the Entry V2 provenance chain and the 0.90
+    # OCR-confidence / view-quality / neighbour-clearance floors carried inside
+    # _strict_parked_proof_matches_session. It does NOT relax what still gates
+    # every write outside the strict branch: rank-1, ReID >= 0.70, margin >= 0.15,
+    # is_plausible_car_crop, crop area, sharpness, body-colour agreement with the
+    # ANPR ground truth, gt-similarity, dedup, and gallery_min_identity_similarity.
+    # slot_plate_requires_ocr is a separate flag and stays on, so appearance alone
+    # still cannot write current_plate.
+    #
+    # Re-enable strict admission once Entry V2 is authoritative and minting proofs.
     if matching.gallery_persist_enabled:
         if not matching.gallery_require_slot_authority:
             raise ValueError(

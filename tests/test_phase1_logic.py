@@ -80,7 +80,14 @@ class TestPhase1Logic(unittest.TestCase):
         # Check: Burst started
         burst_key = (self.cam_id, track_id)
         self.assertIn(burst_key, self.engine._confirmation_bursts)
-        self.assertEqual(self.engine._confirmation_bursts[burst_key]['best_quality'], 400) # 20*20
+        # Quality is a bounded score, not raw bbox area. It used to be exactly
+        # `area * 1.5` (the sharpness term was pinned at 1.0 on every real
+        # frame), so a closer car outranked every other signal by pixel count
+        # alone. Area now saturates, which means the absolute number is not
+        # meaningful on its own — what this test cares about is that a better
+        # frame replaces the first one.
+        first_quality = self.engine._confirmation_bursts[burst_key]['best_quality']
+        self.assertGreater(first_quality, 0.0)
         # First frame only seeds the burst — no confirmation attempt yet.
         self.mock_registry.confirm_at_b1_entrance.assert_not_called()
 
@@ -88,8 +95,10 @@ class TestPhase1Logic(unittest.TestCase):
         det2 = MockDetection(track_id, [10, 10, 60, 60], (40, 40)) # Size 50x50
         self.engine._process_confirmation_zone(self.cam_id, dummy_frame, [det2], self.zone)
 
-        # Check: Best quality updated (2500)
-        self.assertEqual(self.engine._confirmation_bursts[burst_key]['best_quality'], 2500)
+        # Check: the larger, closer view replaced the entry frame as best.
+        self.assertGreater(
+            self.engine._confirmation_bursts[burst_key]['best_quality'], first_quality
+        )
         self.assertEqual(self.engine._confirmation_bursts[burst_key]['frames_collected'], 2)
         # The car is deep in the zone now, so an EARLY confirmation attempt is
         # expected (this replaced the old exit-only Virtual Line rule). The

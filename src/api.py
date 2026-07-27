@@ -38,7 +38,7 @@ from src.events.event_bus import EventBus
 from src.entry.analyzer import PLATE_CROP_SUBDIRECTORY
 from src.entry.domain import EntryCapacityExceeded, EntryInvalid, EntryUnavailable
 from src.models.state_machine import SlotEvent
-from src.services.alert_service import get_alert_type_for_slot
+from src.services.alert_service import get_alert_type_for_slot, notification_suppressed
 from src.services.named_slot_service import get_slot_restriction_type, is_restricted_slot  # now takes a slot ORM object
 
 
@@ -801,6 +801,13 @@ def create_app(
                 
                 # Filter: Only send actual alerts to this stream
                 if not event.is_alert:
+                    continue
+
+                # Filter: alert types configured as notification-suppressed.
+                # They are already persisted by report_alert and remain visible
+                # via /api/alerts/* — they just don't interrupt an operator.
+                # SlotEvent.to_dict() publishes event_type as "alert_type".
+                if notification_suppressed(event.event_type):
                     continue
 
                 # Yield the dict directly so fields match the required order/naming

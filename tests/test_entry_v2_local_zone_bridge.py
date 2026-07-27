@@ -932,3 +932,286 @@ def test_zone_union_falls_back_to_the_box_when_zone_bounds_are_unusable():
         engine, frame, detection, _BadZone(), padding_ratio=0.0
     )
     assert crop is not None and crop.shape[:2] == (280, 300)
+
+
+# --------------------------------------------------------------------------- #
+# Best-plate-view selection
+#
+# The selector used to rank by _score_snapshot_quality, which is
+# `area * (1 + 0.5 * sharpness_factor)`. Area reaches ~10^6 while the sharpness
+# term only scales it by 1.0-1.5, so area decides and the biggest frame always
+# won. On CAM-23's ramp the biggest frame is the one where the car sits under
+# the lens and the plate has rotated out of view: across 29 real captures every
+# frame it picked with no plate in it was one of the four largest, and on track
+# 1493 it discarded a frame that read `1198 SHR` at 0.980.
+# --------------------------------------------------------------------------- #
+
+_PLATE_POLICY = local_zone_policy("CAM-23", "Park_Entry")
+
+
+def _visit_with(crops):
+    """A finished visit holding (quality, frame_no, reid_crop, plate_view)."""
+    from src.entry.local_zone import _Visit
+
+    visit = _Visit(
+        sequence=1,
+        track_id=1493,
+        captured_at=NOW,
+        timestamp_source=VA_HOST_GRAB_TIMESTAMP_SOURCE,
+    )
+    visit.frames_seen = len(crops)
+    visit.crops = list(crops)
+    return visit
+
+
+def _plate_view(*, size, sharp: bool):
+    """A plate view whose 40x18 plate patch is either crisp or flat grey."""
+    image = np.full((size[1], size[0], 3), 90, dtype=np.uint8)
+    if sharp:
+        patch = np.indices((18, 40))[1] % 2 * 255      # 1px stripes -> high variance
+        image[40:58, 60:100] = patch[:, :, None].astype(np.uint8)
+    return image
+
+
+class _StubLPD:
+    """Reports a plate only for the frames named, at a fixed location."""
+
+    def __init__(self, with_plate):
+        self.with_plate = with_plate
+        self.calls = 0
+
+    def detect(self, image):
+        self.calls += 1
+        if (image.shape[1], image.shape[0]) not in self.with_plate:
+            return []
+        return [(60.0, 40.0, 100.0, 58.0, 0.61)]
+
+
+def test_best_plate_view_prefers_the_legible_plate_over_the_largest_frame(
+    bridge, tmp_path, monkeypatch
+):
+    """The regression: the biggest frame has no plate, a smaller one does."""
+    monkeypatch.setenv("ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR", str(tmp_path))
+
+    mid = _plate_view(size=(1203, 1051), sharp=True)     # readable, mid-ramp
+    huge = _plate_view(size=(2143, 1169), sharp=True)    # car under the lens
+    visit = _visit_with(
+        [
+            (1_264_353.0, 3, np.zeros((8, 8, 3), np.uint8), mid),
+            (2_505_167.0, 9, np.zeros((8, 8, 3), np.uint8), huge),   # wins on area
+        ]
+    )
+
+    bridge._plate_view_detector = _StubLPD(with_plate={(1203, 1051)})
+    bridge._save_best_plate_view(_PLATE_POLICY, "Park_Entry", visit)
+
+    written = list((tmp_path / "entry_zone_captures").glob("*.jpg"))
+    assert len(written) == 1
+    # frame 3, not the higher-area frame 9
+    assert "seq-1best3" in written[0].name
+    assert bridge.metrics()["best_plate_view_plate_found"] == 1
+    assert bridge.metrics()["best_plate_view_rescued_from_area_pick"] == 1
+
+
+def test_best_plate_view_ranks_by_plate_sharpness_when_both_have_a_plate(
+    bridge, tmp_path, monkeypatch
+):
+    """Two frames with a plate: the crisper plate wins even though it is smaller.
+
+    Measured on the real captures, plate-crop Laplacian variance separated
+    readable from unreadable cleanly (84-233 vs 1405-12180) where vehicle area
+    did not.
+    """
+    monkeypatch.setenv("ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR", str(tmp_path))
+
+    crisp = _plate_view(size=(1121, 1051), sharp=True)
+    smeared = _plate_view(size=(1618, 1051), sharp=False)
+    visit = _visit_with(
+        [
+            (1_178_000.0, 2, np.zeros((8, 8, 3), np.uint8), crisp),
+            (1_700_000.0, 7, np.zeros((8, 8, 3), np.uint8), smeared),  # wins on area
+        ]
+    )
+
+    bridge._plate_view_detector = _StubLPD(
+        with_plate={(1121, 1051), (1618, 1051)}
+    )
+    bridge._save_best_plate_view(_PLATE_POLICY, "Park_Entry", visit)
+
+    written = list((tmp_path / "entry_zone_captures").glob("*.jpg"))
+    assert len(written) == 1
+    assert "seq-1best2" in written[0].name
+
+
+def test_best_plate_view_falls_back_to_area_when_no_candidate_has_a_plate(
+    bridge, tmp_path, monkeypatch
+):
+    """Writing the old pick still beats writing nothing for field calibration."""
+    monkeypatch.setenv("ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR", str(tmp_path))
+
+    visit = _visit_with(
+        [
+            (900_000.0, 1, np.zeros((8, 8, 3), np.uint8),
+             _plate_view(size=(1044, 1051), sharp=False)),
+            (2_505_167.0, 6, np.zeros((8, 8, 3), np.uint8),
+             _plate_view(size=(2143, 1169), sharp=False)),
+        ]
+    )
+
+    bridge._plate_view_detector = _StubLPD(with_plate=set())
+    bridge._save_best_plate_view(_PLATE_POLICY, "Park_Entry", visit)
+
+    written = list((tmp_path / "entry_zone_captures").glob("*.jpg"))
+    assert len(written) == 1
+    assert "seq-1best6" in written[0].name            # the old area behaviour
+    assert bridge.metrics()["best_plate_view_no_plate_anywhere"] == 1
+    assert bridge.metrics()["best_plate_view_rescued_from_area_pick"] == 0
+
+
+def test_best_plate_view_survives_an_unavailable_plate_detector(
+    bridge, tmp_path, monkeypatch
+):
+    """A missing or broken LPD must degrade to the old pick, never raise."""
+    monkeypatch.setenv("ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR", str(tmp_path))
+
+    class _Exploding:
+        def detect(self, image):
+            raise RuntimeError("openvino unavailable")
+
+    visit = _visit_with(
+        [
+            (900_000.0, 1, np.zeros((8, 8, 3), np.uint8),
+             _plate_view(size=(1044, 1051), sharp=True)),
+            (2_505_167.0, 4, np.zeros((8, 8, 3), np.uint8),
+             _plate_view(size=(2143, 1169), sharp=True)),
+        ]
+    )
+
+    bridge._plate_view_detector = _Exploding()
+    bridge._save_best_plate_view(_PLATE_POLICY, "Park_Entry", visit)
+
+    written = list((tmp_path / "entry_zone_captures").glob("*.jpg"))
+    assert len(written) == 1
+    assert "seq-1best4" in written[0].name
+
+
+def test_best_plate_view_never_builds_the_detector_in_the_hot_path(bridge):
+    """_retain_crop runs per frame; it must not touch the LPD."""
+    from src.entry.local_zone import _Visit
+
+    visit = _Visit(
+        sequence=1,
+        track_id=5,
+        captured_at=NOW,
+        timestamp_source=VA_HOST_GRAB_TIMESTAMP_SOURCE,
+    )
+    for index in range(12):
+        visit.frames_seen = index
+        bridge._retain_crop(
+            visit,
+            LocalVehicleCrop(
+                track_id=5,
+                image=np.full((96, 160, 3), 120, np.uint8),
+                quality=float(1000 * index),
+                plate_image=np.full((300, 400, 3), 90, np.uint8),
+            ),
+        )
+
+    assert bridge._plate_view_detector is None
+
+
+# --------------------------------------------------------------------------- #
+# _score_snapshot_quality
+#
+# It used to return `area * (1 + 0.5 * sharpness_factor)`. Measured over 29 real
+# CAM-23 captures: whole-crop Laplacian variance ran 1075-3746 against a cap of
+# 250, so the sharpness factor was pinned at 1.0 on every frame and the formula
+# was exactly `area * 1.5` — unbounded area wearing a clarity costume.
+# --------------------------------------------------------------------------- #
+
+def _engine():
+    from src.core.engine.engine_tracking import ParkingEngineTrackingMixin
+
+    return ParkingEngineTrackingMixin.__new__(ParkingEngineTrackingMixin)
+
+
+def _detection(x1, y1, x2, y2):
+    return SimpleNamespace(bbox=(float(x1), float(y1), float(x2), float(y2)), track_id=1)
+
+
+def test_snapshot_quality_area_saturates_instead_of_running_away():
+    """The real defect: an 8.75x area ratio used to be an 8.75x score ratio.
+
+    Measured on track 905, where the larger frame is the one with no plate in it.
+    Bounded growth keeps ordering deterministic without letting size dominate.
+    """
+    from src.core.engine.engine_tracking import _snapshot_area_score
+
+    frame_h = 1520.0
+    small = _snapshot_area_score(146_407.0, frame_h)
+    huge = _snapshot_area_score(146_407.0 * 8.75, frame_h)
+
+    assert huge / small < 6.0                  # was exactly 8.75
+    assert huge > small                        # still monotonic, never inverted
+    # Past the reference the curve is nearly flat: doubling again barely moves it.
+    doubled = _snapshot_area_score(146_407.0 * 17.5, frame_h)
+    assert doubled - huge < 0.05
+
+
+def test_snapshot_quality_reference_scales_with_stream_resolution():
+    """A fixed pixel gate silently changes meaning when the stream resolution does.
+
+    The same car filling the same fraction of the frame must score the same at
+    720p and at 1520p.
+    """
+    from src.core.engine.engine_tracking import _snapshot_area_score
+
+    at_720 = _snapshot_area_score(100_000.0, 720.0)
+    scaled = 100_000.0 * (1520.0 / 720.0) ** 2
+    at_1520 = _snapshot_area_score(scaled, 1520.0)
+    assert at_720 == pytest.approx(at_1520, rel=1e-6)
+
+
+def test_snapshot_quality_discounts_a_car_clamped_by_the_frame_edge():
+    """A box touching the border holds a fragment of a car, not a car."""
+    engine = _engine()
+    frame = np.full((1520, 2688, 3), 100, dtype=np.uint8)
+
+    inside = _detection(600, 400, 1400, 1100)           # 800x700, clear of every edge
+    clipped = _detection(600, 820, 1400, 1520)          # 800x700, runs off the bottom
+
+    whole = engine._score_snapshot_quality(inside, None, frame)
+    fragment = engine._score_snapshot_quality(clipped, None, frame)
+
+    # Same box area, so the only difference is being cut off by the frame.
+    assert fragment < whole
+    assert fragment == pytest.approx(whole * 0.25, rel=1e-6)
+
+
+def test_snapshot_quality_without_a_frame_keeps_working():
+    """`frame` is optional; older callers must not break, just score bounded area."""
+    engine = _engine()
+    score = engine._score_snapshot_quality(_detection(0, 0, 400, 300), None)
+    assert score > 0.0
+
+
+def test_snapshot_quality_sharpness_term_still_only_discounts_flat_crops():
+    """The cap stays at 250 on purpose.
+
+    On real captures the statistic tracked headlight glare, not legibility: the
+    unreadable dark frames scored 2410-3746 while the readable ones scored
+    1388-1723. Raising the cap would promote exactly the wrong frames. What it
+    must still do is mark a genuinely featureless crop down.
+    """
+    engine = _engine()
+    frame = np.full((1520, 2688, 3), 100, dtype=np.uint8)
+    detection = _detection(600, 400, 1400, 1100)
+
+    flat = np.full((200, 300, 3), 128, dtype=np.uint8)
+    textured = np.random.default_rng(0).integers(
+        0, 255, (200, 300, 3), dtype=np.uint8
+    )
+
+    assert engine._score_snapshot_quality(detection, flat, frame) < (
+        engine._score_snapshot_quality(detection, textured, frame)
+    )

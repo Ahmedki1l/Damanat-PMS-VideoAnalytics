@@ -299,7 +299,13 @@ class LocalZoneCrossingBridge:
             "source_timestamp_rejected": 0,
             "confirmations": 0,
             "duplicate_frame_observations": 0,
+            "best_plate_view_plate_found": 0,
+            "best_plate_view_no_plate_anywhere": 0,
+            "best_plate_view_rescued_from_area_pick": 0,
         }
+        # Built lazily on the first flush that needs it, never in the hot path.
+        self._plate_view_detector = None
+        self._plate_view_detector_failed = False
 
     def configured_policy(
         self, camera_id: str, zone_id: str
@@ -730,37 +736,133 @@ class LocalZoneCrossingBridge:
             },
         )
 
+    def _plate_view_lpd(self):
+        """Lazily build the plate detector used to rank plate views.
+
+        Only ever called at flush, once per visit, over a bounded reservoir — so
+        the ~19 ms per detect never touches the per-frame path. Any failure here
+        is non-fatal: ranking falls back to vehicle area, which is what this
+        method replaced.
+        """
+        if self._plate_view_detector is not None or self._plate_view_detector_failed:
+            return self._plate_view_detector
+        try:
+            from src.ocr.plate_region_detector import OpenVINOPlateRegionDetector
+
+            settings = self._coordinator.settings
+            self._plate_view_detector = OpenVINOPlateRegionDetector(
+                model_dir=settings.lpd_model_dir,
+                confidence=settings.lpd_confidence,
+                iou=settings.lpd_iou,
+                num_threads=settings.lpd_threads,
+            )
+        except Exception as exc:  # pragma: no cover - environment dependent
+            self._plate_view_detector_failed = True
+            logger.warning(
+                "[EntryV2Local][best-plate-view] plate detector unavailable, "
+                "falling back to area ranking: %s",
+                exc,
+            )
+        return self._plate_view_detector
+
+    @staticmethod
+    def _plate_view_score(detector, image) -> Tuple[float, str]:
+        """Rank a candidate by how legible its plate actually is.
+
+        Vehicle area — what _score_snapshot_quality returns — is the wrong
+        signal here. It is `area * (1 + 0.5 * sharpness)` where area reaches
+        ~10^6 and the sharpness term only ever scales it by 1.0-1.5, so area
+        decides, and the largest frame always wins. On a steep ramp the largest
+        frame is the one where the car sits almost under the lens and the plate
+        has rotated out of view: measured over 29 CAM-23 captures, every frame
+        this picked with no plate in it was one of the four largest, and on one
+        track it discarded a frame that read `1198 SHR` at 0.980 confidence.
+
+        So rank on the plate instead: a detected box first, then the sharpness
+        of the plate crop itself, which separated readable from unreadable
+        cleanly on that sample (84-233 unreadable vs 1405-12180 readable).
+        """
+        if detector is None:
+            return 0.0, "no-detector"
+        try:
+            boxes = detector.detect(image)
+        except Exception:
+            return 0.0, "detect-failed"
+        if not boxes:
+            return 0.0, "no-plate"
+        x1, y1, x2, y2, conf = max(boxes, key=lambda b: b[4])
+        h, w = image.shape[:2]
+        x1 = max(0, int(x1)); y1 = max(0, int(y1))
+        x2 = min(w, int(x2)); y2 = min(h, int(y2))
+        if x2 - x1 < 8 or y2 - y1 < 6:
+            return 0.0, "plate-degenerate"
+        crop = image[y1:y2, x1:x2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        return sharpness, f"plate {x2 - x1}x{y2 - y1} conf {float(conf):.2f}"
+
     def _save_best_plate_view(
         self,
         policy: LocalZonePolicy,
         observed_zone_id: str,
         visit: _Visit,
     ) -> None:
-        """Write the highest-quality plate view the visit collected.
+        """Write the most *legible* plate view the visit collected.
 
-        The entry-capture file is the FIRST frame, which is by definition the
-        farthest the car ever is — measured at ~65px of plate whether the stream
-        ran at 1080p or 2688x1520, because distance, not sensor, sets that
-        number. The reservoir already ranks every later frame by
-        _score_snapshot_quality, so the best one is the closest usable view of
-        the plate this camera position can produce. Saving it is the only way to
-        learn the real ceiling before deciding whether CAM-23 can carry plate
-        reading at all.
+        This used to write the highest-quality view, where quality means
+        vehicle area — see _plate_view_score for why that reliably picked the
+        one frame with no plate in it.
+
+        Ranking is by detected-plate sharpness, falling back to the old area
+        pick when no candidate yields a plate box at all (nothing better is
+        available then, and writing something still beats writing nothing for
+        field calibration).
 
         Called from BOTH flush paths: visits on a transit ramp end in
-        tracker_loss far more often than they finalize, so saving only on success
-        would almost never produce a file.
+        tracker_loss far more often than they finalize, so saving only on
+        success would almost never produce a file.
         """
-        best = None
-        for entry in visit.crops:
-            wide = entry[3] if len(entry) > 3 else None
-            if wide is None or getattr(wide, "size", 0) == 0:
-                continue
-            if best is None or entry[0] > best[0]:
-                best = (entry[0], entry[1], wide)
-        if best is None:
+        candidates = [
+            (entry[0], entry[1], entry[3])
+            for entry in visit.crops
+            if len(entry) > 3
+            and entry[3] is not None
+            and getattr(entry[3], "size", 0)
+        ]
+        if not candidates:
             return
-        quality, frame_no, image = best
+
+        area_pick = max(candidates, key=lambda item: item[0])
+
+        detector = self._plate_view_lpd()
+        scored = []
+        for quality, frame_no, image in candidates:
+            score, detail = self._plate_view_score(detector, image)
+            if score > 0.0:
+                scored.append((score, quality, frame_no, image, detail))
+
+        if scored:
+            score, quality, frame_no, image, detail = max(
+                scored, key=lambda item: item[0]
+            )
+            reason = f"plate-sharpness {score:.0f} ({detail})"
+            self._increment("best_plate_view_plate_found")
+            if frame_no != area_pick[1]:
+                self._increment("best_plate_view_rescued_from_area_pick")
+                logger.info(
+                    "[EntryV2Local][best-plate-view] camera=%s zone=%s track=%s "
+                    "plate ranking chose frame=%s over area pick frame=%s",
+                    policy.camera_id,
+                    observed_zone_id,
+                    visit.track_id,
+                    frame_no,
+                    area_pick[1],
+                )
+        else:
+            quality, frame_no, image = area_pick
+            reason = "no plate in any candidate, fell back to area"
+            self._increment("best_plate_view_no_plate_anywhere")
+
         saved = _save_zone_capture_for_debug(
             image,
             camera_id=policy.camera_id,
@@ -773,7 +875,7 @@ class LocalZoneCrossingBridge:
             shape = getattr(image, "shape", None)
             logger.info(
                 "[EntryV2Local][best-plate-view] camera=%s zone=%s track=%s "
-                "frame=%s of %s crop=%s quality=%.3f saved=%s",
+                "frame=%s of %s crop=%s quality=%.3f picked_by=%s saved=%s",
                 policy.camera_id,
                 observed_zone_id,
                 visit.track_id,
@@ -781,6 +883,7 @@ class LocalZoneCrossingBridge:
                 visit.frames_seen,
                 f"{shape[1]}x{shape[0]}" if shape and len(shape) >= 2 else "?",
                 quality,
+                reason,
                 saved,
             )
 

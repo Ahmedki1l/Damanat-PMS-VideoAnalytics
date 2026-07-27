@@ -31,8 +31,19 @@ SLOT_SCOPED_VIOLATION_ALERT_TYPES = (
 # configured, fall back to the env var.
 _ENABLE_RESTRICTED_ZONE_ALERTS: bool | None = None
 
+# Alert types kept OUT of the real-time SSE stream (/api/alerts/stream).
+# Notification-only: report_alert still writes the row and the REST endpoints
+# still serve it — the dashboard just stops popping a live alert for it.
+# Mirrors AlertsConfig.suppressed_notification_types; overwritten by
+# configure_alerts() once YAML is loaded.
+_SUPPRESSED_NOTIFICATION_TYPES: frozenset[str] = frozenset({"reserved_slot_unidentified"})
 
-def configure_alerts(*, enable_restricted_zone_alerts: bool) -> None:
+
+def configure_alerts(
+    *,
+    enable_restricted_zone_alerts: bool,
+    suppressed_notification_types: tuple[str, ...] | None = None,
+) -> None:
     """Push the resolved AppConfig alert toggles into this module.
 
     Called by load_config(). This module is reached from request handlers and DB
@@ -41,8 +52,22 @@ def configure_alerts(*, enable_restricted_zone_alerts: bool) -> None:
     engine-side gate while this one stayed shut, yielding alert logs and snapshots
     with no corresponding rows in the alerts table.
     """
-    global _ENABLE_RESTRICTED_ZONE_ALERTS
+    global _ENABLE_RESTRICTED_ZONE_ALERTS, _SUPPRESSED_NOTIFICATION_TYPES
     _ENABLE_RESTRICTED_ZONE_ALERTS = bool(enable_restricted_zone_alerts)
+    if suppressed_notification_types is not None:
+        _SUPPRESSED_NOTIFICATION_TYPES = frozenset(
+            t.strip() for t in suppressed_notification_types if t and t.strip()
+        )
+
+
+def notification_suppressed(alert_type: str | None) -> bool:
+    """True when this alert type must not be pushed to connected dashboards.
+
+    Deliberately gates the STREAM, not report_alert: the alert is still a real
+    record worth keeping and querying, it just isn't worth interrupting an
+    operator over.
+    """
+    return bool(alert_type) and alert_type in _SUPPRESSED_NOTIFICATION_TYPES
 
 
 def _restricted_zone_alerts_enabled() -> bool:

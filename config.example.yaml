@@ -429,7 +429,18 @@ matching:
   gallery_persist_enabled: true
   gallery_max_refs_per_car: 10
   gallery_retention_days: 0.0        # 0 = keep verified history until explicit reset
-  gallery_strict_admission_enabled: true
+  # KEEP false UNTIL ENTRY V2 IS AUTHORITATIVE AND MINTING PROOFS.
+  # Strict admission accepts a reference only with an entry_v2_parked_v1 proof.
+  # Nothing but Entry V2 mints one, so with ENTRY_V2_MODE=off this closes the
+  # gallery in BOTH directions: save_ref refuses the ANPR seed, the CAM-23 top
+  # view, the CAM-03 B-entry reference and the learned parked pose (all pass
+  # admission=None), and _active_refs hides every folder already on disk. Every
+  # non-gate worker then holds no plated session, so a CORRECT slot OCR read has
+  # no candidate to confirm against and current_plate stays NULL facility-wide
+  # (B1, 2026-07-27: 32 correct reads of '9990BHD' discarded against "top-0 []").
+  # Turning this off does NOT relax rank-1, ReID >= 0.70, margin >= 0.15,
+  # sharpness, crop area, colour agreement, dedup or slot_plate_requires_ocr.
+  gallery_strict_admission_enabled: false
   gallery_parked_ocr_min_confidence: 0.90
   gallery_parked_reid_min_score: 0.70
   gallery_parked_reid_min_margin: 0.15
@@ -480,3 +491,18 @@ alerts:
   # routinely abstains. Without this deadline that slot would have zero intrusion
   # coverage. Set to 0 to disable the fallback and alert only on a PROVEN non-owner.
   reserved_slot_identity_timeout_s: 300.0
+
+  # Alert types kept OUT of the real-time SSE stream (/api/alerts/stream).
+  # NOTIFICATION-ONLY, not a mute: report_alert still writes the row, the
+  # snapshot is still saved, and /api/alerts/* still serves it. Only the live
+  # push to connected dashboards is skipped.
+  #
+  # reserved_slot_unidentified is listed because it is the "nobody could name
+  # this car" fallback above, not a proven intrusion. On a slot that can never
+  # be identified (B1_CRO, see the note above) it fires on essentially every
+  # occupancy, and an alert panel that is always red gets ignored. The record is
+  # still there for review; it just doesn't interrupt an operator.
+  #
+  # Set to [] to notify on every alert type.
+  suppressed_notification_types:
+    - reserved_slot_unidentified
