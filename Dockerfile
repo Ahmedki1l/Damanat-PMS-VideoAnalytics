@@ -190,13 +190,22 @@ ENV VA_GATE_CAMERAS="CAM-23,CAM-03"
 # shadow/authoritative, but credentials and site calibration are never baked.
 ENV ENTRY_V2_MODE=off
 # NOTE: this pins the variable that OVERRIDES config.yaml's motion_scheduler.mode
-# (config.py reads VA_MOTION_SCHEDULER_MODE last and it wins). Leaving it baked at
-# shadow means a deployment that does not override it gets no motion gating at
-# all — which measured as ~0.10 fps on CAM-23, far too slow for the local entry
-# zone to ever see a car twice. Promoting to enforce (with CAM-23/CAM-03 bypassed
-# in motion_scheduler.camera_overrides) took CAM-23 to ~2.1 fps. Keep the safe
-# default here, but override it in the deployment env, not by relying on YAML.
-ENV VA_MOTION_SCHEDULER_MODE=shadow
+# (config.py reads VA_MOTION_SCHEDULER_MODE last and it wins).
+#
+# MUST be legacy for BUILD 5. Motion scheduling exists only in the single-process
+# async engine, and main.py fails closed (exit 2) on shadow/enforce unless
+# VA_SINGLE_PROCESS=1 — which BUILD 5 clears above. Left at shadow it took prod
+# down: every supervisor group exited 2 at startup ("motion scheduler
+# shadow/enforce modes require VA_SINGLE_PROCESS=1 in multi-camera mode"), the
+# supervisor tore down the rest, CrashLoopBackOff. The BUILD 4 -> BUILD 5 revert
+# cleared VA_SINGLE_PROCESS but left this at shadow (2026-07-28).
+#
+# Costs the gate nothing: CAM-23/CAM-03 bypass gating anyway
+# (motion_scheduler.camera_overrides). Enforce helped them only indirectly, by
+# suppressing the other 25 cameras on BUILD 4's shared queue (~0.10 -> ~2.1 fps)
+# — a gain that evaporated under load. BUILD 5's per-group OpenVINO pool is the
+# replacement. Restore shadow/enforce only with the BUILD 4 block.
+ENV VA_MOTION_SCHEDULER_MODE=legacy
 ENV VA_SLOT_STATE_MODE=shadow
 # Field-calibration diagnostic: persist each zone ENTRY frame to
 # /app/vehicle_images/entry_zone_captures/. Zone crops are RAM-only, and a visit
