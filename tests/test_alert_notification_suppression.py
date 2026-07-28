@@ -99,5 +99,50 @@ class TestSuppressedAlertIsStillRecorded(unittest.TestCase):
         self.assertFalse(written.is_resolved)
 
 
+class TestFullDisable(unittest.TestCase):
+    """DISABLED_ALERT_TYPES turns an alert off entirely: no DB row, no stream."""
+
+    def setUp(self):
+        self._orig = alert_service._DISABLED_ALERT_TYPES
+        self.addCleanup(
+            setattr, alert_service, "_DISABLED_ALERT_TYPES", self._orig
+        )
+
+    def test_configure_sets_the_disabled_set(self):
+        alert_service.configure_alerts(
+            enable_restricted_zone_alerts=True,
+            disabled_alert_types=(" reserved_slot_unidentified ", ""),
+        )
+        self.assertTrue(alert_service.alert_type_disabled("reserved_slot_unidentified"))
+        self.assertFalse(alert_service.alert_type_disabled("vehicle_intrusion"))
+
+    def test_report_alert_writes_nothing_for_a_disabled_type(self):
+        alert_service._DISABLED_ALERT_TYPES = frozenset({"reserved_slot_unidentified"})
+        db = MagicMock()
+        with patch.object(alert_service, "check_slot_restricted", return_value=True), \
+             patch.object(alert_service, "get_alert_type_for_slot",
+                          return_value="reserved_slot_unidentified"), \
+             patch.object(alert_service.AlertRepository, "create") as create:
+            result = alert_service.report_alert(
+                db, slot_id="B1_CRO", alert_type="reserved_slot_unidentified"
+            )
+        self.assertIsNone(result)
+        create.assert_not_called()
+
+    def test_report_alert_unaffected_for_other_types(self):
+        alert_service._DISABLED_ALERT_TYPES = frozenset({"reserved_slot_unidentified"})
+        db = MagicMock()
+        with patch.object(alert_service, "check_slot_restricted", return_value=True), \
+             patch.object(alert_service, "_restricted_zone_alerts_enabled", return_value=True), \
+             patch.object(alert_service, "get_alert_type_for_slot",
+                          return_value="vehicle_intrusion"), \
+             patch.object(alert_service.ParkingSlotRepository, "get_by_id", return_value=None), \
+             patch.object(alert_service.AlertRepository, "get_active_by_slot", return_value=None), \
+             patch.object(alert_service.AlertRepository, "create", return_value="made") as create:
+            result = alert_service.report_alert(db, slot_id="B1_CRO")
+        create.assert_called_once()
+        self.assertEqual(result, "made")
+
+
 if __name__ == "__main__":
     unittest.main()

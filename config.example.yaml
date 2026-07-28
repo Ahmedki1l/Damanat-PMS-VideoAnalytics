@@ -506,3 +506,10 @@ alerts:
   # Set to [] to notify on every alert type.
   suppressed_notification_types:
     - reserved_slot_unidentified
+
+  # Alert types turned OFF entirely: no DB row, no notification. Use this (not
+  # the suppression list above) to make an alert type vanish completely. Empty
+  # (the default) = none disabled. Uncomment to fully drop reserved_slot_unidentified:
+  # disabled_alert_types:
+  #   - reserved_slot_unidentified
+  disabled_alert_types: []

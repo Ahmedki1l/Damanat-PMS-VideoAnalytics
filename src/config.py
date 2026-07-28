@@ -884,6 +884,10 @@ class AlertsConfig:
     # fires on essentially every occupancy, which trains operators to dismiss
     # the alert panel. Set to () to notify on every alert type.
     suppressed_notification_types: tuple[str, ...] = ("reserved_slot_unidentified",)
+    # Alert types turned OFF entirely: no DB row, no notification. Use this (not
+    # the suppression list above) to make an alert type vanish completely, e.g.
+    # disabled_alert_types: ["reserved_slot_unidentified"]. Empty = none off.
+    disabled_alert_types: tuple[str, ...] = ()
 
 
 @dataclass
@@ -1293,6 +1297,13 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             config.alerts.suppressed_notification_types = tuple(
                 str(t).strip() for t in _suppressed if str(t).strip()
             )
+        _disabled = a.get("disabled_alert_types")
+        if _disabled is not None:
+            if isinstance(_disabled, str):
+                _disabled = _disabled.split(",")
+            config.alerts.disabled_alert_types = tuple(
+                str(t).strip() for t in _disabled if str(t).strip()
+            )
     _env_restricted_alerts = os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS")
     if _env_restricted_alerts is not None:
         config.alerts.enable_restricted_zone_alerts = (
@@ -1312,6 +1323,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         _alert_service.configure_alerts(
             enable_restricted_zone_alerts=config.alerts.enable_restricted_zone_alerts,
             suppressed_notification_types=config.alerts.suppressed_notification_types,
+            disabled_alert_types=config.alerts.disabled_alert_types,
         )
     except ImportError as exc:  # pragma: no cover - only in cut-down environments
         print(f"[WARN] Could not push alert config to alert_service: {exc}")

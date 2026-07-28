@@ -38,11 +38,18 @@ _ENABLE_RESTRICTED_ZONE_ALERTS: bool | None = None
 # configure_alerts() once YAML is loaded.
 _SUPPRESSED_NOTIFICATION_TYPES: frozenset[str] = frozenset({"reserved_slot_unidentified"})
 
+# Alert types turned OFF entirely: report_alert drops them before any row is
+# written (no DB, no notification). Distinct from _SUPPRESSED_NOTIFICATION_TYPES,
+# which silences only the live stream but still records the row. Set via
+# configure_alerts() from AlertsConfig.disabled_alert_types.
+_DISABLED_ALERT_TYPES: frozenset[str] = frozenset()
+
 
 def configure_alerts(
     *,
     enable_restricted_zone_alerts: bool,
     suppressed_notification_types: tuple[str, ...] | None = None,
+    disabled_alert_types: tuple[str, ...] | None = None,
 ) -> None:
     """Push the resolved AppConfig alert toggles into this module.
 
@@ -53,10 +60,15 @@ def configure_alerts(
     with no corresponding rows in the alerts table.
     """
     global _ENABLE_RESTRICTED_ZONE_ALERTS, _SUPPRESSED_NOTIFICATION_TYPES
+    global _DISABLED_ALERT_TYPES
     _ENABLE_RESTRICTED_ZONE_ALERTS = bool(enable_restricted_zone_alerts)
     if suppressed_notification_types is not None:
         _SUPPRESSED_NOTIFICATION_TYPES = frozenset(
             t.strip() for t in suppressed_notification_types if t and t.strip()
+        )
+    if disabled_alert_types is not None:
+        _DISABLED_ALERT_TYPES = frozenset(
+            t.strip() for t in disabled_alert_types if t and t.strip()
         )
 
 
@@ -68,6 +80,11 @@ def notification_suppressed(alert_type: str | None) -> bool:
     operator over.
     """
     return bool(alert_type) and alert_type in _SUPPRESSED_NOTIFICATION_TYPES
+
+
+def alert_type_disabled(alert_type: str | None) -> bool:
+    """True when this alert type is turned off entirely (no row, no stream)."""
+    return bool(alert_type) and alert_type in _DISABLED_ALERT_TYPES
 
 
 def _restricted_zone_alerts_enabled() -> bool:
@@ -131,9 +148,15 @@ def report_alert(
     if not check_slot_restricted(db, slot_id):
         return None
 
+    # Fully-disabled alert types are dropped before any row is written — no DB,
+    # no stream. Distinct from notification suppression, which still records the
+    # row. Resolve the effective type first so a slot-derived type is covered too.
+    effective_type = alert_type or get_alert_type_for_slot(db, slot_id)
+    if alert_type_disabled(effective_type):
+        return None
+
     if not _restricted_zone_alerts_enabled():
-        gated_alert_type = alert_type or get_alert_type_for_slot(db, slot_id)
-        if gated_alert_type in _RESTRICTED_GATED_TYPES:
+        if effective_type in _RESTRICTED_GATED_TYPES:
             return None
 
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
