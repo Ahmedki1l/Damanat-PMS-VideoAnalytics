@@ -111,6 +111,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch", type=int, default=32, help="-1 for Ultralytics auto-batch.")
     p.add_argument("--patience", type=int, default=25, help="Early-stopping patience.")
+    p.add_argument("--workers", type=int, default=8,
+                   help="Dataloader workers. LOWER THIS ON WINDOWS if training dies "
+                        "with 'bad allocation' or 'The paging file is too small': "
+                        "workers spawn (not fork) on Windows, so each re-imports "
+                        "torch and costs GB of COMMIT charge — the limit that runs "
+                        "out first here, well before VRAM or physical RAM.")
     p.add_argument("--val-frac", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="0")
@@ -139,6 +145,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             model.train(
                 data=str(data_yaml), imgsz=imgsz, epochs=args.epochs,
                 batch=args.batch, patience=args.patience, device=args.device,
+                workers=args.workers,
                 project=args.project, name=name, exist_ok=True,
                 # fine-tune-friendly: keep strong aug for small dataset, single class
                 pretrained=True, optimizer="auto", cos_lr=True, plots=True,
