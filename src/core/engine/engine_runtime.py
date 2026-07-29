@@ -2756,9 +2756,14 @@ class ParkingEngineRuntimeMixin:
         session = self.db_manager.SessionLocal()
         try:
             from src.repositories import VehicleRepository
+            from src.services.named_slot_service import titles_match
 
             vehicle = VehicleRepository.get_by_plate(session, plate_number)
-            return bool(vehicle and vehicle.title == expected_title)
+            if not vehicle:
+                return False
+            # Normalised comparison, not ==: the Gateway's auto-resolve uses the
+            # same key, so a strict match here would raise criticals it clears.
+            return titles_match(vehicle.title, expected_title)
         except Exception as exc:
             print(
                 f"[ERROR] Failed to validate named-slot ownership for plate "
