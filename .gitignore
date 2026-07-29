@@ -32,7 +32,7 @@ models/color_classifier_openvino/training_metrics.json
 # Humans edit it locally; the manifest.csv it produces is what's tracked.
 tests/data/color_classifier/worklist.csv
 tests/data/color_classifier/manifest.csv
-
+runs
 # Python
 __pycache__/
 *.py[cod]
