@@ -573,17 +573,40 @@ def run(reset_plates: bool = False, foreground: bool = False,
 
     total_cores, pin = _cpu_budget(len(groups))
     if not pin:
+        quota, mask = _quota_cores(), _affinity_cores()
+        bound_by = "the quota" if quota <= mask else f"the {mask}-core MASK"
         print(
-            f"[supervisor] cgroup CPU quota detected ({_quota_cores():.1f} cores) "
-            f"alongside a {_affinity_cores()}-core affinity mask: this is a CPU "
+            f"[supervisor] cgroup CPU quota detected ({quota:.1f} cores) "
+            f"alongside a {mask}-core affinity mask: this is a CPU "
             f"*limit*, not a cpuset, so the mask is the whole node and those cores "
             f"are shared. Running UNPINNED with {total_cores} threads apportioned "
             f"across {len(groups)} groups — pinning would nail each group to host "
             f"CPUs it does not own and make raising the CPU limit a no-op. Threads "
-            f"are sized TO the quota (min {_MIN_THREADS_PER_GROUP}/group): bursting "
+            f"are sized to {bound_by} (min {_MIN_THREADS_PER_GROUP}/group): bursting "
             f"past it doesn't add throughput, it freezes the whole cgroup for the "
             f"rest of each CFS period (measured 57% of periods throttled, 2026-07-16)."
         )
+        if quota > mask:
+            # A limit larger than the machine is not headroom — it is the ABSENCE
+            # of a limit, and it costs the one instrument that would show it.
+            # Throttling can essentially never fire, so `cpu.stat` reads ~0% and
+            # looks healthy no matter how starved the pod actually is; meanwhile
+            # nothing caps the co-tenants sharing these cores. On 2026-07-30 every
+            # group sat at ~550ms/frame against a ~35ms benchmark with only ~161ms
+            # of CPU burned per frame — starved, while throttling read 1-2%.
+            #
+            # Raising the CPU limit further cannot help: the mask is the ceiling.
+            # The levers are a smaller/cpuset-pinned node, fewer co-tenants, or
+            # VA_OV_TOTAL_THREADS set to the pod's REAL usable core count.
+            print(
+                f"[supervisor] WARNING: the CPU limit ({quota:.1f}) EXCEEDS the "
+                f"{mask} cores this pod can see, so it can never bind. Two "
+                f"consequences: cgroup throttling is not a usable health signal "
+                f"here (it will read ~0% even when starved), and nothing limits "
+                f"neighbours competing for these {mask} shared cores. If per-frame "
+                f"inference is far above bench, suspect node contention — not this "
+                f"thread count — and set VA_OV_TOTAL_THREADS to the real budget."
+            )
     total_cams = sum(_cam_count(g) for g in groups)
 
     # On Windows: NEW_PROCESS_GROUP so a stray CTRL_C to us isn't broadcast to

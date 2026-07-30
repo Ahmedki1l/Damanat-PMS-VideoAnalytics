@@ -266,3 +266,56 @@ class TestDrainRevalidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUnverifiedRestore(unittest.TestCase):
+    """A restored plate is a MEMORY, not an observation.
+
+    Restore assumes "slot still OCCUPIED => same car". That is false whenever a
+    different car parked during downtime: the slot never goes VACANT across the
+    swap, so the clear-on-vacant path — the only thing that ever retires a
+    binding — never runs, and the stale plate has no way out.
+
+    Slot B3 displayed a 0.50/unlocked ERS-7949 the running process had never
+    once derived (2026-07-30). The slot is now OCR-armed on restart precisely to
+    confirm-or-correct that guess, so the resulting read must NOT be thrown away
+    by the "already named" guards, which exist to stop a read racing a *live*
+    binding.
+    """
+
+    def _harness(self, restored=True):
+        reg = _Reg(plate_for_slot={"B1": "STALE-1"}, confirm=lambda *_: "ABC123")
+        sm = _SM(OCCUPIED, plate_number="STALE-1")
+        h = _Harness(reg, sm, OCCUPIED)
+        if restored:
+            h._restored_plate_slots = {"B1"}
+        return h, reg, sm
+
+    def test_read_overrides_an_unverified_restore(self):
+        h, reg, sm = self._harness()
+        h._apply_async_ocr_result(_result())
+        self.assertEqual(reg.bound, [("B1", "ABC123", "")])
+        self.assertEqual(sm.identity, ("ABC123", 1.0, True))  # bound AND locked
+
+    def test_binding_retires_the_restore_marker(self):
+        h, reg, sm = self._harness()
+        h._apply_async_ocr_result(_result())
+        self.assertNotIn("B1", h._restored_plate_slots)
+
+    def test_second_read_cannot_overwrite_the_now_locked_binding(self):
+        h, reg, sm = self._harness()
+        h._apply_async_ocr_result(_result())
+        # A second read was already in flight when the first one bound.
+        reg.bound.clear()
+        h._ocr_armed["B1"] = True
+        sm.plate_number = "ABC123"
+        reg._plate["B1"] = "ABC123"
+        h._apply_async_ocr_result(_result())
+        self.assertEqual(reg.bound, [], "a confirmed binding must not be re-bound")
+
+    def test_a_live_binding_still_blocks_the_read(self):
+        # No restore marker: the pre-existing guard must be untouched.
+        h, reg, sm = self._harness(restored=False)
+        h._apply_async_ocr_result(_result())
+        self.assertEqual(reg.bound, [])
+        self.assertFalse(h._ocr_armed["B1"])

@@ -995,10 +995,15 @@ class ParkingEngineRuntimeMixin:
             return
         if is_reid_disabled_floor(floor):
             return
-        # Slots whose plate was restored from persistence but not yet re-derived
-        # by the (freshly empty) ReID gallery. Protected from the per-frame
-        # "clear on no-match" path so a restart doesn't drop the plate before a
-        # live track re-confirms it; cleared once re-derived or the slot vacates.
+        # Slots holding an UNVERIFIED restored binding: restored from persistence
+        # and not yet confirmed by anything this process has seen. Cleared once
+        # re-derived or the slot vacates.
+        #
+        # Only UNLOCKED restores belong here. A locked binding was OCR-verified
+        # before the restart and is frozen until the slot vacates, so it is not
+        # awaiting confirmation and must never be re-read. Keeping locked slots
+        # out is what lets the OCR result path treat membership as "this plate is
+        # a guess, let a live read through" without a second locked check.
         if not hasattr(self, "_restored_plate_slots"):
             self._restored_plate_slots = set()
         now = datetime.now()
@@ -1012,7 +1017,8 @@ class ParkingEngineRuntimeMixin:
                 confidence=b["confidence"],
                 lock=b["locked"],
             )
-            self._restored_plate_slots.add(slot_id)
+            if not b["locked"]:
+                self._restored_plate_slots.add(slot_id)
             self.vehicle_registry.restore_parked_binding(
                 slot_id=slot_id,
                 slot_name=b["slot_name"],
@@ -1104,6 +1110,22 @@ class ParkingEngineRuntimeMixin:
                         "slot_name": db_slot.slot_name or db_slot.slot_id,
                         "camera_id": db_slot.camera_id or "",
                     }
+                    # An UNLOCKED restore is a guess, not an observation. It assumes
+                    # "slot still OCCUPIED => same car", which is false whenever a
+                    # different car parked here during downtime: the slot never goes
+                    # VACANT across that swap, so the clear-on-vacant path — the only
+                    # thing that ever retires a binding — never runs.
+                    #
+                    # The arming argument below applies here too, and having a plate
+                    # is not a reason to skip it. Without this the slot was never
+                    # armed, so nothing could ever re-read it and the guess displayed
+                    # indefinitely: B3 showed a 0.50/unlocked ERS-7949 the running
+                    # process had never derived (2026-07-30).
+                    #
+                    # A LOCKED binding is already OCR-verified and frozen until the
+                    # slot vacates, so it needs no re-read.
+                    if not bool(getattr(db_slot, "plate_locked", False)):
+                        self._arm_ocr_for_slot(db_slot.slot_id)
                 elif not db_slot.is_available:
                     # Occupied, but we never learned who it is. Only vehicle_parked arms
                     # the identity pass, and that transition already happened — before this
@@ -1604,6 +1626,18 @@ class ParkingEngineRuntimeMixin:
         for res in worker.drain():
             self._apply_async_ocr_result(res)
 
+    def _holds_unverified_restore(self, slot_id: str) -> bool:
+        """True when this slot's plate came from persistence and nothing this
+        process has seen has confirmed it yet.
+
+        Such a binding must not count as "already named". The guards that discard
+        an OCR read for a named slot exist to stop a read racing a *live* binding;
+        an unverified restore is the opposite case — the read is the only thing
+        that can ever confirm or correct it, and it was armed precisely for that.
+        Membership implies unlocked (see ``_restore_plate_locks``).
+        """
+        return slot_id in (getattr(self, "_restored_plate_slots", None) or set())
+
     def _apply_async_ocr_result(self, res) -> None:
         job = res.job
         if getattr(job, "kind", "slot") == "track":
@@ -1615,7 +1649,8 @@ class ParkingEngineRuntimeMixin:
             return  # vacated, or already bound+disarmed
         if getattr(self, "_ocr_generation", {}).get(slot_id) != job.token:
             return  # slot was re-armed for a different car since this read began
-        if self.vehicle_registry.get_slot_plate(slot_id):
+        unverified_restore = self._holds_unverified_restore(slot_id)
+        if self.vehicle_registry.get_slot_plate(slot_id) and not unverified_restore:
             self._ocr_armed[slot_id] = False
             return  # named by another path while this read was in flight
         pipeline = (getattr(self, "pipelines", None) or {}).get(cam_id)
@@ -1624,8 +1659,10 @@ class ParkingEngineRuntimeMixin:
         state_machine = pipeline.state_machines.get(slot_id)
         if state_machine is None:
             return
-        if state_machine.state != SlotState.OCCUPIED or state_machine.plate_number:
-            return  # no longer an unnamed, occupied slot
+        if state_machine.state != SlotState.OCCUPIED:
+            return  # no longer an occupied slot
+        if state_machine.plate_number and not unverified_restore:
+            return  # named by a live binding — this read is stale
 
         plate = self.vehicle_registry.confirm_slot_ocr(
             job.plan, job.crop, res.text, res.conf
@@ -1705,6 +1742,11 @@ class ParkingEngineRuntimeMixin:
         if self.db_manager:
             self._persist_slot_plate_binding(slot_id, plate, conf, True, cam_id)
         self._ocr_armed[slot_id] = False
+        # Confirmed by a live read and now locked — it is no longer an unverified
+        # restore, so the "let a read through" exemption must stop applying. Left
+        # set, a second in-flight read could overwrite this locked binding.
+        if getattr(self, "_restored_plate_slots", None):
+            self._restored_plate_slots.discard(slot_id)
         logger.info(
             "[ocr-id] slot=%s BOUND + LOCKED plate=%s on attempt %d/%d (cam=%s) — "
             "held until the car leaves",
@@ -1756,6 +1798,10 @@ class ParkingEngineRuntimeMixin:
         )
         if self.db_manager:
             self._persist_slot_plate_binding(slot_id, plate, conf, False, cam_id)
+        # A live appearance bind replaces the restored guess; it is still
+        # provisional (OCR may overrule it), but it is no longer a restore.
+        if getattr(self, "_restored_plate_slots", None):
+            self._restored_plate_slots.discard(slot_id)
         logger.info(
             "[reid-solo] slot=%s BOUND plate=%s (cam=%s) on attempt %d/%d — "
             "appearance only, NOT locked and NOT taught to the gallery; OCR may still "
@@ -2458,6 +2504,15 @@ class ParkingEngineRuntimeMixin:
         # A live track re-derived a plate for this slot — it is now backed by
         # the running registry, so drop the restart-stickiness protection and
         # let normal clear/upgrade behaviour resume.
+        #
+        # Captured BEFORE the discard: the upgrade rule below needs to know this
+        # binding came from persistence rather than from anything this process
+        # has actually seen. A locked restore never reaches here (the freeze at
+        # the top of this method returns first), so this only ever describes an
+        # unverified, provisional restore.
+        was_restored_unverified = slot.id in (
+            getattr(self, "_restored_plate_slots", None) or set()
+        )
         if getattr(self, "_restored_plate_slots", None):
             self._restored_plate_slots.discard(slot.id)
 
@@ -2471,7 +2526,22 @@ class ParkingEngineRuntimeMixin:
             state_machine.bind_identity(
                 plate, self._build_slot_snapshot_url(slot.id), confidence=conf
             )
-        elif not previous_plate or new_conf > state_machine.plate_confidence:
+        elif (
+            not previous_plate
+            or new_conf > state_machine.plate_confidence
+            or was_restored_unverified
+        ):
+            # `was_restored_unverified` deliberately bypasses the upgrade-only
+            # bar. A restored provisional binding is a MEMORY, not an observation:
+            # restore assumes "slot still OCCUPIED => same car", which is exactly
+            # false when a different car parked here during downtime — the slot
+            # never goes VACANT, so the clear-on-vacant path never runs and the
+            # stale plate has no other way out.
+            #
+            # Without this, the tie is decided by `>` against a persisted 0.50,
+            # and a live provisional derivation is also 0.50 — so the memory won
+            # every frame, forever. Slot B3 showed a plate the running process had
+            # never once derived (2026-07-30). A live read outranks a memory.
             conf = new_conf
             state_machine.bind_identity(
                 plate, self._build_slot_snapshot_url(slot.id), confidence=conf
