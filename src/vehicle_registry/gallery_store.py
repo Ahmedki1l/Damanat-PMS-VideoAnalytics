@@ -117,6 +117,44 @@ class VehicleGalleryStore:
             and self._plate_key(meta.get("plate")) == self._plate_key(plate)
         )
 
+    def all_plates(self) -> List[str]:
+        """Every plate with a gallery on disk, INCLUDING cars with no open session.
+
+        The rest of the system reaches the gallery only through a live session:
+        ``_restore_vehicle_galleries`` hydrates the plates in ``parking_sessions``
+        and nothing else. That makes the gallery unreachable for exactly the car
+        that needs it most — one parked inside with no session, whose references
+        are sitting on disk while ReID reports it has never seen the car.
+        (Measured 2026-07-30: BHD-9990 parked in B13, OCR reading ``BHD`` on 6 of 6
+        frames, and every read discarded as "confirms none of ReID's top-5"
+        because its gallery was never loaded.)
+
+        Reads the plate from each folder's ``meta.json`` rather than trusting the
+        directory name, which is ``safe_plate()``-mangled and not reversible.
+        Returns [] on any filesystem error — a recovery path must never be able
+        to take the engine down.
+        """
+        if not os.path.isdir(self._root):
+            return []
+        out: List[str] = []
+        try:
+            for entry in os.scandir(self._root):
+                if not entry.is_dir():
+                    continue
+                meta = None
+                try:
+                    with open(os.path.join(entry.path, "meta.json"), encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                plate = (meta or {}).get("plate")
+                if plate:
+                    out.append(str(plate))
+        except OSError as exc:  # pragma: no cover - defensive
+            logger.warning("[gallery] all_plates failed under %s: %r", self._root, exc)
+            return []
+        return out
+
     def _read_meta(self, plate: str) -> Optional[dict]:
         path = os.path.join(self._plate_dir(plate), _META)
         try:
@@ -822,7 +860,7 @@ class VehicleGalleryStore:
     # Load
     # ------------------------------------------------------------------ #
     def load_vectors(
-        self, plate: str
+        self, plate: str, *, current_tag_only: bool = False
     ) -> Tuple[List[np.ndarray], Optional[str], List[str]]:
         """Return (vectors, stored_model_tag, source_cameras). Empty when
         absent/unreadable.
@@ -832,6 +870,18 @@ class VehicleGalleryStore:
         is index-aligned with ``vectors`` (the camera that captured each ref, for
         match-time trust weighting). Legacy gate-only refs are excluded and are
         never used for matching (see :meth:`save_ref`).
+
+        ``current_tag_only`` drops references embedded under a DIFFERENT model
+        contract than the one now running. A folder can hold a mix — BHD-9990 in
+        production carries 4 refs tagged ``openvino:PS_matcher V2`` alongside 16
+        tagged ``openvino:PS_matcher V2:13683459c498b2dfc01e`` — and a cosine
+        distance between vectors from two different models means nothing.
+
+        The default is False because the existing caller
+        (``build_session_from_gallery``) inspects the returned tag itself and
+        re-embeds every crop when it mismatches. A caller that scores vectors
+        directly, without that re-embed, must pass True or it will silently
+        compare across contracts.
         """
         meta = self._read_meta(plate)
         if not meta or self._plate_key(meta.get("plate")) != self._plate_key(plate):
@@ -853,6 +903,10 @@ class VehicleGalleryStore:
                 or not self._vector_integrity_ok(d, r)
             ):
                 continue
+            if current_tag_only:
+                ref_tag = str(r.get("model_tag") or meta.get("model_tag") or "unknown")
+                if ref_tag != self._model_tag:
+                    continue
             try:
                 vector = (
                     np.load(os.path.join(d, fn), allow_pickle=False)

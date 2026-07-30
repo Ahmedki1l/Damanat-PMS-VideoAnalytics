@@ -448,6 +448,38 @@ matching:
   gallery_parked_require_rank_one: true  # mandatory in strict persistent mode
   gallery_require_slot_authority: true
   gallery_min_view_quality: 0.90
+
+  # ── Off-session slot recovery ──────────────────────────────────────────────
+  # Names a car parked inside that has NO open parking_session. Such a car is
+  # invisible today, and the reason is circular: the appearance gallery is only
+  # hydrated for plates that HAVE a session, so ReID holds no vectors for the one
+  # car that needs them, and slot OCR then discards its own correct read for
+  # naming a car "ReID has never seen" (B13 read `BHD` on 6 of 6 frames while
+  # BHD-9990 appeared nowhere in the process, 2026-07-30).
+  #
+  # REQUIRES gallery_strict_admission_enabled: false above. With it true, all 50
+  # production gallery folders yield ZERO usable references and recovery silently
+  # never fires — measured, and warned about once at runtime.
+  slot_recovery_enabled: false
+  slot_recovery_min_score: 0.55
+  slot_recovery_min_margin: 0.10
+  slot_recovery_top_k: 5
+  slot_recovery_cache_ttl_s: 300.0
+  slot_recovery_reembed_max_refs: 3
+  # ReID-ALONE tier, for slots where OCR can never corroborate. At 720p the OCR
+  # witness is silent on 6 of 7 unnamed slots, so requiring two witnesses recovers
+  # nothing there; this still can. Bar measured by leave-one-out over the 50
+  # production identities / 782 references, cross-view:
+  #     margin >= 0.10   97.2% precision, 68.3% recall
+  #     margin >= 0.30   99.5%            26.9%
+  #     margin >= 0.35  100.0%            15.5%   <- default
+  # A wrong answer opens a session under a stranger's plate, so precision is
+  # bought at whatever recall costs. The one wrong answer seen live (B7_CHRO ->
+  # RZD-4976) scored margin 0.324 and is correctly refused here. 100% on 121
+  # queries bounds the true error at ~2.5%, on curated crops rather than live
+  # 720p slot views — treat it as "safe enough to try", not "never wrong".
+  slot_recovery_solo_enabled: false
+  slot_recovery_solo_min_margin: 0.35
   gallery_min_sharpness: 40.0
   gallery_min_crop_area: 12000.0
   gallery_accumulate_min_gt_similarity: 0.45

@@ -606,6 +606,66 @@ class MatchingConfig:
     slot_reid_solo_min_score_reserved: float = 0.60
     slot_reid_solo_min_margin_reserved: float = 0.20
 
+    # --- Off-session recovery -------------------------------------------------
+    # A car parked inside with NO open parking_session is unnameable today, and the
+    # reason is circular: _restore_vehicle_galleries hydrates the appearance gallery
+    # only for plates that HAVE a session, so ReID holds no vectors for the one car
+    # that needs them. Slot OCR then reads the plate, finds it in none of ReID's
+    # candidates, and discards the read. Measured 2026-07-30 on B13: OCR returned
+    # `BHD` on 6 of 6 frames and the slot stayed NULL, because BHD-9990 appeared
+    # nowhere in the running system.
+    #
+    # When enabled, an otherwise-unnameable slot also ranks against every gallery on
+    # DISK (GalleryStore.all_plates()), including cars with no session. Those extra
+    # plates are candidates only — a candidate still has to be confirmed by OCR
+    # through read_matches_plate before anything binds.
+    #
+    # OFF by default. It widens the candidate pool from "cars we believe are inside"
+    # to "every car ever seen", which is a real increase in what a wrong answer could
+    # cost, so it is opt-in per deployment rather than on by assumption.
+    slot_recovery_enabled: bool = False
+    # Stricter than the slot_reid_solo floors above, deliberately. Those gates choose
+    # between cars already believed inside; this one can invent a car in the garage.
+    # Measured on the live fleet the same day: correct answers scored 0.620-0.909 with
+    # margins 0.102-0.483, so 0.55/0.10 admits every verified-correct case while still
+    # sitting clear of the 0.218-0.339 an unenrolled car scores.
+    slot_recovery_min_score: float = 0.55
+    slot_recovery_min_margin: float = 0.10
+    # How many ranked plates OCR may corroborate. Rank-1 alone is not enough: ReID put
+    # RZD-4976 above the true ZZR-1372 on B7_CHRO, and OCR is what picks the right one
+    # out of the shortlist. Kept small — every extra candidate is another plate a
+    # garbled read could accidentally match.
+    slot_recovery_top_k: int = 5
+    # Seconds between rebuilds of the on-disk gallery vector cache. The gallery only
+    # changes when a car is taught or pruned, so this is cheap to keep stale; the cold
+    # build measured 4.6s for 38 plates / 307 refs, the warm one 0.1s.
+    slot_recovery_cache_ttl_s: float = 300.0
+    # How many crops per plate to re-embed when the stored model tag has drifted
+    # from the running one. Bounded because this runs on the caller's thread and the
+    # production gallery holds ~780 crops; the best few references carry the match.
+    slot_recovery_reembed_max_refs: int = 3
+    # ReID-ALONE recovery, for slots where OCR can never corroborate. At 720p the
+    # OCR witness is silent on 6 of 7 unnamed slots, so requiring two witnesses
+    # recovers nothing at all there; this is the tier that can still fire.
+    #
+    # The bar is set from measurement, not preference. Leave-one-out over the 50
+    # production identities / 782 references, CROSS-VIEW (every reference from the
+    # query's own camera removed — the operational case):
+    #     margin >= 0.10   97.2% precision, 68.3% recall
+    #     margin >= 0.20   98.3%            44.5%
+    #     margin >= 0.30   99.5%            26.9%
+    #     margin >= 0.35  100.0%            15.5%   <- here
+    # A wrong answer does not merely leave a slot unnamed, it opens a session under
+    # a stranger's plate — so precision is bought at whatever recall costs. The one
+    # wrong answer seen live (B7_CHRO -> RZD-4976) scored margin 0.324 and is
+    # correctly refused by this bar.
+    #
+    # 100% on 121 queries is not proof of zero error: the upper bound on the true
+    # rate is ~2.5%, and these are curated gallery crops rather than live 720p slot
+    # views, which are worse. Treat it as "safe enough to try", not "never wrong".
+    slot_recovery_solo_enabled: bool = False
+    slot_recovery_solo_min_margin: float = 0.35
+
     # Keep asking appearance, every N seconds, while a slot is occupied and still
     # nameless. The 12-attempt budget covers the parking manoeuvre and is then spent
     # forever, which on a never-readable slot gave ReID five shots ~4s apart on ONE pose
@@ -1510,6 +1570,34 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         cm.slot_reid_solo_min_margin_reserved = m.get(
             "slot_reid_solo_min_margin_reserved", cm.slot_reid_solo_min_margin_reserved
+        )
+        if "slot_recovery_enabled" in m:
+            cm.slot_recovery_enabled = _parse_config_bool(
+                m.get("slot_recovery_enabled"),
+                field_name="matching.slot_recovery_enabled",
+            )
+        cm.slot_recovery_min_score = float(
+            m.get("slot_recovery_min_score", cm.slot_recovery_min_score)
+        )
+        cm.slot_recovery_min_margin = float(
+            m.get("slot_recovery_min_margin", cm.slot_recovery_min_margin)
+        )
+        cm.slot_recovery_top_k = int(
+            m.get("slot_recovery_top_k", cm.slot_recovery_top_k)
+        )
+        cm.slot_recovery_cache_ttl_s = float(
+            m.get("slot_recovery_cache_ttl_s", cm.slot_recovery_cache_ttl_s)
+        )
+        cm.slot_recovery_reembed_max_refs = int(
+            m.get("slot_recovery_reembed_max_refs", cm.slot_recovery_reembed_max_refs)
+        )
+        if "slot_recovery_solo_enabled" in m:
+            cm.slot_recovery_solo_enabled = _parse_config_bool(
+                m.get("slot_recovery_solo_enabled"),
+                field_name="matching.slot_recovery_solo_enabled",
+            )
+        cm.slot_recovery_solo_min_margin = float(
+            m.get("slot_recovery_solo_min_margin", cm.slot_recovery_solo_min_margin)
         )
         cm.slot_reid_retry_interval_s = float(
             m.get("slot_reid_retry_interval_s", cm.slot_reid_retry_interval_s) or 0.0

@@ -6,6 +6,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from time import monotonic
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -5067,6 +5068,246 @@ class VehicleRegistryIdentityMixin:
         ocr_text, ocr_conf = self.read_slot_plate(crop_bgr, plan.allow_retry)
         return self.confirm_slot_ocr(plan, crop_bgr, ocr_text, ocr_conf)
 
+    def _offsession_gallery_vectors(self) -> Dict[str, "np.ndarray"]:
+        """Cached {plate: stacked reference vectors} for gallery folders on DISK.
+
+        Deliberately independent of ``self._sessions``. Everything else reaches the
+        gallery through a live session, which is why a car parked inside with no
+        ``parking_session`` is invisible to ReID no matter how many references it has
+        on disk — see ``slot_recovery_enabled``.
+
+        Rebuilt at most every ``slot_recovery_cache_ttl_s``: the gallery only changes
+        when a car is taught or pruned, and the cold build is ~4.6s for 38 plates.
+        """
+        store = self.gallery_store
+        if store is None:
+            return {}
+        now = monotonic()
+        cached = getattr(self, "_offsession_cache", None)
+        if cached is not None and now < getattr(self, "_offsession_cache_until", 0.0):
+            return cached
+
+        ttl = float(getattr(self._matching_config, "slot_recovery_cache_ttl_s", 300.0))
+        out: Dict[str, Tuple["np.ndarray", List[str]]] = {}
+        try:
+            reembedded = 0
+            for plate in store.all_plates():
+                # Fast path: vectors already embedded under the running contract.
+                # Cross-contract vectors are excluded rather than compared — a cosine
+                # distance between two different models means nothing.
+                vectors, _tag, cams = store.load_vectors(plate, current_tag_only=True)
+                if not vectors:
+                    # The tag fingerprints model artifacts AND the preprocessing
+                    # contract, so it drifts on a config change, not just a model
+                    # swap — and then EVERY stored vector is excluded and recovery
+                    # goes quietly dead. Re-embed from the retained crops instead,
+                    # the same escape `build_session_from_gallery` uses.
+                    #
+                    # Bounded per plate: this runs on the caller's thread, and the
+                    # full production gallery is ~780 crops. The best few references
+                    # are what carry a match; embedding all of them would stall the
+                    # pipeline for seconds to add nothing.
+                    crops, crop_cams = store.load_crops(plate)
+                    if crops:
+                        limit = max(1, int(getattr(
+                            self._matching_config, "slot_recovery_reembed_max_refs", 3)))
+                        feats = self.reid_matcher.extract_features_batch(crops[:limit])
+                        vectors, cams = [], []
+                        for f, cam in zip(feats, crop_cams[:limit]):
+                            if f is not None:
+                                vectors.append(f)
+                                cams.append(cam)
+                        reembedded += len(vectors)
+                if vectors:
+                    # The SOURCE CAMERA is kept, not discarded. It is what separates a
+                    # parked-pose reference taught at this very slot (same-view, rank-1
+                    # 0.976) from a gate photo (cross-view, 0.736 — and measured
+                    # INVERTED on individual cars). Without it every reference looks
+                    # equally trustworthy, which is exactly the assumption that makes
+                    # appearance dangerous here.
+                    cams = list(cams) + [""] * (len(vectors) - len(cams))
+                    out[plate] = (
+                        np.vstack([v.reshape(1, -1) for v in vectors]), cams
+                    )
+            if reembedded:
+                logger.info(
+                    "[recovery] re-embedded %d reference(s) whose stored model tag no "
+                    "longer matches the running contract (%s)",
+                    reembedded, getattr(store, "_model_tag", "?"),
+                )
+        except Exception as exc:  # a recovery path must never break identity
+            logger.warning("[recovery] gallery scan failed: %r", exc)
+            out = cached or {}
+
+        if not out and not getattr(self, "_offsession_warned", False):
+            # SILENT NO-OP GUARD. Folders on disk but no usable vectors is the
+            # signature of strict gallery admission: `_active_refs` drops every
+            # reference without an `entry_v2_parked_v1` proof, which only Entry V2
+            # mints. Measured 2026-07-30 on the live gallery — 38 folders, 38 usable
+            # with the flag off, ZERO with it on. It is the same mechanism that
+            # blanked every slot plate on 2026-07-27.
+            #
+            # Without this line recovery just never fires, and looks like "ReID is
+            # not good enough" rather than "the gallery was shut".
+            try:
+                on_disk = len(store.all_plates())
+            except Exception:
+                on_disk = 0
+            if on_disk:
+                logger.warning(
+                    "[recovery] %d gallery folder(s) on disk but NONE yielded usable "
+                    "vectors — recovery cannot fire. This is almost certainly "
+                    "matching.gallery_strict_admission_enabled hiding unverified "
+                    "references; set it false (or mint Entry V2 proofs) to use it.",
+                    on_disk,
+                )
+            self._offsession_warned = True
+
+        self._offsession_cache = out
+        self._offsession_cache_until = now + max(1.0, ttl)
+        return out
+
+    def offsession_gallery_candidates(
+        self,
+        query_vector,
+        *,
+        slot_id: str,
+        slot_camera: Optional[str] = None,
+        exclude: Optional[set] = None,
+    ) -> List[str]:
+        """Plates whose ON-DISK gallery resembles this crop and that have NO session.
+
+        Ranked SAME-VIEW FIRST. A reference taught by the camera now looking at this
+        slot is a parked-pose crop saved by ``save_parked_reference`` on a previous
+        visit — the car photographed exactly where it is standing again. Matching
+        against that is the same-view case (rank-1 0.976); matching against a gate
+        photo is cross-view (0.736, and measured INVERTED per car: 0.583 for the right
+        car against 0.634 for a different one). Treating those two as one number is
+        what makes appearance look unreliable when half of it is not.
+
+        So a warm car is ranked ahead of a cold one even when the cold one scores
+        marginally higher, and the log records which kind of evidence was used.
+
+        Still candidates, not answers: OCR must confirm one through
+        ``read_matches_plate`` before anything binds. Live-session plates are skipped
+        (``reid_rank`` covers them) and plates locked to another slot are dropped —
+        a car cannot be in two places.
+        """
+        cfg = self._matching_config
+        if not bool(getattr(cfg, "slot_recovery_enabled", False)):
+            return []
+        if query_vector is None:
+            return []
+        gallery = self._offsession_gallery_vectors()
+        if not gallery:
+            return []
+
+        with self._lock:
+            live = {s.plate for s in self._sessions.values() if s.plate}
+        skip = live | (exclude or set())
+
+        min_score = float(getattr(cfg, "slot_recovery_min_score", 0.55))
+        min_margin = float(getattr(cfg, "slot_recovery_min_margin", 0.10))
+        top_k = max(1, int(getattr(cfg, "slot_recovery_top_k", 5)))
+
+        scored: List[Tuple[str, float, bool]] = []   # (plate, score, same_view)
+        for plate, (refs, cams) in gallery.items():
+            if plate in skip or self._is_plate_locked_elsewhere(plate, slot_id):
+                continue
+            try:
+                sims = refs @ query_vector
+            except Exception:
+                continue
+            same_idx = [i for i, c in enumerate(cams) if slot_camera and c == slot_camera]
+            if same_idx:
+                # A parked-pose reference from THIS camera exists: score on that alone.
+                # Mixing in the car's gate photos can only drag a warm match down
+                # toward the cross-view number that is not measuring the same thing.
+                scored.append((plate, float(np.max(sims[same_idx])), True))
+            else:
+                scored.append((plate, float(np.max(sims)), False))
+        if not scored:
+            return []
+        # Warm (same-view) evidence outranks cold, then score. A car photographed at
+        # this exact slot before is better evidence than a stranger's gate photo that
+        # happens to score a little higher.
+        scored.sort(key=lambda t: (not t[2], -t[1]))
+
+        best_plate, best_score, best_same = scored[0]
+        peers = [s for s in scored[1:] if s[2] == best_same]
+        runner_up = peers[0][1] if peers else 0.0
+        # The margin is measured against peers of the SAME evidence kind: comparing a
+        # warm 0.97 against a cold 0.70 would manufacture a margin out of the viewpoint
+        # difference rather than out of how much the cars actually differ. A flat field
+        # among peers is the open-set signature of a stranger (an unenrolled car scores
+        # 0.218-0.339 against everything).
+        margin = best_score - runner_up
+        if best_score < min_score or margin < min_margin:
+            logger.debug(
+                "[recovery] slot=%s no off-session candidate: best=%s %.3f margin=%.3f "
+                "same_view=%s (needs >=%.2f / >=%.2f)",
+                slot_id, best_plate, best_score, margin, best_same, min_score, min_margin,
+            )
+            return []
+
+        picked = [p for p, sc, _sv in scored[:top_k] if sc >= min_score]
+        self._last_offsession_rank = (best_plate, best_score, margin, best_same)
+        logger.info(
+            "[recovery] slot=%s off-session candidates %s — best=%s %.3f margin=%.3f "
+            "evidence=%s; OCR must still confirm one before anything binds",
+            slot_id, picked, best_plate, best_score, margin,
+            "SAME-VIEW parked pose" if best_same else "cross-view gate photo only",
+        )
+        return picked
+
+    def offsession_solo_candidate(
+        self, query_vector, *, slot_id: str, slot_camera: Optional[str] = None
+    ) -> Optional[Tuple[str, float, float]]:
+        """A car ReID is sure enough about to name WITHOUT an OCR witness.
+
+        Exists because the second witness is not always available: at 720p the slot
+        OCR is silent on 6 of 7 unnamed slots, so a strict two-witness rule recovers
+        nothing there at all. This trades recall for precision instead of trading
+        the feature away.
+
+        The bar is `slot_recovery_solo_min_margin`, set to 0.35 from a leave-one-out
+        over the 50 production identities / 782 references in the cross-view split:
+        100% precision at 15.5% recall, against 97.2% at the ordinary 0.10 gate.
+        See the config comment for the full curve and its limits.
+
+        Returns (plate, score, margin) or None. Callers must treat this as weaker
+        evidence than a two-witness confirm and record it as such — it is one
+        witness, however confident.
+        """
+        cfg = self._matching_config
+        if not bool(getattr(cfg, "slot_recovery_solo_enabled", False)):
+            return None
+        # Reuse the ordinary ranking so both tiers see the same field, the same
+        # exclusions and the same same-view preference.
+        self._last_offsession_rank = None
+        self.offsession_gallery_candidates(
+            query_vector, slot_id=slot_id, slot_camera=slot_camera
+        )
+        ranked = getattr(self, "_last_offsession_rank", None)
+        if not ranked:
+            return None
+        plate, score, margin, same_view = ranked
+        bar = float(getattr(cfg, "slot_recovery_solo_min_margin", 0.35))
+        if margin < bar:
+            logger.debug(
+                "[recovery] slot=%s solo refused for %s: margin %.3f < %.2f",
+                slot_id, plate, margin, bar,
+            )
+            return None
+        logger.warning(
+            "[recovery] slot=%s SOLO candidate %s score=%.3f margin=%.3f (%s) — "
+            "no OCR witness; admitted on appearance alone at the %.2f margin bar",
+            slot_id, plate, score, margin,
+            "same-view parked pose" if same_view else "cross-view",
+            bar,
+        )
+        return plate, score, margin
+
     def plan_slot_ocr(
         self,
         slot_id: str,
@@ -5115,6 +5356,21 @@ class VehicleRegistryIdentityMixin:
                 for p in self.plates_inside()
                 if not self._is_plate_locked_elsewhere(p, slot_id)
             ]
+
+        # APPEND, never replace. `kept` covers cars with a live session; this adds the
+        # ones whose gallery is on disk but who have no session, and which are therefore
+        # invisible to reid_rank however well they match. Without this a correct read is
+        # discarded for naming a car the running system has no record of — B13 read
+        # `BHD` on 6 of 6 frames while BHD-9990 appeared nowhere in the process.
+        #
+        # Appending cannot turn a correct bind into a wrong one: confirm_slot_ocr still
+        # requires OCR to confirm exactly one candidate, and refuses when two could
+        # explain the same read.
+        offsession = self.offsession_gallery_candidates(
+            qvec, slot_id=slot_id, slot_camera=camera_id, exclude=set(candidates)
+        )
+        if offsession:
+            candidates = candidates + offsession
 
         # The enlarged-retry pass rescues a distant plate (B13: '' -> '9990BHD'), but on
         # a slot whose plate is simply not in frame it costs ~670ms and finds nothing. So
@@ -5331,11 +5587,27 @@ class VehicleRegistryIdentityMixin:
 
         # A clean single-frame confirm supersedes any accumulated votes for this slot.
         self.clear_slot_ocr_votes(slot_id)
-        logger.info(
-            "[ocr-id] slot=%s CONFIRMED %s: ReID shortlisted it and OCR read %r off the "
-            "car — two independent witnesses agree",
-            slot_id, plate, ocr_text,
-        )
+        with self._lock:
+            known = any(s.plate == plate for s in self._sessions.values())
+        if not known:
+            # RECOVERY: this car has no live session, so it reached the shortlist only
+            # through offsession_gallery_candidates. Logged apart from an ordinary
+            # confirm because it means something different downstream — the facility
+            # believes this car is not inside, and the pair of witnesses here is the
+            # evidence that it is. Whoever opens the session needs to be able to find
+            # these, and an operator needs to be able to audit them.
+            logger.warning(
+                "[recovery] slot=%s RECOVERED %s: no open session for this car, but its "
+                "on-disk gallery matched and OCR read %r off it — two independent "
+                "witnesses agree it is parked here",
+                slot_id, plate, ocr_text,
+            )
+        else:
+            logger.info(
+                "[ocr-id] slot=%s CONFIRMED %s: ReID shortlisted it and OCR read %r off "
+                "the car — two independent witnesses agree",
+                slot_id, plate, ocr_text,
+            )
         return plate
 
     def build_parked_reference_proof(
