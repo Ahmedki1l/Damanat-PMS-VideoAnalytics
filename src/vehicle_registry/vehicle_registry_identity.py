@@ -5290,13 +5290,28 @@ class VehicleRegistryIdentityMixin:
         )
         ranked = getattr(self, "_last_offsession_rank", None)
         if not ranked:
+            # INFO, not DEBUG. This and the margin refusal below are the only two ways
+            # the tier can decline, and at DEBUG they made a live investigation read as
+            # "the feature does nothing" — B13/BHD-9990, 2026-08-02. A recovery path
+            # whose whole job is rescuing invisible cars must not itself be invisible.
+            logger.info(
+                "[recovery] slot=%s solo found NO ranked off-session candidate — the "
+                "on-disk gallery produced nothing above score>=%.2f margin>=%.2f. Either "
+                "no unsessioned car resembles this one, or its references are excluded "
+                "(stale model tag / live session / plate locked elsewhere).",
+                slot_id,
+                float(getattr(cfg, "slot_recovery_min_score", 0.55)),
+                float(getattr(cfg, "slot_recovery_min_margin", 0.10)),
+            )
             return None
         plate, score, margin, same_view = ranked
         bar = float(getattr(cfg, "slot_recovery_solo_min_margin", 0.35))
         if margin < bar:
-            logger.debug(
-                "[recovery] slot=%s solo refused for %s: margin %.3f < %.2f",
-                slot_id, plate, margin, bar,
+            logger.info(
+                "[recovery] slot=%s solo REFUSED %s: score %.3f, margin %.3f < %.2f (%s). "
+                "The runner-up is too close to name this car on appearance alone.",
+                slot_id, plate, score, margin, bar,
+                "same-view parked pose" if same_view else "cross-view",
             )
             return None
         logger.warning(

@@ -338,3 +338,68 @@ class TestSoloTier(unittest.TestCase):
     def test_stranger_is_refused(self):
         r = self._reg()
         self.assertIsNone(r.offsession_solo_candidate(STRANGER, slot_id="B13"))
+
+
+class TestSoloTierIsActuallyWired(unittest.TestCase):
+    """The solo tier must be REACHED, not merely defined.
+
+    It shipped once as a method nothing called, with `slot_recovery_solo_enabled`
+    documented and inert — the config said yes and the engine never asked. These
+    tests fail if that happens again.
+    """
+
+    def test_engine_calls_the_offsession_tier(self):
+        """_maybe_bind_reid_solo must fall through to it when live ReID abstains."""
+        import inspect
+        from src.core.engine.engine_runtime import ParkingEngineRuntimeMixin
+        src = inspect.getsource(ParkingEngineRuntimeMixin._maybe_bind_reid_solo)
+        self.assertIn("offsession_solo_candidate", src,
+                      "the engine no longer reaches the off-session tier — "
+                      "slot_recovery_solo_enabled would be inert")
+
+    def test_the_retry_loop_also_reaches_the_offsession_tier(self):
+        """_retry_reid_identify must fall through too — it is the ONLY path a
+        long-parked car ever reaches.
+
+        _maybe_bind_reid_solo runs only while the 12-attempt OCR budget is being
+        spent. A car parked long enough to exhaust it is served exclusively by
+        _retry_reid_identify, so an off-session tier present only in the former is
+        unreachable for exactly the cars the feature exists for.
+
+        Measured 2026-08-02: B13 held BHD-9990 with 20 references on disk and 8 taught
+        by CAM-24 itself, while this loop abstained every 62s against the live-session
+        pool and offsession_solo_candidate was never called. Both flags were true.
+        """
+        import inspect
+        from src.core.engine.engine_runtime import ParkingEngineRuntimeMixin
+        src = inspect.getsource(ParkingEngineRuntimeMixin._retry_reid_identify)
+        self.assertIn("offsession_solo_candidate", src,
+                      "the retry loop no longer reaches the off-session tier — a car "
+                      "whose OCR budget is spent can never be recovered, however good "
+                      "its gallery is")
+
+    def test_offsession_refusals_are_visible_at_info(self):
+        """Both decline paths must log at INFO, not DEBUG.
+
+        At DEBUG a live investigation reads as "the feature does nothing" — there is
+        no way to tell "no candidate" from "margin too close" from "never called".
+        """
+        import inspect
+        src = inspect.getsource(
+            VehicleRegistryIdentityMixin.offsession_solo_candidate)
+        self.assertNotIn("logger.debug", src,
+                         "a recovery path whose job is rescuing invisible cars must "
+                         "not itself be invisible")
+        self.assertGreaterEqual(
+            src.count("logger.info"), 2,
+            "both the no-candidate and margin-refused branches must log at INFO")
+
+    def test_every_public_recovery_entry_point_has_a_caller(self):
+        """Guards the whole feature against the same class of gap."""
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent / "src"
+        body = "\n".join(p.read_text(encoding="utf-8", errors="ignore")
+                         for p in root.rglob("*.py"))
+        for name in ("offsession_solo_candidate", "offsession_gallery_candidates"):
+            calls = body.count(name) - body.count(f"def {name}")
+            self.assertGreater(calls, 0, f"{name} is defined but never called")

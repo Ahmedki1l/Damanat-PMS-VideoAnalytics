@@ -1783,8 +1783,37 @@ class ParkingEngineRuntimeMixin:
             is_reserved=bool((decision_ctx or {}).get("is_reserved")),
             decision_ctx=decision_ctx,
         )
+        recovered = False
         if not plate:
-            return
+            # OFF-SESSION TIER. try_reid_identify_slot ranks live sessions only, so a
+            # car parked with NO parking_session returns nothing here however well it
+            # matches — its gallery was never hydrated, because hydration is keyed on
+            # having a session. That is the circularity slot_recovery exists to break,
+            # and this is the only place in the engine that can act on it: OCR has
+            # already failed (at 720p it is silent on 6 of 7 unnamed slots), so the
+            # two-witness path cannot fire either.
+            #
+            # Held to a much stricter margin than the ordinary solo bind — 0.35 vs
+            # 0.15 — because this names a car the facility believes is not inside.
+            # See matching.slot_recovery_solo_min_margin for the precision curve.
+            solo = None
+            try:
+                qvec = self.vehicle_registry.reid_matcher.extract_feature(crop)
+                solo = self.vehicle_registry.offsession_solo_candidate(
+                    qvec, slot_id=slot_id, slot_camera=cam_id
+                )
+            except Exception as exc:
+                logger.debug("[recovery] slot=%s solo attempt failed: %r", slot_id, exc)
+            if not solo:
+                return
+            plate, solo_score, solo_margin = solo
+            recovered = True
+            logger.warning(
+                "[recovery] slot=%s RECOVERED %s on appearance alone "
+                "(score=%.3f margin=%.3f, cam=%s) — this car has NO open session; "
+                "PMS-AI must be told before it is counted",
+                slot_id, plate, solo_score, solo_margin, cam_id,
+            )
         # Appearance-only: bind it PROVISIONALLY. Not locked, so a later OCR read can
         # still overrule it, and deliberately NOT taught to the gallery — a solo bind is
         # inference, not evidence, and a wrong one would poison the references it was
@@ -1794,7 +1823,8 @@ class ParkingEngineRuntimeMixin:
             plate, self._build_slot_snapshot_url(slot_id), confidence=conf, lock=False
         )
         self.vehicle_registry.bind_plate_to_slot(
-            slot_id, plate, cam_id, floor=None, source="reid_solo"
+            slot_id, plate, cam_id, floor=None,
+            source="offsession_recovery" if recovered else "reid_solo",
         )
         if self.db_manager:
             self._persist_slot_plate_binding(slot_id, plate, conf, False, cam_id)
@@ -1803,11 +1833,23 @@ class ParkingEngineRuntimeMixin:
         if getattr(self, "_restored_plate_slots", None):
             self._restored_plate_slots.discard(slot_id)
         logger.info(
-            "[reid-solo] slot=%s BOUND plate=%s (cam=%s) on attempt %d/%d — "
+            "[%s] slot=%s BOUND plate=%s (cam=%s) on attempt %d/%d — "
             "appearance only, NOT locked and NOT taught to the gallery; OCR may still "
             "overrule it",
+            "recovery" if recovered else "reid-solo",
             slot_id, plate, cam_id, attempt_num, self._OCR_ID_MAX_ATTEMPTS,
         )
+        if recovered:
+            # Queue for the PMS-AI hand-off. Naming the slot is only half of a
+            # recovery: until a parking_session exists the car is still uncounted,
+            # and its eventual exit will still find no entry to match.
+            self._pending_slot_recoveries = getattr(
+                self, "_pending_slot_recoveries", [])
+            self._pending_slot_recoveries.append({
+                "plate_number": plate, "slot_id": slot_id, "camera_id": cam_id,
+                "reid_score": round(float(solo_score), 4),
+                "reid_margin": round(float(solo_margin), 4),
+            })
         self._evaluate_named_slot_ownership(slot_id, cam_id, plate)
 
     def _no_plate_view_slots(self) -> set:
@@ -1901,24 +1943,59 @@ class ParkingEngineRuntimeMixin:
                 "reid_retry": True,
             },
         )
+        recovered = False
         if not plate:
-            return
+            # OFF-SESSION TIER — the same fall-through _maybe_bind_reid_solo has, and it
+            # has to be here too. That one only runs while the OCR budget is being spent
+            # (attempt >= slot_reid_solo_after_attempts, attempts < _OCR_ID_MAX_ATTEMPTS).
+            # A car parked long enough to exhaust its 12 attempts is served ONLY by this
+            # retry, so without this the feature is unreachable for exactly the cars it
+            # exists for: the long-parked ones with no session.
+            #
+            # Measured 2026-08-02: B13 held BHD-9990 — 20 references on disk, 8 of them
+            # taught by CAM-24 itself — while this loop abstained every 62s against the
+            # live-session pool the car is not in, and offsession_solo_candidate was
+            # never called once. Enabling slot_recovery_solo_enabled changed nothing
+            # because nothing asked.
+            try:
+                qvec = self.vehicle_registry.reid_matcher.extract_feature(crop)
+                solo = self.vehicle_registry.offsession_solo_candidate(
+                    qvec, slot_id=slot.id, slot_camera=cam_id
+                )
+            except Exception as exc:
+                logger.debug("[recovery] slot=%s retry solo attempt failed: %r",
+                             slot.id, exc)
+                return
+            if not solo:
+                return
+            plate, solo_score, solo_margin = solo
+            recovered = True
+            logger.warning(
+                "[recovery] slot=%s RECOVERED %s on appearance alone via the RETRY loop "
+                "(score=%.3f margin=%.3f, cam=%s) — OCR's %d attempts were spent long "
+                "ago and this car has NO open session; PMS-AI must be told before it is "
+                "counted",
+                slot.id, plate, solo_score, solo_margin, cam_id,
+                self._OCR_ID_MAX_ATTEMPTS,
+            )
 
         conf = float(getattr(mc, "slot_reid_solo_min_score", 0.70))
         state_machine.bind_identity(
             plate, self._build_slot_snapshot_url(slot.id), confidence=conf, lock=False
         )
         self.vehicle_registry.bind_plate_to_slot(
-            slot.id, plate, cam_id, floor=None, source="reid_solo"
+            slot.id, plate, cam_id, floor=None,
+            source="offsession_recovery" if recovered else "reid_solo",
         )
         if self.db_manager:
             self._persist_slot_plate_binding(slot.id, plate, conf, False, cam_id)
-        logger.info(
-            "[reid-solo] slot=%s BOUND plate=%s (cam=%s) on a RETRY after OCR's %d "
-            "attempts were spent — appearance only, NOT locked and NOT taught to the "
-            "gallery; OCR may still overrule it",
-            slot.id, plate, cam_id, self._OCR_ID_MAX_ATTEMPTS,
-        )
+        if not recovered:
+            logger.info(
+                "[reid-solo] slot=%s BOUND plate=%s (cam=%s) on a RETRY after OCR's %d "
+                "attempts were spent — appearance only, NOT locked and NOT taught to the "
+                "gallery; OCR may still overrule it",
+                slot.id, plate, cam_id, self._OCR_ID_MAX_ATTEMPTS,
+            )
         self._evaluate_named_slot_ownership(slot.id, cam_id, plate)
 
     def _arm_ocr_for_slot(self, slot_id: str) -> None:
