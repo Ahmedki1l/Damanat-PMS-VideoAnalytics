@@ -94,6 +94,7 @@
   "slot_recovery_min_margin": 0.1,
   "slot_recovery_min_score": 0.55,
   "slot_recovery_reembed_max_refs": 3,
+  "slot_recovery_send_interval_s": 15.0,
   "slot_recovery_solo_enabled": false,
   "slot_recovery_solo_min_margin": 0.35,
   "slot_recovery_top_k": 5,

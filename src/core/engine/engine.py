@@ -373,6 +373,11 @@ class ParkingEngine(
         # frame or two later. Only started when the registry can read plates.
         self._start_slot_ocr_worker()
 
+        # Hands recovered cars to PMS-AI so a parking_session is opened. Without it
+        # recovery names the slot and stops there — the car stays uncounted and its
+        # exit still finds no entry to match.
+        self._start_slot_recovery_sender()
+
         self.is_running = True
         self.start_time = time.time()
         self._start_time = self.start_time
@@ -500,6 +505,7 @@ class ParkingEngine(
         finally:
             self._stop_entry_v2_local_bridge()
             self._stop_slot_ocr_worker()
+            self._stop_slot_recovery_sender()
             self.cam_manager.close_all()
             if show:
                 cv2.destroyAllWindows()

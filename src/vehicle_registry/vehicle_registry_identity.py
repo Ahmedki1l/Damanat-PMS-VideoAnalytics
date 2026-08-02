@@ -5571,6 +5571,17 @@ class VehicleRegistryIdentityMixin:
             ctx=plan.decision_ctx,
         )
 
+        if ocr_text:
+            # Keep the RAW read, whatever it was. PMS-AI's slot-recovery contract
+            # requires an ocr_text witness (schemas/slot_recovery.py: min_length=1) and
+            # documents it as evidence to be stored unnormalised — "storing a cleaned-up
+            # version would hide what was actually seen". A read that confirmed nothing
+            # is still what the camera saw: B13/BHD-9990 read '5999BHOL', 'BHOI' and
+            # '39BHOL' on 2026-08-02, none of which matched, while the car was in fact
+            # BHD-9990. Without this the appearance-only recovery has no witness to
+            # send and the session can never be opened.
+            self.record_slot_ocr_read(slot_id, ocr_text)
+
         if not ocr_text:
             # Never silent. A side-on slot (CAM-21 frames B1_CRO in pure profile) reads
             # nothing at all in the settled pose — the plate is simply not in the frame.
@@ -5783,6 +5794,53 @@ class VehicleRegistryIdentityMixin:
         votes = getattr(self, "_slot_ocr_votes", None)
         if votes:
             votes.pop(slot_id, None)
+
+    def record_slot_ocr_read(self, slot_id: str, ocr_text: str) -> None:
+        """Remember the last RAW characters OCR returned for a slot.
+
+        Deliberately kept even when the read confirmed nothing — see the call site in
+        :meth:`confirm_slot_ocr`. Timestamped so a read belonging to a previous occupant
+        can never be attached to the car that replaced it; readers pass a max age and
+        :meth:`clear_slot_ocr_read` drops it outright when the slot re-arms.
+        """
+        if not ocr_text:
+            return
+        reads = getattr(self, "_slot_last_ocr_read", None)
+        if reads is None:
+            reads = self._slot_last_ocr_read = {}
+        reads[slot_id] = (str(ocr_text), monotonic())
+
+    def last_slot_ocr_read(
+        self, slot_id: str, *, max_age_s: float = 900.0
+    ) -> Optional[str]:
+        """The last raw read for a slot, or None when there is none or it is stale.
+
+        A stale read is worse than no read: it would attach one car's characters to
+        another car's recovery and put a false witness in the audit trail.
+        """
+        entry = (getattr(self, "_slot_last_ocr_read", None) or {}).get(slot_id)
+        if not entry:
+            return None
+        text, at = entry
+        return text if (monotonic() - at) <= float(max_age_s) else None
+
+    def clear_slot_ocr_read(self, slot_id: str) -> None:
+        """Drop the remembered raw read (slot vacated or re-armed for a new car)."""
+        reads = getattr(self, "_slot_last_ocr_read", None)
+        if reads:
+            reads.pop(slot_id, None)
+
+    def last_offsession_same_view(self) -> bool:
+        """Whether the most recent off-session rank won on a same-view parked pose.
+
+        PMS-AI records this on the recovery (`reid_same_view`) because the two are not
+        the same quality of evidence: a pose taught by THIS camera on an earlier visit
+        ranks 0.976, a gate photo 0.736 and inverted on individual cars. Exposed as an
+        accessor rather than widening `offsession_solo_candidate`'s return tuple, which
+        callers unpack positionally.
+        """
+        ranked = getattr(self, "_last_offsession_rank", None)
+        return bool(ranked[3]) if ranked else False
 
     def ocr_transit_candidates(self, now=None):
         """Cars whose plate was READ moments ago and that have not parked yet.

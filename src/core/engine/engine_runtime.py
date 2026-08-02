@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -1612,6 +1613,90 @@ class ParkingEngineRuntimeMixin:
             worker.stop()
             self._ocr_worker = None
 
+    def _start_slot_recovery_sender(self) -> None:
+        """Start the PMS-AI hand-off for recovered cars.
+
+        Off-thread on purpose: a recovery is worth one uncounted car until the next
+        attempt, and blocking the frame loop on an HTTP round trip would cost every
+        camera in the group. Independent of ENTRY_V2_MODE — this describes a car
+        already parked, not one arriving at a barrier — so it needs only the PMS base
+        URL and the shared service key.
+
+        Silent no-op when either is unset: recovery still names slots, it just cannot
+        open sessions, and that is stated once at startup rather than per claim.
+        """
+        if getattr(self, "_recovery_sender", None) is not None:
+            return
+        mc = getattr(self.vehicle_registry, "matching_config", None)
+        if not bool(getattr(mc, "slot_recovery_enabled", False)):
+            return
+        base_url = os.getenv("PMS_API_URL", "").strip()
+        service_key = os.getenv("ENTRY_V2_SERVICE_KEY", "").strip()
+        if not base_url or not service_key:
+            logger.warning(
+                "[recovery] slot recovery is ON but the PMS-AI hand-off is not "
+                "configured (PMS_API_URL=%s ENTRY_V2_SERVICE_KEY=%s) — recovered cars "
+                "will be NAMED on their slot but never counted, and their exits will "
+                "not match an entry",
+                "set" if base_url else "unset", "set" if service_key else "unset",
+            )
+            return
+        from src.vehicle_registry.slot_recovery_sender import SlotRecoverySender
+        try:
+            sender = SlotRecoverySender(base_url, service_key)
+        except ValueError as exc:
+            logger.error("[recovery] hand-off disabled — bad PMS_API_URL: %s", exc)
+            return
+        self._recovery_sender = sender
+        self._recovery_stop = threading.Event()
+
+        interval = float(getattr(mc, "slot_recovery_send_interval_s", 15.0) or 15.0)
+
+        def _loop():
+            while not self._recovery_stop.wait(interval):
+                try:
+                    self._flush_pending_slot_recoveries()
+                except Exception as exc:  # a hand-off must never kill the engine
+                    logger.warning("[recovery] send loop error: %r", exc)
+
+        self._recovery_thread = threading.Thread(
+            target=_loop, name="slot-recovery-sender", daemon=True)
+        self._recovery_thread.start()
+        logger.info(
+            "[recovery] PMS-AI hand-off started -> %s (every %.0fs)",
+            base_url, interval,
+        )
+
+    def _flush_pending_slot_recoveries(self) -> None:
+        """Move anything the frame loop queued into the sender, then deliver."""
+        sender = getattr(self, "_recovery_sender", None)
+        if sender is None:
+            return
+        pending = getattr(self, "_pending_slot_recoveries", None)
+        if pending:
+            # Swap the list rather than mutating it: the frame loop appends without a
+            # lock, and rebinding is atomic where item-by-item removal is not.
+            self._pending_slot_recoveries, claims = [], pending
+            for claim in claims:
+                sender.enqueue(claim)
+        if sender.pending():
+            sender.drain()
+
+    def _stop_slot_recovery_sender(self) -> None:
+        stop = getattr(self, "_recovery_stop", None)
+        if stop is not None:
+            stop.set()
+        thread = getattr(self, "_recovery_thread", None)
+        if thread is not None:
+            thread.join(timeout=5.0)
+        # Last chance to hand off anything still queued before the process goes away.
+        try:
+            self._flush_pending_slot_recoveries()
+        except Exception:
+            pass
+        self._recovery_sender = None
+        self._recovery_thread = None
+
     def _drain_slot_ocr_results(self) -> None:
         """Fold every finished async OCR read back into its slot — MAIN THREAD.
 
@@ -1840,17 +1925,53 @@ class ParkingEngineRuntimeMixin:
             slot_id, plate, cam_id, attempt_num, self._OCR_ID_MAX_ATTEMPTS,
         )
         if recovered:
-            # Queue for the PMS-AI hand-off. Naming the slot is only half of a
-            # recovery: until a parking_session exists the car is still uncounted,
-            # and its eventual exit will still find no entry to match.
-            self._pending_slot_recoveries = getattr(
-                self, "_pending_slot_recoveries", [])
-            self._pending_slot_recoveries.append({
-                "plate_number": plate, "slot_id": slot_id, "camera_id": cam_id,
-                "reid_score": round(float(solo_score), 4),
-                "reid_margin": round(float(solo_margin), 4),
-            })
+            self._queue_slot_recovery(
+                plate, slot_id, cam_id, solo_score, solo_margin)
         self._evaluate_named_slot_ownership(slot_id, cam_id, plate)
+
+    def _queue_slot_recovery(
+        self, plate: str, slot_id: str, cam_id: str,
+        reid_score: float, reid_margin: float,
+    ) -> None:
+        """Queue a recovered car for the PMS-AI hand-off.
+
+        Naming the slot is only half of a recovery: until a `parking_session` exists the
+        car is still uncounted, and its eventual exit still finds no entry to match
+        (`[UC2] No matching entry found`). The drainer in `slot_recovery_sender` posts
+        these to /api/v1/internal/slot-recoveries.
+
+        The OCR witness is REQUIRED by that contract (min_length=1) even though the
+        appearance tier admitted this car without one, so we attach the last raw read
+        for the slot. When there is none the claim cannot be expressed at all — a slot
+        whose plate is never in frame (B5: "read NOTHING", 24 consecutive attempts) is
+        named on the dashboard but stays uncounted. That is a real limitation of the
+        current contract, logged loudly rather than dropped in silence.
+        """
+        registry = self.vehicle_registry
+        # getattr-guarded: a hand-off must never be able to break a bind that has
+        # already succeeded. The slot is named either way; only the session is at risk.
+        read_fn = getattr(registry, "last_slot_ocr_read", None)
+        ocr_text = read_fn(slot_id) if callable(read_fn) else None
+        if not ocr_text:
+            logger.warning(
+                "[recovery] slot=%s %s CANNOT be handed to PMS-AI — no raw OCR read to "
+                "witness it (this slot's plate is never in frame). The slot is named but "
+                "the car stays uncounted and its exit will not match an entry.",
+                slot_id, plate,
+            )
+            return
+        self._pending_slot_recoveries = getattr(self, "_pending_slot_recoveries", [])
+        self._pending_slot_recoveries.append({
+            "plate_number": plate,
+            "slot_id": slot_id,
+            "camera_id": cam_id,
+            "reid_score": round(float(reid_score), 4),
+            "reid_margin": round(float(reid_margin), 4),
+            "reid_same_view": bool(
+                getattr(registry, "last_offsession_same_view", lambda: False)()),
+            "ocr_text": ocr_text,
+            "observed_at": datetime.now().isoformat(timespec="seconds"),
+        })
 
     def _no_plate_view_slots(self) -> set:
         """Slots whose plate is never in frame (matching.slot_no_plate_view). Cached —
@@ -1996,6 +2117,9 @@ class ParkingEngineRuntimeMixin:
                 "gallery; OCR may still overrule it",
                 slot.id, plate, cam_id, self._OCR_ID_MAX_ATTEMPTS,
             )
+        else:
+            self._queue_slot_recovery(
+                plate, slot.id, cam_id, solo_score, solo_margin)
         self._evaluate_named_slot_ownership(slot.id, cam_id, plate)
 
     def _arm_ocr_for_slot(self, slot_id: str) -> None:
@@ -2008,6 +2132,12 @@ class ParkingEngineRuntimeMixin:
         self._ocr_id_last_at[slot_id] = 0.0
         self._reid_retry_last_at.pop(slot_id, None)
         self._ocr_armed[slot_id] = True
+        # A new car: the previous occupant's raw read must not become its witness.
+        # getattr-guarded because arming OCR is critical path and must not depend on
+        # the registry carrying a recovery-only helper.
+        clear = getattr(self.vehicle_registry, "clear_slot_ocr_read", None)
+        if callable(clear):
+            clear(slot_id)
         # Occupancy generation: bumped every arm so an ASYNC read that finishes
         # after the car left — and a new car has since parked — is recognised as
         # stale and dropped instead of bound to the wrong occupant.

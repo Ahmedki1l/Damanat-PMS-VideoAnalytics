@@ -644,6 +644,11 @@ class MatchingConfig:
     # from the running one. Bounded because this runs on the caller's thread and the
     # production gallery holds ~780 crops; the best few references carry the match.
     slot_recovery_reembed_max_refs: int = 3
+    # Seconds between PMS-AI hand-off drains. Recovery is not gate evidence: a claim
+    # arriving 15s late costs nothing, and polling faster only burns a thread on an
+    # empty queue. Needs PMS_API_URL + ENTRY_V2_SERVICE_KEY; without a hand-off the
+    # slot is named but no parking_session is ever opened.
+    slot_recovery_send_interval_s: float = 15.0
     # ReID-ALONE recovery, for slots where OCR can never corroborate. At 720p the
     # OCR witness is silent on 6 of 7 unnamed slots, so requiring two witnesses
     # recovers nothing at all there; this is the tier that can still fire.

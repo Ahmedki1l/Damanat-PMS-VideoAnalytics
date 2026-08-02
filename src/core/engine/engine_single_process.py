@@ -74,6 +74,7 @@ class ParkingEngineSingleProcessMixin:
         except ValueError:
             self._stop_entry_v2_local_bridge()
             self._stop_slot_ocr_worker()
+            self._stop_slot_recovery_sender()
             self.cam_manager.close_all()
             raise
 
@@ -87,6 +88,7 @@ class ParkingEngineSingleProcessMixin:
             )
             self._stop_entry_v2_local_bridge()
             self._stop_slot_ocr_worker()
+            self._stop_slot_recovery_sender()
             self.cam_manager.close_all()
             return
         # Expose read-only snapshots to diagnostics/API code without sharing the
@@ -467,6 +469,7 @@ class ParkingEngineSingleProcessMixin:
             consumer_thread.join(timeout=3)
             self._stop_entry_v2_local_bridge()
             self._stop_slot_ocr_worker()
+            self._stop_slot_recovery_sender()
             self.cam_manager.close_all()
             self.event_bus.close()
             print(f"[single] stopped. drops={drops}")
