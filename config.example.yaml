@@ -328,6 +328,13 @@ tracker:
 state_machine:
   confirm_enter_frames: 5
   confirm_leave_frames: 8
+  # Per-camera debounce overrides, keyed by camera id. YAML-only (the two
+  # counters above are DB-owned and re-synced, so a per-camera value in the DB
+  # would be clobbered). Unset keys inherit the global value.
+  #   camera_overrides:
+  #     CAM-00:
+  #       confirm_leave_frames: 16
+  camera_overrides: {}
   # legacy keeps the frame counters above. shadow evaluates elapsed-time
   # hysteresis without changing public state. time makes it authoritative.
   mode: legacy

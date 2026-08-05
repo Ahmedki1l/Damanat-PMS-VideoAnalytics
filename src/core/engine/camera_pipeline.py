@@ -35,6 +35,16 @@ class CameraPipeline:
         self._mask = None
         initial_statuses = initial_statuses or {}
 
+        # Per-camera debounce, if this camera has a state_machine.camera_overrides
+        # entry; otherwise the global (DB-owned) counters, unchanged.
+        sm_config = config.state_machine.resolve_for_camera(camera_id)
+        if sm_config is not config.state_machine:
+            print(
+                f"[INFO] {camera_id}: state machine override "
+                f"confirm_enter_frames={sm_config.confirm_enter_frames}, "
+                f"confirm_leave_frames={sm_config.confirm_leave_frames}"
+            )
+
         self.state_machines: Dict[str, SlotStateMachine] = {}
         for slot in slots:
             is_restricted = (violation_slots is not None) and (slot.id in violation_slots)
@@ -43,8 +53,8 @@ class CameraPipeline:
 
             self.state_machines[slot.id] = SlotStateMachine(
                 slot_id=slot.id,
-                confirm_enter_frames=config.state_machine.confirm_enter_frames,
-                confirm_leave_frames=config.state_machine.confirm_leave_frames,
+                confirm_enter_frames=sm_config.confirm_enter_frames,
+                confirm_leave_frames=sm_config.confirm_leave_frames,
                 is_violation_zone=is_restricted,
                 initial_state=start_state,
                 observation_policy=config.state_machine.observation_policy,

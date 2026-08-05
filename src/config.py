@@ -7,7 +7,7 @@ Supports both single-camera (legacy) and multi-camera configurations.
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional
 
 import yaml
@@ -244,14 +244,78 @@ class TrackerConfig:
     type: str = "bytetrack"
 
 
+# Fields a state_machine.camera_overrides entry is allowed to set. Only the two
+# frame counters: observation_policy is the *time*-based alternative path and is
+# a facility-wide mode switch (legacy/shadow/time), not something one camera
+# should flip on its own.
+STATE_MACHINE_OVERRIDE_KEYS = frozenset(
+    {"confirm_enter_frames", "confirm_leave_frames"}
+)
+
+
+def _parse_state_machine_overrides(raw: Dict) -> Dict[str, Dict]:
+    """Parse+validate state_machine.camera_overrides. Unknown keys raise for the
+    same reason detector overrides do: a typo fails open (the camera silently
+    keeps the global debounce) and the symptom — a slot flipping too early — is
+    exactly what the override was added to fix."""
+    parsed: Dict[str, Dict] = {}
+    for cam_id, fields in (raw or {}).items():
+        fields = dict(fields or {})
+        unknown = set(fields) - STATE_MACHINE_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(
+                f"state_machine.camera_overrides['{cam_id}']: unknown key(s) "
+                f"{sorted(unknown)}. Allowed: {sorted(STATE_MACHINE_OVERRIDE_KEYS)}"
+            )
+        converted = {}
+        for key, value in fields.items():
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"state_machine.camera_overrides['{cam_id}'].{key} must be an "
+                    f"int, got {value!r}"
+                )
+            if count < 1:
+                raise ValueError(
+                    f"state_machine.camera_overrides['{cam_id}'].{key} must be >= 1, "
+                    f"got {count}"
+                )
+            converted[key] = count
+        if converted:
+            parsed[norm_camera_id(cam_id)] = converted
+    return parsed
+
+
 @dataclass
 class StateMachineConfig:
     """State machine debounce thresholds."""
     confirm_enter_frames: int = 5
     confirm_leave_frames: int = 8
+
+    # YAML-ONLY per-camera overrides, keyed by normalized camera id (see
+    # norm_camera_id). NOT DB-owned: sync_app_config_from_db rewrites
+    # confirm_enter_frames/confirm_leave_frames from the Config table on every
+    # sync, so a per-camera value stored there would be clobbered — it lives in
+    # YAML alone, same as detector.camera_overrides. Unset keys inherit the
+    # global (DB) value. Applied once, when CameraPipeline builds a camera's
+    # state machines.
+    camera_overrides: Dict[str, Dict] = field(default_factory=dict)
+
     observation_policy: SlotObservationPolicy = field(
         default_factory=SlotObservationPolicy
     )
+
+    def resolve_for_camera(self, camera_id: str) -> "StateMachineConfig":
+        """Return this config with the camera's overrides applied.
+
+        Returns ``self`` unchanged when the camera has no entry, so the common
+        path allocates nothing.
+        """
+        override = self.camera_overrides.get(norm_camera_id(camera_id))
+        if not override:
+            return self
+        return replace(self, camera_overrides={}, **override)
 
 
 @dataclass
@@ -1199,6 +1263,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         config.state_machine.confirm_leave_frames = sm.get(
             "confirm_leave_frames", config.state_machine.confirm_leave_frames
+        )
+        config.state_machine.camera_overrides = _parse_state_machine_overrides(
+            sm.get("camera_overrides") or {}
         )
         current_policy = config.state_machine.observation_policy
         config.state_machine.observation_policy = SlotObservationPolicy(
