@@ -62,6 +62,19 @@ class ANPREventRequest(BaseModel):
     confidence: Optional[float] = None
 
 
+class ReIDCompareRequest(BaseModel):
+    """Score one crop against the persisted galleries of named plates.
+
+    PMS-AI sends the crop of a car leaving and the plates of the open sessions it
+    might belong to; VA answers with a similarity per plate and decides nothing.
+    Used to resolve an exit whose plate matched no session because the ENTRY read
+    was wrong — see PMS-AI `exit_match_service`.
+    """
+
+    image_base64: str
+    plates: List[str]
+
+
 def _parse_anpr_source_timestamp(event: ANPREventRequest) -> Optional[datetime]:
     """Parse the ANPR source time without ever substituting delivery time.
 
@@ -1049,6 +1062,87 @@ def create_app(
             image_saved=image_saved,
             timestamp=_anpr_response_timestamp(record, source_timestamp),
         )
+
+    @app.post("/api/reid/compare")
+    async def reid_compare(
+        payload: ReIDCompareRequest,
+        service_key: Optional[str] = Header(None, alias=SERVICE_KEY_HEADER),
+    ):
+        """Similarity between one query crop and each named plate's gallery.
+
+        Answers "which of these cars is this?" and nothing else — no session is
+        read or written, no gallery is modified. The caller applies the margin
+        and owns the decision, because the cost of a wrong answer is theirs.
+
+        `current_tag_only=True` is mandatory: a gallery folder can hold refs
+        embedded under different model contracts (BHD-9990 in production carries
+        4 refs under one tag and 16 under another) and a cosine distance across
+        two contracts is meaningless. Scoring vectors directly, as this does,
+        must therefore drop the stale ones.
+
+        A plate with no usable refs returns `score: null` — absence of evidence,
+        which the caller must not read as dissimilarity.
+        """
+        _require_internal_anpr_auth(service_key)
+
+        import cv2
+        import numpy as np
+
+        from src.reid_matcher.reid_burst import is_overexposed, sharpness_score
+        from src.reid_matcher.reid_matcher import (
+            VehicleReIDMatcher,
+            get_reid_matcher,
+        )
+
+        store = getattr(registry, "gallery_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="gallery_disabled")
+
+        try:
+            buffer = np.frombuffer(base64.b64decode(payload.image_base64), np.uint8)
+            query_crop = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+        except Exception:
+            query_crop = None
+        if query_crop is None or query_crop.size == 0:
+            raise HTTPException(status_code=400, detail="undecodable_image")
+
+        # Report quality rather than silently scoring a crop nothing could match
+        # from. The caller refuses on a bad query instead of trusting a low score.
+        quality_ok = not is_overexposed(query_crop)
+        sharpness = float(sharpness_score(query_crop))
+
+        matcher = get_reid_matcher()
+        query_vec = matcher.extract_feature(query_crop)
+        if query_vec is None:
+            raise HTTPException(status_code=422, detail="no_query_feature")
+
+        results = []
+        for plate in payload.plates[:20]:
+            vectors, model_tag, _cameras = store.load_vectors(
+                plate, current_tag_only=True
+            )
+            if not vectors:
+                results.append({"plate": plate, "score": None, "refs": 0})
+                continue
+            best = max(
+                VehicleReIDMatcher.compute_similarity(query_vec, vec)
+                for vec in vectors
+            )
+            results.append(
+                {
+                    "plate": plate,
+                    "score": round(float(best), 4),
+                    "refs": len(vectors),
+                    "model_tag": model_tag,
+                }
+            )
+
+        results.sort(key=lambda r: (r["score"] is None, -(r["score"] or 0.0)))
+        return {
+            "query_quality_ok": quality_ok,
+            "query_sharpness": round(sharpness, 2),
+            "results": results,
+        }
 
     @app.post("/api/line-crossing", response_model=LineCrossingResponse)
     async def line_crossing(event: LineCrossingRequest):
