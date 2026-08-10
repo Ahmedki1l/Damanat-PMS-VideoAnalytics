@@ -2443,7 +2443,9 @@ class ParkingEngineRuntimeMixin:
                       id (``tracked``), the detector confidence, the class id, the
                       assignment method (``point`` = ground-point inside the
                       polygon; ``overlap`` = ground-point OUTSIDE, won on the
-                      bbox-overlap fallback), the overlap fraction, the box, the
+                      bbox-overlap fallback; ``coverage`` = the camera runs
+                      assignment_mode=coverage and the box cleared
+                      coverage_threshold), the overlap fraction, the box, the
                       probe point and any rival slots the same box also touched.
           present=0 : NO detection was assigned — the slot is held only by the
                       leave-debounce. Logs the leave counter vs the frames needed,
@@ -2458,6 +2460,11 @@ class ParkingEngineRuntimeMixin:
             /synthetic track is holding the slot.
           * present=1 with ``via=overlap`` or a tiny ``overlap``       -> an
             assignment bug: the box's ground point is not even in the slot.
+            This is the case assignment_mode=coverage exists to refuse — put the
+            camera in coverage mode with a gate above the observed ``overlap``,
+            but stay under the slot's ceiling (see
+            tools/calibrate_coverage_threshold.py) or the slot goes permanently
+            VACANT instead.
           * present flips 1/0 and ``leave`` never reaches ``need``     -> flicker;
             the debounce is being reset by intermittent (re)detections.
 
