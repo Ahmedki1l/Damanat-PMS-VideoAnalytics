@@ -60,7 +60,19 @@ class CameraPipeline:
                 observation_policy=config.state_machine.observation_policy,
             )
 
-        self.assigner = SlotAssigner(slots=slots, config=config.assigner)
+        # Per-camera slot-membership rule, if this camera has an
+        # assigner.camera_overrides entry; otherwise the global config. This is
+        # how coverage mode gets staged onto one camera at a time.
+        assigner_config = config.assigner.resolve_for_camera(camera_id)
+        if assigner_config is not config.assigner:
+            print(
+                f"[INFO] {camera_id}: assigner override "
+                f"assignment_mode={assigner_config.assignment_mode}, "
+                f"coverage_threshold={assigner_config.coverage_threshold}, "
+                f"overlap_threshold={assigner_config.overlap_threshold}"
+            )
+
+        self.assigner = SlotAssigner(slots=slots, config=assigner_config)
 
     def apply_roi_mask(self, frame: np.ndarray) -> np.ndarray:
         """Apply the ROI mask to the frame, blacking out areas outside the ROI."""

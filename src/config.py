@@ -318,10 +318,113 @@ class StateMachineConfig:
         return replace(self, camera_overrides={}, **override)
 
 
+#: The slot-membership rules SlotAssigner knows how to run.
+ASSIGNMENT_MODES = ("point", "coverage")
+
+# Fields an assigner.camera_overrides entry is allowed to set. All three, because
+# staging coverage mode onto one camera usually means giving it its own gate too.
+ASSIGNER_OVERRIDE_KEYS = frozenset(
+    {"assignment_mode", "coverage_threshold", "overlap_threshold"}
+)
+
+
+def _parse_assigner_overrides(raw: Dict) -> Dict[str, Dict]:
+    """Parse+validate assigner.camera_overrides.
+
+    Unknown keys and bad values raise, matching _parse_state_machine_overrides
+    and for the same reason: a typo here fails OPEN — the camera silently keeps
+    the global rule — and "this camera is still on the old behaviour" is
+    invisible in the output. The global assigner.assignment_mode degrades to
+    "point" instead of raising, because that one can arrive from deployed config
+    on a running engine; these are YAML-authored and checked at load.
+    """
+    parsed: Dict[str, Dict] = {}
+    for cam_id, fields in (raw or {}).items():
+        fields = dict(fields or {})
+        unknown = set(fields) - ASSIGNER_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(
+                f"assigner.camera_overrides['{cam_id}']: unknown key(s) "
+                f"{sorted(unknown)}. Allowed: {sorted(ASSIGNER_OVERRIDE_KEYS)}"
+            )
+        converted = {}
+        for key, value in fields.items():
+            if key == "assignment_mode":
+                mode = str(value).lower()
+                if mode not in ASSIGNMENT_MODES:
+                    raise ValueError(
+                        f"assigner.camera_overrides['{cam_id}'].assignment_mode "
+                        f"must be one of {list(ASSIGNMENT_MODES)}, got {value!r}"
+                    )
+                converted[key] = mode
+                continue
+            try:
+                ratio = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"assigner.camera_overrides['{cam_id}'].{key} must be a "
+                    f"number, got {value!r}"
+                )
+            if not 0.0 <= ratio <= 1.0:
+                raise ValueError(
+                    f"assigner.camera_overrides['{cam_id}'].{key} is a fraction "
+                    f"and must be between 0 and 1, got {ratio}"
+                )
+            converted[key] = ratio
+        if converted:
+            parsed[norm_camera_id(cam_id)] = converted
+    return parsed
+
+
 @dataclass
 class AssignerConfig:
     """Slot assigner settings."""
     overlap_threshold: float = 0.3
+
+    # How a vehicle is judged to be IN a slot.
+    #   "point"    : bottom-center probe inside the polygon, with an
+    #                overlap_threshold fallback. The historical behaviour — the
+    #                production polygons were operator-calibrated against it.
+    #   "coverage" : the fraction of the vehicle's box inside the polygon must
+    #                reach coverage_threshold. No point probe at all.
+    # Unknown values degrade to "point" rather than raising: a typo in deployed
+    # config must not take the engine down.
+    assignment_mode: str = "point"
+
+    # Gate for assignment_mode="coverage". Deliberately NOT overlap_threshold:
+    # that value gates the point-mode *fallback* (a car whose probe missed) and
+    # is tuned for "probably still in the slot". As a primary rule the question
+    # is different — "is this box mostly in the slot" — so it gets its own knob.
+    #
+    # 0.30, not the intuitive 0.5. Coverage has a ceiling the operator cannot
+    # see: slot polygons are perspective trapezoids and detection boxes are
+    # axis-aligned rectangles, so a car filling its slot still hangs its box
+    # corners outside the polygon. Measured on the authored B1 geometry
+    # (tools/calibrate_coverage_threshold.py), the worst slot (G2) tops out at
+    # 0.408 and the 10th percentile at 0.553 — a threshold of 0.5 strands two
+    # slots at permanently VACANT with no error and no log. Re-run that tool
+    # after redrawing polygons; raising this without it is how slots disappear.
+    coverage_threshold: float = 0.30
+
+    # YAML-ONLY per-camera overrides, keyed by normalized camera id — the same
+    # arrangement as state_machine.camera_overrides, and NOT DB-owned for the
+    # same reason: sync_app_config_from_db rewrites overlap_threshold from the
+    # Config table on every sync. This is what makes coverage mode rollable out
+    # one camera at a time, which matters because each camera's polygons were
+    # drawn against the point probe and have to be revalidated separately.
+    # Applied once, when CameraPipeline builds the camera's assigner.
+    camera_overrides: Dict[str, Dict] = field(default_factory=dict)
+
+    def resolve_for_camera(self, camera_id: str) -> "AssignerConfig":
+        """Return this config with the camera's overrides applied.
+
+        Returns ``self`` unchanged when the camera has no entry, so the common
+        path allocates nothing.
+        """
+        override = self.camera_overrides.get(norm_camera_id(camera_id))
+        if not override:
+            return self
+        return replace(self, camera_overrides={}, **override)
 
 
 @dataclass
@@ -1345,6 +1448,16 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.assigner.overlap_threshold = raw["assigner"].get(
             "overlap_threshold", config.assigner.overlap_threshold
         )
+        config.assigner.assignment_mode = raw["assigner"].get(
+            "assignment_mode", config.assigner.assignment_mode
+        )
+        config.assigner.coverage_threshold = raw["assigner"].get(
+            "coverage_threshold", config.assigner.coverage_threshold
+        )
+        if "camera_overrides" in raw["assigner"]:
+            config.assigner.camera_overrides = _parse_assigner_overrides(
+                raw["assigner"]["camera_overrides"]
+            )
 
     # --- Preprocessing ---
     if "preprocessing" in raw:

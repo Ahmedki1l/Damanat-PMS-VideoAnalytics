@@ -353,6 +353,38 @@ state_machine:
 assigner:
   overlap_threshold: 0.2
 
+  # How a vehicle is judged to be IN a slot.
+  #   point    : bottom-center probe inside the polygon, with an
+  #              overlap_threshold fallback. The production polygons were
+  #              operator-calibrated against this — it is the safe default.
+  #   coverage : the fraction of the vehicle's box inside the polygon must
+  #              reach coverage_threshold. No point probe at all.
+  # Switching to coverage changes slot membership at every polygon edge.
+  # Validate one camera at a time on recorded footage before rolling it out,
+  # and expect to re-tune coverage_threshold (and possibly redraw polygons).
+  assignment_mode: point
+
+  # Gate for assignment_mode=coverage only. NOT the same knob as
+  # overlap_threshold, which gates the point-mode fallback.
+  #
+  # 0.30 rather than the intuitive 0.5: slot polygons are perspective
+  # trapezoids and detection boxes are axis-aligned, so a car filling its slot
+  # still hangs its corners outside the polygon and cannot score 1.0. On the
+  # authored B1 geometry the worst slot tops out at 0.41, so a 0.5 gate leaves
+  # two slots permanently VACANT with no error and no log.
+  # Re-run tools/calibrate_coverage_threshold.py before raising this.
+  coverage_threshold: 0.30
+
+  # Per-camera overrides, keyed by camera id. THIS is how you roll coverage
+  # mode out — one camera at a time, after validating that camera's polygons on
+  # footage. YAML-only (the DB config sync would clobber it) and validated at
+  # load: an unknown key or an out-of-range fraction fails startup rather than
+  # leaving the camera silently on the global rule.
+  # camera_overrides:
+  #   CAM-05:
+  #     assignment_mode: coverage
+  #     coverage_threshold: 0.30
+
 # --- Matching / ReID Decision Configuration ---
 # Calibrated against the CARLA-pretrained + facility-finetuned IR
 # (models/osnet_facility_carla_int8_256x128). Tool:
