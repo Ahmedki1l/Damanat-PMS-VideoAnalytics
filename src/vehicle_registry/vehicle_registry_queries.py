@@ -8,6 +8,28 @@ class VehicleRegistryQueryMixin:
             session = self._parked.get(slot_id)
             return session.plate if session else None
 
+    def rename_plate(self, old_plate: str, new_plate: str) -> int:
+        """Rewrite a corrected plate onto every live parked session holding it.
+
+        The DB column and the gallery folder are not enough on their own: for a
+        camera this worker owns, the in-memory registry is authoritative and the
+        slot API reads `get_slot_plate` in preference to `current_plate`. Leave
+        this stale and VA writes the misread straight back over the correction on
+        the next slot update.
+
+        Returns how many sessions were rewritten. Zero is normal — the car has
+        usually left by the time an exit correction arrives.
+        """
+        if not old_plate or not new_plate or old_plate == new_plate:
+            return 0
+        updated = 0
+        with self._lock:
+            for session in self._parked.values():
+                if session is not None and session.plate == old_plate:
+                    session.plate = new_plate
+                    updated += 1
+        return updated
+
     def _get_snapshot_url(self, path: Optional[str]) -> Optional[str]:
         if not path:
             return None

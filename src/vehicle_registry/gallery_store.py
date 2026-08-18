@@ -829,6 +829,102 @@ class VehicleGalleryStore:
             shutil.rmtree(self._plate_dir(plate), ignore_errors=True)
             self._fsync_directory(self._root)
 
+    def rename(self, old_plate: str, new_plate: str) -> bool:
+        """Move a car's gallery to the plate it should have been filed under.
+
+        PMS-AI corrects a stay whose ENTRY plate was misread. Without this the
+        crops stay filed under the misread and VA keeps re-minting it, so the
+        correction survives in PMS and dies here.
+
+        Three cases, and none of them may lose a reference:
+
+        * Nothing on disk for the misread — nothing to move, returns False.
+        * The target has no gallery — one ``os.replace`` of the folder. Atomic,
+          so a crash leaves the refs under exactly one of the two names.
+        * The target ALREADY has a gallery, because the car has been here
+          before. The two sets are merged and pruned to ``max_refs`` rather than
+          either being dropped: the misread folder holds this stay's crops, the
+          target folder holds previous stays', and both are the same car.
+
+        Filenames carry a per-crop token, so merging two folders cannot collide.
+        Never raises — a correction must not fail because a disk did.
+        """
+        with self._lock:
+            src = self._plate_dir(old_plate)
+            dst = self._plate_dir(new_plate)
+            if not os.path.isdir(src):
+                return False
+
+            meta = self._read_meta(old_plate) or {}
+            if os.path.abspath(src) == os.path.abspath(dst):
+                # Different strings, same folder (safe_plate collapses both).
+                meta["plate"] = new_plate
+                return self._write_meta(new_plate, meta)
+
+            try:
+                if not os.path.exists(dst):
+                    os.replace(src, dst)
+                    meta["plate"] = new_plate
+                    ok = self._write_meta(new_plate, meta)
+                    self._fsync_directory(self._root)
+                    logger.info(
+                        "[gallery] renamed %s -> %s (%d refs)",
+                        old_plate, new_plate, len(meta.get("refs", [])),
+                    )
+                    return ok
+                return self._merge_into(src, dst, meta, old_plate, new_plate)
+            except OSError as exc:
+                logger.warning(
+                    "[gallery] rename %s -> %s failed: %r",
+                    old_plate, new_plate, exc,
+                )
+                return False
+
+    def _merge_into(
+        self, src: str, dst: str, meta: dict, old_plate: str, new_plate: str
+    ) -> bool:
+        """Fold the misread plate's refs into an existing gallery, then prune.
+
+        A ref whose files cannot be moved is dropped from the merge rather than
+        carried into the target's meta — a record pointing at a file that is not
+        there reads as a corrupt gallery, which is worse than one fewer crop.
+        """
+        target = self._read_meta(new_plate) or {"plate": new_plate}
+        moved = []
+        for ref in meta.get("refs", []):
+            names = [ref.get(key) for key in ("crop", "vec") if ref.get(key)]
+            try:
+                for name in names:
+                    os.replace(os.path.join(src, name), os.path.join(dst, name))
+            except OSError as exc:
+                logger.warning(
+                    "[gallery] merge %s -> %s dropped a ref: %r",
+                    old_plate, new_plate, exc,
+                )
+                continue
+            moved.append(ref)
+
+        target["plate"] = new_plate
+        target.setdefault("refs", []).extend(moved)
+        removed = self._prune_meta_inplace(target)
+        ok = self._write_meta(new_plate, target)
+        if ok:
+            for item in removed:
+                for key in ("crop", "vec"):
+                    name = item.get(key)
+                    if name:
+                        try:
+                            os.remove(os.path.join(dst, name))
+                        except OSError:
+                            pass
+            shutil.rmtree(src, ignore_errors=True)
+            self._fsync_directory(self._root)
+        logger.info(
+            "[gallery] merged %s into existing %s: %d refs moved, %d pruned",
+            old_plate, new_plate, len(moved), len(removed),
+        )
+        return ok
+
     @staticmethod
     def clear_all(base_dir: str) -> int:
         """Delete every per-plate gallery folder under ``<base_dir>/gallery``.

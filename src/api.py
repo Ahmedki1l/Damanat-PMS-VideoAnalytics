@@ -31,7 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from starlette.concurrency import run_in_threadpool
 from sse_starlette.sse import EventSourceResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.vehicle_registry import VehicleRegistry
 from src.events.event_bus import EventBus
@@ -60,6 +60,19 @@ class ANPREventRequest(BaseModel):
     # misread from minting a second identity for one car. Omit (None) to accept
     # every read, preserving current behaviour for servers that don't send it.
     confidence: Optional[float] = None
+
+
+class ReIDRenameRequest(BaseModel):
+    """Re-file a car under a corrected plate.
+
+    Sent by PMS-AI after `plate_correction_service.apply_correction` rewrites a
+    stay whose ENTRY plate was misread, so VA stops re-minting the misread.
+    """
+
+    from_plate: str = Field(alias="from")
+    to_plate: str = Field(alias="to")
+
+    model_config = {"populate_by_name": True}
 
 
 class ReIDCompareRequest(BaseModel):
@@ -1142,6 +1155,84 @@ def create_app(
             "query_quality_ok": quality_ok,
             "query_sharpness": round(sharpness, 2),
             "results": results,
+        }
+
+    @app.post("/api/reid/rename")
+    async def reid_rename(
+        payload: ReIDRenameRequest,
+        service_key: Optional[str] = Header(None, alias=SERVICE_KEY_HEADER),
+    ):
+        """Re-file a car under the plate it should have had all along.
+
+        PMS-AI corrects a stay whose ENTRY plate was misread — the exit read is
+        the only evidence that can catch that. Without this call the correction
+        stops at PMS-AI's tables: VA's gallery folder, its live parked session
+        and `parking_slots.current_plate` all still say the misread, and the next
+        slot update writes it straight back over the fix.
+
+        Three places, each independent, none allowed to fail the other two.
+        Reported per place rather than as one boolean so a partial rename is
+        visible instead of silently looking like success — `gallery_renamed:
+        false` with `slots_updated: 1` is a real state and the caller should be
+        able to see it.
+
+        Idempotent: replaying it once the rename has happened touches nothing and
+        still answers 200, because PMS-AI calls this fire-and-forget and cannot
+        distinguish a lost reply from a failed rename.
+        """
+        _require_internal_anpr_auth(service_key)
+
+        old_plate = (payload.from_plate or "").strip()
+        new_plate = (payload.to_plate or "").strip()
+        if not old_plate or not new_plate:
+            raise HTTPException(status_code=400, detail="both plates are required")
+        if old_plate == new_plate:
+            return {
+                "status": "ok", "gallery_renamed": False,
+                "sessions_updated": 0, "slots_updated": 0,
+            }
+
+        store = getattr(registry, "gallery_store", None)
+        gallery_renamed = False
+        if store is not None:
+            gallery_renamed = bool(store.rename(old_plate, new_plate))
+
+        sessions_updated = 0
+        try:
+            sessions_updated = registry.rename_plate(old_plate, new_plate)
+        except Exception as exc:  # a stale in-memory plate must not 500 the call
+            print(f"[API] registry rename {old_plate} -> {new_plate} failed: {exc!r}")
+
+        slots_updated = 0
+        if db_manager is not None:
+            session = db_manager.SessionLocal()
+            try:
+                from src.model import ParkingSlot
+
+                slots_updated = (
+                    session.query(ParkingSlot)
+                    .filter(ParkingSlot.current_plate == old_plate)
+                    .update({ParkingSlot.current_plate: new_plate},
+                            synchronize_session=False)
+                )
+                session.commit()
+            except Exception as exc:
+                print(f"[API] slot plate rename {old_plate} -> {new_plate} "
+                      f"failed: {exc!r}")
+                session.rollback()
+            finally:
+                session.close()
+
+        print(
+            f"[API] plate corrected {old_plate} -> {new_plate} "
+            f"(gallery={gallery_renamed} sessions={sessions_updated} "
+            f"slots={slots_updated})"
+        )
+        return {
+            "status": "ok",
+            "gallery_renamed": gallery_renamed,
+            "sessions_updated": sessions_updated,
+            "slots_updated": slots_updated,
         }
 
     @app.post("/api/line-crossing", response_model=LineCrossingResponse)
