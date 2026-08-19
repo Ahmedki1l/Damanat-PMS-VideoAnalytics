@@ -321,10 +321,15 @@ class StateMachineConfig:
 #: The slot-membership rules SlotAssigner knows how to run.
 ASSIGNMENT_MODES = ("point", "coverage")
 
-# Fields an assigner.camera_overrides entry is allowed to set. All three, because
+# Fields an assigner.camera_overrides entry is allowed to set. All four, because
 # staging coverage mode onto one camera usually means giving it its own gate too.
 ASSIGNER_OVERRIDE_KEYS = frozenset(
-    {"assignment_mode", "coverage_threshold", "overlap_threshold"}
+    {
+        "assignment_mode",
+        "coverage_threshold",
+        "overlap_threshold",
+        "point_min_overlap",
+    }
 )
 
 
@@ -396,15 +401,52 @@ class AssignerConfig:
     # is tuned for "probably still in the slot". As a primary rule the question
     # is different — "is this box mostly in the slot" — so it gets its own knob.
     #
-    # 0.30, not the intuitive 0.5. Coverage has a ceiling the operator cannot
-    # see: slot polygons are perspective trapezoids and detection boxes are
+    # 0.25, not the intuitive 0.5. Coverage has a ceiling the operator cannot
+    # see: slot polygons are perspective quads and detection boxes are
     # axis-aligned rectangles, so a car filling its slot still hangs its box
-    # corners outside the polygon. Measured on the authored B1 geometry
-    # (tools/calibrate_coverage_threshold.py), the worst slot (G2) tops out at
-    # 0.408 and the 10th percentile at 0.553 — a threshold of 0.5 strands two
-    # slots at permanently VACANT with no error and no log. Re-run that tool
-    # after redrawing polygons; raising this without it is how slots disappear.
-    coverage_threshold: float = 0.30
+    # corners outside the polygon and can never score 1.0.
+    #
+    # MEASURED, from 526 [SLOTHOLD] lines across 27 slots and every camera on
+    # 2026-08-10 08:10-08:15, all recorded under the old point rule:
+    #     genuinely occupied  min 0.310   p1 0.360   median 0.560
+    #     phantom holds       0.000       (B5/CAM-08, B16/CAM-10)
+    # A clean gap separates the two, and anything in 0.10..0.30 refuses exactly
+    # the 11 phantom holds and no real one. Above that it eats real occupancy
+    # fast: 0.40 refuses 53 of 526 holds, 0.50 refuses 201 and strands 9 of 27
+    # slots at permanently VACANT — with no error and no log. 0.50 was tried in
+    # production on 2026-08-10 and emptied occupied slots within minutes.
+    #
+    # tools/calibrate_coverage_threshold.py bounds this from the polygons alone
+    # (it agrees: worst slot G2 tops out at 0.408). Prefer re-measuring from
+    # [SLOTHOLD] when live data exists — the polygons give a ceiling, the logs
+    # give the real distribution.
+    coverage_threshold: float = 0.25
+
+    # SANITY FLOOR for assignment_mode="point" — NOT a tuning knob. A vehicle
+    # may only win a slot on the point probe if its box actually TOUCHES that
+    # slot's polygon by at least this fraction of the box.
+    #
+    # Why this exists. The point rule short-circuits: once the probe is inside a
+    # polygon the assigner assigns and breaks, and overlap is never consulted.
+    # But the probe is (y1+y2)/1.5, which sits BELOW the box's own bottom edge on
+    # near cameras — so a car parked in a neighbouring bay can project its probe
+    # onto a slot its bounding box does not reach at all. Measured on CAM-08 /
+    # B5, 2026-08-10, eight consecutive observations:
+    #     box (725,186)-(832,292)   B5 polygon y 294..428
+    #     box/polygon overlap 0.000  probe (778,319)  27px BELOW the box bottom
+    # B5 read OCCUPIED continuously while empty. The same shape of fault put a
+    # neighbour's car into B9/CAM-07. Neither overlap_threshold nor
+    # coverage_threshold can catch it: the first is never reached, and the second
+    # only applies in coverage mode.
+    #
+    # 0.05 is a floor, not a threshold. Genuinely occupied slots measured min
+    # 0.310 across 526 [SLOTHOLD] lines (see coverage_threshold above), so this
+    # sits ~6x below anything real and only ever refuses a box that is not on the
+    # slot. Do NOT raise it toward the coverage_threshold range hoping to fix a
+    # mis-drawn polygon — at 0.40 you begin deleting live occupancy, and the
+    # honest fix for a polygon on the wrong bay is to redraw the polygon.
+    # Set to 0.0 to restore the historical short-circuit exactly.
+    point_min_overlap: float = 0.05
 
     # YAML-ONLY per-camera overrides, keyed by normalized camera id — the same
     # arrangement as state_machine.camera_overrides, and NOT DB-owned for the
@@ -1453,6 +1495,9 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         )
         config.assigner.coverage_threshold = raw["assigner"].get(
             "coverage_threshold", config.assigner.coverage_threshold
+        )
+        config.assigner.point_min_overlap = raw["assigner"].get(
+            "point_min_overlap", config.assigner.point_min_overlap
         )
         if "camera_overrides" in raw["assigner"]:
             config.assigner.camera_overrides = _parse_assigner_overrides(

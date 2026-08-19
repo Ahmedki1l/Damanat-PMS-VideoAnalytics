@@ -367,13 +367,17 @@ assigner:
   # Gate for assignment_mode=coverage only. NOT the same knob as
   # overlap_threshold, which gates the point-mode fallback.
   #
-  # 0.30 rather than the intuitive 0.5: slot polygons are perspective
-  # trapezoids and detection boxes are axis-aligned, so a car filling its slot
-  # still hangs its corners outside the polygon and cannot score 1.0. On the
-  # authored B1 geometry the worst slot tops out at 0.41, so a 0.5 gate leaves
-  # two slots permanently VACANT with no error and no log.
-  # Re-run tools/calibrate_coverage_threshold.py before raising this.
-  coverage_threshold: 0.30
+  # 0.25 rather than the intuitive 0.5, and this is measured, not guessed.
+  # Slot polygons are perspective quads and detection boxes are axis-aligned,
+  # so a car filling its slot still hangs its corners outside the polygon and
+  # can never score 1.0. From 526 real [SLOTHOLD] samples over 27 slots:
+  #     genuinely occupied  min 0.310  median 0.560
+  #     phantom holds       0.000
+  # 0.25 sits in the gap. 0.40 refuses 53 of 526 real holds; 0.50 refuses 201
+  # and strands 9 of 27 slots at permanently VACANT, with no error and no log.
+  # Re-measure from [SLOTHOLD] (or run tools/calibrate_coverage_threshold.py)
+  # before raising this.
+  coverage_threshold: 0.25
 
   # Per-camera overrides, keyed by camera id. THIS is how you roll coverage
   # mode out — one camera at a time, after validating that camera's polygons on

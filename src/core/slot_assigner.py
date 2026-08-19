@@ -6,11 +6,25 @@ Two assignment modes, selected by ``AssignerConfig.assignment_mode``.
 POINT MODE (``"point"``, the default and the historical behaviour):
   1. PRIMARY: Compute the bottom-center point of each vehicle's bounding box.
      Test this point against each slot polygon using Shapely's point-in-polygon.
+     A probe hit only counts if the vehicle's box also TOUCHES that polygon by at
+     least ``point_min_overlap`` — see the sanity-floor note below.
   2. FALLBACK: If the bottom-center is not inside any slot, compute the overlap
      ratio between the vehicle's bounding box and each slot polygon. If the
      overlap exceeds ``overlap_threshold``, assign the vehicle to that slot.
   3. TIE-BREAKING: If multiple vehicles map to the same slot, the one whose
      bottom-center is closest to the slot's centroid wins.
+
+  The sanity floor (step 1) closes a hole that neither threshold could reach.
+  The probe sits at ``(y1+y2)/1.5``, BELOW the box's own bottom edge, so a car
+  parked in a NEIGHBOURING bay can project its probe onto a slot polygon its box
+  never reaches. Because the primary rule assigns and breaks, ``overlap_threshold``
+  is never consulted and the slot pins OCCUPIED forever. Measured on CAM-08/B5
+  (2026-08-10): box (725,186)-(832,292) against a polygon spanning y 294..428 —
+  overlap 0.000, probe 27px below the box, slot held while empty. Vehicles are
+  detected per camera and slot polygons live in per-camera pixel coordinates, so
+  nothing downstream can notice that the real car is already holding its own slot
+  on another camera (see engine_tracking._detection_in_own_slot). The floor is
+  the only place this is catchable.
 
 COVERAGE MODE (``"coverage"``):
   1. There is no point probe. A vehicle is in the slot that its box covers most,
@@ -89,6 +103,13 @@ class SlotAssignment:
         self.slot_vehicle_map: Dict[str, Tuple[int, Detection]] = {}
         self.unassigned: List[Detection] = []
         self.evidence: Dict[str, dict] = {}
+        #: (slot_id, overlap) for point-probe hits refused by the
+        #: ``point_min_overlap`` sanity floor. Diagnostic only — nothing branches
+        #: on it. A slot appearing here repeatedly is a polygon sitting where a
+        #: NEIGHBOURING bay's cars project their probe, i.e. the polygon needs
+        #: redrawing; the floor is only stopping the symptom. Surfaced on the
+        #: throttled [CAMDETS] line so the condition cannot recur silently.
+        self.refused: List[Tuple[str, float]] = []
 
 
 class SlotAssigner:
@@ -108,6 +129,17 @@ class SlotAssigner:
         self.slots = slots
         self.overlap_threshold = config.overlap_threshold
         self.coverage_threshold = getattr(config, "coverage_threshold", 0.5)
+        self.point_min_overlap = float(getattr(config, "point_min_overlap", 0.0) or 0.0)
+        if self.point_min_overlap > self.overlap_threshold:
+            # Incoherent: the primary rule would refuse a box the fallback then
+            # accepts on the very same number. Warn rather than raise — deployed
+            # config must not take the engine down — and keep the floor a floor.
+            print(
+                f"[WARN] assigner.point_min_overlap={self.point_min_overlap} exceeds "
+                f"overlap_threshold={self.overlap_threshold}; the point sanity floor "
+                f"is meant to sit well BELOW the fallback gate. Clamping to it."
+            )
+            self.point_min_overlap = self.overlap_threshold
 
         mode = str(getattr(config, "assignment_mode", "point") or "point").lower()
         if mode not in self.MODES:
@@ -168,12 +200,25 @@ class SlotAssigner:
 
             # --- PRIMARY: bottom-center point-in-polygon ---
             for slot in self.slots:
-                if slot.polygon.contains(bc_point):
-                    dist = self._distance_to_centroid(bc_x, bc_y, slot)
-                    candidates.append((slot.id, det, (0.0, dist)))
-                    how[id(det)] = ("point", self._overlap_for(det, slot))
-                    assigned = True
-                    break  # One vehicle can only be in one slot
+                if not slot.polygon.contains(bc_point):
+                    continue
+
+                overlap = self._overlap_for(det, slot)
+                if overlap < self.point_min_overlap:
+                    # Probe landed inside a slot this vehicle's box does not
+                    # touch — it is parked somewhere else and the probe, which
+                    # sits below the box, merely projected onto this polygon.
+                    # Refuse and keep looking; if nothing else claims it the
+                    # overlap fallback below gets its turn (and refuses it too,
+                    # since overlap_threshold is far above this floor).
+                    result.refused.append((slot.id, round(float(overlap), 3)))
+                    continue
+
+                dist = self._distance_to_centroid(bc_x, bc_y, slot)
+                candidates.append((slot.id, det, (0.0, dist)))
+                how[id(det)] = ("point", overlap)
+                assigned = True
+                break  # One vehicle can only be in one slot
 
             if assigned:
                 continue

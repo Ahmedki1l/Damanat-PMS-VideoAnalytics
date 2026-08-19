@@ -2384,9 +2384,19 @@ class ParkingEngineRuntimeMixin:
                 f"probe=({px:.0f},{py:.0f}) nearest_slot={best_id} "
                 f"dist={best_dist:.0f}px"
             )
+        refused = ""
+        if getattr(assignment, "refused", None):
+            # Point-probe hits rejected by the point_min_overlap sanity floor: a
+            # box projected its probe into a slot it does not touch. Worth seeing
+            # even though the refusal is correct — a slot that shows up here every
+            # frame has a polygon sitting on a neighbouring bay's cars, and wants
+            # redrawing rather than a permanently-active guard.
+            refused = " | refused: " + " ".join(
+                f"{sid}:{ov:.2f}" for sid, ov in assignment.refused[:3]
+            )
         logger.info(
-            "[CAMDETS] cam=%s raw=%d roi=%d assigned=%d unassigned=%d%s",
-            cam_id, n_raw, n_roi, n_assigned, len(unassigned), near,
+            "[CAMDETS] cam=%s raw=%d roi=%d assigned=%d unassigned=%d%s%s",
+            cam_id, n_raw, n_roi, n_assigned, len(unassigned), near, refused,
         )
 
     def _log_slot_hold(

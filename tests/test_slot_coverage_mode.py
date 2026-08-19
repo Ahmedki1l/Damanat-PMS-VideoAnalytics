@@ -265,6 +265,89 @@ class TestPerCameraRollout:
             _parse_assigner_overrides({"CAM-05": {"coverage_threshold": 30}})
 
 
+def test_default_threshold_sits_in_the_measured_gap_between_phantoms_and_real_cars():
+    """The shipped default is bounded by production data on BOTH sides.
+
+    Measured from 526 [SLOTHOLD] lines over 27 slots and every camera on
+    2026-08-10 08:10-08:15, all under the old point rule:
+
+        genuinely occupied slots   min 0.310   p1 0.360   median 0.560
+        phantom holds              0.000       (B5/CAM-08, B16/CAM-10)
+
+    A phantom is a detection whose /1.5 probe projects ~27px BELOW its own box
+    and lands inside a polygon the box never touches. The default must refuse
+    those and keep every real car, so it has to sit strictly inside the gap.
+
+    0.50 was tried in production on 2026-08-10: it refused 201 of 526 real
+    holds and emptied occupied slots on CAM-06/07/08/20 within minutes. If this
+    test fails, the default has drifted into the real-occupancy range and slots
+    will read VACANT with a car sitting in them — no error, no log.
+    """
+    MEASURED_PHANTOM_HOLD = 0.000
+    MEASURED_LOWEST_REAL_HOLD = 0.310
+
+    default = AssignerConfig().coverage_threshold
+
+    assert default > MEASURED_PHANTOM_HOLD, "default would admit the phantom holds"
+    assert default < MEASURED_LOWEST_REAL_HOLD, (
+        f"default {default} is at or above the lowest REAL hold ever measured "
+        f"({MEASURED_LOWEST_REAL_HOLD}) — occupied slots will read VACANT. "
+        f"Re-measure from [SLOTHOLD] before raising it."
+    )
+    # And not hugging the real floor: leave room for a car parked worse than any
+    # yet observed. 0.28 would technically pass the bound above and still be a
+    # bad idea.
+    assert MEASURED_LOWEST_REAL_HOLD - default >= 0.05
+
+
+def test_coverage_mode_refuses_the_phantom_that_the_point_rule_could_not():
+    """The exact production failure, with the real numbers from CAM-08.
+
+    A stationary detection sat at bbox (725, 186, 832, 292) for four minutes.
+    B5's polygon spans y 294..428 — the box does not touch it. But the /1.5
+    probe projects to y=319, INSIDE the polygon, so the point rule pinned B5
+    OCCUPIED with no car in it and no plate.
+
+    overlap_threshold could never have fixed this: the point rule never
+    consults overlap once the probe is inside, and the overlap here is 0.000
+    anyway, so no threshold rejects it. Only coverage-as-primary does.
+
+    SUPERSEDED IN PART: point mode now refuses this too, via the
+    ``point_min_overlap`` sanity floor added after the same fault reappeared as
+    cross-camera double occupancy (one car holding B6 on CAM-06 AND B5 on
+    CAM-08). The original claim — that the point rule as it stood could not
+    reject this — is preserved below by disabling the floor, because that is the
+    behaviour coverage mode was introduced to escape. See
+    tests/test_slot_point_overlap_floor.py.
+    """
+    b5 = ParkingSlot(
+        id="B5",
+        polygon=Polygon([(723, 423), (1014, 428), (906, 294), (725, 297)]),
+    )
+    phantom = _detection((725.0, 186.3, 832.0, 291.7))
+
+    # The point rule, WITHOUT the sanity floor, takes it...
+    point_mode = _assign([b5], [phantom], point_min_overlap=0.0)
+    assert point_mode.slot_vehicle_map[b5.id][1] is phantom
+    assert point_mode.evidence[b5.id]["method"] == "point"
+    assert point_mode.evidence[b5.id]["overlap"] == pytest.approx(0.0, abs=1e-6)
+
+    # ...with the shipped floor it does not.
+    floored = _assign([b5], [phantom])
+    assert floored.slot_vehicle_map == {}
+    assert floored.refused == [("B5", 0.0)]
+
+    # ...coverage mode, at the shipped default, refuses it.
+    coverage_mode = _assign(
+        [b5],
+        [phantom],
+        assignment_mode="coverage",
+        coverage_threshold=AssignerConfig().coverage_threshold,
+    )
+    assert coverage_mode.slot_vehicle_map == {}
+    assert coverage_mode.unassigned == [phantom]
+
+
 def test_coverage_mode_never_falls_back_to_the_point_probe():
     """A vehicle that touches nothing is unassigned even if its probe would have
     landed in a slot under point mode — coverage is the only rule in this mode."""
