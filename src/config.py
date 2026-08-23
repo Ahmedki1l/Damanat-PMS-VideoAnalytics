@@ -74,6 +74,24 @@ class ProcessingConfig:
     # False reverts to the legacy single shared tracker (lower RAM, worse IDs).
     per_camera_tracker: bool = True
 
+    # Per-camera overrides for the settings above. YAML-ONLY, and that is the
+    # POINT for stream_channel: the DB sync rewrites processing.stream_channel
+    # from the Config table, so the global value cannot be pinned here. There is
+    # deliberately no DB column for this map, so an override survives the sync
+    # and the dashboard cannot silently undo it.
+    camera_overrides: Dict[str, Dict] = field(default_factory=dict)
+
+    def resolve_for_camera(self, camera_id: str) -> "ProcessingConfig":
+        """Return this config with the camera's overrides applied.
+
+        Returns ``self`` unchanged when the camera has no entry, so the common
+        path allocates nothing.
+        """
+        override = self.camera_overrides.get(norm_camera_id(camera_id))
+        if not override:
+            return self
+        return replace(self, camera_overrides={}, **override)
+
 
 MOTION_CAMERA_OVERRIDE_KEYS = frozenset(
     {
@@ -316,6 +334,55 @@ class StateMachineConfig:
         if not override:
             return self
         return replace(self, camera_overrides={}, **override)
+
+
+# Fields a processing.camera_overrides entry is allowed to set. Only the RTSP
+# stream selection so far -- the rest of ProcessingConfig is engine-wide (round
+# robin ordering, tracker allocation) and is not meaningful per camera.
+PROCESSING_OVERRIDE_KEYS = frozenset({"stream_channel"})
+
+#: Hikvision stream ids. 101 = main, 102 = sub. Anything else is a typo, not a
+#: third stream: an unknown channel yields an RTSP URL the camera refuses, and
+#: the camera then simply never connects.
+STREAM_CHANNELS = (101, 102)
+
+
+def _parse_processing_overrides(raw: Dict) -> Dict[str, Dict]:
+    """Parse+validate processing.camera_overrides.
+
+    Unknown keys and bad values raise, matching _parse_assigner_overrides and
+    for the same reason: a typo here fails OPEN -- the camera keeps the global
+    stream -- and "this camera is still on the wrong stream" is invisible in the
+    output until someone reads a resolution off the boot log.
+    """
+    parsed: Dict[str, Dict] = {}
+    for cam_id, fields in (raw or {}).items():
+        fields = dict(fields or {})
+        unknown = set(fields) - PROCESSING_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(
+                f"processing.camera_overrides['{cam_id}']: unknown key(s) "
+                f"{sorted(unknown)}. Allowed: {sorted(PROCESSING_OVERRIDE_KEYS)}"
+            )
+        converted = {}
+        for key, value in fields.items():
+            try:
+                channel = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"processing.camera_overrides['{cam_id}'].{key} must be an "
+                    f"integer stream id, got {value!r}"
+                )
+            if channel not in STREAM_CHANNELS:
+                raise ValueError(
+                    f"processing.camera_overrides['{cam_id}'].{key} must be one "
+                    f"of {list(STREAM_CHANNELS)} (101=main, 102=sub), got "
+                    f"{channel}"
+                )
+            converted[key] = channel
+        if converted:
+            parsed[norm_camera_id(cam_id)] = converted
+    return parsed
 
 
 #: The slot-membership rules SlotAssigner knows how to run.
@@ -1297,6 +1364,10 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         config.processing.target_fps_per_camera = p.get(
             "target_fps_per_camera", config.processing.target_fps_per_camera
         )
+        if "camera_overrides" in p:
+            config.processing.camera_overrides = _parse_processing_overrides(
+                p["camera_overrides"]
+            )
         config.processing.stream_channel = p.get(
             "stream_channel", config.processing.stream_channel
         )

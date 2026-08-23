@@ -843,7 +843,20 @@ class ParkingEngineRuntimeMixin:
                 slots_file=camera.slots_file,
                 rtsp_port=camera.rtsp_port,
             )
-            camera_config.build_rtsp_url(channel=self.config.processing.stream_channel)
+            # Per-camera stream selection. Resolved here rather than read
+            # straight off processing.stream_channel because the DB sync
+            # rewrites that global from the Config table; the override map is
+            # YAML-only and survives it.
+            processing = self.config.processing.resolve_for_camera(camera.id)
+            camera_config.build_rtsp_url(channel=processing.stream_channel)
+            if processing.stream_channel != self.config.processing.stream_channel:
+                logger.info(
+                    "%s: processing override stream_channel=%s (%s), global=%s",
+                    camera.id,
+                    processing.stream_channel,
+                    "main" if processing.stream_channel == 101 else "sub",
+                    self.config.processing.stream_channel,
+                )
             camera_configs.append(camera_config)
         return camera_configs
 
