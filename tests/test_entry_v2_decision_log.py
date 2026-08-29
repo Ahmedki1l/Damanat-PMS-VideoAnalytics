@@ -524,3 +524,76 @@ class CoordinatorEmissionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HikDirectionTests(unittest.TestCase):
+    """HikCentral is a PULL source: we call it, it never calls us.
+
+    Pinned here because stages 5 and 6 are where it could drift. The `hik`
+    block records a query OUR service issued in response to OUR event, and the
+    schema has to make that unambiguous to whoever reads the corpus later.
+    """
+
+    def test_the_hik_block_records_a_call_we_made(self):
+        record = decision_record.build_record(
+            stage="hik_enrich",
+            result=decision_record.RESULT_ABSTAINED,
+            reason="identity_enriched",
+            hik={
+                "trigger": "anpr_identity",
+                "queried": True,
+                "window": ["2026-08-29T12:00:00+00:00", "2026-08-29T12:00:35+00:00"],
+                "records": 3,
+                "images": 2,
+                "reid_matched": ["guid-1"],
+                "unmatched": ["guid-2", "guid-3"],
+                "api_error": None,
+            },
+        )
+        hik = record["hik"]
+        # The trigger names OUR event, never a HikCentral one.
+        self.assertEqual("anpr_identity", hik["trigger"])
+        self.assertTrue(hik["queried"])
+        # We asked for a window; HikCentral did not choose one for us.
+        self.assertEqual(2, len(hik["window"]))
+        # WE decided which returned records belong to this car.
+        self.assertEqual(["guid-1"], hik["reid_matched"])
+        self.assertEqual(2, len(hik["unmatched"]))
+
+    def test_the_two_triggers_are_both_our_own_events(self):
+        for trigger in ("anpr_identity", "missing_anpr_recovery"):
+            record = decision_record.build_record(
+                stage="hik_enrich",
+                result=decision_record.RESULT_ABSTAINED,
+                reason="r",
+                hik={"trigger": trigger, "queried": True},
+            )
+            self.assertEqual(trigger, record["hik"]["trigger"])
+
+    def test_an_unreachable_platform_is_a_degraded_query_not_a_lost_event(self):
+        # There was no event of theirs to lose. The entry proceeds on ANPR and
+        # camera evidence (rule 18A).
+        record = decision_record.build_record(
+            stage="hik_enrich",
+            result=decision_record.RESULT_HIK_DEGRADED,
+            reason="hik_api_unavailable",
+            hik={
+                "trigger": "anpr_identity",
+                "queried": True,
+                "records": 0,
+                "api_error": "timeout",
+            },
+        )
+        self.assertEqual("hik_degraded", record["result"])
+        self.assertEqual("timeout", record["hik"]["api_error"])
+
+    def test_not_calling_is_recorded_as_our_choice(self):
+        record = decision_record.build_record(
+            stage="hik_enrich",
+            result=decision_record.RESULT_ABSTAINED,
+            reason="hik_disabled",
+            hik={"trigger": "anpr_identity", "queried": False},
+        )
+        # queried:false means WE chose not to call, never that HikCentral
+        # chose not to tell us.
+        self.assertFalse(record["hik"]["queried"])

@@ -68,6 +68,18 @@ class WitnessSource(str, Enum):
     CAM23 = "cam23"     # CAM-23 visual observation
     CAM03 = "cam03"     # CAM-03 visual observation
 
+    # DIRECTION OF COMMUNICATION — HikCentral is a PULL source.
+    #
+    # HikCentral never pushes anything into this pipeline and never triggers
+    # it. WE call its API, in response to an event we already have: an ANPR
+    # read, or a camera observation with no identity to attach to. It answers
+    # with candidate records and images, and we do the deciding.
+    #
+    # Do not confuse this with the "hikvision" producer string on a crossing.
+    # That is the CAMERA webhook, which really is pushed to us by the camera
+    # server, and it is a different system from the HikCentral platform we
+    # query. Both appear in this codebase; only one of them calls us.
+
 
 class PlateSourceKind(str, Enum):
     """Something that READ a plate. Exactly three, forever.

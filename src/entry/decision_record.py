@@ -23,6 +23,25 @@ STAGED POPULATION
         stage 3  colour, fifo, ranked candidates
         stage 4  plate
         stage 5  hik
+
+THE HIK BLOCK IS A RECORD OF A CALL WE MADE
+    HikCentral is a PULL source: it never pushes into this pipeline and never
+    triggers it. Every `hik` block describes a query OUR service issued, in
+    response to an event we already had, and what came back:
+
+        "hik": {
+          "trigger": "anpr_identity" | "missing_anpr_recovery",
+          "queried": true,              # we called the API
+          "window": ["<from>", "<to>"], # the search scope we asked for
+          "records": 3,                 # what it returned
+          "images": 2,                  # of those, how many carried an image
+          "reid_matched": ["guid-1"],   # the ones WE associated to this car
+          "unmatched": ["guid-2"],      # other cars passing through
+          "api_error": null             # 18A: degraded, never fatal
+        }
+
+    `trigger` names OUR event, never a HikCentral one, and `queried: false`
+    means we chose not to call — never that HikCentral chose not to tell us.
 """
 from __future__ import annotations
 
