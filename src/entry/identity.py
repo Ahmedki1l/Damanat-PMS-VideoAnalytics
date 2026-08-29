@@ -10,6 +10,8 @@ from typing import Literal, Optional, Protocol, Tuple
 from src.matching.plate_ocr_match import is_plausible_plate
 from src.vehicle_registry.errors import ValidatedEntrySupersededByExit
 
+from .decision import OCR_SOURCE_CONSENSUS, REASON_CONSENSUS, REASON_CORRECTION
+
 from .domain import (
     CrossingRole,
     DecisionStatus,
@@ -69,16 +71,19 @@ def build_gallery_authorization_proof(
     if not canonical or not is_plausible_plate(canonical):
         return None
 
+    # The CAMERA check stands: only an approved ramp camera's crop may be
+    # taught to the durable gallery. What is gone is the expectation that the
+    # plate came FROM that camera — it never does now. The plate is decided by
+    # consensus across ANPR, HikCentral and our own OCR, so ocr_source names
+    # the mechanism rather than a camera role.
     camera_id = norm_camera_id(crossing_camera_id)
     if crossing_role == CrossingRole.PRIMARY:
         allowed_camera = camera_id == "CAM23" and camera_id in settings.primary_cameras
-        expected_ocr_source = "primary"
     elif crossing_role == CrossingRole.FALLBACK:
         allowed_camera = camera_id == "CAM03" and camera_id in settings.fallback_cameras
-        expected_ocr_source = "fallback"
     else:  # pragma: no cover - enum currently has exactly two members
         return None
-    if not allowed_camera or decision.ocr_source != expected_ocr_source:
+    if not allowed_camera or decision.ocr_source != OCR_SOURCE_CONSENSUS:
         return None
 
     numeric_evidence = (
@@ -97,8 +102,7 @@ def build_gallery_authorization_proof(
     if not decision.ocr_evidence_ids:
         return None
 
-    exact_reason = f"reid_and_{expected_ocr_source}_ocr_exact"
-    if decision.reason == exact_reason:
+    if decision.reason == REASON_CONSENSUS:
         confidence = decision.reported_confidence
         if (
             confidence is None
@@ -109,7 +113,7 @@ def build_gallery_authorization_proof(
             return None
         path: Literal["exact_plate", "corrected_plate"] = "exact_plate"
         requires_parked_ocr = True
-    elif decision.reason == "reid_and_independent_ocr_correction":
+    elif decision.reason == REASON_CORRECTION:
         if (
             not decision.corrected
             or len(set(decision.ocr_evidence_ids)) < settings.correction_min_evidence

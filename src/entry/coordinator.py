@@ -462,13 +462,14 @@ class EntryCoordinator:
                     group_id: {
                         "attempt_ids": sorted(group.attempts),
                         "status": group.status.value,
-                        "primary_ocr_state": group.primary_ocr_state,
                         "identity_key": group.identity_key,
                         "correction_candidate_of": group.correction_candidate_of,
                         "witnesses": sorted(w.value for w in group.witnesses),
                         "plate_sources": {
                             source.value: reading.text
-                            for source, reading in group.plate_sources.items()
+                            for source, reading in (
+                                self._engine.available_plate_sources(group).items()
+                            )
                         },
                         "hypotheses": {
                             hypothesis.display: hypothesis.status.value
@@ -1126,16 +1127,10 @@ class EntryCoordinator:
         # SOURCE. Two different axes for one event — neither implies the other.
         if embeddings:
             group.witnesses.setdefault(WitnessSource.ANPR, request.attempt_id)
-        if identity_key:
-            group.plate_sources.setdefault(
-                PlateSourceKind.ANPR,
-                PlateReading(
-                    source=PlateSourceKind.ANPR,
-                    text=request.reported_plate,
-                    confidence=float(request.reported_confidence or 0.0),
-                    origin=request.attempt_id,
-                ),
-            )
+        # The gate's reported plate is a PLATE SOURCE, but it is not stored
+        # here: it is derived from the attempts by the engine, so the causal
+        # projection cannot be handed a plate read after the car went past.
+        # `plate_sources` holds only what we FETCHED (HikCentral, stage 5).
 
         self._emit_decision_record(
             stage="anpr_identity",
@@ -1392,17 +1387,6 @@ class EntryCoordinator:
                 hypothesis.status = original.status
         return projected
 
-    @staticmethod
-    def _copy_primary_state(
-        target: AttemptGroup,
-        source: AttemptGroup,
-    ) -> None:
-        target.primary_ocr_state = source.primary_ocr_state
-        target.primary_blocks_fallback = source.primary_blocks_fallback
-        target.primary_reliable_ocr_keys = set(source.primary_reliable_ocr_keys)
-        target.primary_ocr_evidence_ids = set(source.primary_ocr_evidence_ids)
-        target.primary_ocr_conflicted = source.primary_ocr_conflicted
-
     def _partition_group_for_confirmation_locked(
         self,
         group: AttemptGroup,
@@ -1418,7 +1402,6 @@ class EntryCoordinator:
         group.attempts = dict(confirmed.attempts)
         group.hypotheses = confirmed.hypotheses
         group.canonical_plate = confirmed.canonical_plate
-        self._copy_primary_state(group, confirmed)
         if not future_attempts:
             return
 
@@ -1550,7 +1533,6 @@ class EntryCoordinator:
                             outcome="abstained",
                             reason=shortfall,
                         )
-                self._copy_primary_state(group, causal_group)
                 decision = self._build_decision(
                     causal_group,
                     crossing,
@@ -1606,13 +1588,46 @@ class EntryCoordinator:
                 )
             )
         for members, family_row in zip(families, family_rows):
-            if (
-                family_row.request.role == CrossingRole.FALLBACK
-                and self._family_has_reliable_ocr_conflict(members)
-            ):
-                # CAM03 fallback has no higher-priority policy that can safely
-                # resolve two trusted producers reading different plates. Keep
-                # the family pending for explicit correction/cancellation.
+            if self._family_has_reliable_ocr_conflict(members):
+                # Two producers reading DIFFERENT plates are evidence they are
+                # not reporting the same physical crossing after all, and
+                # pooling them would put two cars' embeddings in one row — the
+                # poisoning that makes every later match ambiguous. Keep the
+                # family pending for explicit correction/cancellation.
+                #
+                # This is the ONE use of a ramp camera's OCR that survives, and
+                # it is not plate evidence: the question is "are these two
+                # notifications the same event?", never "what is the plate?".
+                # Subtractive, like the colour veto — it can withhold a row, it
+                # can never name a car.
+                #
+                # Applies to BOTH roles now. It used to guard only CAM-03,
+                # because a conflicting CAM-23 read was caught by the primary
+                # OCR policy instead; that policy is gone, so the guard has to
+                # cover what it used to.
+                #
+                # Withholding is silent to PMS — the rows simply stay pending
+                # and are retried on the next event — so it MUST be recorded
+                # here, or a fail-closed refusal would leave no trace anywhere.
+                self._emit_decision_record(
+                    stage="producer_family",
+                    result=decision_record.RESULT_AMBIGUOUS,
+                    reason="producer_family_ocr_conflict",
+                    crossing=family_row,
+                    extra={
+                        "family": [
+                            member.request.crossing_id for member in members
+                        ],
+                        "observed_plate_texts": sorted(
+                            {
+                                item.text
+                                for member in members
+                                for item in member.plate_evidence
+                                if item.text
+                            }
+                        ),
+                    },
+                )
                 continue
             match = self._find_unique_match_with_observability_locked(
                 family_row,

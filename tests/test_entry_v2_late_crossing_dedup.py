@@ -688,10 +688,17 @@ def test_equivalent_primary_family_keeps_conflicting_ocr_fail_closed():
         [b"anpr-1"],
     )
 
-    assert result.decision_status == "abstained"
-    assert sink.payloads
-    assert all(payload["status"] == "abstained" for payload in sink.payloads)
-    assert all(payload["reason"] == "primary_ocr_conflict" for payload in sink.payloads)
+    # Two producers of the SAME physical crossing reading different plates are
+    # evidence they are not the same event, so the family is withheld rather
+    # than pooled — pooling would put two cars' embeddings in one row.
+    #
+    # POLICY CHANGE (stage 4): this used to emit an abstained callback with
+    # reason "primary_ocr_conflict", produced by the CAM-23 plate policy that
+    # no longer exists. The rows are now simply held pending and retried on the
+    # next event, and the refusal is recorded in the decision log instead of
+    # being announced to PMS.
+    assert result.decision_status != "confirmed"
+    assert not any(payload["status"] == "confirmed" for payload in sink.payloads)
     assert coordinator.state_summary()["attempt_count"] == 1
     assert coordinator.state_summary()["crossing_count"] == 2
 
@@ -1615,10 +1622,22 @@ def test_source_future_attempt_ocr_cannot_confirm_an_older_crossing():
         [b"primary-old"],
     )
 
-    assert result.decision_status == "abstained"
-    assert not any(payload["status"] == "confirmed" for payload in sink.payloads)
+    # THE CAUSALITY INVARIANT STILL HOLDS, and it is what this test is for: the
+    # future attempt (NOW+10min) is excluded from the causal projection of a
+    # crossing at NOW+5min, so it contributes nothing — not its embedding, not
+    # its plate.
+    #
+    # POLICY CHANGE (stage 4): this used to ABSTAIN, because CAM-23 read
+    # BBB2222 and that contradicted the only causally-eligible attempt. The
+    # ramp cameras no longer read plates, so the crossing now confirms against
+    # the attempt that legitimately precedes it. What must never happen is it
+    # confirming under the FUTURE attempt's plate.
     assert sink.payloads[-1]["attempt_id"] == "attempt-old"
-    assert coordinator.state_summary()["attempt_count"] == 2
+    assert all(
+        payload["canonical_plate"] != "BBB-2222"
+        for payload in sink.payloads
+        if payload["status"] == "confirmed"
+    )
 
 
 def test_reentry_evidence_arriving_before_exit_webhook_is_released_by_source_time():
@@ -2099,7 +2118,9 @@ def test_fallback_family_aggregates_nonconflicting_ocr(strong_source):
 
     assert result.decision_status == "confirmed"
     assert len(sink.payloads) == 1
-    assert sink.payloads[0]["ocr_source"] == "fallback"
+    # The plate no longer comes from a camera role — it is decided by consensus
+    # across ANPR, HikCentral and our own OCR.
+    assert sink.payloads[0]["ocr_source"] == "consensus"
     assert sink.payloads[0]["ocr_text"] == "AAA-1111"
     assert coordinator.state_summary()["crossing_count"] == 0
 

@@ -327,7 +327,7 @@ def test_anpr_then_much_later_cam03_fallback_confirms_without_cam23_or_timer(
         assert sink.payloads[0]["entry_camera_id"] == "ANPR-ENTRY"
         assert sink.payloads[0]["crossing_id"].startswith("va-zone-")
         assert sink.payloads[0]["entry_captured_at"] == late_crossing_at.isoformat()
-        assert sink.payloads[0]["ocr_source"] == "fallback"
+        assert sink.payloads[0]["ocr_source"] == "consensus"
         assert [call["source_role"] for call in processor.calls] == [
             "anpr",
             "fallback",

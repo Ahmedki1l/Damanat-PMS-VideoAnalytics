@@ -48,7 +48,7 @@ def _decision(**overrides):
     base = EntryDecision(
         decision_id="decision-1",
         status=DecisionStatus.CONFIRMED,
-        reason="reid_and_primary_ocr_exact",
+        reason="reid_and_plate_consensus",
         group_id="group-1",
         attempt_id="attempt-1",
         crossing_id="crossing-1",
@@ -62,7 +62,7 @@ def _decision(**overrides):
         reid_score=0.85,
         reid_row_margin=0.12,
         reid_column_margin=0.12,
-        ocr_source="primary",
+        ocr_source="consensus",
         ocr_text="ABC-1234",
         ocr_confidence=0.90,
         ocr_evidence_ids=("crossing-1:0",),
@@ -132,7 +132,7 @@ def test_exact_primary_threshold_equality_authorizes_immutable_proof():
 
     assert isinstance(proof, GalleryAuthorizationProof)
     assert proof.authorized is True
-    assert proof.reason == "reid_and_primary_ocr_exact"
+    assert proof.reason == "reid_and_plate_consensus"
     assert proof.authorization_path == "exact_plate"
     assert proof.requires_parked_ocr is True
     with pytest.raises(FrozenInstanceError):
@@ -195,8 +195,8 @@ def test_exact_path_rejects_digit_first_reordering_as_a_different_identity():
 def test_configured_cam03_fallback_can_authorize_exact_plate():
     proof = build_gallery_authorization_proof(
         _decision(
-            reason="reid_and_fallback_ocr_exact",
-            ocr_source="fallback",
+            reason="reid_and_plate_consensus",
+            ocr_source="consensus",
         ),
         crossing_camera_id="cam_03",
         crossing_role=CrossingRole.FALLBACK,
@@ -211,8 +211,8 @@ def test_configured_cam03_fallback_can_authorize_exact_plate():
 def test_unconfigured_or_wrong_role_crossing_cannot_authorize_gallery():
     unconfigured = build_gallery_authorization_proof(
         _decision(
-            reason="reid_and_fallback_ocr_exact",
-            ocr_source="fallback",
+            reason="reid_and_plate_consensus",
+            ocr_source="consensus",
         ),
         crossing_camera_id="CAM-03",
         crossing_role=CrossingRole.FALLBACK,
@@ -350,7 +350,7 @@ def test_authorization_is_forwarded_only_after_successful_pms_ack(delivered):
         assert len(registry.calls) == 1
         proof = registry.calls[0]["gallery_authorization"]
         assert proof.authorized is True
-        assert proof.reason == "reid_and_primary_ocr_exact"
+        assert proof.reason == "reid_and_plate_consensus"
     else:
         with pytest.raises(EntryUnavailable, match="delivery_failed"):
             coordinator.ingest_crossing(_crossing(), [b"crossing"])

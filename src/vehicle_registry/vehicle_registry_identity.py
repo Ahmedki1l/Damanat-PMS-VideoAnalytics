@@ -138,10 +138,15 @@ def _entry_gallery_proof_matches_session(session: VehicleSession) -> bool:
     role = str(proof.get("crossing_role") or "")
     source = str(proof.get("ocr_source") or "")
     camera = _camera_key(proof.get("crossing_camera_id"))
-    if (role, source, camera) not in {
-        ("primary", "primary", "CAM23"),
-        ("fallback", "fallback", "CAM03"),
-    }:
+    # The CAMERA still has to be an approved one for its role — only a CAM-23
+    # or CAM-03 crop may teach the durable gallery. What changed is the source:
+    # the plate no longer comes from the camera that produced the crop. It is
+    # decided by consensus across ANPR, HikCentral and our own OCR, so every
+    # authorized proof reports "consensus" whichever camera saw the car.
+    if (role, camera) not in {
+        ("primary", "CAM23"),
+        ("fallback", "CAM03"),
+    } or source != "consensus":
         return False
     if not all(
         (
@@ -162,7 +167,7 @@ def _entry_gallery_proof_matches_session(session: VehicleSession) -> bool:
     if not isinstance(evidence_ids, list) or not evidence_ids:
         return False
     if path == "exact_plate":
-        expected_reason = f"reid_and_{source}_ocr_exact"
+        expected_reason = "reid_and_plate_consensus"
         return bool(
             session.gallery_entry_authorization_reason == expected_reason
             and proof.get("corrected") is False

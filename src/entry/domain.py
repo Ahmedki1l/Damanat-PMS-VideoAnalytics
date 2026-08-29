@@ -289,16 +289,11 @@ class AttemptGroup:
     # A MARKER ONLY: it never merges the identities, because letting appearance
     # override the plate key would put Re-ID back in charge of who a car is.
     correction_candidate_of: str = ""
-    # A reliable/conflicting primary read blocks a downstream fallback. When
-    # CAM23 emits no usable event, a separately configured downstream crossing
-    # remains independent physical-entry proof; there is no timer-based wait.
-    primary_ocr_state: Optional[str] = None
-    primary_blocks_fallback: bool = False
-    # Reliable CAM23 reads accumulate across distinct crossing events. A later
-    # contradictory value must not erase the first one by arrival order.
-    primary_reliable_ocr_keys: set[str] = field(default_factory=set)
-    primary_ocr_evidence_ids: set[str] = field(default_factory=set)
-    primary_ocr_conflicted: bool = False
+    # NOTE: the primary_ocr_* / primary_blocks_fallback fields that used to sit
+    # here are GONE. They existed to arbitrate a CAM-23 plate read against a
+    # CAM-03 plate read — a question that no longer exists, because neither
+    # camera is a plate source. Nothing replaced them: the plate is decided by
+    # consensus across ANPR, HikCentral and our own OCR.
 
     @property
     def embeddings(self) -> Tuple[Tuple[float, ...], ...]:

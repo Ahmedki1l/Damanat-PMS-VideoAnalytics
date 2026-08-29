@@ -244,10 +244,14 @@ class VehicleGalleryStore:
         role = str(entry_proof.get("crossing_role") or "")
         source = str(entry_proof.get("ocr_source") or "")
         crossing_camera = cls._plate_key(entry_proof.get("crossing_camera_id"))
-        if (role, source, crossing_camera) not in {
-            ("primary", "primary", "CAM23"),
-            ("fallback", "fallback", "CAM03"),
-        }:
+        # The CAMERA must still be an approved one for its role, but the plate
+        # no longer comes from that camera: it is decided by consensus across
+        # ANPR, HikCentral and our own OCR, so every authorized proof reports
+        # "consensus" whichever camera produced the crop.
+        if (role, crossing_camera) not in {
+            ("primary", "CAM23"),
+            ("fallback", "CAM03"),
+        } or source != "consensus":
             return False
         entry_numeric_floors = (
             (entry_proof.get("reid_score"), 0.85, 1.0),
@@ -275,7 +279,7 @@ class VehicleGalleryStore:
             except (TypeError, ValueError):
                 return False
             if (
-                entry_reason != f"reid_and_{source}_ocr_exact"
+                entry_reason != "reid_and_plate_consensus"
                 or entry_proof.get("corrected") is not False
                 or not math.isfinite(reported_confidence)
                 or reported_confidence < 0.90

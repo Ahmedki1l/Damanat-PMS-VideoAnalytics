@@ -307,283 +307,6 @@ def test_mixed_primary_burst_cannot_combine_reid_ocr_or_registry_anchor():
     assert coord.state_summary()["crossing_count"] == 0
 
 
-def test_same_vehicle_burst_remains_eligible_for_cached_anpr_ocr():
-    evidence = {
-        "a1": [
-            frame("a1-0", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE),
-            frame(
-                "a1-1",
-                "ANPR-ENTRY",
-                (0.999, 0.01),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.99,
-            ),
-        ],
-        "c1": [
-            frame(
-                "c1",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.NO_PLATE,
-                role="primary",
-            )
-        ],
-    }
-    publisher = RecordingPublisher()
-    coord, sink = coordinator(evidence, publisher=publisher)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"burst-1", b"burst-2"])
-
-    result = coord.ingest_crossing(crossing("c1"), [b"crossing"])
-
-    assert result.decision_status == "confirmed"
-    assert sink.payloads[-1]["ocr_source"] == "anpr_cached"
-    assert len(publisher.identities) == 1
-    assert len(publisher.identities[0].attempt_embeddings) == 2
-
-
-def test_readable_primary_conflict_abstains_and_blocks_fallback():
-    evidence = {
-        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
-        "c1": [frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.READABLE, "XYZ9999", 0.95, "primary")],
-        "f1": [frame("f1", "CAM-03", (1.0, 0.0), PlateReadState.READABLE, "ABC1234", 0.98, "fallback")],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-
-    first = coord.ingest_crossing(crossing("c1"), [b"c"])
-    fallback = coord.ingest_crossing(
-        crossing("f1", camera="CAM-03", line="B-IN", direction="B-entry", role=CrossingRole.FALLBACK),
-        [b"f"],
-    )
-
-    assert first.decision_status == "abstained"
-    assert sink.payloads[0]["reason"] == "correction_consensus_insufficient"
-    assert fallback.decision_status == "abstained"
-    assert sink.payloads[1]["reason"] == "readable_primary_blocks_fallback"
-    assert coord.state_summary()["attempt_count"] == 1
-
-
-def test_distinct_reliable_primary_reads_cannot_use_arrival_order_to_confirm():
-    evidence = {
-        "a1": [
-            frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)
-        ],
-        "p-wrong": [
-            frame(
-                "p-wrong",
-                "CAM-23",
-                (0.8, 0.6),
-                PlateReadState.READABLE,
-                "XYZ9999",
-                0.99,
-                "primary",
-            )
-        ],
-        "p-correct": [
-            frame(
-                "p-correct",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.99,
-                "primary",
-            )
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"attempt"])
-
-    first = coord.ingest_crossing(crossing("p-wrong"), [b"wrong"])
-    second = coord.ingest_crossing(crossing("p-correct"), [b"correct"])
-
-    assert first.decision_status == "abstained"
-    assert second.decision_status == "abstained"
-    assert sink.payloads[-1]["reason"] == "primary_ocr_conflict"
-    assert sorted(sink.payloads[-1]["ocr_evidence_ids"]) == [
-        "p-correct:0",
-        "p-wrong:0",
-    ]
-    assert coord.state_summary()["attempt_count"] == 1
-
-
-def test_low_confidence_primary_noise_cannot_veto_reliable_primary_ocr():
-    evidence = {
-        "a1": [
-            frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)
-        ],
-        "c1": [
-            frame(
-                "c1-good",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.99,
-                "primary",
-            ),
-            frame(
-                "c1-noise",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "XYZ9999",
-                0.20,
-                "primary",
-            ),
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"attempt"])
-
-    result = coord.ingest_crossing(crossing("c1"), [b"good", b"noise"])
-
-    assert result.decision_status == "confirmed"
-    assert sink.payloads[-1]["canonical_plate"] == "ABC-1234"
-    assert sink.payloads[-1]["ocr_evidence_ids"] == ["c1-good:0"]
-
-
-def test_pending_conflicting_primary_reads_are_seen_before_best_one_can_confirm():
-    evidence = {
-        "p-wrong": [
-            frame(
-                "p-wrong",
-                "CAM-23",
-                (0.8, 0.6),
-                PlateReadState.READABLE,
-                "XYZ9999",
-                0.99,
-                "primary",
-            )
-        ],
-        "p-correct": [
-            frame(
-                "p-correct",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.99,
-                "primary",
-            )
-        ],
-        "a1": [
-            frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_crossing(crossing("p-wrong"), [b"wrong"])
-    coord.ingest_crossing(crossing("p-correct"), [b"correct"])
-
-    result = coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"attempt"])
-
-    assert result.decision_status == "abstained"
-    assert sink.payloads
-    assert all(payload["status"] == "abstained" for payload in sink.payloads)
-    assert all(
-        payload["reason"] == "primary_ocr_conflict" for payload in sink.payloads
-    )
-    assert coord.state_summary()["attempt_count"] == 1
-
-
-def test_anpr_cached_ocr_is_used_only_when_primary_has_no_plate():
-    evidence = {
-        "a1": [
-            frame(
-                "a1",
-                "ANPR-ENTRY",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.93,
-            )
-        ],
-        "c1": [
-            frame(
-                "c1",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.NO_PLATE,
-                role="primary",
-            )
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-    result = coord.ingest_crossing(crossing("c1"), [b"c"])
-
-    assert result.decision_status == "confirmed"
-    assert sink.payloads[0]["ocr_source"] == "anpr_cached"
-    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
-
-
-def test_digit_first_cached_ocr_does_not_match_letter_first_reported_plate():
-    evidence = {
-        "a1": [
-            frame(
-                "a1",
-                "ANPR-ENTRY",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "1234ABC",
-                0.93,
-            )
-        ],
-        "c1": [
-            frame(
-                "c1",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.NO_PLATE,
-                role="primary",
-            )
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-
-    result = coord.ingest_crossing(crossing("c1"), [b"c"])
-
-    assert result.decision_status == "abstained"
-    assert all(payload["status"] == "abstained" for payload in sink.payloads)
-    assert coord.state_summary()["attempt_count"] == 1
-
-
-def test_high_confidence_anpr_ocr_replaces_failed_low_confidence_primary_read():
-    evidence = {
-        "a1": [
-            frame(
-                "a1",
-                "ANPR-ENTRY",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.96,
-            )
-        ],
-        "c1": [
-            frame(
-                "c1",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "XYZ9999",
-                0.60,
-                "primary",
-            )
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-
-    result = coord.ingest_crossing(crossing("c1"), [b"c"])
-
-    assert result.decision_status == "confirmed"
-    assert sink.payloads[-1]["ocr_source"] == "anpr_cached"
-    assert sink.payloads[-1]["canonical_plate"] == "ABC-1234"
-
-
 def test_downstream_fallback_can_confirm_when_primary_event_never_arrives():
     evidence = {
         "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
@@ -600,96 +323,6 @@ def test_downstream_fallback_can_confirm_when_primary_event_never_arrives():
     assert [payload["status"] for payload in sink.payloads] == ["confirmed"]
     assert sink.payloads[0]["crossing_id"] == "f1"
     assert coord.state_summary()["attempt_count"] == 0
-
-
-def test_downstream_fallback_reid_uses_cached_anpr_ocr_when_its_ocr_fails():
-    evidence = {
-        "a1": [
-            frame(
-                "a1",
-                "ANPR-ENTRY",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.96,
-            )
-        ],
-        "f1": [
-            frame(
-                "f1",
-                "CAM-03",
-                (1.0, 0.0),
-                PlateReadState.NO_PLATE,
-                role="fallback",
-            )
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"anpr"])
-
-    result = coord.ingest_crossing(
-        crossing(
-            "f1",
-            camera="CAM-03",
-            line="B-IN",
-            direction="B-entry",
-            role=CrossingRole.FALLBACK,
-        ),
-        [b"fallback"],
-    )
-
-    assert result.decision_status == "confirmed"
-    assert sink.payloads[-1]["ocr_source"] == "anpr_cached"
-
-
-def test_primary_policy_runs_before_higher_scoring_fallback_in_same_evaluation():
-    evidence = {
-        "p1": [
-            frame(
-                "p1",
-                "CAM-23",
-                (0.9, 0.1),
-                PlateReadState.NO_PLATE,
-                role="primary",
-            )
-        ],
-        "f1": [
-            frame(
-                "f1",
-                "CAM-03",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.96,
-                "fallback",
-            )
-        ],
-        "a1": [
-            frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_crossing(crossing("p1"), [b"p"])
-    coord.ingest_crossing(
-        crossing(
-            "f1",
-            camera="CAM-03",
-            line="B-IN",
-            direction="B-entry",
-            role=CrossingRole.FALLBACK,
-        ),
-        [b"f"],
-    )
-
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-
-    assert [payload["crossing_id"] for payload in sink.payloads] == ["p1", "f1"]
-    assert [payload["status"] for payload in sink.payloads] == [
-        "abstained",
-        "confirmed",
-    ]
-    assert coord.state_summary()["attempt_count"] == 0
-    assert coord.state_summary()["crossing_count"] == 0
 
 
 def test_primary_confirmation_compacts_correlated_fallback_before_next_car():
@@ -867,99 +500,34 @@ def test_fractional_camera_confidence_is_rounded_for_integer_pms_contract():
     assert sink.payloads[-1]["plate_confidence"] == 92
 
 
-def test_unreported_plate_correction_needs_independent_camera_consensus():
+def test_a_later_differently_read_anpr_cannot_rewrite_a_confirmed_entry():
+    """Once an entry is confirmed under a plate, a later ANPR read of a
+    DIFFERENT plate is a new identity, not a correction to the old one.
+
+    (This replaces a test built on the old behaviour, where a ramp camera's OCR
+    conflict held the first crossing pending long enough for a late ANPR read
+    to rewrite it. The ramp cameras no longer read plates, so the first
+    crossing confirms straight away and there is nothing left pending.)
+    """
     evidence = {
-        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE, "XYZ9999", 0.94)],
-        "c1": [frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.READABLE, "XYZ9999", 0.97, "primary")],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-    result = coord.ingest_crossing(crossing("c1"), [b"c"])
-
-    assert result.decision_status == "confirmed"
-    payload = sink.payloads[0]
-    assert payload["canonical_plate"] == "XYZ-9999"
-    assert payload["corrected"] is True
-    assert payload["superseded_plates"] == ["ABC-1234"]
-    assert sorted(payload["ocr_evidence_ids"]) == ["a1:0", "c1:0"]
-
-
-def test_single_crossing_ocr_cannot_rewrite_reported_plate():
-    evidence = {
-        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
-        "c1": [frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.READABLE, "XYZ9999", 0.97, "primary")],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-    result = coord.ingest_crossing(crossing("c1"), [b"c"])
-
-    assert result.decision_status == "abstained"
-    assert sink.payloads[0]["reason"] == "correction_consensus_insufficient"
-    assert coord.state_summary()["attempt_count"] == 1
-
-
-def test_a_late_differently_read_anpr_does_not_rewrite_a_pending_crossings_plate():
-    evidence = {
-        "a-wrong": [
-            frame(
-                "a-wrong",
-                "ANPR-ENTRY",
-                (1.0, 0.0),
-                PlateReadState.NO_PLATE,
-            )
-        ],
+        "a-first": [frame("a-first", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
         "c1": [
-            frame(
-                "c1",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "XYZ9999",
-                0.97,
-                "primary",
-            )
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
         ],
-        "a-correct": [
-            frame(
-                "a-correct",
-                "ANPR-ENTRY",
-                (1.0, 0.0),
-                PlateReadState.NO_PLATE,
-            )
-        ],
+        "a-late": [frame("a-late", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
     }
     coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a-wrong", "ABC-1234"), [b"wrong"])
+    coord.ingest_attempt(attempt("a-first", "ABC-1234"), [b"first"])
     first = coord.ingest_crossing(crossing("c1"), [b"crossing"])
 
-    assert first.decision_status == "abstained"
-    assert coord.state_summary()["crossing_count"] == 1
+    assert first.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
 
-    second = coord.ingest_attempt(attempt("a-correct", "XYZ-9999"), [b"correct"])
+    coord.ingest_attempt(attempt("a-late", "XYZ-9999"), [b"late"])
 
-    # POLICY CHANGE (Entry Pipeline v3, stage 2). A late ANPR read under a
-    # DIFFERENT plate no longer rewrites the pending crossing's plate by being
-    # merged into the same group on appearance. It is a second identity, and
-    # the crossing now faces two candidates of identical appearance, so it
-    # abstains instead of confirming one of them on a guess.
-    #
-    # The correct-plate recovery this used to perform has not been abandoned,
-    # it has moved: a misread is resolved by the plate consensus across ANPR,
-    # HikCentral's own reading and our independent OCR — never by a ramp
-    # camera's OCR, which is not a plate source at all.
-    # No decision at all for the second attempt: the crossing already abstained
-    # and nothing has changed that could resolve it, so no second callback is
-    # produced either.
-    assert second.decision_status is None
-    assert [payload["status"] for payload in sink.payloads] == ["abstained"]
-
-    state = coord.state_summary()
-    assert state["group_count"] == 2
-    assert state["crossing_count"] == 1
-    identity_keys = {
-        group["identity_key"] for group in state["groups"].values()
-    }
-    assert identity_keys == {"ABC1234", "XYZ9999"}
+    # The confirmed entry keeps its plate; the late read is its own identity.
+    confirmed = [p for p in sink.payloads if p["status"] == "confirmed"]
+    assert [p["canonical_plate"] for p in confirmed] == ["ABC-1234"]
 
 
 def test_entry_time_is_physical_crossing_after_long_barrier_wait():
@@ -1185,12 +753,29 @@ def test_duplicate_retry_becoming_permanent_fails_closed():
 
 @pytest.mark.parametrize(
     ("ocr_confidence", "expected"),
-    [(0.75, "confirmed"), (0.749, "abstained")],
+    [(0.75, "abstained"), (0.749, "confirmed")],
 )
 def test_ocr_confidence_boundary(ocr_confidence, expected):
+    """ocr_min_confidence decides whether OUR reader produced a reading at all.
+
+    The boundary is only observable when the read DISAGREES with ANPR. At or
+    above the bar our OCR is a source and contradicts the gate, so there is no
+    consensus and nothing opens. Below it our OCR has not produced a reading,
+    so ANPR stands alone and the entry confirms.
+
+    (The read is placed on the ANPR image. CAM-23 is not a plate source, so a
+    reading there could not move this boundary either way.)
+    """
     evidence = {
-        "a1": [frame("a1", "ANPR", (1.0, 0.0), PlateReadState.NO_PLATE)],
-        "c1": [frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.READABLE, "AAA1111", ocr_confidence, "primary")],
+        "a1": [
+            frame(
+                "a1", "ANPR", (1.0, 0.0), PlateReadState.READABLE,
+                "BBB2222", ocr_confidence,
+            )
+        ],
+        "c1": [
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
+        ],
     }
     coord, _ = coordinator(evidence)
     coord.ingest_attempt(attempt("a1", "AAA-1111"), [b"a"])
@@ -1221,52 +806,7 @@ def test_implausible_ocr_can_never_become_a_confirmed_plate(garbage):
     result = coord.ingest_crossing(crossing("c1"), [b"c"])
 
     assert result.decision_status == "abstained"
-    assert sink.payloads[-1]["reason"] == "ocr_plate_implausible"
-
-
-def test_later_no_plate_crossing_cannot_weaken_prior_readable_conflict():
-    evidence = {
-        "a1": [
-            frame(
-                "a1",
-                "ANPR",
-                (1.0, 0.0),
-                PlateReadState.READABLE,
-                "ABC1234",
-                0.99,
-            )
-        ],
-        "c-conflict": [
-            frame(
-                "c-conflict",
-                "CAM-23",
-                (0.8, 0.0),
-                PlateReadState.READABLE,
-                "XYZ9999",
-                0.99,
-                "primary",
-            )
-        ],
-        "c-empty": [
-            frame(
-                "c-empty",
-                "CAM-23",
-                (1.0, 0.0),
-                PlateReadState.NO_PLATE,
-                role="primary",
-            )
-        ],
-    }
-    coord, sink = coordinator(evidence)
-    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-    coord.ingest_crossing(crossing("c-conflict"), [b"conflict"])
-    second = coord.ingest_crossing(crossing("c-empty"), [b"empty"])
-
-    assert second.decision_status == "abstained"
-    assert sink.payloads[-1]["reason"] == (
-        "prior_readable_primary_blocks_weaker_evidence"
-    )
-    assert coord.state_summary()["attempt_count"] == 1
+    assert sink.payloads[-1]["reason"] == "plate_implausible"
 
 
 @pytest.mark.parametrize(
@@ -1343,13 +883,16 @@ def test_two_plate_readings_of_one_car_stay_separate_identities_and_are_marked()
     # Both identities hold the ANPR witness and the ANPR plate source.
     for group_id in (first.group_id, second.group_id):
         assert groups[group_id]["witnesses"] == ["anpr"]
-    assert groups[first.group_id]["plate_sources"] == {"anpr": "ABC-1234"}
-    assert groups[second.group_id]["plate_sources"] == {"anpr": "XYZ-9999"}
+    assert groups[first.group_id]["plate_sources"]["anpr"] == "ABC-1234"
+    assert groups[second.group_id]["plate_sources"]["anpr"] == "XYZ-9999"
+    # The second identity's ANPR image also gave OUR reader a look at it, and
+    # it agrees - two sources, one answer.
+    assert groups[second.group_id]["plate_sources"]["our_ocr"] == "XYZ9999"
 
     # Two identities of identical appearance leave the crossing unable to pick
     # one, so nothing is confirmed on a guess.
     coord.ingest_crossing(crossing("c1"), [b"c"])
-    assert sink.payloads == []
+    assert not any(p["status"] == "confirmed" for p in sink.payloads)
 
 
 def test_a_second_read_of_the_same_plate_and_car_enriches_one_identity():
@@ -2014,3 +1557,222 @@ def test_coordinator_state_never_retains_request_image_bytes():
     assert not contains_raw(coord._groups)
     assert not contains_raw(coord._crossings)
     assert not contains_raw(coord._receipts)
+
+
+# =========================================================================== #
+# Plate consensus (Entry Pipeline v3, stage 4)
+#
+# POLICY CHANGE. Twelve tests were removed from this file with this change.
+# They exercised the CAM-23-versus-CAM-03 OCR arbitration in detail: cached
+# ANPR OCR admitted only when the primary had no plate, a readable primary read
+# blocking the fallback, low-confidence primary noise unable to veto a reliable
+# primary read, arrival order between two reliable primary reads, and so on.
+#
+# All of it answered one question - "which ramp camera's plate reading wins?" -
+# and that question no longer exists. CAM-23 and CAM-03 are visual observation
+# sources for Re-ID and read no plates at all. There are exactly three plate
+# sources: the gate ANPR system, HikCentral, and our own OCR on an available
+# vehicle image. The plate is whatever those agree on.
+#
+# The tests below assert the rule that replaced them.
+# =========================================================================== #
+
+
+def test_one_available_source_confirms_when_two_witnesses_agree():
+    """Consensus is "at least two AGREEING", not "two of exactly three".
+
+    With one source there is nothing to contradict it, and by this point two
+    independent observations have already agreed on the physical vehicle.
+    HikCentral being unreachable or an image being unusable must not stop
+    ordinary traffic; what is refused is a contradiction, not a thin record.
+    """
+    evidence = {
+        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
+        "c1": [
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
+        ],
+    }
+    coord, sink = coordinator(evidence)
+    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
+    assert sink.payloads[0]["reason"] == "reid_and_plate_consensus"
+    assert sink.payloads[0]["ocr_source"] == "consensus"
+
+
+def test_two_agreeing_sources_confirm():
+    """ANPR reported it and our own OCR of the ANPR image read the same."""
+    evidence = {
+        "a1": [
+            frame(
+                "a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE,
+                "ABC1234", 0.96,
+            )
+        ],
+        "c1": [
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
+        ],
+    }
+    coord, sink = coordinator(evidence)
+    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
+
+
+def test_two_sources_that_disagree_have_no_consensus_and_open_nothing():
+    """The whole point of the rule. A wrong plate opens a session under another
+    person's name, so a contradiction refuses rather than picks."""
+    evidence = {
+        "a1": [
+            frame(
+                "a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE,
+                "XYZ9999", 0.96,
+            )
+        ],
+        "c1": [
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
+        ],
+    }
+    coord, sink = coordinator(evidence)
+    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    assert result.decision_status == "abstained"
+    assert sink.payloads[0]["reason"] == "plate_no_consensus"
+    assert sink.payloads[0]["canonical_plate"] is None
+
+
+def test_an_implausible_read_is_not_a_source_and_cannot_disagree():
+    """A digit-first reading of a letter-first plate is not a rival answer, it
+    is an implausible one, and it is filtered before consensus ever sees it.
+
+    (That digit-first and letter-first are DIFFERENT identities is a separate
+    invariant, covered in test_entry_v2_domain.py and by the identity tests.)"""
+    evidence = {
+        "a1": [
+            frame(
+                "a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE,
+                "1234ABC", 0.96,
+            )
+        ],
+        "c1": [
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
+        ],
+    }
+    coord, sink = coordinator(evidence)
+    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
+
+
+def test_our_ocr_reading_two_images_is_still_one_source():
+    """Counting our reader twice would let it reach consensus with itself and
+    manufacture a two-source agreement out of one opinion. When it contradicts
+    itself the source is dropped entirely, leaving ANPR alone to stand."""
+    evidence = {
+        "a1": [
+            frame(
+                "a1:0", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE,
+                "ABC1234", 0.96,
+            ),
+            frame(
+                "a1:1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE,
+                "XYZ9999", 0.95,
+            ),
+        ],
+        "c1": [
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
+        ],
+    }
+    coord, sink = coordinator(evidence)
+    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    # our_ocr contradicted itself and is excluded; ANPR is the only source left.
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
+
+
+def test_a_ramp_camera_reading_can_withhold_an_entry_but_never_name_one():
+    """The exact limit of what a ramp camera may do to the plate.
+
+    CAM-23 reads XYZ9999 while the sources agree on ABC-1234. It does NOT get
+    to make the plate XYZ9999 — it is not a plate source and never names a car.
+    What it does is withhold: a reliable read that contradicts the consensus is
+    evidence Re-ID matched the wrong identity, so the entry is refused rather
+    than opened under a plate one of the two cameras disagrees with.
+
+    Subtractive, like the colour veto. Disable with
+    ENTRY_V2_OBSERVATION_PLATE_VETO_ENABLED if the shadow window shows ramp
+    reads are too unreliable to withhold on.
+    """
+    evidence = {
+        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
+        "c1": [
+            frame(
+                "c1", "CAM-23", (1.0, 0.0), PlateReadState.READABLE,
+                "XYZ9999", 0.99, "primary",
+            )
+        ],
+    }
+    coord, sink = coordinator(evidence)
+    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    assert result.decision_status == "abstained"
+    assert sink.payloads[0]["reason"] == "observation_plate_contradiction"
+    # It withheld the entry; it did not rename the car.
+    assert sink.payloads[0]["canonical_plate"] is None
+
+    # With the veto off, the ramp read is inert and ANPR stands alone.
+    coord2, sink2 = coordinator(
+        evidence, cfg=settings(observation_plate_veto_enabled=False)
+    )
+    coord2.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    assert (
+        coord2.ingest_crossing(crossing("c1"), [b"c"]).decision_status == "confirmed"
+    )
+    assert sink2.payloads[0]["canonical_plate"] == "ABC-1234"
+
+
+def test_a_low_confidence_read_is_not_a_source_at_all():
+    """Below ocr_min_confidence our OCR has not produced a reading, so there is
+    nothing to disagree with - not a disagreement to resolve."""
+    evidence = {
+        "a1": [
+            frame(
+                "a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE,
+                "XYZ9999", 0.10,
+            )
+        ],
+        "c1": [
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
+        ],
+    }
+    coord, sink = coordinator(evidence)
+    coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
+
+
+def test_an_implausible_consensus_plate_is_still_refused():
+    evidence = {
+        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
+        "c1": [
+            frame("c1", "CAM-23", (1.0, 0.0), PlateReadState.NO_PLATE, role="primary")
+        ],
+    }
+    coord, sink = coordinator(evidence)
+    coord.ingest_attempt(attempt("a1", "UNKNOWN"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    assert result.decision_status == "abstained"
+    assert sink.payloads[0]["reason"] == "plate_implausible"

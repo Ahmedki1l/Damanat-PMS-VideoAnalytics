@@ -16,16 +16,55 @@ from .domain import (
     AttemptGroup,
     AttemptRecord,
     CrossingRecord,
-    CrossingRole,
     PlateEvidence,
     PlateReadState,
+    PlateReading,
     PlateResolution,
+    PlateSourceKind,
     ReIDMatch,
     RecordStatus,
     canonical_plate,
     norm_camera_id,
+    plate_key,
 )
 from .settings import EntrySettings
+
+
+# The plate no longer comes from a camera role, so ocr_source no longer names
+# one. It names the mechanism: agreement across the sources that read a plate.
+OCR_SOURCE_CONSENSUS = "consensus"
+REASON_CONSENSUS = "reid_and_plate_consensus"
+REASON_CORRECTION = "reid_and_independent_ocr_correction"
+
+
+@dataclass(frozen=True)
+class PlateConsensus:
+    """Agreement across the plate sources that actually produced a reading.
+
+    There are only three sources, ever: the gate ANPR system, HikCentral, and
+    our own OCR on whatever vehicle image is available. `available` lists the
+    ones that returned something usable; a source that contradicted itself is
+    excluded before it gets here.
+    """
+
+    outcome: str  # consensus | no_consensus | unavailable
+    plate: Optional[str] = None
+    agreeing: Tuple[str, ...] = ()
+    available: Tuple[str, ...] = ()
+    disagreeing: Tuple[Tuple[str, str], ...] = ()
+    confidence: float = 0.0
+    evidence_ids: Tuple[str, ...] = ()
+
+    def as_record(self) -> dict:
+        """The `plate` block of a decision-log record."""
+        return {
+            "outcome": self.outcome,
+            "plate": self.plate,
+            "agreeing": list(self.agreeing),
+            "available": list(self.available),
+            "disagreeing": [list(item) for item in self.disagreeing],
+            "confidence": round(float(self.confidence), 4),
+        }
 
 
 @dataclass(frozen=True)
@@ -157,9 +196,16 @@ class EntryDecisionEngine:
     ) -> Optional[ReIDMatchEvaluation]:
         """Mutual-unique assignment with absolute, row, and column gates.
 
-        Rows are crossings competing for attempt groups. Columns are attempt
-        groups competing for crossings of the same physical role. Primary and
-        fallback crossings are separate stages and therefore not competitors.
+        Rows are observations competing for identities. Columns are identities
+        competing for other observations FROM THE SAME CAMERA — two different
+        cars must not both claim one identity from one viewpoint.
+
+        CAM-23 and CAM-03 are deliberately NOT competitors. They are two
+        independent witnesses to one entry, and making them compete would mean
+        the second camera could only ever take the identity away from the
+        first. (This is the rule the previous design got backwards, treating
+        CAM-03 as a separate fallback STAGE rather than a peer.)
+
         ``None`` means there was no causally eligible candidate to evaluate.
         """
         ranked = []
@@ -258,198 +304,262 @@ class EntryDecisionEngine:
             vetoed=tuple(vetoed),
         )
 
+    # ------------------------------------------------------------------ #
+    # Plate consensus
+    # ------------------------------------------------------------------ #
+    def our_ocr_reading(self, group: AttemptGroup) -> Optional[PlateReading]:
+        """Fold every image OUR reader looked at into ONE plate source.
+
+        Our OCR is a single opinion however many images produced it. Counting a
+        read of the ANPR image and a read of the HikCentral image as two
+        sources would let our own model reach consensus with itself and
+        manufacture a two-source agreement out of one reader.
+
+        Disagreeing with itself marks the source CONFLICTED, which removes it
+        from the available set entirely. A reader that contradicts itself is
+        evidence of unreliability, not a tie to be broken.
+
+        Note what is NOT in this pool: CAM-23 and CAM-03 evidence. The ramp
+        cameras are visual observation sources and read no plates.
+        """
+        reliable = [
+            item
+            for item in group.cached_plate_evidence
+            if item.state == PlateReadState.READABLE
+            and item.confidence >= self.settings.ocr_min_confidence
+            and item.key
+            and is_plausible_plate(canonical_plate(item.text))
+        ]
+        if not reliable:
+            return None
+        keys = {item.key for item in reliable}
+        best = max(reliable, key=lambda item: item.confidence)
+        return PlateReading(
+            source=PlateSourceKind.OUR_OCR,
+            text=best.text,
+            confidence=best.confidence,
+            origin=",".join(sorted(item.evidence_id for item in reliable)),
+            conflicted=len(keys) > 1,
+        )
+
+    def anpr_reading(self, group: AttemptGroup) -> Optional[PlateReading]:
+        """What the gate ANPR system reported, folded across its attempts.
+
+        Derived from the group's attempts rather than stored, for the same
+        reason our OCR is: the causal projection restricts an identity to the
+        attempts that PRECEDE a crossing, and a stored copy would happily hand
+        the decision a plate read after the car had already gone past.
+        """
+        readings = [
+            attempt.request
+            for attempt in group.attempts.values()
+            if plate_key(attempt.request.reported_plate)
+        ]
+        if not readings:
+            return None
+        keys = {plate_key(item.reported_plate) for item in readings}
+        best = max(readings, key=lambda item: item.reported_confidence or 0.0)
+        return PlateReading(
+            source=PlateSourceKind.ANPR,
+            text=best.reported_plate,
+            confidence=float(best.reported_confidence or 0.0),
+            origin=",".join(sorted(item.attempt_id for item in readings)),
+            conflicted=len(keys) > 1,
+        )
+
+    def available_plate_sources(self, group: AttemptGroup):
+        """The plate sources that actually produced a usable reading.
+
+        ANPR and our own OCR are DERIVED from the identity's attempts, so they
+        automatically respect the causal projection and can never fall out of
+        step with the evidence they are folded from. Only what we FETCHED from
+        HikCentral is stored — and stage 5 must attach it with its own
+        causality check, since it does not come from an attempt.
+        """
+        sources = {
+            kind: reading
+            for kind, reading in group.plate_sources.items()
+            if kind is PlateSourceKind.HIK_TEXT
+        }
+        for derived in (self.anpr_reading(group), self.our_ocr_reading(group)):
+            if derived is not None:
+                sources[derived.source] = derived
+        return {
+            kind: reading
+            for kind, reading in sources.items()
+            if reading.key and not reading.conflicted
+        }
+
+    def plate_consensus(self, group: AttemptGroup) -> PlateConsensus:
+        """Agreement across the sources that actually read a plate.
+
+        The rule is "at least two agreeing", not "two out of exactly three":
+        with n sources available, the winning group must have at least
+        min(2, n) members and must not be tied. So
+
+            three sources, two agree      -> those two win
+            three sources, all disagree   -> no consensus
+            two sources, both agree       -> consensus
+            two sources, they disagree    -> no consensus
+            one source                    -> it stands
+
+        The single-source case is deliberate. HikCentral being unreachable or
+        an image being unusable must not stop ordinary traffic, and by the time
+        this runs two independent observations have already agreed on the
+        physical vehicle. What is refused is a CONTRADICTION, not a thin
+        record.
+        """
+        available = self.available_plate_sources(group)
+        if not available:
+            return PlateConsensus(outcome="unavailable", plate=None)
+
+        by_key = {}
+        for kind, reading in available.items():
+            by_key.setdefault(reading.key, []).append((kind, reading))
+
+        ranked = sorted(by_key.items(), key=lambda item: -len(item[1]))
+        top_key, top = ranked[0]
+        tied = len(ranked) > 1 and len(ranked[1][1]) == len(top)
+        needed = min(2, len(available))
+
+        disagreeing = tuple(
+            (kind.value, reading.text)
+            for key, entries in ranked[1:]
+            for kind, reading in entries
+        )
+        if len(top) < needed or tied:
+            return PlateConsensus(
+                outcome="no_consensus",
+                plate=None,
+                available=tuple(sorted(k.value for k in available)),
+                disagreeing=tuple(
+                    (kind.value, reading.text)
+                    for kind, reading in available.items()
+                ),
+            )
+
+        best = max(top, key=lambda item: item[1].confidence)
+        return PlateConsensus(
+            outcome="consensus",
+            plate=canonical_plate(best[1].text),
+            agreeing=tuple(sorted(kind.value for kind, _ in top)),
+            available=tuple(sorted(k.value for k in available)),
+            disagreeing=disagreeing,
+            confidence=best[1].confidence,
+            evidence_ids=tuple(
+                sorted(
+                    part
+                    for _, reading in top
+                    for part in (reading.origin.split(",") if reading.origin else ())
+                    if part
+                )
+            ),
+        )
+
+    def observation_contradicts(
+        self,
+        crossing: CrossingRecord,
+        consensus: PlateConsensus,
+    ) -> bool:
+        """Does the observation itself read a DIFFERENT plate? Then withhold.
+
+        A ramp camera is not a plate source and can never name a car. But when
+        it reads a plate reliably and that plate is not the one the sources
+        agreed on, it is evidence that Re-ID has matched the wrong identity —
+        and refusing on that is not the same as naming a plate with it.
+
+        This closes a real hole. Two similar cars at Re-ID 0.92 with only one
+        ANPR read between them will otherwise confirm the second car's crossing
+        under the first car's plate: the witnesses agree, the consensus has
+        nothing to contradict it, and nothing else is left to object. The old
+        design caught this with its CAM-23 plate policy; with that gone, the
+        veto has to.
+
+        Subtractive, like the colour check and the producer-family gate: it can
+        withhold an entry, never create one. Erring toward an entry we do not
+        open rather than a session opened under someone else's name.
+
+        Off via ENTRY_V2_OBSERVATION_PLATE_VETO_ENABLED if the shadow window
+        shows ramp reads are too unreliable to withhold on.
+        """
+        if not self.settings.observation_plate_veto_enabled:
+            return False
+        if consensus.outcome != "consensus" or not consensus.plate:
+            return False
+        key = plate_key(consensus.plate)
+        for item in crossing.plate_evidence:
+            if (
+                item.state == PlateReadState.READABLE
+                and item.confidence >= self.settings.ocr_min_confidence
+                and item.key
+                and is_plausible_plate(canonical_plate(item.text))
+                and item.key != key
+            ):
+                return True
+        return False
+
     def resolve_plate(
         self,
         group: AttemptGroup,
         crossing: CrossingRecord,
         correlated_primary_crossings: Sequence[CrossingRecord] = (),
     ) -> PlateResolution:
-        for primary_crossing in correlated_primary_crossings:
-            self._remember_primary_read(
-                group,
-                self._select_ocr(primary_crossing.plate_evidence),
-            )
-        crossing_read = self._select_ocr(crossing.plate_evidence)
+        """Name the vehicle a confirmed entry belongs to.
 
-        if crossing.request.role == CrossingRole.PRIMARY:
-            return self._resolve_primary(group, crossing_read)
-        return self._resolve_fallback(group, crossing_read)
+        Re-ID chose WHICH identity; this chooses what its plate is, from the
+        plate sources alone. The crossing is passed only so callers keep one
+        signature — nothing about it is read, because CAM-23 and CAM-03 do not
+        read plates. `correlated_primary_crossings` is likewise ignored and
+        kept only so existing call sites do not have to change in this stage.
+        """
+        del correlated_primary_crossings
 
-    def _resolve_primary(
-        self, group: AttemptGroup, crossing_read: OCRSelection
-    ) -> PlateResolution:
-        self._remember_primary_read(group, crossing_read)
-
-        if group.primary_ocr_conflicted:
-            evidence = crossing_read.evidence
+        consensus = self.plate_consensus(group)
+        contradiction = self.observation_contradicts(crossing, consensus)
+        if contradiction:
             return PlateResolution(
                 outcome="abstained",
-                reason="primary_ocr_conflict",
-                ocr_source="primary",
-                ocr_text=canonical_plate(evidence.text) if evidence else None,
-                ocr_confidence=evidence.confidence if evidence else None,
-                ocr_evidence_ids=tuple(sorted(group.primary_ocr_evidence_ids)),
+                reason="observation_plate_contradiction",
+                ocr_source=OCR_SOURCE_CONSENSUS,
+                ocr_text=consensus.plate,
+                ocr_confidence=consensus.confidence,
             )
-
-        if group.primary_blocks_fallback and crossing_read.state in {
-            "no_plate",
-            "unreadable",
-            "low_confidence",
-        }:
-            # Once CAM23 produced readable/conflicting evidence, a later weak
-            # notification cannot erase it and unlock the ANPR fallback.
-            return PlateResolution(
-                outcome="abstained",
-                reason="prior_readable_primary_blocks_weaker_evidence",
-                ocr_source="primary",
-            )
-        if crossing_read.state == "selected":
-            return self._resolve_selected(group, crossing_read, "primary")
-
-        # The cached ANPR OCR is admissible when CAM23 had no reliable plate,
-        # including a below-threshold read. It is never consulted to overrule
-        # either a reliable CAM23 read or a true multi-text CAM23 conflict.
-        cached = self._select_ocr(group.cached_plate_evidence)
-        if cached.state == "selected":
-            return self._resolve_selected(group, cached, "anpr_cached")
-        if cached.state in {"conflict", "low_confidence"}:
-            return self._abstain_from_selection(
-                f"anpr_cached_ocr_{cached.state}", cached, "anpr_cached"
-            )
-        if crossing_read.state == "low_confidence":
-            return self._abstain_from_selection(
-                "primary_ocr_low_confidence",
-                crossing_read,
-                "primary",
-            )
-        return PlateResolution(
-            outcome="abstained",
-            reason="ocr_unavailable",
-            ocr_source="anpr_cached",
-        )
-
-    @staticmethod
-    def _remember_primary_read(
-        group: AttemptGroup,
-        crossing_read: OCRSelection,
-    ) -> None:
-        if crossing_read.state == "selected" and crossing_read.evidence is not None:
-            group.primary_reliable_ocr_keys.add(crossing_read.evidence.key)
-            group.primary_ocr_evidence_ids.update(crossing_read.evidence_ids)
-            if len(group.primary_reliable_ocr_keys) > 1:
-                group.primary_ocr_conflicted = True
-            group.primary_ocr_state = "selected"
-            group.primary_blocks_fallback = True
-        elif crossing_read.state == "conflict":
-            group.primary_ocr_conflicted = True
-            group.primary_ocr_evidence_ids.update(crossing_read.evidence_ids)
-
-        if group.primary_ocr_conflicted:
-            group.primary_ocr_state = "conflict"
-            group.primary_blocks_fallback = True
-        elif not group.primary_blocks_fallback:
-            weak_priority = {"no_plate": 0, "unreadable": 1, "low_confidence": 2}
-            current_priority = weak_priority.get(group.primary_ocr_state or "", -1)
-            new_priority = weak_priority.get(crossing_read.state, -1)
-            if new_priority > current_priority:
-                group.primary_ocr_state = crossing_read.state
-
-    def _resolve_fallback(
-        self, group: AttemptGroup, crossing_read: OCRSelection
-    ) -> PlateResolution:
-        if group.primary_blocks_fallback or (
-            group.primary_ocr_state is not None
-            and group.primary_ocr_state
-            not in {
-                "no_plate",
-                "unreadable",
-                "low_confidence",
-            }
-        ):
-            return PlateResolution(
-                outcome="abstained", reason="readable_primary_blocks_fallback"
-            )
-        if crossing_read.state == "selected":
-            return self._resolve_selected(group, crossing_read, "fallback")
-        cached = self._select_ocr(group.cached_plate_evidence)
-        if cached.state == "selected":
-            return self._resolve_selected(group, cached, "anpr_cached")
-        if cached.state in {"conflict", "low_confidence"}:
-            return self._abstain_from_selection(
-                f"anpr_cached_ocr_{cached.state}", cached, "anpr_cached"
-            )
-        return self._abstain_from_selection(
-            f"fallback_ocr_{crossing_read.state}", crossing_read, "fallback"
-        )
-
-    def _resolve_selected(
-        self, group: AttemptGroup, selected: OCRSelection, source: str
-    ) -> PlateResolution:
-        assert selected.evidence is not None
-        evidence = selected.evidence
-        key = evidence.key
-        display_plate = canonical_plate(evidence.text)
         common = dict(
-            ocr_source=source,
-            ocr_text=display_plate,
-            ocr_confidence=evidence.confidence,
-            ocr_evidence_ids=selected.evidence_ids,
+            ocr_source=OCR_SOURCE_CONSENSUS,
+            ocr_text=consensus.plate,
+            ocr_confidence=consensus.confidence,
+            ocr_evidence_ids=consensus.evidence_ids,
         )
-        if not is_plausible_plate(display_plate):
+        if consensus.outcome == "unavailable":
             return PlateResolution(
                 outcome="abstained",
-                reason="ocr_plate_implausible",
-                **common,
+                reason="plate_sources_unavailable",
+                ocr_source=OCR_SOURCE_CONSENSUS,
             )
-        if key in group.reported_keys:
+        if consensus.outcome == "no_consensus":
             return PlateResolution(
-                outcome="confirmed",
-                reason=f"reid_and_{source}_ocr_exact",
-                canonical_plate=display_plate,
+                outcome="abstained",
+                reason="plate_no_consensus",
+                ocr_source=OCR_SOURCE_CONSENSUS,
+            )
+        if not is_plausible_plate(consensus.plate or ""):
+            return PlateResolution(
+                outcome="abstained",
+                reason="plate_implausible",
                 **common,
             )
 
-        # A new plate value is a correction, not a match. Require exact OCR
-        # consensus from independent evidence and independent cameras. Camera
-        # ANPR text itself is not counted because it is the value under review.
-        all_ocr = list(group.cached_plate_evidence)
-        if source != "anpr_cached":
-            all_ocr.append(evidence)
-        reliable = [
-            item
-            for item in all_ocr
-            if item.state == PlateReadState.READABLE
-            and item.confidence >= self.settings.ocr_min_confidence
-            and item.key
-            and is_plausible_plate(canonical_plate(item.text))
-        ]
-        if any(item.key != key for item in reliable):
-            return PlateResolution(
-                outcome="abstained",
-                reason="correction_ocr_conflict",
-                **common,
-            )
-        agreeing_ids = {item.evidence_id for item in reliable if item.key == key}
-        agreeing_cameras = {
-            norm_camera_id(item.camera_id) for item in reliable if item.key == key
-        }
-        if (
-            len(agreeing_ids) < self.settings.correction_min_evidence
-            or len(agreeing_cameras) < self.settings.correction_min_cameras
-        ):
-            return PlateResolution(
-                outcome="abstained",
-                reason="correction_consensus_insufficient",
-                **common,
-            )
+        # A consensus that disagrees with every plate ANPR reported is a
+        # CORRECTION, and is held to a higher bar for teaching the durable
+        # gallery — see identity.build_gallery_authorization_proof.
+        corrected = plate_key(consensus.plate or "") not in group.reported_keys
         return PlateResolution(
             outcome="confirmed",
-            reason="reid_and_independent_ocr_correction",
-            canonical_plate=canonical_plate(evidence.text),
-            ocr_source=source,
-            ocr_text=canonical_plate(evidence.text),
-            ocr_confidence=evidence.confidence,
-            ocr_evidence_ids=tuple(sorted(agreeing_ids)),
+            reason=(
+                REASON_CORRECTION if corrected else REASON_CONSENSUS
+            ),
+            canonical_plate=consensus.plate,
+            **common,
         )
 
     def _select_ocr(self, evidence: Iterable[PlateEvidence]) -> OCRSelection:
@@ -493,18 +603,4 @@ class EntryDecisionEngine:
             state="selected",
             evidence=best,
             evidence_ids=tuple(sorted(item.evidence_id for item in reliable)),
-        )
-
-    @staticmethod
-    def _abstain_from_selection(
-        reason: str, selected: OCRSelection, source: str
-    ) -> PlateResolution:
-        evidence = selected.evidence
-        return PlateResolution(
-            outcome="abstained",
-            reason=reason,
-            ocr_source=source,
-            ocr_text=canonical_plate(evidence.text) if evidence else None,
-            ocr_confidence=evidence.confidence if evidence else None,
-            ocr_evidence_ids=selected.evidence_ids,
         )
