@@ -9,7 +9,7 @@ import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from . import decision_record
@@ -49,8 +49,11 @@ from .domain import (
     HypothesisStatus,
     IngestResult,
     PlateHypothesis,
+    PlateReading,
+    PlateSourceKind,
     ReIDMatch,
     RecordStatus,
+    WitnessSource,
     canonical_plate,
     norm_camera_id,
     plate_key,
@@ -96,7 +99,13 @@ class EntryCoordinator:
         *,
         unavailable_reason: str = "",
         decision_log: Optional[Any] = None,
+        clock: Optional[Any] = None,
     ):
+        # The ONLY wall clock in the coordinator, and it exists solely to age
+        # state out. It is never consulted to decide whether two observations
+        # are the same vehicle — that is Re-ID's job, and a clock cannot answer
+        # it. Injectable so TTL behaviour is testable without sleeping.
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.settings = settings
         self._processor = evidence_processor
         self._sink = confirmation_sink
@@ -272,15 +281,20 @@ class EntryCoordinator:
                     crossing = CrossingRecord(
                         request=request,
                         evidence=tuple(evidence),
+                        created_at=self._clock(),
                     )
                     self._crossings[request.crossing_id] = crossing
                 else:
                     finalized_duplicate, match_kind = finalized_match
                     if match_kind == "provisional":
+                        # Quarantined rows have their own lifecycle (they are
+                        # released or retired by journey reconciliation), so
+                        # they are stamped for the log but never TTL-swept.
                         self._provisional_crossings[request.crossing_id] = (
                             CrossingRecord(
                                 request=request,
                                 evidence=tuple(evidence),
+                                created_at=self._clock(),
                             ),
                             finalized_duplicate,
                         )
@@ -429,6 +443,13 @@ class EntryCoordinator:
                         "attempt_ids": sorted(group.attempts),
                         "status": group.status.value,
                         "primary_ocr_state": group.primary_ocr_state,
+                        "identity_key": group.identity_key,
+                        "correction_candidate_of": group.correction_candidate_of,
+                        "witnesses": sorted(w.value for w in group.witnesses),
+                        "plate_sources": {
+                            source.value: reading.text
+                            for source, reading in group.plate_sources.items()
+                        },
                         "hypotheses": {
                             hypothesis.display: hypothesis.status.value
                             for hypothesis in group.hypotheses.values()
@@ -1022,15 +1043,99 @@ class EntryCoordinator:
     def _add_attempt_locked(
         self, request: AttemptInput, evidence: Sequence[FrameEvidence]
     ) -> AttemptGroup:
-        merge_group_id = self._engine.find_merge_group(
-            [item.embedding for item in evidence if item.embedding],
-            self._groups.values(),
+        now = self._clock()
+        embeddings = [item.embedding for item in evidence if item.embedding]
+        identity_key = plate_key(request.reported_plate)
+
+        # PLATE-KEYED find-or-create. The plate is the identity, so a second
+        # ANPR read of the same plate enriches the live candidate instead of
+        # creating a rival for it.
+        group = self._identity_for_plate_locked(identity_key, embeddings)
+        same_key_split = bool(
+            group is None
+            and identity_key
+            and any(
+                other.status == RecordStatus.PENDING
+                and other.identity_key == identity_key
+                for other in self._groups.values()
+            )
         )
-        group_id = merge_group_id or self._group_id(request.attempt_id)
-        group = self._groups.get(group_id)
+        correction_of = ""
         if group is None:
-            group = AttemptGroup(group_id=group_id)
+            if identity_key:
+                # A plated attempt that matches no live identity by key. Before
+                # creating one, ask Re-ID whether a live identity is the same
+                # CAR under a different plate string — an ANPR misread. We do
+                # NOT merge on that answer: letting appearance override the
+                # plate key would put Re-ID back in charge of who a car is, and
+                # the plate consensus is what resolves a misread. Record the
+                # suspicion and let the shadow log say how often it fires.
+                correction_of = (
+                    self._engine.find_merge_group(embeddings, self._groups.values())
+                    or ""
+                )
+            else:
+                # PLATELESS. There is no key to group by, so appearance is all
+                # there is — this is the dropped-ANPR recovery path, and the
+                # Re-ID merge gate is retained for exactly this case.
+                merged = self._engine.find_merge_group(
+                    embeddings,
+                    [g for g in self._groups.values() if not g.identity_key],
+                )
+                if merged:
+                    group = self._groups.get(merged)
+
+        if group is None:
+            group_id = self._group_id(request.attempt_id)
+            group = AttemptGroup(
+                group_id=group_id,
+                identity_key=identity_key,
+                created_at=now,
+                last_activity_at=now,
+                correction_candidate_of=correction_of,
+            )
             self._groups[group_id] = group
+            created = True
+        else:
+            group_id = group.group_id
+            # "Creates OR activates": enrichment restarts the candidate's TTL.
+            group.last_activity_at = now
+            created = False
+
+        # The ANPR image is a WITNESS; the gate's reported plate is a PLATE
+        # SOURCE. Two different axes for one event — neither implies the other.
+        if embeddings:
+            group.witnesses.setdefault(WitnessSource.ANPR, request.attempt_id)
+        if identity_key:
+            group.plate_sources.setdefault(
+                PlateSourceKind.ANPR,
+                PlateReading(
+                    source=PlateSourceKind.ANPR,
+                    text=request.reported_plate,
+                    confidence=float(request.reported_confidence or 0.0),
+                    origin=request.attempt_id,
+                ),
+            )
+
+        self._emit_decision_record(
+            stage="anpr_identity",
+            result=decision_record.RESULT_ABSTAINED,
+            reason="identity_created" if created else "identity_enriched",
+            identity={
+                "group_id": group_id,
+                "identity_key": identity_key,
+                "attempt_id": request.attempt_id,
+                "created": created,
+                "correction_candidate_of": group.correction_candidate_of,
+                # The plate key already existed but appearance disagreed, so a
+                # second identity now shares it. Rare and worth counting: a
+                # rising rate means ANPR is misreading, or merge_min_score is
+                # too tight for this facility's gate imagery.
+                "same_key_split": same_key_split,
+                "attempt_count": len(group.attempts) + 1,
+            },
+            witnesses=[w.value for w in group.witnesses],
+        )
         record = AttemptRecord(
             request=request,
             evidence=tuple(evidence),
@@ -1335,6 +1440,7 @@ class EntryCoordinator:
         self._release_provisional_crossings_locked()
 
     def _evaluate_pending_locked(self) -> list[EntryDecision]:
+        self._expire_stale_locked()
         available_callbacks = max(
             0,
             self.settings.max_pending_callbacks
@@ -1567,6 +1673,143 @@ class EntryCoordinator:
             crossing=crossing,
             evaluation=evaluation,
         )
+
+    def _identity_for_plate_locked(self, identity_key: str, embeddings):
+        """The live identity for this plate key that this attempt may enrich.
+
+        Derived by scan rather than kept as an index. `_groups` is bounded by
+        max_pending_attempts (256), so the scan is trivial, and an index would
+        have to be kept in sync across three insertion sites and two removal
+        sites — a stale entry there would bind an attempt to the WRONG
+        identity, which is the one failure this whole design exists to prevent.
+        Cheaper to be certain.
+
+        THE APPEARANCE GUARD. The plate is the identity key, but a key match is
+        not a licence to pool images. ANPR misreads car B's plate as car A's,
+        and pooling B's images into identity A poisons it: every later crossing
+        then matches A perfectly, no crossing can out-margin any other on the
+        column gate, and NOTHING ever confirms. That is a deadlock, and it is
+        the same gallery-poisoning failure this codebase has fought before.
+
+        So an attempt enriches a same-key identity only when Re-ID agrees it is
+        the same car, at `merge_min_score` — already documented as the
+        "very-high-confidence same-car" bar and comfortably above the measured
+        ~0.66 same-view similarity between DIFFERENT cars. When appearance
+        disagrees, the attempt gets its own identity under the same key.
+
+        This is not Re-ID deciding identity: the plate already decided that.
+        Re-ID is vetoing the pooling of contradictory evidence, exactly as the
+        colour check does. Two live identities may therefore share a plate key
+        — which is also what lets a genuine exit-and-re-entry stay two visits.
+        """
+        if not identity_key:
+            return None
+        candidates = [
+            group
+            for group in self._groups.values()
+            if group.status == RecordStatus.PENDING
+            and group.identity_key == identity_key
+        ]
+        if not candidates:
+            return None
+        if not embeddings:
+            return candidates[0]
+
+        best, best_score = None, -1.0
+        for group in candidates:
+            score = max_similarity(embeddings, group.embeddings)
+            if score > best_score:
+                best, best_score = group, score
+        # A candidate with no embeddings at all scores -1.0 and is still the
+        # right thing to enrich — there is nothing to contradict.
+        if best_score < 0.0:
+            return best
+        if best_score >= self.settings.merge_min_score:
+            return best
+        return None
+
+    def _age_seconds(self, anchor: Optional[datetime], now: datetime):
+        """Age in seconds, or None when it cannot be established.
+
+        Mixed aware/naive timestamps fail CLOSED — returning None means "do not
+        expire this". Never delete state you cannot reason about; the capacity
+        bounds are still there as the backstop.
+        """
+        if anchor is None:
+            return None
+        try:
+            return (now - anchor).total_seconds()
+        except TypeError:
+            return None
+
+    def _expire_stale_locked(self) -> None:
+        """Age out unconfirmed identities and unmatched observations.
+
+        Runs on every evaluation pass rather than on a timer thread: the
+        coordinator is already woken by every event, and a timer would need its
+        own lock discipline for no benefit.
+
+        This is a LIFETIME bound, not an identity rule. Expiry never decides
+        that two observations belong to the same car; it only decides that a
+        candidate has waited long enough to stop being one.
+        """
+        now = self._clock()
+        identity_ttl = self.settings.identity_ttl_minutes * 60
+        observation_ttl = self.settings.observation_ttl_minutes * 60
+
+        for group_id, group in list(self._groups.items()):
+            if group.status != RecordStatus.PENDING:
+                continue
+            # An identity with a decision in flight is not idle — expiring it
+            # would strand the callback that is about to reference it.
+            if self._group_has_callback_in_flight_locked(group_id):
+                continue
+            age = self._age_seconds(group.last_activity_at or group.created_at, now)
+            if age is None or age < identity_ttl:
+                continue
+            self._groups.pop(group_id, None)
+            for attempt_id in group.attempts:
+                self._attempts.pop(attempt_id, None)
+            self._emit_decision_record(
+                stage="ttl_expiry",
+                result=decision_record.RESULT_EXPIRED,
+                reason="identity_ttl_expired",
+                identity={
+                    "group_id": group_id,
+                    "identity_key": group.identity_key,
+                    "age_seconds": round(age, 1),
+                    "ttl_seconds": identity_ttl,
+                    "attempt_count": len(group.attempts),
+                },
+                witnesses=[w.value for w in group.witnesses],
+            )
+
+        for crossing_id, crossing in list(self._crossings.items()):
+            if crossing.status != RecordStatus.PENDING:
+                continue
+            age = self._age_seconds(crossing.created_at, now)
+            if age is None or age < observation_ttl:
+                continue
+            self._crossings.pop(crossing_id, None)
+            self._emit_decision_record(
+                stage="ttl_expiry",
+                result=decision_record.RESULT_EXPIRED,
+                reason="observation_ttl_expired",
+                crossing=crossing,
+                extra={
+                    "age_seconds": round(age, 1),
+                    "ttl_seconds": observation_ttl,
+                },
+            )
+
+    def _group_has_callback_in_flight_locked(self, group_id: str) -> bool:
+        for decision, _payload in self._pending_callbacks.values():
+            if decision.group_id == group_id:
+                return True
+        for decision in self._callback_reservations.values():
+            if decision.group_id == group_id:
+                return True
+        return False
 
     def _emit_decision_record(self, **kwargs: Any) -> None:
         """Queue one decision-log record. Never raises, never blocks.

@@ -120,6 +120,18 @@ class EntrySettings:
     decision_log_dir: str = ""
     decision_log_retention_days: int = 30
     decision_log_queue_max: int = 2000
+    # How long an UNCONFIRMED entry identity stays eligible for correlation.
+    # This is a LIFETIME, not an identity-matching rule: it never says two
+    # observations are the same vehicle, it only bounds how long a candidate
+    # exists. Re-ID remains the only thing that associates a car.
+    #
+    # It is far longer than the legacy path's 10s FIFO bind window, and safe
+    # only because nothing here binds a plate by arrival order. If FIFO ever
+    # returns to the binding path, this must come down with it.
+    identity_ttl_minutes: int = 15
+    # Observations outlive identities on purpose, so a late HikCentral sweep can
+    # still rescue a dropped entry after the ANPR side is gone.
+    observation_ttl_minutes: int = 60
     va_process_count: int = 1
     invalid_va_process_count: str = ""
     va_single_process: bool = False
@@ -240,6 +252,8 @@ class EntrySettings:
                 "ENTRY_V2_DECISION_LOG_RETENTION_DAYS", 30
             ),
             decision_log_queue_max=_env_int("ENTRY_V2_DECISION_LOG_QUEUE_MAX", 2000),
+            identity_ttl_minutes=_env_int("ENTRY_IDENTITY_TTL_MINUTES", 15),
+            observation_ttl_minutes=_env_int("ENTRY_OBSERVATION_TTL_MINUTES", 60),
             va_process_count=va_process_count,
             invalid_va_process_count=invalid_va_process_count,
             va_single_process=_env_true("VA_SINGLE_PROCESS"),
@@ -294,6 +308,15 @@ class EntrySettings:
             errors.append("entry_v2_local_zone_requires_va_single_process")
         if self.receipt_capacity < self.max_concurrent_ingest_requests:
             errors.append("receipt_capacity_below_ingest_concurrency")
+        if self.identity_ttl_minutes <= 0:
+            errors.append("ENTRY_IDENTITY_TTL_MINUTES")
+        if self.observation_ttl_minutes <= 0:
+            errors.append("ENTRY_OBSERVATION_TTL_MINUTES")
+        elif self.observation_ttl_minutes < self.identity_ttl_minutes:
+            # An observation that died before its identity could never be
+            # rescued by a late sweep, which is the only reason the two TTLs
+            # differ at all.
+            errors.append("observation_ttl_below_identity_ttl")
         if self.decision_log_dir:
             # Only checked when the log is actually configured. A malformed
             # integer arrives here as 0 (see _env_int), and 0 would silently mean

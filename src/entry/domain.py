@@ -54,6 +54,51 @@ class DecisionStatus(str, Enum):
     ABSTAINED = "abstained"
 
 
+class WitnessSource(str, Enum):
+    """Something that SAW a vehicle. Not a plate reading — see PlateSourceKind.
+
+    These two axes are separate and must stay separate. A source appearing on
+    one list does not put it on the other: CAM-23 and CAM-03 are witnesses that
+    read no plates, and HikCentral's text-only record is a plate source that
+    witnessed nothing we can associate.
+    """
+
+    ANPR = "anpr"       # the ANPR vehicle image
+    HIK = "hik"         # a HikCentral vehicle image, Re-ID-associated
+    CAM23 = "cam23"     # CAM-23 visual observation
+    CAM03 = "cam03"     # CAM-03 visual observation
+
+
+class PlateSourceKind(str, Enum):
+    """Something that READ a plate. Exactly three, forever.
+
+    There are only two plate-reading systems in this flow — the gate ANPR and
+    HikCentral — plus our own OCR on whatever vehicle image is available
+    (primarily the HikCentral vehiclePicUri image, secondarily the ANPR image).
+
+    There is deliberately no camera-derived member. If one is ever added, the
+    ramp cameras have become plate sources and the separation above is gone.
+    """
+
+    ANPR = "anpr"
+    HIK_TEXT = "hik_text"
+    OUR_OCR = "our_ocr"
+
+
+# Cameras whose observations are witnesses. Anything else reports its own
+# normalised id rather than being bucketed as a known witness, so a
+# mis-normalised camera shows up in the log instead of silently counting.
+_WITNESS_BY_CAMERA = {
+    "CAM23": WitnessSource.CAM23,
+    "CAM03": WitnessSource.CAM03,
+}
+
+
+def witness_for_camera(camera_id: str) -> Optional[WitnessSource]:
+    """Map a camera id to its witness, or None when it is not a ramp camera."""
+    return _WITNESS_BY_CAMERA.get(norm_camera_id(camera_id))
+
+
 _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
 _LETTERS_DIGITS = re.compile(r"^([A-Z]{1,4})([0-9]{1,4})$")
 
@@ -84,6 +129,32 @@ class PlateEvidence:
     state: PlateReadState
     text: str = ""
     confidence: float = 0.0
+
+    @property
+    def key(self) -> str:
+        return plate_key(self.text)
+
+
+@dataclass(frozen=True)
+class PlateReading:
+    """One plate-source reading, for the consensus in a later stage.
+
+    Distinct from PlateEvidence, which is an OCR result on one specific image.
+    A PlateReading is what a SOURCE says the plate is: the gate's own reported
+    value, HikCentral's own reported value, or our OCR's conclusion folded
+    across every image it read.
+
+    ``conflicted`` marks a source that contradicted itself — our OCR reading two
+    images and disagreeing. Such a source is excluded from consensus entirely
+    rather than having its readings counted as two opinions, because our reader
+    contradicting itself is evidence of unreliability, not a tie to break.
+    """
+
+    source: PlateSourceKind
+    text: str = ""
+    confidence: float = 0.0
+    origin: str = ""          # attempt_id, evidence_id, or HikCentral GUID
+    conflicted: bool = False
 
     @property
     def key(self) -> str:
@@ -156,11 +227,42 @@ class AttemptRecord:
 
 @dataclass
 class AttemptGroup:
+    """One entry identity. Keyed by PLATE, not by appearance.
+
+    The ANPR event is the anchor because it supplies both the plate and the
+    first vehicle image. A second ANPR read of the same plate enriches this
+    identity rather than creating another; HikCentral and ramp-camera evidence
+    likewise attach to the identity that already exists.
+    """
+
     group_id: str
     attempts: Dict[str, AttemptRecord] = field(default_factory=dict)
     hypotheses: Dict[str, PlateHypothesis] = field(default_factory=dict)
     status: RecordStatus = RecordStatus.PENDING
     canonical_plate: Optional[str] = None
+
+    # --- identity (stage 2) ------------------------------------------- #
+    # plate_key of the anchoring ANPR read. Empty for a PLATELESS identity,
+    # which is what the dropped-ANPR recovery path creates: with no plate there
+    # is no key to group by, and appearance is the only thing left.
+    identity_key: str = ""
+    # Wall-clock, not captured_at. The TTL is a lifetime in OUR time; anchoring
+    # it on capture would make a backfilled event arrive already expired.
+    created_at: Optional[datetime] = None
+    # Refreshed whenever an attempt is added: an ANPR event "creates OR
+    # activates" the candidate, so enrichment restarts its 15 minutes.
+    last_activity_at: Optional[datetime] = None
+    # WitnessSource -> the id that produced it. Two entries confirm an entry.
+    witnesses: Dict["WitnessSource", str] = field(default_factory=dict)
+    # PlateSourceKind -> that source's reading. At most one per source.
+    plate_sources: Dict["PlateSourceKind", PlateReading] = field(default_factory=dict)
+    # Consumed HikCentral GUIDs, so repeated queries cannot double-ingest.
+    hik_guids_consumed: set[str] = field(default_factory=set)
+    # Set when this identity's plate differs from a live identity that Re-ID
+    # says is the same car — i.e. one of the two reads is probably a misread.
+    # A MARKER ONLY: it never merges the identities, because letting appearance
+    # override the plate key would put Re-ID back in charge of who a car is.
+    correction_candidate_of: str = ""
     # A reliable/conflicting primary read blocks a downstream fallback. When
     # CAM23 emits no usable event, a separately configured downstream crossing
     # remains independent physical-entry proof; there is no timer-based wait.
@@ -204,6 +306,14 @@ class CrossingRecord:
     status: RecordStatus = RecordStatus.PENDING
     matched_group_id: Optional[str] = None
     last_decision_id: Optional[str] = None
+    # Wall-clock ingest time, for the observation TTL. Not refreshed: an
+    # observation is a point event, not a candidate that can be reactivated.
+    created_at: Optional[datetime] = None
+
+    @property
+    def witness(self) -> Optional["WitnessSource"]:
+        """Which physical witness this observation is. Never a plate source."""
+        return witness_for_camera(self.request.camera_id)
 
     @property
     def embeddings(self) -> Tuple[Tuple[float, ...], ...]:

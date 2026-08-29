@@ -898,7 +898,7 @@ def test_single_crossing_ocr_cannot_rewrite_reported_plate():
     assert coord.state_summary()["attempt_count"] == 1
 
 
-def test_late_correct_anpr_reuses_abstained_crossing_and_supersedes_wrong_plate():
+def test_a_late_differently_read_anpr_does_not_rewrite_a_pending_crossings_plate():
     evidence = {
         "a-wrong": [
             frame(
@@ -937,15 +937,29 @@ def test_late_correct_anpr_reuses_abstained_crossing_and_supersedes_wrong_plate(
 
     second = coord.ingest_attempt(attempt("a-correct", "XYZ-9999"), [b"correct"])
 
-    assert second.decision_status == "confirmed"
-    assert [payload["status"] for payload in sink.payloads] == [
-        "abstained",
-        "confirmed",
-    ]
-    assert sink.payloads[-1]["canonical_plate"] == "XYZ-9999"
-    assert sink.payloads[-1]["superseded_plates"] == ["ABC-1234"]
-    assert coord.state_summary()["attempt_count"] == 0
-    assert coord.state_summary()["crossing_count"] == 0
+    # POLICY CHANGE (Entry Pipeline v3, stage 2). A late ANPR read under a
+    # DIFFERENT plate no longer rewrites the pending crossing's plate by being
+    # merged into the same group on appearance. It is a second identity, and
+    # the crossing now faces two candidates of identical appearance, so it
+    # abstains instead of confirming one of them on a guess.
+    #
+    # The correct-plate recovery this used to perform has not been abandoned,
+    # it has moved: a misread is resolved by the plate consensus across ANPR,
+    # HikCentral's own reading and our independent OCR — never by a ramp
+    # camera's OCR, which is not a plate source at all.
+    # No decision at all for the second attempt: the crossing already abstained
+    # and nothing has changed that could resolve it, so no second callback is
+    # produced either.
+    assert second.decision_status is None
+    assert [payload["status"] for payload in sink.payloads] == ["abstained"]
+
+    state = coord.state_summary()
+    assert state["group_count"] == 2
+    assert state["crossing_count"] == 1
+    identity_keys = {
+        group["identity_key"] for group in state["groups"].values()
+    }
+    assert identity_keys == {"ABC1234", "XYZ9999"}
 
 
 def test_entry_time_is_physical_crossing_after_long_barrier_wait():
@@ -1288,7 +1302,23 @@ def test_reid_absolute_score_boundary_is_observable(score, expected, caplog):
         )
 
 
-def test_same_car_wrong_and_correct_attempts_merge_then_supersede_wrong_plate():
+def test_two_plate_readings_of_one_car_stay_separate_identities_and_are_marked():
+    """POLICY CHANGE (Entry Pipeline v3, stage 2).
+
+    This used to assert that two ANPR reads of the SAME car under DIFFERENT
+    plates were merged by Re-ID into one group, and that the later reading
+    superseded the earlier one.
+
+    Identity is now keyed by PLATE. Two plate keys are two identities, and
+    appearance is not allowed to collapse them: letting Re-ID overrule the plate
+    key would put appearance back in charge of who a car is, which is exactly
+    what this rewrite removes. The disagreement is recorded rather than
+    resolved here — `correction_candidate_of` marks it, and the plate consensus
+    over ANPR / HikCentral / our own OCR is what decides which reading is right.
+
+    Note also that CAM-23's OCR (XYZ9999 above) can no longer break the tie: the
+    ramp cameras are visual observation sources and read no plates.
+    """
     evidence = {
         "a-wrong": [frame("a-wrong", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
         "a-correct": [frame("a-correct", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE, "XYZ9999", 0.96)],
@@ -1298,14 +1328,70 @@ def test_same_car_wrong_and_correct_attempts_merge_then_supersede_wrong_plate():
     first = coord.ingest_attempt(attempt("a-wrong", "ABC-1234"), [b"a1"])
     second = coord.ingest_attempt(attempt("a-correct", "XYZ-9999"), [b"a2"])
 
-    assert first.group_id == second.group_id
-    assert coord.state_summary()["group_count"] == 1
-    coord.ingest_crossing(crossing("c1"), [b"c"])
+    assert first.group_id != second.group_id
+    state = coord.state_summary()
+    assert state["group_count"] == 2
 
-    payload = sink.payloads[0]
-    assert payload["canonical_plate"] == "XYZ-9999"
-    assert payload["superseded_plates"] == ["ABC-1234"]
-    assert payload["attempt_id"] == "a-correct"
+    groups = state["groups"]
+    assert groups[first.group_id]["identity_key"] == "ABC1234"
+    assert groups[second.group_id]["identity_key"] == "XYZ9999"
+    # Re-ID says it is the same car, so the second identity carries the marker.
+    assert groups[second.group_id]["correction_candidate_of"] == first.group_id
+    # ...but the marker never merges them.
+    assert groups[first.group_id]["correction_candidate_of"] == ""
+
+    # Both identities hold the ANPR witness and the ANPR plate source.
+    for group_id in (first.group_id, second.group_id):
+        assert groups[group_id]["witnesses"] == ["anpr"]
+    assert groups[first.group_id]["plate_sources"] == {"anpr": "ABC-1234"}
+    assert groups[second.group_id]["plate_sources"] == {"anpr": "XYZ-9999"}
+
+    # Two identities of identical appearance leave the crossing unable to pick
+    # one, so nothing is confirmed on a guess.
+    coord.ingest_crossing(crossing("c1"), [b"c"])
+    assert sink.payloads == []
+
+
+def test_a_second_read_of_the_same_plate_and_car_enriches_one_identity():
+    """The other half of the rule: same key AND same car is ONE identity."""
+    evidence = {
+        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
+        "a2": [frame("a2", "ANPR-ENTRY", (0.99, 0.01), PlateReadState.NO_PLATE)],
+    }
+    coord, _ = coordinator(evidence)
+    first = coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a1"])
+    second = coord.ingest_attempt(attempt("a2", "ABC-1234"), [b"a2"])
+
+    assert first.group_id == second.group_id
+    state = coord.state_summary()
+    assert state["group_count"] == 1
+    assert state["groups"][first.group_id]["attempt_ids"] == ["a1", "a2"]
+
+
+def test_same_plate_but_a_different_car_gets_its_own_identity():
+    """The appearance guard.
+
+    A key match is not a licence to pool images. If ANPR reads car B's plate as
+    car A's, pooling B's images into identity A poisons it: every later crossing
+    then matches A perfectly, no crossing can out-margin another on the column
+    gate, and nothing ever confirms. Re-ID vetoes the pooling — it does not
+    decide the identity, which the plate already did.
+    """
+    evidence = {
+        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
+        "a2": [frame("a2", "ANPR-ENTRY", (0.0, 1.0), PlateReadState.NO_PLATE)],
+    }
+    coord, _ = coordinator(evidence)
+    first = coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a1"])
+    second = coord.ingest_attempt(attempt("a2", "ABC-1234"), [b"a2"])
+
+    assert first.group_id != second.group_id
+    state = coord.state_summary()
+    assert state["group_count"] == 2
+    # Both keep the plate key; they are two candidates for one plate, not one
+    # candidate with two appearances.
+    for group_id in (first.group_id, second.group_id):
+        assert state["groups"][group_id]["identity_key"] == "ABC1234"
 
 
 def test_matching_later_car_does_not_drop_unrelated_earlier_attempt():
