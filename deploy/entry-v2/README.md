@@ -1,5 +1,12 @@
 # Entry V2 Docker deployment
 
+> **PRODUCTION IS KUBERNETES.** The Compose commands below are how this was
+> developed, not how it is deployed. For the actual rollout — preflight,
+> off → shadow → review → authoritative, and the loop back to shadow when the
+> review fails — see [PREFLIGHT.md](PREFLIGHT.md).
+>
+> The reasoning here still applies. The mechanics do not.
+
 This bundle injects runtime settings and mounts production configuration without
 baking credentials or camera passwords into the image.
 

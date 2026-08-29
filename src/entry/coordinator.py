@@ -1580,6 +1580,30 @@ class EntryCoordinator:
                             outcome="abstained",
                             reason=shortfall,
                         )
+                # The plate decision, recorded in its own right. The review
+                # gate asks "were there confirmations with no plate consensus?"
+                # and "did any plate source come from a ramp camera?", and
+                # neither question can be answered from a decision status.
+                consensus = self._engine.plate_consensus(causal_group)
+                self._emit_decision_record(
+                    stage="plate_consensus",
+                    result=(
+                        decision_record.RESULT_CONFIRMED
+                        if resolution.outcome == "confirmed"
+                        else decision_record.RESULT_UNREADABLE
+                        if consensus.outcome != "consensus"
+                        else decision_record.RESULT_ABSTAINED
+                    ),
+                    reason=resolution.reason,
+                    crossing=crossing,
+                    identity={
+                        "group_id": group.group_id,
+                        "identity_key": group.identity_key,
+                    },
+                    plate=consensus.as_record(),
+                    witnesses=[w.value for w in group.confirming_witnesses()],
+                    observed_plate_text=_best_observed_plate_text(crossing),
+                )
                 decision = self._build_decision(
                     causal_group,
                     crossing,
