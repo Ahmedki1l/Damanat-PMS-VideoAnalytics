@@ -64,6 +64,22 @@ from .settings import EntrySettings
 logger = logging.getLogger(__name__)
 
 
+def _is_hik_sourced_attempt(request) -> bool:
+    """Did these bytes come from a HikCentral query we issued?
+
+    HikCentral is a PULL source. An attempt marked this way exists because our
+    service asked HikCentral for a record and got an image back — not because
+    HikCentral told us anything. The marker changes what the attempt counts as:
+    HikCentral's plate reading rather than the gate ANPR system's, and a HIK
+    witness rather than an ANPR one.
+    """
+    try:
+        metadata = request.metadata or {}
+        return str(metadata.get("evidence_source", "")).lower() == "hikcentral"
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _round_hsv(value):
     return None if value is None else [round(float(v), 1) for v in value]
 
@@ -1123,14 +1139,44 @@ class EntryCoordinator:
             group.last_activity_at = now
             created = False
 
-        # The ANPR image is a WITNESS; the gate's reported plate is a PLATE
-        # SOURCE. Two different axes for one event — neither implies the other.
+        # The image is a WITNESS; the reported plate is a PLATE SOURCE. Two
+        # different axes for one event — neither implies the other.
+        #
+        # WHICH witness and WHICH source depends on where the bytes came from.
+        # A HikCentral-sourced attempt exists because WE went and asked for it
+        # (HikCentral is a pull source and never pushes); its plate is
+        # HikCentral's own reading, not the gate ANPR system's, and conflating
+        # the two would let one platform's answer be counted as two sources.
+        hik_sourced = _is_hik_sourced_attempt(request)
         if embeddings:
-            group.witnesses.setdefault(WitnessSource.ANPR, request.attempt_id)
-        # The gate's reported plate is a PLATE SOURCE, but it is not stored
-        # here: it is derived from the attempts by the engine, so the causal
-        # projection cannot be handed a plate read after the car went past.
-        # `plate_sources` holds only what we FETCHED (HikCentral, stage 5).
+            group.witnesses.setdefault(
+                WitnessSource.HIK if hik_sourced else WitnessSource.ANPR,
+                request.attempt_id,
+            )
+        if hik_sourced and identity_key:
+            # HikCentral's own plate reading is STORED, unlike ANPR's and our
+            # OCR's, which the engine derives from the attempts. It has to be:
+            # it did not come from a camera event, so there is no attempt whose
+            # capture time places it before or after the crossing. Stage 6 must
+            # give it a causality check of its own if it ever attaches records
+            # that could postdate the observation they are used to explain.
+            group.plate_sources.setdefault(
+                PlateSourceKind.HIK_TEXT,
+                PlateReading(
+                    source=PlateSourceKind.HIK_TEXT,
+                    text=request.reported_plate,
+                    confidence=float(request.reported_confidence or 0.0),
+                    origin=str(
+                        (request.metadata or {}).get("hik_guid", request.attempt_id)
+                    ),
+                ),
+            )
+            guid = str((request.metadata or {}).get("hik_guid", ""))
+            if guid:
+                group.hik_guids_consumed.add(guid)
+        # The gate's reported plate is not stored: the engine derives it from
+        # the attempts, so the causal projection cannot be handed a plate read
+        # from after the car went past.
 
         self._emit_decision_record(
             stage="anpr_identity",
@@ -1147,6 +1193,7 @@ class EntryCoordinator:
                 # rising rate means ANPR is misreading, or merge_min_score is
                 # too tight for this facility's gate imagery.
                 "same_key_split": same_key_split,
+                "hik_sourced": hik_sourced,
                 "attempt_count": len(group.attempts) + 1,
             },
             witnesses=[w.value for w in group.witnesses],

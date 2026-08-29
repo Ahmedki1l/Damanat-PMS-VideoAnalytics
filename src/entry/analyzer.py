@@ -21,6 +21,20 @@ from .domain import (
 from .settings import EntrySettings
 
 
+def _is_hik_sourced(metadata) -> bool:
+    """Was this frame pulled from HikCentral by us, rather than pushed by a camera?
+
+    HikCentral is a PULL source: these bytes exist because our service asked for
+    them. The marker matters because such a frame carries HikCentral's own
+    composited plate panel, which our OCR must not read back as if it were an
+    independent look at the car.
+    """
+    try:
+        return str((metadata or {}).get("evidence_source", "")).lower() == "hikcentral"
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _safe_dominant_colour(frame):
     """Mean HSV of the crop centre, or None. Never raises.
 
@@ -135,6 +149,30 @@ class ExistingModelsEvidenceProcessor:
         self._plate_detector = None
         self._ocr = None
 
+    def _overlay_regions_for(self, source_role: str, metadata):
+        """Where Hikvision may have composited a plate panel into this frame.
+
+        Applies to WHOLE-FRAME sources only: the ANPR overview (PMS forwards the
+        bounded full frame precisely so we localise the plate ourselves, panel
+        and all) and anything pulled from HikCentral. Ramp line-crossing crops
+        are already tight around the vehicle, so there is no panel in them and
+        no reason to risk excluding part of a real plate.
+
+        Returns () when nothing is configured, which makes the guard inert.
+        """
+        if not self._settings.overlay_exclude_regions:
+            if _is_hik_sourced(metadata):
+                logger.warning(
+                    "[EntryV2] HikCentral-sourced frame analysed with NO overlay "
+                    "guard configured - our OCR may be reading Hikvision's own "
+                    "composited plate panel back to itself. Set "
+                    "ENTRY_V2_OVERLAY_EXCLUDE_REGIONS from the image probe."
+                )
+            return ()
+        if _is_hik_sourced(metadata) or (source_role or "").lower() == "anpr":
+            return self._settings.overlay_exclude_regions
+        return ()
+
     def analyze(
         self,
         *,
@@ -144,10 +182,10 @@ class ExistingModelsEvidenceProcessor:
         images: Sequence[bytes],
         metadata: Mapping[str, Any],
     ) -> Tuple[FrameEvidence, ...]:
-        del metadata  # reserved for future crop-role descriptors; never retained
         if not images:
             raise EvidenceUnavailable("at_least_one_image_is_required")
         reid, detector, ocr = self._models()
+        exclude_regions = self._overlay_regions_for(source_role, metadata)
 
         import cv2
         import numpy as np
@@ -183,7 +221,9 @@ class ExistingModelsEvidenceProcessor:
                     if norm > 0.0:
                         embedding = tuple(float(value) for value in array / norm)
 
-                plate_crop = detector.crop_plate(frame)
+                plate_crop = detector.crop_plate(
+                    frame, exclude_regions=exclude_regions
+                )
                 if plate_crop is None or getattr(plate_crop, "size", 0) == 0:
                     plate = PlateEvidence(
                         evidence_id=frame_id,

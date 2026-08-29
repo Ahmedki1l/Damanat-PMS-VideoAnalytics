@@ -108,6 +108,15 @@ class ReIDMatchEvaluation:
         )
 
 
+def _is_hik_sourced(request) -> bool:
+    """Did this attempt come from a HikCentral query rather than a gate read?"""
+    try:
+        metadata = request.metadata or {}
+        return str(metadata.get("evidence_source", "")).lower() == "hikcentral"
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def cosine(left: Sequence[float], right: Sequence[float]) -> float:
     if not left or not right or len(left) != len(right):
         return -1.0
@@ -354,6 +363,12 @@ class EntryDecisionEngine:
             attempt.request
             for attempt in group.attempts.values()
             if plate_key(attempt.request.reported_plate)
+            # A HikCentral-sourced attempt carries HIKCENTRAL's plate reading,
+            # not the gate ANPR system's. Counting it here would let one
+            # platform's answer appear as two agreeing sources — precisely the
+            # thing the consensus rule exists to prevent. It is recorded as
+            # HIK_TEXT when it arrives.
+            and not _is_hik_sourced(attempt.request)
         ]
         if not readings:
             return None

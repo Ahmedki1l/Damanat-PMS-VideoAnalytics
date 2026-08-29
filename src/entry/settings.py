@@ -52,6 +52,34 @@ def _env_true(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in _ENV_TRUE_VALUES
 
 
+def _env_regions(name: str):
+    """Parse "x1,y1,x2,y2;x1,y1,x2,y2" into normalised boxes.
+
+    Anything malformed yields NO region rather than a partial one. A guard that
+    silently half-applied would be worse than one that is off, because it would
+    look configured while protecting the wrong part of the frame.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return ()
+    regions = []
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [item.strip() for item in chunk.split(",")]
+        if len(parts) != 4:
+            return ()
+        try:
+            x1, y1, x2, y2 = (float(item) for item in parts)
+        except ValueError:
+            return ()
+        if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+            return ()
+        regions.append((x1, y1, x2, y2))
+    return tuple(regions)
+
+
 @dataclass(frozen=True)
 class EntrySettings:
     mode: EntryMode = EntryMode.OFF
@@ -130,6 +158,15 @@ class EntrySettings:
     # refusing on that is not the same as naming a plate with it. Subtractive:
     # it can withhold an entry, never create one.
     observation_plate_veto_enabled: bool = True
+    # THE OVERLAY GUARD. Normalised (x1,y1,x2,y2) boxes in 0..1 naming where
+    # Hikvision composites its own plate/OSD panel into a frame. A plate box
+    # whose centre lands inside one is skipped in favour of the next candidate.
+    #
+    # Empty by DEFAULT, and deliberately so. The panel's real geometry has to
+    # come from the image probe against this facility's own frames; a guessed
+    # rectangle would reject real plates, which is worse than the echo it is
+    # meant to prevent. Until it is measured the guard is inert and says so.
+    overlay_exclude_regions: tuple = ()
     # How long an UNCONFIRMED entry identity stays eligible for correlation.
     # This is a LIFETIME, not an identity-matching rule: it never says two
     # observations are the same vehicle, it only bounds how long a candidate
@@ -268,6 +305,9 @@ class EntrySettings:
             observation_plate_veto_enabled=os.getenv(
                 "ENTRY_V2_OBSERVATION_PLATE_VETO_ENABLED", "1"
             ).strip().lower() in _ENV_TRUE_VALUES,
+            overlay_exclude_regions=_env_regions(
+                "ENTRY_V2_OVERLAY_EXCLUDE_REGIONS"
+            ),
             identity_ttl_minutes=_env_int("ENTRY_IDENTITY_TTL_MINUTES", 15),
             observation_ttl_minutes=_env_int("ENTRY_OBSERVATION_TTL_MINUTES", 60),
             va_process_count=va_process_count,

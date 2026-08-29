@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -187,22 +187,70 @@ class OpenVINOPlateRegionDetector(PlateRegionDetector):
         ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
         return inter / ua if ua > 0 else 0.0
 
+    @staticmethod
+    def _first_box_outside(
+        boxes: List[Box],
+        exclude_regions: Optional[Sequence[Tuple[float, float, float, float]]],
+        *,
+        width: int,
+        height: int,
+    ) -> Optional[Box]:
+        """Best-scoring box whose centre is outside every excluded region.
+
+        Centre-based rather than overlap-based on purpose. A real plate can sit
+        partly under a composited panel, and rejecting on any overlap would
+        throw away a legible plate to avoid a false one. The centre is what
+        says which of the two things the detector actually locked onto.
+        """
+        if not exclude_regions:
+            return boxes[0]
+        for x1, y1, x2, y2, score in boxes:
+            cx = (x1 + x2) / 2.0 / max(1, width)
+            cy = (y1 + y2) / 2.0 / max(1, height)
+            if not any(
+                rx1 <= cx <= rx2 and ry1 <= cy <= ry2
+                for rx1, ry1, rx2, ry2 in exclude_regions
+            ):
+                return (x1, y1, x2, y2, score)
+        return None
+
     # -- the thing callers actually want ----------------------------------- #
 
     def crop_plate(
-        self, bgr: np.ndarray, *, pad_ratio: float = 0.15
+        self,
+        bgr: np.ndarray,
+        *,
+        pad_ratio: float = 0.15,
+        exclude_regions: Optional[Sequence[Tuple[float, float, float, float]]] = None,
     ) -> Optional[np.ndarray]:
         """The highest-scoring plate region, padded, or ``None`` if none found.
 
         The pad matters: PaddleOCR's recogniser wants a little quiet space around
         the glyphs, and a box clipped exactly to the plate edge loses the outer
         characters on a slightly-off localisation.
+
+        ``exclude_regions`` is the OVERLAY GUARD, and it exists because of one
+        specific trap: Hikvision composites its own plate/OSD panel into the
+        corner of a frame, and that panel is a sharp, high-contrast, perfectly
+        rectangular rendering of a plate. The detector loves it. It will
+        routinely outscore the real plate on a car twenty metres away, and then
+        our "independent" OCR is reading Hikvision's own answer back to itself —
+        which is not independent verification, it is a very expensive echo.
+
+        Regions are NORMALISED ``(x1, y1, x2, y2)`` in 0..1 so a caller does not
+        have to know the frame size. A candidate whose CENTRE falls inside an
+        excluded region is skipped and the next-ranked box is tried, rather than
+        giving up: a real plate that happens to sit near the panel must still be
+        found. Only if every candidate is excluded does this return ``None``.
         """
         boxes = self.detect(bgr)
         if not boxes:
             return None
-        x1, y1, x2, y2, _ = boxes[0]
         h, w = bgr.shape[:2]
+        box = self._first_box_outside(boxes, exclude_regions, width=w, height=h)
+        if box is None:
+            return None
+        x1, y1, x2, y2, _ = box
         px, py = (x2 - x1) * pad_ratio, (y2 - y1) * pad_ratio
         xa, ya = max(0, int(x1 - px)), max(0, int(y1 - py))
         xb, yb = min(w, int(x2 + px)), min(h, int(y2 + py))

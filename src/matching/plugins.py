@@ -120,9 +120,18 @@ class PlateRegionDetector(ABC):
 
     @abstractmethod
     def crop_plate(
-        self, bgr: np.ndarray, *, pad_ratio: float = 0.15
+        self,
+        bgr: np.ndarray,
+        *,
+        pad_ratio: float = 0.15,
+        exclude_regions=None,
     ) -> Optional[np.ndarray]:
         """Detect and return the cropped and padded license plate region.
+
+        ``exclude_regions`` is an optional sequence of normalised
+        ``(x1, y1, x2, y2)`` boxes in 0..1. A candidate whose centre falls
+        inside one is skipped in favour of the next-ranked box — the overlay
+        guard against Hikvision's composited plate panel.
 
         Returns
         -------
@@ -281,6 +290,10 @@ class NoopPlateRegionDetector(PlateRegionDetector):
         return []
 
     def crop_plate(
-        self, bgr: np.ndarray, *, pad_ratio: float = 0.15
+        self,
+        bgr: np.ndarray,
+        *,
+        pad_ratio: float = 0.15,
+        exclude_regions=None,
     ) -> Optional[np.ndarray]:
         return None
