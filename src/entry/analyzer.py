@@ -21,6 +21,22 @@ from .domain import (
 from .settings import EntrySettings
 
 
+def _safe_dominant_colour(frame):
+    """Mean HSV of the crop centre, or None. Never raises.
+
+    Colour is an optional, subtractive signal: a frame that yields no colour
+    simply cannot veto anything, and every consumer fails open. Losing an entry
+    because a colour probe threw would be absurd, so it cannot.
+    """
+    try:
+        from src.reid_matcher import dominant_color_hsv
+
+        return dominant_color_hsv(frame)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("[EntryV2] colour probe failed: %r", exc)
+        return None
+
+
 logger = logging.getLogger(__name__)
 PLATE_CROP_SUBDIRECTORY = "entry_plate_crops"
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -215,6 +231,12 @@ class ExistingModelsEvidenceProcessor:
                         evidence_id=frame_id,
                         embedding=embedding,
                         plate=plate,
+                        # Mean HSV of the crop centre — a few array ops, no
+                        # second model. VA is CPU-starved and a learned colour
+                        # classifier on the gate path would compete with the
+                        # detector for frames; this check is already tuned and
+                        # is only ever used to REMOVE an impossible candidate.
+                        colour_hsv=_safe_dominant_colour(frame),
                     )
                 )
 

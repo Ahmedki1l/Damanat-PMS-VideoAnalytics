@@ -128,6 +128,11 @@ class EntrySettings:
     # It is far longer than the legacy path's 10s FIFO bind window, and safe
     # only because nothing here binds a plate by arrival order. If FIFO ever
     # returns to the binding path, this must come down with it.
+    # Colour is a VETO and a tie-break, never confirming weight. Uses the
+    # already-tuned HSV compatibility check, which costs a mean over a centre
+    # crop — no second model on the gate path, because VA is CPU-starved and a
+    # learned classifier there would compete with the detector for frames.
+    colour_veto_enabled: bool = True
     identity_ttl_minutes: int = 15
     # Observations outlive identities on purpose, so a late HikCentral sweep can
     # still rescue a dropped entry after the ANPR side is gone.
@@ -252,6 +257,9 @@ class EntrySettings:
                 "ENTRY_V2_DECISION_LOG_RETENTION_DAYS", 30
             ),
             decision_log_queue_max=_env_int("ENTRY_V2_DECISION_LOG_QUEUE_MAX", 2000),
+            colour_veto_enabled=os.getenv(
+                "ENTRY_V2_COLOUR_VETO_ENABLED", "1"
+            ).strip().lower() in _ENV_TRUE_VALUES,
             identity_ttl_minutes=_env_int("ENTRY_IDENTITY_TTL_MINUTES", 15),
             observation_ttl_minutes=_env_int("ENTRY_OBSERVATION_TTL_MINUTES", 60),
             va_process_count=va_process_count,

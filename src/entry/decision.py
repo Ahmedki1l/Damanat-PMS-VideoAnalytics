@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 from src.matching.plate_ocr_match import is_plausible_plate
+# Reused, not reimplemented. body_colour_compatible is already tuned against
+# this facility's imagery: it ignores hue for achromatic cars (where hue is
+# noise), tolerates the hue shift between the daylight gate and the artificial
+# light downstairs, and fails OPEN whenever either colour is missing.
+from src.reid_matcher import body_colour_compatible
 
 from .domain import (
     AttemptGroup,
@@ -42,11 +47,26 @@ class ReIDMatchEvaluation:
     column_margin: float
     reason: str
     match: Optional[ReIDMatch] = None
+    # The full candidate list, best first, AFTER the colour veto. Recorded so a
+    # threshold sweep can be run over real traffic later: a decision that only
+    # says "0.81 accepted" cannot answer what a different bar would have done.
+    ranked: Tuple[Tuple[str, float], ...] = ()
+    # Identities colour removed from contention before ranking.
+    vetoed: Tuple[str, ...] = ()
 
     @property
     def accepted(self) -> bool:
         """Whether ReID uniqueness passed; OCR/final confirmation is separate."""
         return self.match is not None
+
+    @property
+    def cleared_absolute_score(self) -> bool:
+        """Score passed but a margin did not — two plausible cars, not a weak
+        look at one. This is what the log calls AMBIGUOUS."""
+        return self.match is None and self.reason in (
+            "row_margin_below_minimum",
+            "column_margin_below_minimum",
+        )
 
 
 def cosine(left: Sequence[float], right: Sequence[float]) -> float:
@@ -143,11 +163,27 @@ class EntryDecisionEngine:
         ``None`` means there was no causally eligible candidate to evaluate.
         """
         ranked = []
+        vetoed = []
+        query_colour = crossing.colour_hsv
         for group in groups.values():
             if group.status != RecordStatus.PENDING:
                 continue
             group_embeddings = causal_group_embeddings(group, crossing)
             if not group_embeddings:
+                continue
+            # COLOUR VETO. Colour is subtractive only: it removes a candidate
+            # that cannot be this car, and the margin is then recomputed over
+            # the survivors. It never adds score to anything, because colour is
+            # low-entropy — most cars are black, grey, silver or white, and two
+            # white sedans agreeing on colour is not evidence they are one car.
+            #
+            # Removing a candidate is also how an ambiguity gets broken: with
+            # the impostor gone the true match's row margin can clear on its
+            # own merit, rather than being credited for the colour agreeing.
+            if self.settings.colour_veto_enabled and not body_colour_compatible(
+                query_colour, group.colour_hsv
+            ):
+                vetoed.append(group.group_id)
                 continue
             ranked.append(
                 (
@@ -165,9 +201,22 @@ class EntryDecisionEngine:
         group = groups[group_id]
         column_scores = []
         for other in crossings:
+            # Column competition is scoped PER CAMERA, not per role.
+            #
+            # It exists to stop two different cars claiming one identity from
+            # the same viewpoint. CAM-23 and CAM-03 seeing the SAME car are not
+            # competitors — they are two independent witnesses to one entry, and
+            # making them compete would mean the second camera could only ever
+            # take the identity away from the first.
+            #
+            # Behaviourally identical to the previous role comparison, because
+            # role and camera are one-to-one today. Written as camera because
+            # that is the actual reason, and because CAM-03 is no longer a
+            # "fallback stage" whose role is what matters about it.
             if (
                 other.status != RecordStatus.PENDING
-                or other.request.role != crossing.request.role
+                or norm_camera_id(other.request.camera_id)
+                != norm_camera_id(crossing.request.camera_id)
                 or other.request.crossing_id == crossing.request.crossing_id
             ):
                 continue
@@ -205,6 +254,8 @@ class EntryDecisionEngine:
             column_margin=column_margin,
             reason=reason,
             match=match,
+            ranked=tuple((gid, value) for value, gid in ranked),
+            vetoed=tuple(vetoed),
         )
 
     def resolve_plate(

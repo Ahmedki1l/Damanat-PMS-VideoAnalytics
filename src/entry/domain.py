@@ -166,6 +166,10 @@ class FrameEvidence:
     evidence_id: str
     embedding: Tuple[float, ...]
     plate: PlateEvidence
+    # Mean HSV of the crop centre. A LOW-ENTROPY signal: most cars are black,
+    # grey, silver or white, so colour can only ever REMOVE a candidate, never
+    # add confidence to one. Optional, and every check fails open when absent.
+    colour_hsv: Optional[Tuple[float, float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -252,8 +256,18 @@ class AttemptGroup:
     # Refreshed whenever an attempt is added: an ANPR event "creates OR
     # activates" the candidate, so enrichment restarts its 15 minutes.
     last_activity_at: Optional[datetime] = None
-    # WitnessSource -> the id that produced it. Two entries confirm an entry.
+    # WitnessSource -> the id that produced it. A STRONG vote: this witness
+    # named this identity as its Re-ID argmax AND cleared its gates.
     witnesses: Dict["WitnessSource", str] = field(default_factory=dict)
+    # WitnessSource -> the id that produced it. A WEAK vote: this witness named
+    # this identity as its argmax but could not clear the margin on its own.
+    #
+    # This is what lets an ambiguous CAM-23 be resolved by a confident CAM-03
+    # instead of being forced or discarded. Weak votes count toward the
+    # two-witness rule but can never satisfy it alone — a confirmation always
+    # needs at least one witness that cleared the bar by itself, so two
+    # uncertain looks never add up to a certainty.
+    weak_votes: Dict["WitnessSource", str] = field(default_factory=dict)
     # PlateSourceKind -> that source's reading. At most one per source.
     plate_sources: Dict["PlateSourceKind", PlateReading] = field(default_factory=dict)
     # Consumed HikCentral GUIDs, so repeated queries cannot double-ingest.
@@ -281,6 +295,28 @@ class AttemptGroup:
             for attempt in self.attempts.values()
             for embedding in attempt.embeddings
         )
+
+    def confirming_witnesses(self) -> set:
+        """The witnesses that count toward the two-witness rule.
+
+        HikCentral substitutes for a MISSING ANPR read; it never adds a second
+        witness alongside one. A Hik pass record is the platform's log of the
+        same gate event the ANPR camera already reported, so counting both
+        would be counting one observation twice.
+        """
+        names = set(self.witnesses) | set(self.weak_votes)
+        if WitnessSource.HIK in names and WitnessSource.ANPR in names:
+            names.discard(WitnessSource.HIK)
+        return names
+
+    @property
+    def colour_hsv(self) -> Optional[Tuple[float, float, float]]:
+        """This identity's ground-truth body colour, from its ANPR image."""
+        for attempt in self.attempts.values():
+            for frame in attempt.evidence:
+                if frame.colour_hsv is not None:
+                    return frame.colour_hsv
+        return None
 
     @property
     def cached_plate_evidence(self) -> Tuple[PlateEvidence, ...]:
@@ -314,6 +350,13 @@ class CrossingRecord:
     def witness(self) -> Optional["WitnessSource"]:
         """Which physical witness this observation is. Never a plate source."""
         return witness_for_camera(self.request.camera_id)
+
+    @property
+    def colour_hsv(self) -> Optional[Tuple[float, float, float]]:
+        for frame in self.evidence:
+            if frame.colour_hsv is not None:
+                return frame.colour_hsv
+        return None
 
     @property
     def embeddings(self) -> Tuple[Tuple[float, ...], ...]:

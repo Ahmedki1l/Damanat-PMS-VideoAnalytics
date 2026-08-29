@@ -64,6 +64,26 @@ from .settings import EntrySettings
 logger = logging.getLogger(__name__)
 
 
+def _round_hsv(value):
+    return None if value is None else [round(float(v), 1) for v in value]
+
+
+def _best_observed_plate_text(crossing) -> str:
+    """The ramp camera's own OCR reading — DIAGNOSTIC ONLY.
+
+    CAM-23 and CAM-03 are visual observation sources and read no plates. This
+    is recorded so the question "could the ramp cameras carry plate evidence?"
+    can be answered from real traffic later, and it is deliberately not
+    returned in any shape a decision rule could consume.
+    """
+    best = ""
+    best_confidence = -1.0
+    for item in crossing.plate_evidence:
+        if item.text and item.confidence > best_confidence:
+            best, best_confidence = item.text, item.confidence
+    return best
+
+
 @dataclass(frozen=True)
 class _FinalizedJourney:
     """Compact, bounded tombstone for source-ordered crossing deduplication."""
@@ -1487,6 +1507,49 @@ class EntryCoordinator:
                 )
                 if resolution.outcome == "pending":
                     continue
+                # This crossing cleared its gates on this identity, so it is a
+                # STRONG witness for it.
+                witness = crossing.witness
+                if witness is not None:
+                    group.witnesses.setdefault(
+                        witness, crossing.request.crossing_id
+                    )
+                    group.weak_votes.pop(witness, None)
+                if resolution.outcome == "confirmed":
+                    shortfall = self._witness_shortfall_locked(group)
+                    # S5, recorded in its own right: this is where "did two
+                    # independent observations agree on one physical vehicle?"
+                    # is answered, and the answer is the whole basis for
+                    # opening a session.
+                    self._emit_decision_record(
+                        stage="physical_confirm",
+                        result=(
+                            decision_record.RESULT_ABSTAINED
+                            if shortfall
+                            else decision_record.RESULT_CONFIRMED
+                        ),
+                        reason=shortfall or "witnesses_agree",
+                        crossing=crossing,
+                        identity={
+                            "group_id": group.group_id,
+                            "identity_key": group.identity_key,
+                            "strong": sorted(w.value for w in group.witnesses),
+                            "weak": sorted(w.value for w in group.weak_votes),
+                        },
+                        witnesses=[
+                            w.value for w in group.confirming_witnesses()
+                        ],
+                    )
+                    if shortfall:
+                        # Re-ID and the plate agree, but only ONE independent
+                        # observation places this car at the entry. A single
+                        # source must never open a session, so hold it: another
+                        # witness may still arrive, and no TTL has run out yet.
+                        resolution = replace(
+                            resolution,
+                            outcome="abstained",
+                            reason=shortfall,
+                        )
                 self._copy_primary_state(group, causal_group)
                 decision = self._build_decision(
                     causal_group,
@@ -1662,16 +1725,46 @@ class EntryCoordinator:
             "accepted" if evaluation.accepted else "rejected",
             evaluation.reason,
         )
+        self._record_weak_vote_locked(crossing, evaluation)
+
+        group = self._groups.get(evaluation.group_id)
+        if evaluation.accepted:
+            result = decision_record.RESULT_CONFIRMED
+        elif evaluation.cleared_absolute_score:
+            # Cleared the absolute bar but not the margin: two plausible cars,
+            # not one weak look. Recorded as AMBIGUOUS so the review can tell
+            # "more evidence would help" from "more evidence will not".
+            result = decision_record.RESULT_AMBIGUOUS
+        else:
+            result = decision_record.RESULT_ABSTAINED
+
         self._emit_decision_record(
             stage="reid_evaluation",
-            result=(
-                decision_record.RESULT_CONFIRMED
-                if evaluation.accepted
-                else decision_record.RESULT_ABSTAINED
-            ),
+            result=result,
             reason=evaluation.reason,
             crossing=crossing,
             evaluation=evaluation,
+            ranked=evaluation.ranked,
+            colour={
+                "query_hsv": _round_hsv(crossing.colour_hsv),
+                "vetoed": list(evaluation.vetoed),
+                "enabled": self.settings.colour_veto_enabled,
+            },
+            fifo=self._fifo_block_locked(crossing, evaluation),
+            identity=(
+                {
+                    "group_id": evaluation.group_id,
+                    "identity_key": group.identity_key,
+                }
+                if group is not None
+                else None
+            ),
+            witnesses=(
+                [w.value for w in group.confirming_witnesses()]
+                if group is not None
+                else None
+            ),
+            observed_plate_text=_best_observed_plate_text(crossing),
         )
 
     def _identity_for_plate_locked(self, identity_key: str, embeddings):
@@ -1801,6 +1894,94 @@ class EntryCoordinator:
                     "ttl_seconds": observation_ttl,
                 },
             )
+
+    def _witness_shortfall_locked(self, group) -> str:
+        """"" when the two-witness rule is satisfied, else the failing reason.
+
+        An entry is confirmed only when at least TWO independent observations
+        agree on the same physical vehicle. The accepted pairs are
+        ANPR+CAM-23, ANPR+CAM-03, CAM-23+CAM-03, and — only when ANPR is
+        missing — CAM-23+Hik or CAM-03+Hik.
+
+        At least one of them must have cleared its gates on its own. Weak votes
+        exist so an ambiguous CAM-23 can be resolved by a confident CAM-03,
+        not so that two uncertain looks can add up to a certainty.
+        """
+        witnesses = group.confirming_witnesses()
+        if len(witnesses) < 2:
+            return "insufficient_witnesses"
+        if not (set(group.witnesses) & witnesses):
+            return "no_witness_cleared_gates"
+        return ""
+
+    def _record_weak_vote_locked(self, crossing, evaluation) -> None:
+        """Record that a witness named this identity but could not prove it.
+
+        This is the CAM-23-ambiguous / CAM-03-confident path: the uncertain
+        camera still says which identity it thinks this is, and that agreement
+        is what a later confident witness combines with. It can never confirm
+        on its own — see _witness_shortfall_locked.
+        """
+        witness = crossing.witness
+        if witness is None or evaluation is None or evaluation.accepted:
+            return
+        group = self._groups.get(evaluation.group_id)
+        if group is None or group.status != RecordStatus.PENDING:
+            return
+        if witness in group.witnesses:
+            return
+        group.weak_votes[witness] = crossing.request.crossing_id
+
+    def _fifo_block_locked(self, crossing, evaluation) -> Dict[str, Any]:
+        """Compare the expected ramp ordering against what Re-ID actually did.
+
+        The ramp is narrow, so cars are EXPECTED to arrive in order. That is a
+        prior, not a matcher: a car can stop or wait, and forcing the expected
+        order onto an out-of-order pair is exactly how the wrong plate gets
+        bound. So this is measured and written to the log, and nothing reads it
+        back. If the shadow data later shows FIFO and Re-ID agree almost
+        always, that is an argument for using it as a tie-break — made from
+        evidence rather than assumption.
+        """
+        pending = sorted(
+            (
+                other
+                for other in self._crossings.values()
+                if other.status == RecordStatus.PENDING
+                and norm_camera_id(other.request.camera_id)
+                == norm_camera_id(crossing.request.camera_id)
+            ),
+            key=lambda item: item.request.captured_at,
+        )
+        try:
+            fifo_rank = [
+                item.request.crossing_id for item in pending
+            ].index(crossing.request.crossing_id)
+        except ValueError:
+            fifo_rank = -1
+
+        groups_by_age = sorted(
+            (
+                group
+                for group in self._groups.values()
+                if group.status == RecordStatus.PENDING
+            ),
+            key=lambda item: min(
+                (a.request.captured_at for a in item.attempts.values()),
+                default=item.created_at,
+            ),
+        )
+        expected = (
+            groups_by_age[fifo_rank].group_id
+            if 0 <= fifo_rank < len(groups_by_age)
+            else ""
+        )
+        return {
+            "expected_rank": fifo_rank,
+            "expected_group": expected,
+            "reid_group": evaluation.group_id,
+            "agreed": bool(expected) and expected == evaluation.group_id,
+        }
 
     def _group_has_callback_in_flight_locked(self, group_id: str) -> bool:
         for decision, _payload in self._pending_callbacks.values():

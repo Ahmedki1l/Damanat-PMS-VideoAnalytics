@@ -463,16 +463,34 @@ class CoordinatorEmissionTests(unittest.TestCase):
         self.assertEqual("grp-abc", record["reid"]["argmax"])
         self.assertEqual("cam23", record["observation"]["witness"])
 
-    def test_a_rejected_evaluation_records_abstained_with_its_reason(self):
+    def test_a_margin_failure_records_ambiguous_not_abstained(self):
+        # Refined in stage 3: clearing the absolute score but failing a margin
+        # means two plausible cars, which is a different problem from one weak
+        # look at a car. The review has to be able to tell them apart.
         log = _CollectingLog()
         coordinator = self._coordinator(log)
 
         coordinator._log_reid_evaluation_locked(_crossing(), _evaluation(accepted=False))
 
         record = log.records[0]
-        self.assertEqual("abstained", record["result"])
+        self.assertEqual("ambiguous", record["result"])
         self.assertEqual("row_margin_below_minimum", record["reason"])
         self.assertFalse(record["reid"]["accepted"])
+
+    def test_a_score_failure_records_abstained(self):
+        log = _CollectingLog()
+        coordinator = self._coordinator(log)
+        evaluation = dataclasses.replace(
+            _evaluation(accepted=False),
+            score=0.10,
+            reason="score_below_minimum",
+        )
+
+        coordinator._log_reid_evaluation_locked(_crossing(), evaluation)
+
+        record = log.records[0]
+        self.assertEqual("abstained", record["result"])
+        self.assertEqual("score_below_minimum", record["reason"])
 
     def test_the_existing_fingerprint_dedup_still_suppresses_a_repeat(self):
         log = _CollectingLog()
