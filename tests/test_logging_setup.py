@@ -140,5 +140,64 @@ class LoggingSetupTests(unittest.TestCase):
         self.assertIn("%(asctime)s", DEFAULT_FORMAT)
 
 
+
+class PerFrameCapTests(unittest.TestCase):
+    """Turning the root logger up to INFO switches on 146 logger.info() calls
+    at once, and a few sit in the frame loop rather than on an event. On a
+    CPU-starved fleet that is paid on every frame of every camera, and it would
+    bury the entry decisions the logging was turned on to see."""
+
+    def setUp(self):
+        root = logging.getLogger()
+        self._saved = list(root.handlers)
+        self._level = root.level
+        root.handlers = []
+        for name in ("src.core.engine.engine_tracking", "src.ocr"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
+    def tearDown(self):
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        root.handlers = list(self._saved)
+        root.setLevel(self._level)
+        for name in ("src.core.engine.engine_tracking", "src.ocr"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
+    def test_per_frame_loggers_are_capped_at_warning(self):
+        configure_logging("INFO", stream=io.StringIO())
+        capped = logging.getLogger("src.core.engine.engine_tracking")
+        self.assertEqual(logging.WARNING, capped.level)
+
+    def test_the_entry_pipeline_is_not_capped(self):
+        # The whole point of configuring logging was to see these.
+        stream = io.StringIO()
+        configure_logging("INFO", stream=stream)
+        logging.getLogger("src.entry.coordinator").info("[EntryV2][ReID] visible")
+        self.assertIn("[EntryV2][ReID] visible", stream.getvalue())
+
+    def test_an_explicit_override_beats_the_cap(self):
+        stream = io.StringIO()
+        with mock.patch.dict(
+            "os.environ",
+            {"LOG_LEVEL_OVERRIDES": "src.core.engine.engine_tracking=INFO"},
+            clear=False,
+        ):
+            configure_logging("INFO", stream=stream)
+        self.assertEqual(
+            logging.INFO,
+            logging.getLogger("src.core.engine.engine_tracking").level,
+        )
+
+    def test_a_malformed_override_does_not_cost_the_others(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"LOG_LEVEL_OVERRIDES": "garbage,,src.ocr=DEBUG,also=NOPE"},
+            clear=False,
+        ):
+            configure_logging("INFO", stream=io.StringIO())
+        self.assertEqual(logging.DEBUG, logging.getLogger("src.ocr").level)
+
+
 if __name__ == "__main__":
     unittest.main()

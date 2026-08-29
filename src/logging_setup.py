@@ -52,6 +52,24 @@ _NOISY_LIBRARIES = (
     "ppocr",
 )
 
+# OUR OWN per-frame loggers, capped for the same reason as the libraries above.
+#
+# Turning the root logger up to INFO for the first time switches on 146
+# logger.info() calls at once, and a few of them sit in the frame loop rather
+# than on an event — engine_tracking's "[quality] track=... clearance=..."
+# fires per detection whenever clearance < 1.0. On a fleet that is already
+# CPU-starved, that is a real cost paid on every frame of every camera, and it
+# would bury the entry decisions this logging was turned on to see.
+#
+# These are capped, NOT silenced: raise one deliberately with
+# LOG_LEVEL_OVERRIDES when you are actually debugging it.
+_PER_FRAME_LOGGERS = (
+    "src.core.engine.engine_tracking",
+    "src.core.engine.engine_runtime",
+    "src.core.motion_scheduler",
+    "src.detection.tracker",
+)
+
 
 def _resolve_level(raw: Optional[str]) -> int:
     """Map LOG_LEVEL to a logging level, falling back to INFO.
@@ -113,15 +131,41 @@ def configure_logging(
     root.addHandler(handler)
     root.setLevel(resolved)
 
-    # Only quiet libraries that have not been given an explicit level already,
-    # so an operator debugging httpx with LOG_LEVEL plus a manual override is
-    # not silently overruled here.
-    for name in _NOISY_LIBRARIES:
-        lib = logging.getLogger(name)
-        if lib.level == logging.NOTSET:
-            lib.setLevel(max(resolved, logging.WARNING))
+    # Only quiet loggers that have not been given an explicit level already,
+    # so an operator debugging one of them is not silently overruled here.
+    for name in _NOISY_LIBRARIES + _PER_FRAME_LOGGERS:
+        noisy = logging.getLogger(name)
+        if noisy.level == logging.NOTSET:
+            noisy.setLevel(max(resolved, logging.WARNING))
+
+    # Explicit per-logger overrides win over everything above, including the
+    # per-frame caps: "src.core.engine.engine_tracking=INFO,src.ocr=DEBUG".
+    for name, level in _parse_overrides(os.getenv("LOG_LEVEL_OVERRIDES")).items():
+        logging.getLogger(name).setLevel(level)
 
     return root
+
+
+def _parse_overrides(raw: Optional[str]) -> dict:
+    """Parse "logger=LEVEL,logger=LEVEL". Malformed entries are skipped.
+
+    One bad entry must not cost the others: this runs before anything can
+    report the problem, so failing the whole string would silently drop a
+    deliberate override an operator is relying on.
+    """
+    overrides: dict = {}
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        name, _, level = chunk.partition("=")
+        name, level = name.strip(), level.strip()
+        if not name or not level:
+            continue
+        resolved = logging.getLevelName(level.upper())
+        if isinstance(resolved, int):
+            overrides[name] = resolved
+    return overrides
 
 
 def is_configured() -> bool:
