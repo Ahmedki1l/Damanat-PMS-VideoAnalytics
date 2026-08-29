@@ -751,4 +751,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # `python supervisor.py` is a second, independent entry point (main.py
+    # --supervise is the other, and configures logging in main()). Without this
+    # the supervisor's own logger.info() calls are discarded exactly as the
+    # workers' were.
+    from src.logging_setup import configure_logging
+
+    configure_logging()
     raise SystemExit(main())

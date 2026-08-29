@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any, Mapping
+import os
+from typing import Any, Mapping, Optional
+
+from src.matching.decision_log import DecisionLog, prune_old_logs
 
 from .analyzer import DisabledEvidenceProcessor, ExistingModelsEvidenceProcessor
 from .callback import (
@@ -21,11 +24,64 @@ from .settings import EntrySettings
 logger = logging.getLogger(__name__)
 _RETRY_TASK_STATE_KEY = "entry_v2_callback_retry_task"
 
+# Filenames are entry_decisions_<worker>_<YYYY-MM-DD>.jsonl. The prefix keeps
+# this corpus distinct from the slot-identity training corpus, which has a
+# different lifecycle and its own retention.
+ENTRY_DECISION_LOG_PREFIX = "entry_decisions"
+
 
 class _DisabledSink:
     def deliver(self, payload: Mapping[str, Any]) -> DeliveryResult:
         del payload
         return DeliveryResult(False, 0, "entry_v2_unavailable")
+
+
+def _prepare_decision_log_dir(settings: EntrySettings) -> None:
+    """Create the log directory and prune expired files. Safe in every mode.
+
+    Runs even when Entry V2 is OFF, and deliberately so: the deployment ladder's
+    first step ships the image with ENTRY_V2_MODE=off and verifies the log
+    directory exists before shadow is ever enabled. If the directory only
+    appeared once the pipeline was live, that check could not be made until it
+    was too late to be useful.
+
+    Never raises. A log volume that cannot be prepared is a degraded review, not
+    a reason to keep the cameras down.
+    """
+    if not settings.decision_log_dir:
+        return
+    try:
+        os.makedirs(settings.decision_log_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "[EntryV2] decision log directory %s is not usable: %r",
+            settings.decision_log_dir,
+            exc,
+        )
+        return
+    prune_old_logs(
+        settings.decision_log_dir,
+        settings.decision_log_retention_days,
+        ENTRY_DECISION_LOG_PREFIX,
+    )
+
+
+def build_decision_log(settings: EntrySettings) -> Optional[DecisionLog]:
+    """Construct the Entry V2 decision log, or None when it is not configured.
+
+    The worker name comes from VA_GROUP so the supervisor's processes never share
+    a file handle (interleaved, corrupt lines are what that avoids). Entry V2
+    runs in the single --api/gate group, so in practice this is one file per day.
+    """
+    _prepare_decision_log_dir(settings)
+    if not settings.decision_log_dir:
+        return None
+    return DecisionLog(
+        directory=settings.decision_log_dir,
+        worker=os.environ.get("VA_GROUP", "") or f"pid{os.getpid()}",
+        max_queue=settings.decision_log_queue_max,
+        prefix=ENTRY_DECISION_LOG_PREFIX,
+    )
 
 
 def build_entry_coordinator(
@@ -36,6 +92,11 @@ def build_entry_coordinator(
     settings = EntrySettings.from_env()
     errors = settings.configuration_errors()
     if errors:
+        # Still prepare the directory: an invalid configuration degrades to
+        # DisabledEvidenceProcessor, which is safe but records nothing, and the
+        # operator checking for the directory needs to be able to tell those
+        # apart from a mode that simply is not on yet.
+        _prepare_decision_log_dir(settings)
         return EntryCoordinator(
             settings,
             DisabledEvidenceProcessor(),
@@ -43,6 +104,7 @@ def build_entry_coordinator(
             unavailable_reason="entry_v2_invalid_configuration:" + ",".join(errors),
         )
     if settings.mode.value == "off":
+        _prepare_decision_log_dir(settings)
         return EntryCoordinator(
             settings,
             DisabledEvidenceProcessor(),
@@ -71,6 +133,7 @@ def build_entry_coordinator(
         processor,
         sink,
         identity_publisher=RegistryIdentityPublisher(registry),
+        decision_log=build_decision_log(settings),
     )
 
 

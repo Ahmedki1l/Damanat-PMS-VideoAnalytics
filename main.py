@@ -57,6 +57,7 @@ if _CV_THREADS:
     except (ImportError, ValueError) as _exc:
         print(f"[WARN] could not cap OpenCV threads to {_CV_THREADS!r}: {_exc!r}")
 
+from src.logging_setup import configure_logging
 from src.config import load_config
 from src.core.engine import ParkingEngine
 from src.database import init_db
@@ -189,6 +190,11 @@ def start_api_server(
 
 
 def main():
+    # FIRST statement, before argparse and before any subsystem logs. Until this
+    # runs the root logger has no handler and every logger.info() in src/ is
+    # discarded by logging.lastResort (level WARNING). See src/logging_setup.py.
+    configure_logging()
+
     parser = argparse.ArgumentParser(
         description="Damanat PMS Video Analytics — CPU-optimized parking slot detection.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

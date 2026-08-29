@@ -113,6 +113,13 @@ class EntrySettings:
     lpd_iou: float = 0.45
     lpd_threads: int = 2
     ocr_model_dir: str = ""
+    # The decision log. Empty disables it, matching
+    # ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR's convention. Point it at the volume the
+    # vehicle images live on: every record cites image paths on that volume, so
+    # log and evidence must be copied, archived and rotated as one unit.
+    decision_log_dir: str = ""
+    decision_log_retention_days: int = 30
+    decision_log_queue_max: int = 2000
     va_process_count: int = 1
     invalid_va_process_count: str = ""
     va_single_process: bool = False
@@ -228,6 +235,11 @@ class EntrySettings:
             lpd_iou=_env_float("ENTRY_V2_LPD_IOU", 0.45),
             lpd_threads=_env_int("ENTRY_V2_LPD_THREADS", 2),
             ocr_model_dir=os.getenv("ENTRY_V2_OCR_MODEL_DIR", ""),
+            decision_log_dir=os.getenv("ENTRY_V2_DECISION_LOG_DIR", "").strip(),
+            decision_log_retention_days=_env_int(
+                "ENTRY_V2_DECISION_LOG_RETENTION_DAYS", 30
+            ),
+            decision_log_queue_max=_env_int("ENTRY_V2_DECISION_LOG_QUEUE_MAX", 2000),
             va_process_count=va_process_count,
             invalid_va_process_count=invalid_va_process_count,
             va_single_process=_env_true("VA_SINGLE_PROCESS"),
@@ -282,6 +294,15 @@ class EntrySettings:
             errors.append("entry_v2_local_zone_requires_va_single_process")
         if self.receipt_capacity < self.max_concurrent_ingest_requests:
             errors.append("receipt_capacity_below_ingest_concurrency")
+        if self.decision_log_dir:
+            # Only checked when the log is actually configured. A malformed
+            # integer arrives here as 0 (see _env_int), and 0 would silently mean
+            # "never prune" on the same volume that holds vehicle imagery — so a
+            # typo must fail configuration rather than quietly fill a disk.
+            if self.decision_log_retention_days <= 0:
+                errors.append("ENTRY_V2_DECISION_LOG_RETENTION_DAYS")
+            if self.decision_log_queue_max <= 0:
+                errors.append("ENTRY_V2_DECISION_LOG_QUEUE_MAX")
         if not self.primary_cameras:
             errors.append("primary_cameras")
         if not self.primary_lines:

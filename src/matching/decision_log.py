@@ -34,7 +34,7 @@ import logging
 import os
 import queue
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ class DecisionLog:
         worker: str = "",
         max_queue: int = 2000,
         enabled: bool = True,
+        prefix: str = "decisions",
     ) -> None:
         # This file is a TRAINING CORPUS, not a debug log. A unit test's synthetic
         # fixtures (TRUE-CAR, TWIN-A, STRANGER-A) would teach the ranker nonsense, and
@@ -70,6 +71,11 @@ class DecisionLog:
         self.enabled = bool(enabled) and "PYTEST_CURRENT_TEST" not in os.environ
         self._dir = directory
         self._worker = worker or f"pid{os.getpid()}"
+        # Distinct corpora must not share a filename pattern even when they never
+        # share a directory: the slot-identity training corpus and the Entry V2
+        # decision log have different lifecycles and different retention, and a
+        # glob that catches both would let one prune the other.
+        self._prefix = prefix or "decisions"
         self._q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=max_queue)
         self._dropped = 0
         self._written = 0
@@ -108,7 +114,9 @@ class DecisionLog:
                     self._fh.close()
                 except Exception:
                     pass
-            path = os.path.join(self._dir, f"decisions_{self._worker}_{day}.jsonl")
+            path = os.path.join(
+                self._dir, f"{self._prefix}_{self._worker}_{day}.jsonl"
+            )
             self._fh = open(path, "a", encoding="utf-8")
             self._day = day
         return self._fh
@@ -145,6 +153,57 @@ class DecisionLog:
                 self._fh.close()
             except Exception:
                 pass
+
+
+_DAY_SUFFIX_LEN = len("YYYY-MM-DD.jsonl")
+
+
+def prune_old_logs(directory: str, retention_days: int, prefix: str) -> int:
+    """Delete ``<prefix>_<worker>_<day>.jsonl`` files older than the retention.
+
+    The writer rolls over daily but never prunes, so a log left running grows
+    without bound on the same volume that holds vehicle imagery. Call this once
+    at startup.
+
+    Scoped by ``prefix`` on purpose: two corpora with different lifecycles can
+    share a volume, and a prune that matched ``*.jsonl`` would delete the other
+    one. Returns the number of files removed; never raises — a log that cannot
+    be tidied is not a reason to fail startup.
+    """
+    if retention_days <= 0 or not directory:
+        return 0
+    try:
+        entries = os.listdir(directory)
+    except OSError as exc:
+        logger.warning("[decision-log] retention scan failed for %s: %r", directory, exc)
+        return 0
+
+    cutoff = datetime.now().date() - timedelta(days=retention_days)
+    removed = 0
+    marker = f"{prefix}_"
+    for name in entries:
+        if not name.startswith(marker) or not name.endswith(".jsonl"):
+            continue
+        # Parse the trailing YYYY-MM-DD rather than trusting mtime: a file copied
+        # off the pod and back would otherwise look new and survive forever.
+        day_text = name[: -len(".jsonl")][-10:]
+        try:
+            day = datetime.strptime(day_text, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if day >= cutoff:
+            continue
+        try:
+            os.remove(os.path.join(directory, name))
+            removed += 1
+        except OSError as exc:
+            logger.warning("[decision-log] could not remove %s: %r", name, exc)
+    if removed:
+        logger.info(
+            "[decision-log] retention removed %d file(s) older than %d day(s) from %s",
+            removed, retention_days, directory,
+        )
+    return removed
 
 
 def build_record(

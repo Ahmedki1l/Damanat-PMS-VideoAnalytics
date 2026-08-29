@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
+from . import decision_record
 from .analyzer import EvidenceProcessor
 from .callback import ConfirmationSink, DeliveryResult
 from .decision import (
@@ -94,11 +95,16 @@ class EntryCoordinator:
         identity_publisher: Optional[IdentityPublisher] = None,
         *,
         unavailable_reason: str = "",
+        decision_log: Optional[Any] = None,
     ):
         self.settings = settings
         self._processor = evidence_processor
         self._sink = confirmation_sink
         self._identity_publisher = identity_publisher or NullIdentityPublisher()
+        # Optional by design: every test constructs a coordinator directly, and
+        # none of them should have to know about a log. None means "record
+        # nothing", never "fail".
+        self._decision_log = decision_log
         self._engine = EntryDecisionEngine(settings)
         self._unavailable_reason = unavailable_reason
         self._lock = threading.RLock()
@@ -1550,6 +1556,38 @@ class EntryCoordinator:
             "accepted" if evaluation.accepted else "rejected",
             evaluation.reason,
         )
+        self._emit_decision_record(
+            stage="reid_evaluation",
+            result=(
+                decision_record.RESULT_CONFIRMED
+                if evaluation.accepted
+                else decision_record.RESULT_ABSTAINED
+            ),
+            reason=evaluation.reason,
+            crossing=crossing,
+            evaluation=evaluation,
+        )
+
+    def _emit_decision_record(self, **kwargs: Any) -> None:
+        """Queue one decision-log record. Never raises, never blocks.
+
+        Called under the coordinator lock, so the write MUST stay on the
+        DecisionLog queue — a synchronous disk write here would hold the lock
+        across I/O and stall every camera behind it. DecisionLog.emit drops on a
+        full queue rather than waiting, which is the behaviour this relies on.
+
+        A failure to build or queue a record is swallowed: the log exists to
+        observe the pipeline, and it must never be able to break it.
+        """
+        log = self._decision_log
+        if log is None:
+            return
+        try:
+            log.emit(
+                decision_record.build_record(settings=self.settings, **kwargs)
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("[EntryV2] decision record dropped: %r", exc)
 
     def _pending_crossing_families_locked(
         self,
