@@ -182,6 +182,16 @@ class EntrySettings:
     va_process_count: int = 1
     invalid_va_process_count: str = ""
     va_single_process: bool = False
+    # Set by supervisor.py on the ONE group it launches with --api, and cleared
+    # on every other group. This is the process that serves the Entry V2 HTTP
+    # transport, so it is the only one whose coordinator can ever receive a
+    # crossing over the wire.
+    entry_host: bool = False
+    # The cameras that process owns, also reported by supervisor.py. Needed
+    # because the local-zone bridge reads RTSP frames IN-PROCESS: a gate camera
+    # in a different group feeds a different coordinator, and two coordinators
+    # each holding one witness can never satisfy the two-witness rule.
+    group_cameras: FrozenSet[str] = field(default_factory=frozenset)
 
     @classmethod
     def from_env(cls) -> "EntrySettings":
@@ -313,6 +323,8 @@ class EntrySettings:
             va_process_count=va_process_count,
             invalid_va_process_count=invalid_va_process_count,
             va_single_process=_env_true("VA_SINGLE_PROCESS"),
+            entry_host=_env_true("VA_ENTRY_HOST"),
+            group_cameras=_csv_cameras(os.getenv("VA_GROUP_CAMERAS", "")),
         )
 
     @property
@@ -323,6 +335,60 @@ class EntrySettings:
         if role == CrossingRole.PRIMARY:
             return self.primary_cameras, self.primary_lines, self.primary_directions
         return self.fallback_cameras, self.fallback_lines, self.fallback_directions
+
+    def local_zone_cameras(self) -> FrozenSet[str]:
+        """The cameras whose VA-local RTSP zone this configuration enables.
+
+        Only these need to be co-located with the coordinator. A camera that
+        reaches Entry V2 purely over HTTP always lands in the ``--api`` process
+        by construction, so it imposes no topology requirement at all.
+        """
+        enabled = set()
+        if "CAM23" in self.primary_cameras and "PARK_ENTRY" in self.primary_lines:
+            enabled.add("CAM23")
+        if "CAM03" in self.fallback_cameras and "B1_ENTRENCE" in self.fallback_lines:
+            enabled.add("CAM03")
+        return frozenset(enabled)
+
+    def local_zone_is_co_located(self) -> bool:
+        """True when this process can actually host the local-zone bridge.
+
+        Entry V2 keeps identities, observations and witnesses in RAM, and TWO
+        surfaces feed one coordinator: the HTTP transport, served only by the
+        ``--api`` process, and the local-zone bridge, which reads RTSP frames of
+        whichever cameras THIS process owns.  Split those across processes and
+        each coordinator sees one witness, so the two-witness rule can never
+        fire -- manufacturing by topology the exact dropped-entry class Entry V2
+        exists to remove.
+
+        There are two honest ways to establish that property, and this accepts
+        either:
+
+        ``VA_SINGLE_PROCESS``
+            One process feeds every camera (the BUILD 4 async engine), so
+            co-location is trivially true.  Note what this flag really controls:
+            ``main.py`` also reads it to force ``VA_INFER=async`` and to call
+            ``engine.run_single_process()``.  It is an ENGINE switch, not an
+            attestation, which is why it must not be set merely to satisfy a
+            configuration check -- under the multi-process supervisor that would
+            give every group its own async queue.
+
+        ``VA_ENTRY_HOST`` + ``VA_GROUP_CAMERAS``
+            Reported by ``supervisor.py`` for the one group it launches with
+            ``--api``.  The supervisor already forces the gate cameras out of
+            their area groups and into that single group, and refuses to start
+            if the API camera is not among them.  We verify rather than assume:
+            every camera whose local zone is enabled must appear in the group
+            this process was actually given.
+
+        Fails closed.  With neither signal present -- ``VA_GATE_CAMERAS`` set
+        empty, a camera dropped from the gate set, or a non-API worker -- this
+        returns False and the caller degrades to a disabled processor, which is
+        the correct outcome for a process that cannot host the state anyway.
+        """
+        if self.va_single_process:
+            return True
+        return self.entry_host and self.local_zone_cameras() <= self.group_cameras
 
     def configuration_errors(self) -> List[str]:
         if self.invalid_mode_value:
@@ -352,16 +418,15 @@ class EntrySettings:
             "va_process_count": self.va_process_count,
         }
         errors.extend(name for name, value in positive.items() if value <= 0)
-        local_zone_enabled = (
-            "CAM23" in self.primary_cameras and "PARK_ENTRY" in self.primary_lines
-        ) or ("CAM03" in self.fallback_cameras and "B1_ENTRENCE" in self.fallback_lines)
+        local_zone_cameras = self.local_zone_cameras()
+        local_zone_enabled = bool(local_zone_cameras)
         if local_zone_enabled and self.max_images_per_event < 2:
             # The RTSP bridge requires two stable, independently processed
             # frames. Accepting a one-image limit would leave the configured
             # local path silently enabled but physically unable to emit.
             errors.append("local_zone_requires_two_images")
-        if local_zone_enabled and not self.va_single_process:
-            errors.append("entry_v2_local_zone_requires_va_single_process")
+        if local_zone_enabled and not self.local_zone_is_co_located():
+            errors.append("entry_v2_local_zone_requires_single_process_or_gate_group")
         if self.receipt_capacity < self.max_concurrent_ingest_requests:
             errors.append("receipt_capacity_below_ingest_concurrency")
         if self.identity_ttl_minutes <= 0:

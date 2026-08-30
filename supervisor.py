@@ -495,6 +495,28 @@ def _child_env(cores: list[int], pin: bool = True) -> dict:
     return env
 
 
+def _entry_v2_topology_env(group: dict) -> dict:
+    """Report this group's Entry V2 topology to the child, as fact.
+
+    Entry V2 keeps its identities and witnesses in RAM, and two surfaces feed
+    one coordinator: the HTTP transport, served only by the ``--api`` group, and
+    the local-zone bridge, which reads RTSP frames of the cameras THIS process
+    owns. Split the gate cameras across groups and each coordinator sees one
+    witness, so the two-witness rule can never fire.
+
+    ``src/entry/settings.py`` used to infer that property from
+    ``VA_SINGLE_PROCESS``, which answers a different question -- ``main.py``
+    reads that flag to force ``VA_INFER=async`` and call
+    ``engine.run_single_process()``. It is empty on this build by design, so
+    setting it merely to satisfy a configuration check would hand every group
+    its own async queue. The supervisor knows the real answer; it says it here.
+    """
+    env = {"VA_GROUP_CAMERAS": group["cams"]}
+    if group.get("api"):
+        env["VA_ENTRY_HOST"] = "1"
+    return env
+
+
 def _reset_plates() -> None:
     """One-shot GLOBAL plate wipe, run ONCE before the groups start (never per
     group — that would race N wipes). Clears then exits."""
@@ -655,6 +677,10 @@ def run(reset_plates: bool = False, foreground: bool = False,
         child_env = _child_env(cores, pin=pin)
         child_env["VA_GROUP"] = g["name"]
         child_env["VA_PROCESS_COUNT"] = str(len(groups))
+        # Cleared first: a pod-level VA_ENTRY_HOST would otherwise be inherited
+        # by every worker, attesting for groups that own no gate camera.
+        child_env.pop("VA_ENTRY_HOST", None)
+        child_env.update(_entry_v2_topology_env(g))
         proc = subprocess.Popen(
             cli, cwd=str(ROOT), env=child_env,
             stdout=out_fh, stderr=err_fh, **popen_kwargs,

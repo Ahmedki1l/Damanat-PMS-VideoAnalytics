@@ -353,9 +353,25 @@ least the greatest of `0.90`, `ENTRY_V2_EVENT_CONSISTENCY_MIN_SCORE`, and
 `ENTRY_V2_MERGE_MIN_SCORE`.
 When either canonical RTSP zone is enabled, `ENTRY_V2_MAX_IMAGES` must be at
 least `2`, because a local crossing requires two stable processed frames.
-That path also fails closed unless `VA_SINGLE_PROCESS` is explicitly one of
-`1`, `true`, `yes`, or `on` (case-insensitive); unset, false, and unknown values
-produce `entry_v2_local_zone_requires_va_single_process`.
+That path also fails closed unless the coordinator can be proven to be
+co-located with every camera whose local zone is enabled, by one of two routes:
+
+- `VA_SINGLE_PROCESS` explicitly one of `1`, `true`, `yes`, `on`
+  (case-insensitive) — one process feeds every camera, so co-location is
+  trivially true; or
+- `VA_ENTRY_HOST=1` together with a `VA_GROUP_CAMERAS` list containing those
+  cameras. Both are set by `supervisor.py` on the single group it launches with
+  `--api`, and cleared on every other group.
+
+Neither route present produces
+`entry_v2_local_zone_requires_single_process_or_gate_group`.
+
+**Do not set `VA_SINGLE_PROCESS=1` merely to clear that error.** It is an engine
+switch, not an attestation: `main.py` also reads it to force `VA_INFER=async`
+and to call `engine.run_single_process()`. Under the multi-process supervisor
+that gives every group its own async inference queue — the BUILD 4 topology that
+was reverted on measured throughput. The second route exists precisely so the
+configuration check can be satisfied without changing the engine.
 The callback retry interval is an operational delivery cadence, not an evidence
 expiry. Transient failures stay in a bounded RAM queue. Permanent authentication
 or callback-contract failures are not retried: VA stops admission and reports
