@@ -187,7 +187,21 @@ ENV VA_CMD=""
 # frames through a PROCESS-LOCAL buffer, so co-location is required, not optional.
 ENV VA_GATE_CAMERAS="CAM-23,CAM-03"
 # Safe rollout defaults. Deployment-time env may promote Entry V2 from off to
-# shadow/authoritative, but credentials and site calibration are never baked.
+# shadow/authoritative. CREDENTIALS are never baked; site calibration IS baked
+# below, as a sane fallback rather than as the source of truth.
+#
+# PRECEDENCE, and it has bitten this deployment twice: in Kubernetes an
+# `envFrom.secretRef` value OVERRIDES the image ENV. Everything below is a
+# DEFAULT that the deployed Secret wins against. That is deliberate — the Secret
+# is where a value gets swept without a rebuild — but it means a stale key in the
+# Secret silently defeats a change made here. After any rollout that changes one
+# of these, verify against the RUNNING pod, never against this file:
+#
+#   kubectl exec deploy/pms-video-analytics -- printenv | grep ^ENTRY_V2_
+#
+# These are baked because `kubectl create secret --from-env-file` REPLACES the
+# whole Secret, which has twice dropped the camera-policy variables entirely. An
+# image default turns that from a silent policy change into a survivable one.
 ENV ENTRY_V2_MODE=off
 # NOTE: this pins the variable that OVERRIDES config.yaml's motion_scheduler.mode
 # (config.py reads VA_MOTION_SCHEDULER_MODE last and it wins).
@@ -221,6 +235,105 @@ ENV ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR=/app/vehicle_images
 # --- Supervisor-only knobs (ignored while VA_CMD bypasses the supervisor) ---
 ENV VA_OV_TOTAL_THREADS=""
 ENV VA_MERGE_GROUPS=""
+
+# ============================================================================
+# Entry Pipeline v3 — shadow-window defaults
+# ============================================================================
+
+# Emit logger.info at all. Without this the root logger has no handler, records
+# fall through to logging.lastResort (WARNING), and every logger.info() in src/
+# is discarded — including the [EntryV2][ReID] lines the calibration depends on.
+ENV LOG_LEVEL=INFO
+# Per-logger overrides, "logger=LEVEL,logger=LEVEL". EMPTY is correct: the
+# per-frame caps are applied in CODE (logging_setup.py:67-68 lists the noisy
+# loggers, :139 pins them to WARNING), so raising the root logger to INFO does
+# not switch on engine_tracking's per-detection "[quality] track=..." line on an
+# already CPU-starved fleet. Set one here only to debug it deliberately:
+#   LOG_LEVEL_OVERRIDES=src.core.engine.engine_tracking=INFO
+ENV LOG_LEVEL_OVERRIDES=
+
+# The pipeline raises NO alerts — every outcome is a record here, so this
+# directory is the entire operational surface. Must be on the PVC-backed gallery
+# mount: every record cites image paths on that volume, and a log that outlives
+# the images it references is not evidence. Empty disables it.
+ENV ENTRY_V2_DECISION_LOG_DIR=/app/vehicle_images/entry_v2_shadow
+# Rolls over daily, never prunes by mtime — files are deleted by the DAY IN
+# THEIR FILENAME. It shares a volume with vehicle imagery.
+ENV ENTRY_V2_DECISION_LOG_RETENTION_DAYS=30
+
+# How long an UNCONFIRMED identity stays eligible for correlation, and how long
+# an unmatched observation outlives it so a late HikCentral sweep can still
+# rescue a dropped entry. Observation TTL must be >= identity TTL or config
+# fails. This is 90x the legacy path's 10s FIFO bind window, and safe ONLY
+# because nothing here binds a plate by arrival order — if FIFO ever returns to
+# the binding path, bring these down with it.
+ENV ENTRY_IDENTITY_TTL_MINUTES=15
+ENV ENTRY_OBSERVATION_TTL_MINUTES=60
+
+# Colour REMOVES a candidate that cannot be this car; the margin is then
+# recomputed over the survivors. It never adds score — two white sedans agreeing
+# on colour is not evidence they are one car. Fails open on missing colour.
+# Vetoed nothing incorrectly across the 2026-08-30/31 window.
+ENV ENTRY_V2_COLOUR_VETO_ENABLED=1
+
+# OFF, measured — ramp OCR is not reliable enough to WITHHOLD an entry on.
+# Two reads of the SAME car in one window, both above the 0.75 confidence gate:
+# "7383HAS" and "AATEIGH7383HAS". The veto compares exact plate keys
+# (decision.py:500 `item.key != key`), so a hallucinated prefix reads as a
+# contradiction — as does the known letters-first vs digits-first swap, e.g. a
+# ramp read of "7286EED" against a consensus plate of "EED7286". Both withhold a
+# CORRECT entry. The same exact-key flaw sits in the producer-family gate
+# (coordinator.py:2181), which refused one real crossing 13 times on the 30th.
+# Re-enable only behind a digit-run comparison, never behind exact keys.
+ENV ENTRY_V2_OBSERVATION_PLATE_VETO_ENABLED=0
+
+# Normalised (x1,y1,x2,y2) boxes in 0..1, semicolon-separated, naming where
+# Hikvision composites its own plate/OSD panel into a frame. LEAVE EMPTY until
+# the panel geometry is measured against this facility's own frames — a guessed
+# rectangle rejects real plates, which is worse than the echo it prevents.
+ENV ENTRY_V2_OVERLAY_EXCLUDE_REGIONS=
+
+# Camera crossing policy. The line/direction values are the RAW Hikvision
+# strings; they must not be quoted here or in the Secret — a literal quote
+# survives into the parsed set ("'1", "PARK_ENTRY'") and every crossing on that
+# camera is then rejected as crossing_line_not_configured_for_role, invisibly,
+# because configuration_errors() short-circuits while the mode is off.
+ENV ENTRY_V2_PRIMARY_CAMERAS=CAM-23
+ENV ENTRY_V2_PRIMARY_LINES=1,Park_Entry
+ENV ENTRY_V2_PRIMARY_DIRECTIONS=ramp-entry
+ENV ENTRY_V2_FALLBACK_CAMERAS=CAM-03
+ENV ENTRY_V2_FALLBACK_LINES=1,B1_Entrence
+ENV ENTRY_V2_FALLBACK_DIRECTIONS=B-to-A,b-entry
+
+# Measured, 2026-08-30/31 shadow window (560 records, 57 identities, 66 ramp
+# observations). The shipped 0.75 was UNREACHABLE: the maximum ANPR->ramp Re-ID
+# score observed was 0.689, so zero entries could ever confirm — 55 identities
+# expired holding only ['anpr'] and 65 observations expired with no witness.
+#
+# Per-observation best score is near-identical on the two cameras (CAM-23 median
+# 0.406, CAM-03 0.402), so ONE threshold is right here. The per-RECORD split
+# that suggests otherwise (0.417 vs 0.197) is an artifact: the 365 evaluations
+# cover only 66 observations, and CAM-03 is re-scored against more wrong
+# identities.
+#
+#   min_score   confirmable/57    both-ramp pairs
+#     0.30        31 (54%)             14
+#     0.35        26 (46%)             13   <- top of the plateau
+#     0.40        22 (39%)             11
+#     0.45        17 (30%)              4   <- cliff
+#     0.75         0 ( 0%)              0   <- as shipped
+#
+# Margins carry the discrimination, not absolute score: 48 of 53 contested
+# observations clear 0.08, median row margin 0.21-0.28. That matches the
+# ReID-alone precision curve measured on the 50-car gallery, where margin — not
+# score — separated the classes. If this value moves, keep the margins at 0.08+.
+#
+# NOT a precision measurement. The only truth signal in that window was 8 ramp
+# plate reads, all of which CORROBORATED the Re-ID argmax (down to score 0.18)
+# with zero contradictions. Eight is a signal, not a calibration; the window
+# that runs at 0.35 is the one that measures whether these confirmations are
+# actually right.
+ENV ENTRY_V2_REID_MIN_SCORE=0.35
 
 # Copy app code
 COPY . .
