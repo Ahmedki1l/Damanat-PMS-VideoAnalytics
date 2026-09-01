@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import hashlib
 import json
 import logging
@@ -57,6 +58,7 @@ from .domain import (
     canonical_plate,
     norm_camera_id,
     plate_key,
+    plates_contradict,
 )
 from .settings import EntrySettings
 
@@ -84,20 +86,27 @@ def _round_hsv(value):
     return None if value is None else [round(float(v), 1) for v in value]
 
 
-def _best_observed_plate_text(crossing) -> str:
-    """The ramp camera's own OCR reading — DIAGNOSTIC ONLY.
+def _best_observed_plate_read(crossing):
+    """The ramp camera's own OCR reading and its confidence — DIAGNOSTIC ONLY.
 
     CAM-23 and CAM-03 are visual observation sources and read no plates. This
     is recorded so the question "could the ramp cameras carry plate evidence?"
     can be answered from real traffic later, and it is deliberately not
     returned in any shape a decision rule could consume.
+
+    Returns (text, confidence). The confidence used to be computed here and
+    then dropped on the floor, which left `observed_plate_confidence` null in
+    every record ever written — so the one field that exists to answer "are
+    ramp reads good enough to veto on?" could not answer it. That question
+    gates re-enabling the observation plate veto, so the number has to survive
+    the return.
     """
     best = ""
-    best_confidence = -1.0
+    best_confidence = None
     for item in crossing.plate_evidence:
-        if item.text and item.confidence > best_confidence:
+        if item.text and (best_confidence is None or item.confidence > best_confidence):
             best, best_confidence = item.text, item.confidence
-    return best
+    return best, best_confidence
 
 
 @dataclass(frozen=True)
@@ -1585,6 +1594,7 @@ class EntryCoordinator:
                 # and "did any plate source come from a ramp camera?", and
                 # neither question can be answered from a decision status.
                 consensus = self._engine.plate_consensus(causal_group)
+                _observed = _best_observed_plate_read(crossing)
                 self._emit_decision_record(
                     stage="plate_consensus",
                     result=(
@@ -1602,7 +1612,8 @@ class EntryCoordinator:
                     },
                     plate=consensus.as_record(),
                     witnesses=[w.value for w in group.confirming_witnesses()],
-                    observed_plate_text=_best_observed_plate_text(crossing),
+                    observed_plate_text=_observed[0],
+                    observed_plate_confidence=_observed[1],
                 )
                 decision = self._build_decision(
                     causal_group,
@@ -1824,6 +1835,7 @@ class EntryCoordinator:
         else:
             result = decision_record.RESULT_ABSTAINED
 
+        _observed = _best_observed_plate_read(crossing)
         self._emit_decision_record(
             stage="reid_evaluation",
             result=result,
@@ -1850,7 +1862,8 @@ class EntryCoordinator:
                 if group is not None
                 else None
             ),
-            observed_plate_text=_best_observed_plate_text(crossing),
+            observed_plate_text=_observed[0],
+            observed_plate_confidence=_observed[1],
         )
 
     def _identity_for_plate_locked(self, identity_key: str, embeddings):
@@ -2066,7 +2079,14 @@ class EntryCoordinator:
             "expected_rank": fifo_rank,
             "expected_group": expected,
             "reid_group": evaluation.group_id,
-            "agreed": bool(expected) and expected == evaluation.group_id,
+            # None, not False, when FIFO had NO expectation to offer — the rank
+            # fell outside the live group list, so there is nothing to agree or
+            # disagree with. Writing False there conflates "FIFO was wrong" with
+            # "FIFO was silent" and buries the measurement this field exists to
+            # take: on 2026-09-01, 346 of 451 records had no expectation at all,
+            # making agreement read as 13% when it was 58% (61/105) among the
+            # records that actually had one.
+            "agreed": (expected == evaluation.group_id) if expected else None,
         }
 
     def _group_has_callback_in_flight_locked(self, group_id: str) -> bool:
@@ -2182,13 +2202,25 @@ class EntryCoordinator:
         self,
         members: Sequence[CrossingRecord],
     ) -> bool:
-        reliable_keys = {
-            item.key
+        """True when this producer family holds two reads of DIFFERENT cars.
+
+        Was `len({keys}) > 1`, i.e. any two distinct plate strings. Exact keys
+        treat a digits-first/letters-first swap and a hallucinated letter
+        prefix as disagreements, so this gate refused one real crossing
+        thirteen times on 2026-08-30 (`7383HAS` against `AATEIGH7383HAS`, both
+        above the confidence gate, one car). `plates_contradict` compares digit
+        runs instead, so only a genuine difference blocks the family.
+        """
+        reliable = [
+            item.text
             for member in members
             for item in member.plate_evidence
             if item.key and item.confidence >= self.settings.ocr_min_confidence
-        }
-        return len(reliable_keys) > 1
+        ]
+        return any(
+            plates_contradict(left, right)
+            for left, right in itertools.combinations(reliable, 2)
+        )
 
     @staticmethod
     def _crossing_source(crossing: CrossingRecord) -> str:

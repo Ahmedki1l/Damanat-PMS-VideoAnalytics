@@ -1564,76 +1564,91 @@ def create_app(
             "max_pending_crossings": crossing_capacity,
             "journey_capacity": journey_capacity,
         }
-        if (
-            active_entry_coordinator.settings.mode.value != "off"
-            and not active_entry_coordinator.available
-        ):
-            health_data["status"] = "unhealthy"
-            reasons = list(health_data.get("health_reasons") or [])
-            reasons.append(
+        # Entry V2/V3 conditions are collected here and applied to the
+        # SERVICE verdict only when explicitly linked. Entry V2 is one pipeline
+        # inside VideoAnalytics; in shadow it is observation-only and must not
+        # be able to report the whole service degraded. `pending_exit_count > 0`
+        # did exactly that — 39 exits retained from the two days v3 could not
+        # confirm anything held VA amber while every camera, stream and
+        # inference path was healthy, and the gateway aggregated that into an
+        # overall "degraded".
+        #
+        # The information is not lost: the counters stay in the `entry_v2`
+        # block and every condition below is reported under `entry_v2_reasons`
+        # whether or not it is linked.
+        mode_on = active_entry_coordinator.settings.mode.value != "off"
+        entry_v2_reasons: list[str] = []
+        entry_v2_severity = "ok"
+
+        def _entry_v2(severity: str, reason: str) -> None:
+            nonlocal entry_v2_severity
+            entry_v2_reasons.append(reason)
+            if severity == "unhealthy" or entry_v2_severity == "unhealthy":
+                entry_v2_severity = "unhealthy"
+            else:
+                entry_v2_severity = "degraded"
+
+        if mode_on and not active_entry_coordinator.available:
+            _entry_v2(
+                "unhealthy",
                 "entry_v2 unavailable: "
                 + (
                     active_entry_coordinator.unavailable_reason
                     or "unknown configuration/runtime error"
-                )
+                ),
             )
-            health_data["health_reasons"] = reasons
         if callback_load > 0:
-            reasons = list(health_data.get("health_reasons") or [])
-            reasons.append(
-                "entry_v2 callback backlog: "
-                f"{callback_load}/{callback_capacity}"
+            _entry_v2(
+                "unhealthy" if callback_load >= callback_capacity else "degraded",
+                f"entry_v2 callback backlog: {callback_load}/{callback_capacity}",
             )
-            health_data["health_reasons"] = reasons
-            if callback_load >= callback_capacity:
-                health_data["status"] = "unhealthy"
-            elif health_data.get("status") == "ok":
-                health_data["status"] = "degraded"
-        if (
-            active_entry_coordinator.settings.mode.value != "off"
-            and attempt_load >= attempt_capacity
-        ):
-            reasons = list(health_data.get("health_reasons") or [])
-            reasons.append(
+        if mode_on and attempt_load >= attempt_capacity:
+            _entry_v2(
+                "unhealthy",
                 "entry_v2 attempt capacity exhausted: "
-                f"{attempt_load}/{attempt_capacity}"
+                f"{attempt_load}/{attempt_capacity}",
             )
-            health_data["health_reasons"] = reasons
-            health_data["status"] = "unhealthy"
-        if (
-            active_entry_coordinator.settings.mode.value != "off"
-            and crossing_load >= crossing_capacity
-        ):
-            reasons = list(health_data.get("health_reasons") or [])
-            reasons.append(
+        if mode_on and crossing_load >= crossing_capacity:
+            _entry_v2(
+                "unhealthy",
                 "entry_v2 crossing capacity exhausted: "
-                f"{crossing_load}/{crossing_capacity}"
+                f"{crossing_load}/{crossing_capacity}",
             )
-            health_data["health_reasons"] = reasons
-            health_data["status"] = "unhealthy"
-        if active_entry_coordinator.settings.mode.value != "off" and (
+        if mode_on and (
             journey_load >= journey_capacity
             or pending_exit_count >= journey_capacity
         ):
-            reasons = list(health_data.get("health_reasons") or [])
-            reasons.append(
+            _entry_v2(
+                "unhealthy",
                 "entry_v2 journey lifecycle capacity exhausted: "
                 f"journeys={journey_load}/{journey_capacity}, "
-                f"pending_exits={pending_exit_count}/{journey_capacity}"
+                f"pending_exits={pending_exit_count}/{journey_capacity}",
             )
-            health_data["health_reasons"] = reasons
-            health_data["status"] = "unhealthy"
-        elif (
-            active_entry_coordinator.settings.mode.value != "off"
-            and pending_exit_count > 0
-        ):
-            reasons = list(health_data.get("health_reasons") or [])
-            reasons.append(
+        elif mode_on and pending_exit_count > 0:
+            # Retained exits are ordinary operation, not impairment: an exit
+            # whose entry was never confirmed has nothing to match and waits.
+            # Capacity exhaustion above is the condition that actually hurts.
+            _entry_v2(
+                "degraded",
                 "entry_v2 unmatched exit boundaries: "
-                f"{pending_exit_count}/{journey_capacity}"
+                f"{pending_exit_count}/{journey_capacity}",
             )
-            health_data["health_reasons"] = reasons
-            if health_data.get("status") == "ok":
+
+        health_data["entry_v2_reasons"] = entry_v2_reasons
+        health_data["entry_v2_status"] = entry_v2_severity
+        health_data["entry_v2_linked_to_service_health"] = (
+            active_entry_coordinator.settings.entry_v2_affects_service_health
+        )
+        if (
+            active_entry_coordinator.settings.entry_v2_affects_service_health
+            and entry_v2_reasons
+        ):
+            health_data["health_reasons"] = list(
+                health_data.get("health_reasons") or []
+            ) + entry_v2_reasons
+            if entry_v2_severity == "unhealthy":
+                health_data["status"] = "unhealthy"
+            elif health_data.get("status") == "ok":
                 health_data["status"] = "degraded"
         if health_data.get("status") == "unhealthy":
             response.status_code = 503

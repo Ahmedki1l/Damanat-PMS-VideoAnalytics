@@ -141,7 +141,12 @@ ENV PYTHONUNBUFFERED=1
 # VA_OV_NUM_THREADS/VA_FEED_THREADS/VA_INFER_NIREQ values listed there.
 # To reach true PROD: PERF_TRACE=0 as well.
 # ============================================================================
-ENV PERF_TRACE=1
+# PROD value. Was 1 for the entry-v3 shadow window, where the per-stage timing
+# was the point; it must not ride into the authoritative flip, because the
+# fleet is already CPU-starved (measured 0.1 fps/cam) and this pays for timing
+# on every stage of every frame. Flip it back at run time when measuring —
+# `-e PERF_TRACE=1` — rather than rebuilding.
+ENV PERF_TRACE=0
 ENV PERF_TRACE_EVERY=50
 #
 #   BUILD 5  *** CURRENT — gate-camera capacity ISOLATION. ***

@@ -26,6 +26,7 @@ from .domain import (
     canonical_plate,
     norm_camera_id,
     plate_key,
+    plates_contradict,
 )
 from .settings import EntrySettings
 
@@ -250,7 +251,40 @@ class EntryDecisionEngine:
         if not ranked:
             return None
         score, group_id = ranked[0]
-        row_runner = ranked[1][0] if len(ranked) > 1 else 0.0
+
+        # Remember what every identity has ever scored against this
+        # observation, then contest the winner against the best of them — not
+        # just against whoever happens to still be in the pool right now.
+        #
+        # A margin is meant to say "this identity stands clearly apart from the
+        # alternatives". Deleting an alternative satisfies that test just as
+        # well as new evidence does, and on 2026-09-01 it did: a competitor hit
+        # its TTL and an observation refused twice as ambiguous confirmed on the
+        # next pass with an identical score. A second case promoted a runner-up
+        # after the winner was consumed, confirming at 0.378 what had been
+        # refused at 0.441.
+        #
+        # This is deliberately NOT symmetric with the colour veto. Colour
+        # removes a candidate that CANNOT be this car, so the survivors' margins
+        # genuinely improve. TTL removes a candidate that merely got old, and
+        # consumption removes one that another observation claimed — neither is
+        # evidence about THIS car. Vetoed candidates never enter `ranked`, so
+        # they are never remembered here.
+        for candidate_score, candidate_id in ranked:
+            previous = crossing.contested_scores.get(candidate_id)
+            if previous is None or candidate_score > previous:
+                crossing.contested_scores[candidate_id] = candidate_score
+
+        live_runner = ranked[1][0] if len(ranked) > 1 else 0.0
+        remembered_runner = max(
+            (
+                remembered
+                for other_id, remembered in crossing.contested_scores.items()
+                if other_id != group_id
+            ),
+            default=0.0,
+        )
+        row_runner = max(live_runner, remembered_runner)
         row_margin = score - row_runner
 
         group = groups[group_id]
@@ -501,14 +535,19 @@ class EntryDecisionEngine:
             return False
         if consensus.outcome != "consensus" or not consensus.plate:
             return False
-        key = plate_key(consensus.plate)
         for item in crossing.plate_evidence:
             if (
                 item.state == PlateReadState.READABLE
                 and item.confidence >= self.settings.ocr_min_confidence
                 and item.key
                 and is_plausible_plate(canonical_plate(item.text))
-                and item.key != key
+                # Digit runs, not exact keys. `item.key != key` called
+                # `7286EED` a contradiction of consensus plate `EED7286` (the
+                # same plate, digits-first versus letters-first) and
+                # `AATEIGH7383HAS` a contradiction of `7383HAS` (one car, one
+                # hallucinated prefix). Both would WITHHOLD A CORRECT ENTRY,
+                # which is why this veto currently ships disabled.
+                and plates_contradict(item.text, consensus.plate)
             ):
                 return True
         return False

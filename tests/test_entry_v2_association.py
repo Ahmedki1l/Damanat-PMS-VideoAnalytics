@@ -15,6 +15,7 @@ And FIFO is measured against Re-ID and written to the log, where nothing reads
 it back: a car can stop on the ramp, so arrival order is a prior and never the
 matcher.
 """
+import pytest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -626,3 +627,140 @@ def test_a_shortfall_is_recorded_with_the_reason_it_failed():
     assert record["result"] == "abstained"
     assert record["reason"] == "insufficient_witnesses"
     assert statuses(sink) == ["abstained"]
+
+
+# --------------------------------------------------------------------------- #
+# A margin must be won on evidence, not on the pool shrinking
+# --------------------------------------------------------------------------- #
+def _identity(group_id, key, vector):
+    from src.entry.domain import AttemptGroup, AttemptRecord
+
+    group = AttemptGroup(group_id=group_id, identity_key=key)
+    group.attempts[f"a-{group_id}"] = AttemptRecord(
+        request=attempt(f"a-{group_id}", key),
+        evidence=(frame(f"a-{group_id}", "ANPR-ENTRY", vector),),
+        group_id=group_id,
+    )
+    return group
+
+
+def _contested_pair():
+    """Two identities a CAM-23 observation cannot tell apart.
+
+    cos with the query (1, 0) is the first component, so these score 0.90 and
+    0.85 — a 0.05 row margin against a 0.08 gate.
+    """
+    import math
+
+    winner = _identity("g-win", "ABR8000", (0.90, math.sqrt(1 - 0.90**2)))
+    rival = _identity("g-rival", "SNA226", (0.85, math.sqrt(1 - 0.85**2)))
+    return winner, rival
+
+
+def test_a_competitor_that_ages_out_does_not_hand_over_the_margin():
+    """Reproduces observation 3cce0428 of 2026-09-01.
+
+        05:54:07  ABR8000 0.686 / SNA226 0.627  margin 0.059  ambiguous
+        05:55:54  same                          margin 0.059  ambiguous
+        06:03:08  SNA226 hits its identity TTL and is deleted
+        06:03:09  ABR8000 0.686, no runner-up   margin 0.093  CONFIRMED
+
+    Same observation, same score to six decimals. Only the competitor changed,
+    and a competitor getting old is not evidence about this car.
+    """
+    engine = EntryDecisionEngine(settings())
+    from src.entry.domain import CrossingRecord
+
+    winner, rival = _contested_pair()
+    observation = CrossingRecord(
+        request=crossing("c1"),
+        evidence=(frame("c1", "CAM-23", (1.0, 0.0), role="primary"),),
+    )
+    groups = {"g-win": winner, "g-rival": rival}
+
+    first = engine.evaluate_unique_match(observation, groups, [observation])
+    assert first.accepted is False
+    assert first.reason == "row_margin_below_minimum"
+
+    # The rival ages out. The observation and its evidence are untouched.
+    del groups["g-rival"]
+    second = engine.evaluate_unique_match(observation, groups, [observation])
+
+    assert second.accepted is False, "a TTL expiry must not confirm an entry"
+    assert second.reason == "row_margin_below_minimum"
+    assert second.row_runner == pytest.approx(0.85, abs=1e-6)
+
+
+def test_a_consumed_winner_does_not_promote_its_runner_up():
+    """Reproduces observation 03b16a25 of 2026-09-01.
+
+        05:55:54  ABR8000 0.441 / ZZR1372 0.378  margin 0.024  ambiguous
+        06:03:09  ABR8000 consumed by another observation
+        06:03:09  ZZR1372 0.378                  margin 0.146  CONFIRMED
+
+    The score went DOWN and it confirmed anyway. Being taken by someone else is
+    not evidence that this observation is the runner-up.
+    """
+    engine = EntryDecisionEngine(settings())
+    from src.entry.domain import CrossingRecord
+
+    winner, rival = _contested_pair()
+    observation = CrossingRecord(
+        request=crossing("c1"),
+        evidence=(frame("c1", "CAM-23", (1.0, 0.0), role="primary"),),
+    )
+    groups = {"g-win": winner, "g-rival": rival}
+
+    engine.evaluate_unique_match(observation, groups, [observation])
+
+    del groups["g-win"]  # confirmed elsewhere, leaves the pending pool
+    second = engine.evaluate_unique_match(observation, groups, [observation])
+
+    assert second.group_id == "g-rival"
+    assert second.accepted is False
+    assert second.row_runner == pytest.approx(0.90, abs=1e-6)
+
+
+def test_a_genuinely_uncontested_observation_still_confirms():
+    """The freeze must only remember contests that actually happened."""
+    engine = EntryDecisionEngine(settings())
+    from src.entry.domain import CrossingRecord
+
+    winner, _ = _contested_pair()
+    observation = CrossingRecord(
+        request=crossing("c1"),
+        evidence=(frame("c1", "CAM-23", (1.0, 0.0), role="primary"),),
+    )
+
+    evaluation = engine.evaluate_unique_match(
+        observation, {"g-win": winner}, [observation]
+    )
+
+    assert evaluation.accepted is True
+    assert evaluation.row_runner == 0.0
+
+
+def test_new_evidence_can_still_clear_a_frozen_margin():
+    """The freeze raises the bar; it must not make the bar unreachable.
+
+    A later identity that genuinely outscores the remembered contest confirms.
+    """
+    import math
+
+    engine = EntryDecisionEngine(settings())
+    from src.entry.domain import CrossingRecord
+
+    winner, rival = _contested_pair()
+    observation = CrossingRecord(
+        request=crossing("c1"),
+        evidence=(frame("c1", "CAM-23", (1.0, 0.0), role="primary"),),
+    )
+    groups = {"g-win": winner, "g-rival": rival}
+    engine.evaluate_unique_match(observation, groups, [observation])
+
+    # The ANPR read for this car finally arrives and matches it almost exactly.
+    groups["g-true"] = _identity("g-true", "KKR6294", (0.99, math.sqrt(1 - 0.99**2)))
+    evaluation = engine.evaluate_unique_match(observation, groups, [observation])
+
+    assert evaluation.group_id == "g-true"
+    assert evaluation.accepted is True

@@ -120,6 +120,53 @@ def plate_key(value: str) -> str:
     return _NON_ALNUM.sub("", (value or "").upper())
 
 
+_DIGIT_RUN = re.compile(r"[0-9]+")
+
+
+def plate_digit_run(value: str) -> str:
+    """The digits of a plate, in order, letters discarded.
+
+    Order-independent by construction, which is the point: the UI renders
+    plates digits-first and the DB letters-first, so `7286EED` and `EED7286`
+    are the SAME plate written two ways.
+    """
+    return "".join(_DIGIT_RUN.findall(plate_key(value)))
+
+
+def plates_contradict(left: str, right: str) -> bool:
+    """True only when two reads genuinely name DIFFERENT cars.
+
+    Replaces exact-key inequality, which was measured to be wrong in two ways
+    that both WITHHOLD A CORRECT ENTRY:
+
+      * `7286EED` vs `EED7286` — the same plate, digits-first versus
+        letters-first. Exact keys call this a contradiction.
+      * `7383HAS` vs `AATEIGH7383HAS` — two reads of one car in one window,
+        both above the 0.75 confidence gate, the second carrying a
+        hallucinated letter prefix. Exact keys call this a contradiction too.
+
+    So the digits decide, and they are compared leniently: identical, or one a
+    prefix/suffix of the other, means the same car with characters lost or
+    invented off an end. `6951` versus `56951` is one car, not two.
+
+    Deliberately asymmetric in caution. A missed contradiction costs a veto
+    that would not have fired; a false contradiction refuses a real entry —
+    which is what the producer-family gate did to one real crossing thirteen
+    times on 2026-08-30. When either side has no digits at all there is
+    nothing to compare, and we do NOT contradict.
+    """
+    left_key, right_key = plate_key(left), plate_key(right)
+    if not left_key or not right_key or left_key == right_key:
+        return False
+    left_digits, right_digits = plate_digit_run(left), plate_digit_run(right)
+    if not left_digits or not right_digits:
+        return False
+    if left_digits == right_digits:
+        return False
+    short, long = sorted((left_digits, right_digits), key=len)
+    return not (long.startswith(short) or long.endswith(short))
+
+
 def canonical_plate(value: str) -> str:
     """Stable display form for common Saudi Latin-letter plate readings."""
     key = plate_key(value)
@@ -352,6 +399,17 @@ class CrossingRecord:
     # Wall-clock ingest time, for the observation TTL. Not refreshed: an
     # observation is a point event, not a candidate that can be reactivated.
     created_at: Optional[datetime] = None
+    # Highest Re-ID score every identity has ever reached against THIS
+    # observation, kept so a margin cannot be won by the pool shrinking.
+    #
+    # Measured 2026-09-01: observation 3cce0428 ranked ABR8000 0.686 against
+    # SNA226 0.627 and was correctly refused as ambiguous, twice. SNA226 then
+    # hit its 15-minute identity TTL, and on the very next pass the SAME
+    # observation with the SAME score to six decimals cleared the margin and
+    # confirmed. Nothing about the evidence changed; the competitor merely got
+    # old. Remembering the contest keeps it honest — a candidate that once
+    # looked that good does not stop counting because it left the room.
+    contested_scores: Dict[str, float] = field(default_factory=dict)
 
     @property
     def witness(self) -> Optional["WitnessSource"]:

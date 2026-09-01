@@ -100,6 +100,18 @@ def observation_block(crossing) -> Dict[str, Any]:
         "direction": request.direction,
         "captured_at": _iso(request.captured_at),
         "source": str((request.metadata or {}).get("source", "")),
+        # Where captured_at actually came from. PMS-AI has always sent this
+        # (`_metadata` -> "timestamp_source": event.trigger_time_source); the
+        # record simply never surfaced it, and that is why CAM-03 stamping
+        # every event `-08:00` instead of `+03:00` — 11 hours into the future,
+        # which silently disabled the causality guard on that camera — went
+        # unnoticed for the whole shadow window. "camera" means the device's
+        # own offset was trusted; "camera_assumed_facility_timezone" means it
+        # sent none; "pms_receive_*" means the time is OUR receipt time, not
+        # the camera's, and no causality conclusion should rest on it.
+        "captured_at_source": str(
+            (request.metadata or {}).get("timestamp_source", "")
+        ),
     }
 
 

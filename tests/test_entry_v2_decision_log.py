@@ -597,3 +597,158 @@ class HikDirectionTests(unittest.TestCase):
         # queried:false means WE chose not to call, never that HikCentral
         # chose not to tell us.
         self.assertFalse(record["hik"]["queried"])
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostic fields the shadow review actually reads
+# --------------------------------------------------------------------------- #
+class ObservedPlateConfidenceTests(unittest.TestCase):
+    """`observed_plate_confidence` was null in every record ever written.
+
+    The helper computed the best-confidence read and then returned only its
+    text, so the one field that answers "are ramp reads good enough to veto
+    on?" carried nothing. That question gates re-enabling the observation
+    plate veto, so the number has to reach the record.
+    """
+
+    def _crossing_with_reads(self, *reads):
+        from src.entry.domain import FrameEvidence, PlateEvidence, PlateReadState
+
+        crossing = _crossing()
+        evidence = tuple(
+            FrameEvidence(
+                evidence_id=f"ev-{i}",
+                embedding=(1.0, 0.0),
+                plate=PlateEvidence(
+                    evidence_id=f"ev-{i}",
+                    camera_id="CAM-23",
+                    source_role="primary",
+                    state=PlateReadState.READABLE,
+                    text=text,
+                    confidence=conf,
+                ),
+            )
+            for i, (text, conf) in enumerate(reads)
+        )
+        return dataclasses.replace(crossing, evidence=evidence)
+
+    def test_the_best_read_carries_its_confidence(self):
+        from src.entry.coordinator import _best_observed_plate_read
+
+        crossing = self._crossing_with_reads(("7383HAS", 0.62), ("AATEIGH7383HAS", 0.91))
+
+        self.assertEqual(("AATEIGH7383HAS", 0.91), _best_observed_plate_read(crossing))
+
+    def test_no_reads_yields_no_confidence_rather_than_zero(self):
+        from src.entry.coordinator import _best_observed_plate_read
+
+        # 0.0 would be indistinguishable from a genuine zero-confidence read.
+        self.assertEqual(("", None), _best_observed_plate_read(self._crossing_with_reads()))
+
+    def test_a_zero_confidence_read_is_still_reported(self):
+        from src.entry.coordinator import _best_observed_plate_read
+
+        crossing = self._crossing_with_reads(("BLURRY", 0.0))
+
+        self.assertEqual(("BLURRY", 0.0), _best_observed_plate_read(crossing))
+
+    def test_the_confidence_reaches_the_emitted_record(self):
+        log = _CollectingLog()
+        from src.entry.coordinator import EntryCoordinator
+
+        coordinator = EntryCoordinator(
+            _settings(mode=EntryMode.SHADOW), _StubProcessor(), _StubSink(),
+            decision_log=log,
+        )
+        crossing = self._crossing_with_reads(("7286EED", 0.83))
+
+        coordinator._log_reid_evaluation_locked(crossing, _evaluation())
+
+        self.assertEqual(0.83, log.records[0]["observed_plate_confidence"])
+
+
+class FifoAgreementTests(unittest.TestCase):
+    """`agreed` must distinguish "FIFO was wrong" from "FIFO was silent".
+
+    When `fifo_rank` falls outside the live group list there is no expectation
+    to agree with. Writing False there made agreement read as 13% on
+    2026-09-01 when, among the records that actually had an expectation, it
+    was 58% (61/105).
+    """
+
+    def _coordinator(self):
+        from src.entry.coordinator import EntryCoordinator
+
+        return EntryCoordinator(
+            _settings(mode=EntryMode.SHADOW), _StubProcessor(), _StubSink(),
+            decision_log=_CollectingLog(),
+        )
+
+    def test_no_expectation_is_none_not_false(self):
+        coordinator = self._coordinator()
+
+        block = coordinator._fifo_block_locked(_crossing(), _evaluation())
+
+        self.assertEqual("", block["expected_group"])
+        self.assertIsNone(block["agreed"])
+
+    def test_the_record_carries_the_null_through(self):
+        log = _CollectingLog()
+        from src.entry.coordinator import EntryCoordinator
+
+        coordinator = EntryCoordinator(
+            _settings(mode=EntryMode.SHADOW), _StubProcessor(), _StubSink(),
+            decision_log=log,
+        )
+
+        coordinator._log_reid_evaluation_locked(_crossing(), _evaluation())
+
+        self.assertIsNone(log.records[0]["fifo"]["agreed"])
+
+
+class TimestampProvenanceTests(unittest.TestCase):
+    """`captured_at_source` — why CAM-03's 11-hour clock error went unseen.
+
+    PMS-AI has always sent `timestamp_source` in the crossing metadata; the
+    record just never surfaced it, so nothing in the shadow log said whether a
+    captured_at came from the device's own offset, from a facility-timezone
+    assumption, or from our own receipt clock.
+    """
+
+    def _record_for(self, metadata):
+        crossing = _crossing()
+        request = dataclasses.replace(crossing.request, metadata=metadata)
+        return decision_record.build_record(
+            stage="reid_evaluation",
+            result=decision_record.RESULT_ABSTAINED,
+            reason="score_below_minimum",
+            crossing=dataclasses.replace(crossing, request=request),
+        )
+
+    def test_the_device_offset_is_reported(self):
+        record = self._record_for({"timestamp_source": "camera"})
+
+        self.assertEqual("camera", record["observation"]["captured_at_source"])
+
+    def test_an_assumed_timezone_is_distinguishable(self):
+        record = self._record_for(
+            {"timestamp_source": "camera_assumed_facility_timezone"}
+        )
+
+        self.assertEqual(
+            "camera_assumed_facility_timezone",
+            record["observation"]["captured_at_source"],
+        )
+
+    def test_our_own_receipt_time_is_named_as_such(self):
+        # No causality conclusion may rest on this value.
+        record = self._record_for({"timestamp_source": "pms_receive_missing"})
+
+        self.assertEqual(
+            "pms_receive_missing", record["observation"]["captured_at_source"]
+        )
+
+    def test_missing_provenance_is_empty_not_absent(self):
+        record = self._record_for({})
+
+        self.assertEqual("", record["observation"]["captured_at_source"])
