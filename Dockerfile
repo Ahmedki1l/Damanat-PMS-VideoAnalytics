@@ -338,8 +338,38 @@ ENV ENTRY_V2_FALLBACK_DIRECTIONS=B-to-A,b-entry
 # with zero contradictions. Eight is a signal, not a calibration; the window
 # that runs at 0.35 is the one that measures whether these confirmations are
 # actually right.
-ENV ENTRY_V2_REID_MIN_SCORE=0.35
+#
+# ── That window ran. 2026-09-02, 28 real entries, ground truth = 27 CAM-23 ramp
+# crossings (CAM-03 corroborates at 26) plus one HikCentral-only entry.
+#
+# Precision at 0.35 is 19/19 — every confirmation was a real car, no phantom.
+# So the answer to the question above is yes, and the plateau extends further
+# down than the 2026-08-30/31 table could see:
+#
+#   floor  booked  real  PHANTOM   recovered
+#   0.35     19     19      0      <- previous setting
+#   0.30     22     22      0      HER-9235, EEB-80, RLR-2714
+#   0.20     25     25      0      + TXR-4857, ZZR-1372, RGR-6466
+#   0.15     25     25      0      no further gain
+#
+# It plateaus at 0.20 because the MARGIN gate becomes the binding constraint —
+# which is the note above, confirmed: 6 of the 8 refusals that day were blocked
+# by score alone with a completely clean margin, and only the two RGR twins were
+# refused for real ambiguity. In 51 of 85 evaluations row_margin EQUALS score
+# (no runner-up at all), so below the contested cases the score gate was not a
+# second opinion — it was the margin gate again, set 15 points too high.
+#
+# Hence: score demoted to a floor against unusable crops, margin left to decide.
+# 0.20 also sits just above the 0.18 the ramp plate reads corroborated to.
+# KEEP THE MARGINS AT 0.08 — they are now the only thing separating a car from
+# its own misread twin (RGR-6466 clears at 0.086, RGR-6666 tops out at 0.020).
+#
+# Still shadow-only. Do not promote on this: at 25/28 it books fewer cars than
+# the live path's 24-correct-plus-2-phantom, so a cutover today trades 2 phantoms
+# for 3 missing cars. Confirm the plateau holds over a full week first.
+ENV ENTRY_V2_REID_MIN_SCORE=0.20
 
+ENV ENTRY_V2_REID_MIN_MARGIN=0.08
 # Copy app code
 COPY . .
 

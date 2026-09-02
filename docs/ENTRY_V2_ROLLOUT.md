@@ -299,7 +299,10 @@ ENTRY_V2_MAX_DECODED_IMAGE_PIXELS=12000000
 ENTRY_V2_MAX_DECODED_IMAGE_DIMENSION=8192
 ENTRY_V2_MAX_METADATA_BYTES=16384
 
-ENTRY_V2_REID_MIN_SCORE=0.75
+# 0.75 is unreachable — the highest ANPR->ramp score ever observed is 0.689, so
+# nothing confirms. The score is a floor against unusable crops; the margins do
+# the discriminating. Measurement block is in the Dockerfile.
+ENTRY_V2_REID_MIN_SCORE=0.20
 ENTRY_V2_REID_ROW_MARGIN=0.08
 ENTRY_V2_REID_COLUMN_MARGIN=0.08
 ENTRY_V2_MERGE_MIN_SCORE=0.82

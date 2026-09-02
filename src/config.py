@@ -1214,6 +1214,22 @@ class AlertsConfig:
     # PROVEN non-owner.
     reserved_slot_identity_timeout_s: float = 300.0
 
+    # How long a car must sit in a no-parking zone before it counts as parked
+    # there.
+    #
+    # The zone alerts on the state machine's vehicle_parked, which confirms after
+    # two frames — roughly two seconds. A car queueing at the barrier or turning
+    # through the zone trips it exactly like a car that stopped and got out.
+    # Measured on 2026-09-02: Violation-MAIN raised 31 alerts in four hours, and
+    # every one was a clean OCCUPIED -> VACANT cycle lasting 29-263s, median 64s.
+    # Nobody parks illegally for a minute; all 31 were traffic.
+    #
+    # The verdict is deferred rather than dropped, on the same machinery the
+    # named slots use: the occupancy is recorded at park time and the alert is
+    # raised later only if the car is still there. Set <= 0 to alert on contact,
+    # which is the pre-2026-09 behaviour.
+    violation_min_dwell_s: float = 180.0
+
     # Alert types kept OUT of the real-time SSE stream (/api/alerts/stream).
     # Notification-only: report_alert still writes the row and the REST alert
     # endpoints still serve it, so history and auditing are unaffected — the
@@ -1646,6 +1662,15 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
                 a.get(
                     "reserved_slot_identity_timeout_s",
                     config.alerts.reserved_slot_identity_timeout_s,
+                )
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
+            config.alerts.violation_min_dwell_s = float(
+                a.get(
+                    "violation_min_dwell_s",
+                    config.alerts.violation_min_dwell_s,
                 )
             )
         except (TypeError, ValueError):

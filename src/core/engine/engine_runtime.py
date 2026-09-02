@@ -1283,6 +1283,8 @@ class ParkingEngineRuntimeMixin:
         # (owner => silent) rather than racing the timeout. Costs one dict scan over
         # a handful of slots.
         self._sweep_pending_ownership(time.time())
+        # Same scan, for the no-parking zones: raise the alerts whose cars stayed.
+        self._sweep_pending_violations(time.time())
         return assignment
 
     def _process_special_zones(
@@ -2265,6 +2267,10 @@ class ParkingEngineRuntimeMixin:
                     # is written by the violation filter, which runs with or without
                     # a registry, so it must be cleared unconditionally or it leaks.
                     self._clear_pending_ownership(slot.id)
+                    # Same reasoning for the no-parking hold: a car that leaves
+                    # before the dwell elapses was passing through, and the next
+                    # car must start its own clock rather than inherit this one's.
+                    self._clear_pending_violation(slot.id)
 
                 if event.event_type == "vehicle_parked":
                     # VACANT -> OCCUPIED: this is the moment, and the ONLY moment, that
@@ -2995,6 +3001,17 @@ class ParkingEngineRuntimeMixin:
                 ):
                     final_events.append(event)
                     continue
+                if alert_type == "vehicle_violation" and self._defer_violation(
+                    event.slot_id, cam_id, crop, now_ts
+                ):
+                    # Occupying a no-parking zone is not yet parking in one. The
+                    # verdict is settled by _sweep_pending_violations once the
+                    # car has actually stayed, or dropped by
+                    # _clear_pending_violation when it drives on. Occupancy is
+                    # unaffected — the event goes through as a plain
+                    # vehicle_parked.
+                    final_events.append(event)
+                    continue
                 event.event_type = alert_type
                 event.is_alert = True
                 event.severity = (
@@ -3207,6 +3224,104 @@ class ParkingEngineRuntimeMixin:
             )
             self._raise_named_slot_alert(
                 slot_id, entry, "reserved_slot_unidentified", plate=None, severity="warning"
+            )
+
+    # ── no-parking zones: occupancy is not yet a violation ──────────────────
+    #
+    # Same shape as the named-slot deferral above, for a different reason. There
+    # the missing fact is WHO parked; here it is WHETHER the car parked at all.
+    # vehicle_parked confirms after two frames, so a car queueing at the barrier
+    # or turning through the zone raises the identical alert as one that stopped
+    # and was abandoned. See AlertConfig.violation_min_dwell_s for the numbers.
+    #
+    # Settled exactly once by whichever comes first:
+    #   * _sweep_pending_violations — the car is still there; alert for real
+    #   * _clear_pending_violation  — the slot went VACANT; it was just traffic
+
+    def _pending_violations(self) -> dict:
+        pending = getattr(self, "_pending_violation_map", None)
+        if pending is None:
+            pending = self._pending_violation_map = {}
+        return pending
+
+    def _violation_min_dwell(self) -> float:
+        alerts_cfg = getattr(getattr(self, "config", None), "alerts", None)
+        try:
+            return float(getattr(alerts_cfg, "violation_min_dwell_s", 180.0))
+        except (TypeError, ValueError):
+            return 180.0
+
+    def _defer_violation(self, slot_id, cam_id, crop, now_ts) -> bool:
+        """Hold a no-parking alert until the car has actually stayed.
+
+        Returns True when the alert was deferred and the caller must not raise
+        it now. A dwell of <= 0 disables the wait entirely and restores the
+        alert-on-contact behaviour.
+        """
+        if self._violation_min_dwell() <= 0:
+            return False
+        pending = self._pending_violations()
+        if slot_id in pending:
+            return True  # already waiting on this occupancy
+        # Hold the crop, not the frame — this lives for minutes. An empty crop is
+        # fine: _save_alert_snapshot falls back to the slot's rolling snapshot.
+        held_crop = crop.copy() if (crop is not None and crop.size > 0) else None
+        pipeline = (getattr(self, "pipelines", None) or {}).get(cam_id)
+        slot_obj = None
+        for candidate in (getattr(pipeline, "slots", None) or []):
+            if candidate.id == slot_id:
+                slot_obj = candidate
+                break
+        pending[slot_id] = {
+            "cam_id": cam_id,
+            "crop": held_crop,
+            "since": now_ts,
+            "floor": getattr(pipeline, "floor", "") or "",
+            "slot_name": getattr(slot_obj, "label", "") or slot_id,
+            "zone_id": getattr(slot_obj, "zone_id", "") or "",
+            "zone_name": getattr(slot_obj, "zone_name", "") or "",
+            "alerted": False,
+        }
+        logger.info(
+            "[violation-zone] slot=%s occupied — holding the alert for %.0fs to "
+            "see whether the car parks or just passes through (cam=%s)",
+            slot_id, self._violation_min_dwell(), cam_id,
+        )
+        return True
+
+    def _clear_pending_violation(self, slot_id: str) -> None:
+        """Slot went VACANT. If no alert was raised, it was passing traffic."""
+        entry = self._pending_violations().pop(slot_id, None)
+        if entry and not entry.get("alerted"):
+            logger.info(
+                "[violation-zone] slot=%s cleared after %.0fs without parking — "
+                "no alert raised",
+                slot_id, time.time() - entry["since"],
+            )
+
+    def _sweep_pending_violations(self, now_ts: float) -> None:
+        """The car stayed. Raise the alert the deferral held back."""
+        # Called once per processed frame, so the empty case must be free — and
+        # empty is the normal case.
+        pending = getattr(self, "_pending_violation_map", None)
+        if not pending:
+            return
+        dwell = self._violation_min_dwell()
+        if dwell <= 0:
+            return
+        for slot_id, entry in list(pending.items()):
+            if entry.get("alerted"):
+                continue
+            if now_ts - entry["since"] < dwell:
+                continue
+            entry["alerted"] = True  # latch: one alert per occupancy, not per frame
+            logger.warning(
+                "[violation-zone] slot=%s VIOLATION — still occupied after %.0fs, "
+                "so the car parked here rather than passing through",
+                slot_id, now_ts - entry["since"],
+            )
+            self._raise_named_slot_alert(
+                slot_id, entry, "vehicle_violation", plate=None, severity="critical"
             )
 
     def _raise_named_slot_alert(

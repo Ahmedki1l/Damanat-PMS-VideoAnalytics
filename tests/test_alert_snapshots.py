@@ -59,7 +59,7 @@ finally:
 
 class DummyEngine(ParkingEngineRuntimeMixin):
     def __init__(self, reserved_for=None, special=None, enable_restricted=True,
-                 identity_timeout_s=300.0):
+                 identity_timeout_s=300.0, violation_min_dwell_s=180.0):
         self.pipelines = {}
         self._recent_violators = []
         self._violation_history_limit = 60
@@ -73,6 +73,7 @@ class DummyEngine(ParkingEngineRuntimeMixin):
             alerts=SimpleNamespace(
                 enable_restricted_zone_alerts=enable_restricted,
                 reserved_slot_identity_timeout_s=identity_timeout_s,
+                violation_min_dwell_s=violation_min_dwell_s,
             ),
             output=SimpleNamespace(
                 snapshot_base_dir="vehicle_images",
@@ -448,14 +449,12 @@ def test_special_needs_slot_still_alerts_immediately(monkeypatch):
     assert "G1" not in engine._pending_ownership()
 
 
-def test_violation_slot_creates_permanent_alert_snapshot(monkeypatch):
-    temp_dir = _make_repo_temp_dir()
-    monkeypatch.chdir(temp_dir)
-    engine = DummyEngine()
+def _violation_setup(engine):
     engine.pipelines["CAM_02"] = SimpleNamespace(
-        state_machines={"Violation_1": SimpleNamespace(is_violation_zone=True)}
+        state_machines={"Violation_1": SimpleNamespace(is_violation_zone=True)},
+        slots=[],
+        floor="B1",
     )
-
     detection = SimpleNamespace(bbox=[15, 15, 75, 85])
     assignment = SimpleNamespace(slot_vehicle_map={"Violation_1": (202, detection)})
     frame = np.full((120, 120, 3), 127, dtype=np.uint8)
@@ -465,14 +464,76 @@ def test_violation_slot_creates_permanent_alert_snapshot(monkeypatch):
         track_id=202,
         timestamp="2026-04-28T10:05:00",
     )
+    return assignment, frame, event
+
+
+def test_violation_slot_creates_permanent_alert_snapshot(monkeypatch):
+    """The snapshot still lands — now on the deferred alert, once the car stays."""
+    temp_dir = _make_repo_temp_dir()
+    monkeypatch.chdir(temp_dir)
+    engine = DummyEngine(violation_min_dwell_s=180.0)
+    assignment, frame, event = _violation_setup(engine)
+
+    emitted = []
+    engine.event_bus = SimpleNamespace(emit_batch=emitted.extend)
+
+    # Contact: occupancy passes through, no alert yet.
+    result = engine._filter_violation_events(frame, assignment, "CAM_02", [event])
+    assert len(result) == 1
+    assert result[0].event_type == "vehicle_parked"
+    assert emitted == []
+
+    # Still there past the dwell — now it is a violation.
+    entry = engine._pending_violations()["Violation_1"]
+    engine._sweep_pending_violations(entry["since"] + 181.0)
+
+    assert len(emitted) == 1
+    assert emitted[0].event_type == "vehicle_violation"
+    assert emitted[0].severity == "critical"
+    # _save_alert_snapshot returns the externally-reachable URL, not a bare path.
+    assert "/alerts/" in emitted[0].snapshot_path
+    assert _snapshot_disk_path(temp_dir, emitted[0].snapshot_path).exists()
+
+
+def test_a_car_passing_through_a_violation_zone_raises_nothing(monkeypatch):
+    """The 2026-09-02 Violation-MAIN noise: 31 alerts, median dwell 64s, all traffic."""
+    temp_dir = _make_repo_temp_dir()
+    monkeypatch.chdir(temp_dir)
+    engine = DummyEngine(violation_min_dwell_s=180.0)
+    assignment, frame, event = _violation_setup(engine)
+
+    emitted = []
+    engine.event_bus = SimpleNamespace(emit_batch=emitted.extend)
+
+    engine._filter_violation_events(frame, assignment, "CAM_02", [event])
+    entry = engine._pending_violations()["Violation_1"]
+
+    # 64 seconds later the slot goes VACANT — the car drove on.
+    engine._sweep_pending_violations(entry["since"] + 64.0)
+    engine._clear_pending_violation("Violation_1")
+
+    assert emitted == []
+    assert engine._pending_violations() == {}
+
+    # And the sweep cannot resurrect it afterwards.
+    engine._sweep_pending_violations(entry["since"] + 600.0)
+    assert emitted == []
+
+
+def test_violation_dwell_of_zero_restores_alert_on_contact(monkeypatch):
+    """The escape hatch: dwell <= 0 is the pre-2026-09 behaviour, unchanged."""
+    temp_dir = _make_repo_temp_dir()
+    monkeypatch.chdir(temp_dir)
+    engine = DummyEngine(violation_min_dwell_s=0.0)
+    assignment, frame, event = _violation_setup(engine)
 
     result = engine._filter_violation_events(frame, assignment, "CAM_02", [event])
 
     assert len(result) == 1
     assert result[0].event_type == "vehicle_violation"
-    # _save_alert_snapshot returns the externally-reachable URL, not a bare path.
     assert "/alerts/" in result[0].snapshot_path
     assert _snapshot_disk_path(temp_dir, result[0].snapshot_path).exists()
+    assert engine._pending_violations() == {}
 
 
 def test_log_vehicle_event_passes_snapshot_path_to_report_alert():
