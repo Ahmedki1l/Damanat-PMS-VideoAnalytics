@@ -18,7 +18,7 @@ class FakePlateDetector:
         self.present = present
         self.exclude_regions_seen = []
 
-    def crop_plate(self, frame, *, pad_ratio=0.15, exclude_regions=None):
+    def crop_plate(self, frame, *, pad_ratio=0.15, exclude_regions=None, boxes=None):
         # Records what the overlay guard asked for, so a test can assert the
         # guard is applied to whole-frame sources and not to tight ramp crops.
         self.exclude_regions_seen.append(exclude_regions)

@@ -125,8 +125,14 @@ class PlateRegionDetector(ABC):
         *,
         pad_ratio: float = 0.15,
         exclude_regions=None,
+        boxes=None,
     ) -> Optional[np.ndarray]:
         """Detect and return the cropped and padded license plate region.
+
+        ``boxes`` is an optional pre-computed ``detect()`` result for THIS
+        frame. A caller that has already detected passes it so the plate is not
+        localised twice; selection is deterministic, so the answer is the same
+        either way. Left None, the implementation detects for itself.
 
         ``exclude_regions`` is an optional sequence of normalised
         ``(x1, y1, x2, y2)`` boxes in 0..1. A candidate whose centre falls
@@ -295,5 +301,6 @@ class NoopPlateRegionDetector(PlateRegionDetector):
         *,
         pad_ratio: float = 0.15,
         exclude_regions=None,
+        boxes=None,
     ) -> Optional[np.ndarray]:
         return None

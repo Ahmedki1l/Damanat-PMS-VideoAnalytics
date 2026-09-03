@@ -148,6 +148,53 @@ class EntrySettings:
     lpd_confidence: float = 0.30
     lpd_iou: float = 0.45
     lpd_threads: int = 2
+
+    # ── Vehicle crop for Re-ID ───────────────────────────────────────────────
+    # The gate ANPR overview reaches us as a WHOLE 2688x1552 frame (PMS-AI's
+    # ENTRY_V2_ANPR_FULL_FRAME, so our own LPD can localise the plate rather
+    # than re-reading Hikvision's composited panel). Embedding that frame is
+    # what the Re-ID gallery reference used to be, and it is dominated by sky,
+    # road and buildings: measured on HBR-4920 2026-09-03, the car is 24.3% of
+    # the frame and full-frame-vs-ramp-crop scores 0.114 while
+    # vehicle-crop-vs-ramp-crop scores 0.477. Same photograph, only the framing
+    # differs. Below ~25% vehicle share the embedding stops being about the car
+    # at all: cropped-vs-uncropped of one identical photo measured -0.036.
+    #
+    # So we detect the vehicle and embed the crop. OCR still gets the full
+    # frame — that path's 27%->42% localisation gain was measured separately
+    # and nothing here touches it.
+    #
+    # Applies to WHOLE-FRAME sources only. Ramp line-crossing evidence already
+    # arrives as a camera-side vehicle_rect_crop, and re-detecting inside it
+    # could only crop tighter or find the wrong thing: 120 idle CAM-03 frames
+    # carried 2+ vehicles over 5% of frame in 39 of them, because that view
+    # includes the parking bays.
+    vehicle_crop_enabled: bool = True
+    vehicle_model_dir: str = "models/yolo11m_openvino_model"
+    vehicle_confidence: float = 0.30
+    # Must match the IR's static input. The stock yolo11m OpenVINO export is
+    # fixed at 640x640 and raises "model input (shape=[1,3,640,640]) and the
+    # tensor ... are incompatible" on anything else, so the DetectorConfig
+    # default of 480 cannot be inherited here.
+    vehicle_imgsz: int = 640
+    vehicle_crop_pad: float = 0.12
+    # Sanity floor on the CHOSEN box, not a quality bar on the embedding. The
+    # ~25% figure above is where a car stops dominating the pixels it is
+    # embedded from; it is NOT a threshold a subject box must clear, and using
+    # it as one would reject the real subject -- HBR-4920's own gate box was
+    # 24.3%. This only exists to reject a box too small to be the car standing
+    # at the barrier.
+    #
+    # Provisional: fitted against a single measured gate frame. Re-check once
+    # entry_vehicle_crops holds a few days of `share=` values, which is what
+    # that directory is for.
+    vehicle_min_area_ratio: float = 0.05
+    # Higher bar when the plate did NOT pick the box. `largest_box` is reached
+    # only when the LPD found nothing in the frame, which is also when a car
+    # queued back from the barrier can be the biggest thing in shot -- and that
+    # car has no plate read, so nothing downstream would contradict it. A guess
+    # has to be a big object before it may replace the full frame.
+    vehicle_min_area_ratio_unverified: float = 0.12
     ocr_model_dir: str = ""
     # The decision log. Empty disables it, matching
     # ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR's convention. Point it at the volume the
@@ -311,6 +358,19 @@ class EntrySettings:
             lpd_confidence=_env_float("ENTRY_V2_LPD_CONFIDENCE", 0.30),
             lpd_iou=_env_float("ENTRY_V2_LPD_IOU", 0.45),
             lpd_threads=_env_int("ENTRY_V2_LPD_THREADS", 2),
+            vehicle_crop_enabled=not _env_true("ENTRY_V2_VEHICLE_CROP_DISABLED"),
+            vehicle_model_dir=os.getenv(
+                "ENTRY_V2_VEHICLE_MODEL_DIR", "models/yolo11m_openvino_model"
+            ),
+            vehicle_confidence=_env_float("ENTRY_V2_VEHICLE_CONFIDENCE", 0.30),
+            vehicle_imgsz=_env_int("ENTRY_V2_VEHICLE_IMGSZ", 640),
+            vehicle_crop_pad=_env_float("ENTRY_V2_VEHICLE_CROP_PAD", 0.12),
+            vehicle_min_area_ratio=_env_float(
+                "ENTRY_V2_VEHICLE_MIN_AREA_RATIO", 0.05
+            ),
+            vehicle_min_area_ratio_unverified=_env_float(
+                "ENTRY_V2_VEHICLE_MIN_AREA_RATIO_UNVERIFIED", 0.12
+            ),
             ocr_model_dir=os.getenv("ENTRY_V2_OCR_MODEL_DIR", ""),
             decision_log_dir=os.getenv("ENTRY_V2_DECISION_LOG_DIR", "").strip(),
             decision_log_retention_days=_env_int(

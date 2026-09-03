@@ -222,6 +222,7 @@ class OpenVINOPlateRegionDetector(PlateRegionDetector):
         *,
         pad_ratio: float = 0.15,
         exclude_regions: Optional[Sequence[Tuple[float, float, float, float]]] = None,
+        boxes: Optional[List[Box]] = None,
     ) -> Optional[np.ndarray]:
         """The highest-scoring plate region, padded, or ``None`` if none found.
 
@@ -243,7 +244,12 @@ class OpenVINOPlateRegionDetector(PlateRegionDetector):
         giving up: a real plate that happens to sit near the panel must still be
         found. Only if every candidate is excluded does this return ``None``.
         """
-        boxes = self.detect(bgr)
+        # `boxes` lets a caller that has ALREADY detected on this exact frame
+        # hand the result back instead of paying for a second forward pass. The
+        # selection below is deterministic, so re-detecting cannot produce a
+        # different answer -- it only costs. Left None, behaviour is unchanged.
+        if boxes is None:
+            boxes = self.detect(bgr)
         if not boxes:
             return None
         h, w = bgr.shape[:2]
