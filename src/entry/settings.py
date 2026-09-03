@@ -90,21 +90,14 @@ class EntrySettings:
     max_concurrent_ingest_requests: int = 2
     receipt_capacity: int = 4096
     journey_capacity: int = 4096
-    # Whether Entry V2/V3 state may change the SERVICE-level health verdict.
-    #
-    # Off by design. Entry V2 is one pipeline inside VideoAnalytics, and in
-    # shadow it is observation-only — it must not be able to report the whole
-    # service as degraded, because that is what the gateway aggregates and what
-    # operators page on. A single unmatched exit boundary did exactly that: the
-    # gate is `pending_exit_count > 0`, and 39 retained exits left over from the
-    # two days v3 could not confirm anything (reid_min_score was unreachable)
-    # held VideoAnalytics amber while every camera, stream and inference path
-    # was healthy.
-    #
-    # Nothing is hidden by this: the counters stay in the `entry_v2` block and
-    # the conditions are still listed, under `entry_v2_reasons`. Only the
-    # top-level verdict is decoupled. Set to 1 to fold them back in.
-    entry_v2_affects_service_health: bool = False
+    # NOTE: there is deliberately no `entry_v2_affects_service_health` setting
+    # (ENTRY_V2_AFFECTS_SERVICE_HEALTH). Entry V2/V3 state can never change the
+    # SERVICE-level health verdict — `/api/health` `status` answers "is
+    # VideoAnalytics running", and this pipeline is observation-only in shadow.
+    # The switch existed briefly and was removed because `api.py` honoured it
+    # while the engine's local-zone check degraded around it; see the health
+    # endpoint for the full account. Report on `entry_v2_status` and
+    # `entry_v2_reasons` instead — every condition is still published there.
     max_images_per_event: int = 4
     max_image_bytes: int = 4 * 1024 * 1024
     max_decoded_image_pixels: int = 12_000_000
@@ -239,9 +232,6 @@ class EntrySettings:
             ),
             receipt_capacity=_env_int("ENTRY_V2_RECEIPT_CAPACITY", 4096),
             journey_capacity=_env_int("ENTRY_V2_JOURNEY_CAPACITY", 4096),
-            entry_v2_affects_service_health=os.getenv(
-                "ENTRY_V2_AFFECTS_SERVICE_HEALTH", "0"
-            ).strip().lower() in _ENV_TRUE_VALUES,
             max_images_per_event=_env_int("ENTRY_V2_MAX_IMAGES", 4),
             max_image_bytes=_env_int("ENTRY_V2_MAX_IMAGE_BYTES", 4 * 1024 * 1024),
             max_decoded_image_pixels=_env_int(

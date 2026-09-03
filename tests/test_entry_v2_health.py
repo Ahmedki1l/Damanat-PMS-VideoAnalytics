@@ -17,28 +17,30 @@ class _UnusedEntryDependency:
         raise AssertionError(payload)
 
 
-def _entry_coordinator(mode, unavailable_reason="", linked=False):
-    """`linked` folds Entry V2 state back into the SERVICE health verdict.
+def _entry_coordinator(mode, unavailable_reason=""):
+    """Entry V2 state can NEVER change the SERVICE health verdict.
 
-    POLICY CHANGE. Entry V2 conditions used to set the top-level `status`
-    unconditionally. They no longer do: Entry V2 is one pipeline inside
-    VideoAnalytics and in shadow it is observation-only, so it must not be able
-    to report the whole service degraded — the gateway aggregates that verdict
-    and operators page on it. `pending_exit_count > 0` did exactly that, holding
-    VA amber over 39 exits retained from the two days v3 could not confirm
+    POLICY. Entry V2 conditions used to set the top-level `status`, first
+    unconditionally and then behind ENTRY_V2_AFFECTS_SERVICE_HEALTH. Both are
+    gone. Entry V2 is one pipeline inside VideoAnalytics and in shadow it is
+    observation-only, so it must not report the whole service degraded — the
+    gateway aggregates that verdict into a dashboard-wide outage banner and
+    operators page on it. `pending_exit_count > 0` did exactly that, holding VA
+    amber over 39 exits retained from the two days v3 could not confirm
     anything, while every camera, stream and inference path was healthy.
 
-    Every condition below is still asserted. It now lands in `entry_v2_status`
-    and `entry_v2_reasons`, and only reaches `status`/`health_reasons` when
-    ENTRY_V2_AFFECTS_SERVICE_HEALTH is on — which these tests exercise both ways.
+    The switch that replaced it was worse: `api.py` honoured it while the
+    engine's local-zone check degraded from inside `get_engine_status()`,
+    upstream of the gate, so a latched `crossing_ingest_failed` reported the
+    service degraded for a day while the same payload declared the pipeline
+    unlinked. `status` now answers one question — is VideoAnalytics running.
+
+    Every condition below is still asserted. It lands in `entry_v2_status` and
+    `entry_v2_reasons`, which is what to page on for the pipeline.
     """
     dependency = _UnusedEntryDependency()
     return EntryCoordinator(
-        EntrySettings(
-            mode=mode,
-            service_key="health-test",
-            entry_v2_affects_service_health=linked,
-        ),
+        EntrySettings(mode=mode, service_key="health-test"),
         dependency,
         dependency,
         unavailable_reason=unavailable_reason,
@@ -278,42 +280,38 @@ def test_full_journey_lifecycle_capacity_is_unhealthy(tmp_path) -> None:
 # -- the same conditions, with Entry V2 deliberately linked back in ----------
 
 
-def test_linking_restores_service_level_reporting(tmp_path) -> None:
-    """ENTRY_V2_AFFECTS_SERVICE_HEALTH=1 folds the pipeline back into the
-    service verdict, for a deployment that wants it that way."""
-    coordinator = _entry_coordinator(EntryMode.AUTHORITATIVE, linked=True)
+def test_no_entry_v2_condition_can_degrade_the_service(tmp_path) -> None:
+    """The whole point: a hard pipeline failure leaves the SERVICE verdict ok.
+
+    There is no longer a setting that changes this, so there is nothing to
+    exercise "both ways" — that switch is what let the engine bypass the
+    decoupling and report a day-long degrade behind an `unlinked` payload.
+    """
+    coordinator = _entry_coordinator(EntryMode.AUTHORITATIVE)
     summary = coordinator.state_summary()
+    summary["attempt_count"] = coordinator.settings.max_pending_attempts
     summary["pending_exit_count"] = 1
     coordinator.state_summary = lambda: summary
 
     response = _health(coordinator, tmp_path)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "degraded"
+    assert response.json()["status"] == "ok"
+    # No engine status is wired in these tests, so the key is absent rather
+    # than empty — either way nothing from entry_v2 reached the service list.
+    assert not response.json().get("health_reasons")
+    assert response.json()["entry_v2_status"] == "unhealthy"
     assert (
-        "entry_v2 unmatched exit boundaries: 1/4096"
-        in response.json()["health_reasons"]
+        "entry_v2 attempt capacity exhausted: 256/256"
+        in response.json()["entry_v2_reasons"]
     )
 
 
-def test_linking_restores_the_503_for_a_hard_failure(tmp_path) -> None:
-    coordinator = _entry_coordinator(EntryMode.AUTHORITATIVE, linked=True)
-    summary = coordinator.state_summary()
-    summary["attempt_count"] = coordinator.settings.max_pending_attempts
-    coordinator.state_summary = lambda: summary
+def test_the_service_verdict_carries_no_entry_v2_link_field(tmp_path) -> None:
+    """The field existed only to describe a switch that no longer exists."""
+    response = _health(_entry_coordinator(EntryMode.SHADOW), tmp_path)
 
-    response = _health(coordinator, tmp_path)
-
-    assert response.status_code == 503
-    assert response.json()["status"] == "unhealthy"
-
-
-def test_the_link_state_is_reported_so_an_operator_can_see_it(tmp_path) -> None:
-    unlinked = _health(_entry_coordinator(EntryMode.SHADOW), tmp_path)
-    linked = _health(_entry_coordinator(EntryMode.SHADOW, linked=True), tmp_path)
-
-    assert unlinked.json()["entry_v2_linked_to_service_health"] is False
-    assert linked.json()["entry_v2_linked_to_service_health"] is True
+    assert "entry_v2_linked_to_service_health" not in response.json()
 
 
 def test_a_healthy_pipeline_reports_no_entry_v2_reasons(tmp_path) -> None:

@@ -1564,18 +1564,26 @@ def create_app(
             "max_pending_crossings": crossing_capacity,
             "journey_capacity": journey_capacity,
         }
-        # Entry V2/V3 conditions are collected here and applied to the
-        # SERVICE verdict only when explicitly linked. Entry V2 is one pipeline
-        # inside VideoAnalytics; in shadow it is observation-only and must not
-        # be able to report the whole service degraded. `pending_exit_count > 0`
-        # did exactly that — 39 exits retained from the two days v3 could not
-        # confirm anything held VA amber while every camera, stream and
-        # inference path was healthy, and the gateway aggregated that into an
-        # overall "degraded".
+        # Entry V2/V3 conditions are collected here and NEVER applied to the
+        # service verdict. `status` answers one question — is VideoAnalytics
+        # running — and Entry V2 is one pipeline inside it, in shadow, whose
+        # faults leave detection, occupancy and alerting untouched.
+        #
+        # This used to be switchable via ENTRY_V2_AFFECTS_SERVICE_HEALTH, and
+        # the switch was a trap twice over. `pending_exit_count > 0` held VA
+        # amber over 39 exits retained from the two days v3 could not confirm
+        # anything, while every camera, stream and inference path was healthy.
+        # Worse, the engine's own local-zone check degraded from INSIDE
+        # `get_engine_status()` — upstream of the gate — so a latched
+        # `crossing_ingest_failed` reported the service degraded for a day with
+        # the payload simultaneously declaring the pipeline unlinked. A switch
+        # that one code path honours and another bypasses is worse than no
+        # switch, and nobody wanted it on.
         #
         # The information is not lost: the counters stay in the `entry_v2`
         # block and every condition below is reported under `entry_v2_reasons`
-        # whether or not it is linked.
+        # and summarised in `entry_v2_status`. Page on those if you want to
+        # page on the pipeline.
         mode_on = active_entry_coordinator.settings.mode.value != "off"
         entry_v2_reasons: list[str] = []
         entry_v2_severity = "ok"
@@ -1636,20 +1644,6 @@ def create_app(
 
         health_data["entry_v2_reasons"] = entry_v2_reasons
         health_data["entry_v2_status"] = entry_v2_severity
-        health_data["entry_v2_linked_to_service_health"] = (
-            active_entry_coordinator.settings.entry_v2_affects_service_health
-        )
-        if (
-            active_entry_coordinator.settings.entry_v2_affects_service_health
-            and entry_v2_reasons
-        ):
-            health_data["health_reasons"] = list(
-                health_data.get("health_reasons") or []
-            ) + entry_v2_reasons
-            if entry_v2_severity == "unhealthy":
-                health_data["status"] = "unhealthy"
-            elif health_data.get("status") == "ok":
-                health_data["status"] = "degraded"
         if health_data.get("status") == "unhealthy":
             response.status_code = 503
         return health_data

@@ -279,14 +279,20 @@ class ParkingEngine(
         if not self.model_loaded:
             _degrade("model not loaded")
 
+        # Entry V2 state is REPORTED here and never folded into ``status``.
+        # This verdict answers one question — is VideoAnalytics running: is the
+        # loop turning, are the streams delivering, is the model loaded, is the
+        # DB reachable. Entry V2 is one pipeline inside the service, in shadow
+        # for now, and a fault in it leaves detection, occupancy and the alert
+        # path completely intact. It used to `_degrade` from here, upstream of
+        # the decoupling `api.py` performs, so it bypassed that gate entirely
+        # and reported the whole service amber — which the gateway aggregated
+        # into a dashboard-wide "AI Analytics Service Temporarily Unavailable".
+        # The metrics stay in ``entry_v2_local_zone`` for whoever is watching
+        # the pipeline; they are not evidence about the service.
         local_entry_metrics = None
         if self._entry_v2_local_bridge is not None:
             local_entry_metrics = self._entry_v2_local_bridge.metrics()
-            if not local_entry_metrics["healthy"]:
-                _degrade(
-                    "entry v2 local-zone ingestion failed "
-                    f"({local_entry_metrics['last_error']})"
-                )
 
         result = {
             "status": status,

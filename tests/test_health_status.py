@@ -122,7 +122,15 @@ def test_model_not_loaded_is_degraded():
     assert _status(cam=_FakeCam(20, [], [], 20), model=False) == "degraded"
 
 
-def test_local_entry_queue_saturation_degrades_engine_health():
+def test_local_entry_failure_is_reported_but_never_degrades_the_service():
+    """Entry V2's local-zone bridge is published, never folded into `status`.
+
+    It used to `_degrade` from here — upstream of the decoupling `api.py` does,
+    so it bypassed that gate and took the whole service amber. A latched
+    `crossing_ingest_failed` then held VideoAnalytics degraded for a full day,
+    and the dashboard showed "AI Analytics Service Temporarily Unavailable",
+    while the loop, both streams, the model and the DB were all fine.
+    """
     engine = _engine(cam=_FakeCam(20, [], [], 20))
     engine._entry_v2_local_bridge = _FakeLocalEntryBridge(
         healthy=False,
@@ -131,11 +139,13 @@ def test_local_entry_queue_saturation_degrades_engine_health():
 
     status = engine.get_engine_status()
 
-    assert status["status"] == "degraded"
+    assert status["status"] == "ok"
+    assert status["health_reasons"] == []
+    # Still visible to anyone watching the pipeline rather than the service.
     assert status["entry_v2_local_zone"]["queue_saturated"] is True
-    assert any(
-        "local_zone_queue_capacity_exceeded" in reason
-        for reason in status["health_reasons"]
+    assert (
+        status["entry_v2_local_zone"]["last_error"]
+        == "local_zone_queue_capacity_exceeded"
     )
 
 

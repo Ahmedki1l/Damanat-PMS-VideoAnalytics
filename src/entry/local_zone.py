@@ -1007,6 +1007,7 @@ class LocalZoneCrossingBridge:
             logger.exception("[EntryV2Local] local zone crossing failed")
         else:
             self._increment("submissions_completed")
+            self._clear_last_error()
             if result.decision_status == "confirmed":
                 self._increment("confirmations")
             logger.info(
@@ -1074,6 +1075,31 @@ class LocalZoneCrossingBridge:
                 or None
             )
         return result
+
+    def _clear_last_error(self) -> None:
+        """A completed crossing proves ingestion works again.
+
+        ``_last_error`` was write-only: set on a failed submission and never
+        reset, so ONE failure — a PMS-AI restart, a readiness race against the
+        init container at boot — latched ``metrics()["healthy"]`` False for the
+        whole process lifetime. The engine turned that into a permanent
+        ``degraded`` and the dashboard into a permanent red banner, clearable
+        only by restarting the pod, while ingestion had recovered seconds later
+        and every subsequent crossing was being accepted.
+
+        Its two siblings in the same verdict — ``_invalid_timestamp_cameras``
+        and ``_capacity_rejected_crossings`` — always had paired recovery
+        (``mark_source_timestamp_valid``, ``_clear_capacity_saturation``). This
+        is the third, and it logs like they do so a recovery is greppable.
+        """
+        with self._lock:
+            recovered = self._last_error
+            self._last_error = ""
+        if recovered:
+            logger.info(
+                "[EntryV2Local] local-zone ingestion recovered (was %s)",
+                recovered,
+            )
 
     def mark_source_timestamp_invalid(self, camera_id: str) -> None:
         """Expose and latch an active missing/invalid frame timestamp."""

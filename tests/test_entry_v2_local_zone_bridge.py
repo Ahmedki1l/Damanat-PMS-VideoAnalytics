@@ -532,7 +532,20 @@ def test_worker_failure_is_visible_in_health_metrics():
         bridge.close(wait=True)
 
 
-def test_transient_worker_failure_retries_same_crossing_and_stays_degraded():
+def test_transient_worker_failure_retries_same_crossing_and_recovers():
+    """A retry that succeeds must clear the fault, not just count it.
+
+    `_last_error` used to be write-only, so this sequence — one transient
+    failure, one successful retry of the SAME crossing — left the bridge
+    reporting `healthy: False` for the rest of the process lifetime. In prod
+    that latched at boot (a readiness race with PMS-AI) and held
+    VideoAnalytics `degraded` for a full day while every subsequent crossing
+    was accepted; only a pod restart cleared it.
+
+    The counters still record what happened: `submissions_failed` stays 1.
+    A bridge that is genuinely broken never reaches the success branch and
+    stays unhealthy — see `test_worker_failure_is_visible_in_health_metrics`.
+    """
     coordinator = RecordingCoordinator(failures_remaining=1)
     bridge = LocalZoneCrossingBridge(coordinator)
     try:
@@ -552,8 +565,8 @@ def test_transient_worker_failure_retries_same_crossing_and_stays_degraded():
         assert metrics["submissions_failed"] == 1
         assert metrics["submissions_completed"] == 1
         assert metrics["confirmations"] == 1
-        assert metrics["healthy"] is False
-        assert metrics["last_error"] == "crossing_ingest_failed"
+        assert metrics["healthy"] is True
+        assert metrics["last_error"] is None
     finally:
         bridge.close(wait=True)
 
