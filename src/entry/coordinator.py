@@ -23,6 +23,11 @@ from .decision import (
     causally_eligible_attempts,
     max_similarity,
 )
+from .gallery import (
+    EMPTY_LOOKUP,
+    GalleryReferences,
+    NullGalleryReferences,
+)
 from .identity import (
     IdentitySupersededByExit,
     IdentityPublisher,
@@ -145,6 +150,7 @@ class EntryCoordinator:
         unavailable_reason: str = "",
         decision_log: Optional[Any] = None,
         clock: Optional[Any] = None,
+        gallery_references: Optional[GalleryReferences] = None,
     ):
         # The ONLY wall clock in the coordinator, and it exists solely to age
         # state out. It is never consulted to decide whether two observations
@@ -155,6 +161,10 @@ class EntryCoordinator:
         self._processor = evidence_processor
         self._sink = confirmation_sink
         self._identity_publisher = identity_publisher or NullIdentityPublisher()
+        # Optional for the same reason the decision log is: every test builds a
+        # coordinator directly and none of them should need a gallery on disk.
+        # None means "score exactly what this visit produced", never "fail".
+        self._gallery_references = gallery_references or NullGalleryReferences()
         # Optional by design: every test constructs a coordinator directly, and
         # none of them should have to know about a log. None means "record
         # nothing", never "fail".
@@ -1133,12 +1143,15 @@ class EntryCoordinator:
 
         if group is None:
             group_id = self._group_id(request.attempt_id)
+            lookup = self._gallery_lookup(request.reported_plate)
             group = AttemptGroup(
                 group_id=group_id,
                 identity_key=identity_key,
                 created_at=now,
                 last_activity_at=now,
                 correction_candidate_of=correction_of,
+                gallery_embeddings=lookup.vectors,
+                gallery_stats=lookup.as_record(),
             )
             self._groups[group_id] = group
             created = True
@@ -1410,19 +1423,163 @@ class EntryCoordinator:
         if ocr_evidence_id:
             hypothesis.ocr_evidence_ids.add(ocr_evidence_id)
 
+    def _retire_superseded_same_key_locked(
+        self,
+        confirmed: AttemptGroup,
+        crossing: CrossingRecord,
+    ) -> None:
+        """Drop same-plate identities that were the SAME arrival as this one.
+
+        The gate reads a plate more than once per car. When two reads are too
+        dissimilar to merge at `merge_min_score` they become two identities
+        under one key (`same_key_split`), one gets the ramp crossing, and the
+        other is left pending as a live Re-ID competitor for its full fifteen
+        minutes. On 2026-09-06 that is exactly what happened: GGR-9064 was read
+        at 10:09:18 and again at 10:10:34, the first identity confirmed on the
+        10:11:20 crossing, and the leftover then won RGR-6466's 10:24:04 CAM-23
+        crossing at 0.636 — one physical car, two witnesses, two identities,
+        both confirmed. Under authoritative that closes a live stay and reopens
+        it thirteen minutes later.
+
+        THE TEST IS SOURCE TIME, NOT PLATE EQUALITY. Two live identities may
+        legitimately share a plate key — that is what lets a genuine
+        exit-and-re-entry stay two visits, and `_identity_for_plate_locked`
+        says so in as many words. What separates the two cases is when the ANPR
+        read happened relative to the crossing that just confirmed:
+
+        * every attempt at or before the crossing -> the same arrival, read
+          twice. The car is now inside; this identity describes a journey that
+          has already been accounted for.
+        * any attempt after the crossing -> a later journey. Untouched.
+
+        Retired rather than merged: pooling its images into the confirmed
+        identity is the gallery-poisoning failure the appearance guard exists to
+        prevent, and Re-ID has already said these two do not look alike.
+        """
+        if not self.settings.same_key_retirement_enabled:
+            return
+        if not confirmed.identity_key:
+            return
+        boundary = crossing.request.captured_at
+        for group in list(self._groups.values()):
+            if (
+                group.group_id == confirmed.group_id
+                or group.status != RecordStatus.PENDING
+                or group.identity_key != confirmed.identity_key
+                or not group.attempts
+            ):
+                continue
+            try:
+                superseded = all(
+                    attempt.request.captured_at <= boundary
+                    for attempt in group.attempts.values()
+                )
+            except TypeError:
+                # Mixed aware/naive timestamps cannot establish ordering, and a
+                # retirement is destructive. Fail closed: leave it pending.
+                continue
+            if not superseded:
+                continue
+            group.status = RecordStatus.RESOLVED
+            self._emit_decision_record(
+                stage="same_key_retirement",
+                result=decision_record.RESULT_EXPIRED,
+                reason="superseded_by_confirmed_same_key",
+                identity={
+                    "group_id": group.group_id,
+                    "identity_key": group.identity_key,
+                    "superseded_by": confirmed.group_id,
+                    "crossing_id": crossing.request.crossing_id,
+                    "attempt_count": len(group.attempts),
+                },
+                witnesses=[w.value for w in group.witnesses],
+            )
+            logger.info(
+                "[EntryV2] retired superseded same-key identity %s (key=%s) "
+                "after %s confirmed on crossing %s",
+                group.group_id,
+                group.identity_key,
+                confirmed.group_id,
+                crossing.request.crossing_id,
+            )
+
+    def _gallery_lookup(self, plate: str):
+        """This plate's durable references, read once at identity creation.
+
+        Never raises. A gallery that cannot be read is a weaker match, not a
+        dropped entry — the caller falls back to exactly the reference set it
+        used before the gallery was wired in at all.
+        """
+        if not self.settings.gallery_match_enabled:
+            return EMPTY_LOOKUP
+        try:
+            return self._gallery_references.lookup(plate)
+        except Exception as exc:  # pragma: no cover - defensive I/O boundary
+            logger.warning(
+                "[EntryV2][gallery] lookup failed for plate=%r: %r", plate, exc
+            )
+            return EMPTY_LOOKUP
+
+    @staticmethod
+    def _causal_plate_sources_locked(
+        group: AttemptGroup,
+        eligible: Sequence[AttemptRecord],
+    ) -> Dict[PlateSourceKind, PlateReading]:
+        """The stored plate sources this crossing is allowed to be named by.
+
+        This is the causality check the storage site asks for in so many words:
+        "Stage 6 must give it a causality check of its own if it ever attaches
+        records that could postdate the observation they are used to explain."
+
+        Only HIK_TEXT is stored, and it arrives on a HikCentral-sourced attempt
+        whose `captured_at` is the platform's pass time. So the reading is
+        causal exactly when such an attempt survived the projection. A Hik pass
+        recorded AFTER the car went past describes a later journey and must not
+        name this one.
+        """
+        hik = group.plate_sources.get(PlateSourceKind.HIK_TEXT)
+        if hik is None:
+            return {}
+        if any(_is_hik_sourced_attempt(item.request) for item in eligible):
+            return {PlateSourceKind.HIK_TEXT: hik}
+        return {}
+
     def _causal_group_projection(
         self,
         group: AttemptGroup,
         crossing: CrossingRecord,
     ) -> AttemptGroup:
-        """Project attempt-derived identity to source-causal evidence only."""
+        """Project attempt-derived identity to source-causal evidence only.
+
+        The projection restricts what is DERIVED FROM ATTEMPTS, because attempts
+        are the only evidence that can postdate a crossing. Everything stored on
+        the identity itself has to be carried across, and forgetting one is not
+        a harmless omission — it silently deletes a whole class of evidence from
+        the decision:
+
+        * `plate_sources` holds HikCentral's own plate reading, the one source
+          that can contradict a gate misread. Dropping it made
+          `available_plate_sources` see an empty dict on EVERY decision, so all
+          109 confirmations ever logged read `available: ["anpr"]` and the
+          two-of-three consensus rule never once executed. It was not that
+          HikCentral disagreed; it was never asked.
+        * `gallery_embeddings` is this car's durable appearance. Dropping it
+          would send the plate stage a different identity from the one Re-ID
+          matched.
+
+        ANPR's own reading and our OCR's are deliberately NOT copied: the engine
+        derives both from `attempts`, which is exactly what makes them respect
+        the projection.
+        """
+        eligible = causally_eligible_attempts(group, crossing)
         projected = AttemptGroup(
             group_id=group.group_id,
-            attempts={
-                attempt.request.attempt_id: attempt
-                for attempt in causally_eligible_attempts(group, crossing)
-            },
+            attempts={attempt.request.attempt_id: attempt for attempt in eligible},
             status=group.status,
+            identity_key=group.identity_key,
+            plate_sources=self._causal_plate_sources_locked(group, eligible),
+            gallery_embeddings=group.gallery_embeddings,
+            gallery_stats=dict(group.gallery_stats),
         )
         for attempt in projected.attempts.values():
             self._add_hypothesis(
@@ -1642,6 +1799,10 @@ class EntryCoordinator:
                         related.matched_group_id = group.group_id
                         related.status = RecordStatus.RESOLVED
                     group.status = RecordStatus.RESOLVED
+                    self._retire_superseded_same_key_locked(
+                        group,
+                        resolution_crossing,
+                    )
                 self._callback_reservations[decision.decision_id] = decision
                 decisions.append(decision)
                 produced_decision = True
@@ -1849,6 +2010,7 @@ class EntryCoordinator:
                 "enabled": self.settings.colour_veto_enabled,
             },
             fifo=self._fifo_block_locked(crossing, evaluation),
+            gallery=(group.gallery_stats if group is not None else None),
             identity=(
                 {
                     "group_id": evaluation.group_id,

@@ -140,12 +140,20 @@ def review_sections(records: list[dict]) -> dict:
     # almost always, that is an argument for using it as a tie-break - made
     # from evidence rather than assumption. If it disagrees often, that is the
     # justification for having refused to enforce it.
+    #
+    # `agreed` is a TRISTATE. It is null when there was no FIFO expectation to
+    # compare against, which is not a disagreement and must not be counted as
+    # one: on the 2026-09-05/06 corpus that treated 34 of 42 evaluations as
+    # Re-ID contradicting FIFO and told the operator to go read 34 cases that
+    # did not exist, when the real count was zero.
     fifo = [r.get("fifo") for r in records if r.get("fifo")]
-    agreed = sum(1 for f in fifo if f.get("agreed"))
+    agreed = sum(1 for f in fifo if f.get("agreed") is True)
+    disagreed = sum(1 for f in fifo if f.get("agreed") is False)
     out["fifo"] = {
-        "compared": len(fifo),
+        "compared": agreed + disagreed,
         "agreed": agreed,
-        "disagreed": len(fifo) - agreed,
+        "disagreed": disagreed,
+        "no_expectation": len(fifo) - agreed - disagreed,
     }
 
     # Every colour veto is a candidate REMOVED from contention. A veto that
@@ -186,6 +194,65 @@ def review_sections(records: list[dict]) -> dict:
         for r in _stage(records, "reid_evaluation")
         if not (r.get("reid") or {}).get("accepted")
     )
+
+    # THE GALLERY DELTA. `score` is what the crossing scored against this car's
+    # durable gallery plus the visit's gate crops; `attempt_only_score` is what
+    # it would have scored against the gate crops alone, which is what every
+    # decision before this feature was made on. The paired difference is the
+    # measured value of consulting the gallery, and the flip counts are the
+    # decisions it actually changed. Read both before moving any threshold.
+    paired = [
+        (r["score"], r["attempt_only_score"], bool(r.get("accepted")))
+        for r in accepted + rejected
+        if r.get("attempt_only_score") is not None and r.get("score") is not None
+    ]
+    min_score = next(
+        (r.get("min_score") for r in accepted + rejected if r.get("min_score")),
+        None,
+    )
+    out["gallery"] = {
+        "evaluations_with_refs": len(paired),
+        "delta": _distribution([score - alone for score, alone, _ in paired]),
+        "score_with_gallery": _distribution([score for score, _, _ in paired]),
+        "score_without": _distribution([alone for _, alone, _ in paired]),
+        # Would the old reference set have cleared today's bar? A "rescued"
+        # decision is one the gallery lifted over the floor; a "regressed" one
+        # is a decision it should not have been able to change and must be read.
+        "rescued": (
+            sum(
+                1
+                for score, alone, ok in paired
+                if ok and alone < min_score <= score
+            )
+            if min_score is not None
+            else None
+        ),
+        "regressed": (
+            sum(
+                1
+                for score, alone, ok in paired
+                if not ok and score < min_score <= alone
+            )
+            if min_score is not None
+            else None
+        ),
+        "refs_used": _distribution(
+            [
+                float((r.get("gallery") or {}).get("used") or 0)
+                for r in _stage(records, "reid_evaluation")
+            ]
+        ),
+        "dropped_model_tag": sum(
+            int((r.get("gallery") or {}).get("dropped_model_tag") or 0)
+            for r in _stage(records, "reid_evaluation")
+        ),
+        "empty_lookups": sum(
+            1
+            for r in _stage(records, "reid_evaluation")
+            if not (r.get("gallery") or {}).get("used")
+        ),
+    }
+    out["same_key_retirements"] = len(_stage(records, "same_key_retirement"))
 
     # The cases a person must open individually.
     out["needs_eyes"] = {
@@ -289,11 +356,42 @@ def render(records: list[dict]) -> int:
     for reason, count in review["reid_reject_reasons"].most_common(6):
         print(f"    {reason:<34} {count}")
 
+    gallery = review["gallery"]
+    if gallery["evaluations_with_refs"]:
+        print("\nDURABLE GALLERY  (the delta this feature is being judged on)")
+        print(f"  evaluations with references: {gallery['evaluations_with_refs']}")
+        print(f"  refs used per evaluation   : {gallery['refs_used']}")
+        print(f"  score WITH gallery         : {gallery['score_with_gallery']}")
+        print(f"  score without (gate only)  : {gallery['score_without']}")
+        print(f"  paired delta               : {gallery['delta']}")
+        print(
+            f"  cleared the floor only with the gallery: {gallery['rescued']}"
+        )
+        if gallery["regressed"]:
+            print(
+                f"  !! REGRESSED (gallery pushed a match BELOW the floor): "
+                f"{gallery['regressed']} — read every one"
+            )
+        if gallery["dropped_model_tag"]:
+            print(
+                f"  refs skipped as another model's: "
+                f"{gallery['dropped_model_tag']}  (re-embed or ignore)"
+            )
+        print(f"  evaluations with an EMPTY gallery: {gallery['empty_lookups']}")
+    else:
+        print("\nDURABLE GALLERY  not consulted in this corpus")
+        print("  -> ENTRY_V2_GALLERY_MATCH_ENABLED is off, or no folder resolved.")
+
+    if review["same_key_retirements"]:
+        print(f"\nSAME-KEY RETIREMENTS  {review['same_key_retirements']}")
+        print("  -> confirm each was a duplicate gate read, NOT a real re-entry.")
+
     fifo = review["fifo"]
     print("\nFIFO vs Re-ID  (measured, never enforced)")
     print(
         f"  compared {fifo['compared']}   agreed {fifo['agreed']}   "
-        f"disagreed {fifo['disagreed']}"
+        f"disagreed {fifo['disagreed']}   "
+        f"no expectation {fifo['no_expectation']}"
     )
     if fifo["disagreed"]:
         print("  -> read each disagreement: Re-ID should have been right in all.")

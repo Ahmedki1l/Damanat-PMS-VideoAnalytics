@@ -93,6 +93,17 @@ class ReIDMatchEvaluation:
     ranked: Tuple[Tuple[str, float], ...] = ()
     # Identities colour removed from contention before ranking.
     vetoed: Tuple[str, ...] = ()
+    # What the winner would have scored on this visit's gate crops ALONE.
+    #
+    # Recorded on every evaluation so a shadow window measures the change
+    # instead of asserting it: the delta between this and `score`, read across
+    # a week of real traffic, is the whole evidence for whether the gallery
+    # belongs in the match and where the thresholds should then sit. None when
+    # the gallery contributed nothing, in which case `score` already is it.
+    attempt_only_score: Optional[float] = None
+    # group_id -> how many gallery references it was scored with. The row
+    # margin only means something when these are comparable.
+    gallery_ref_counts: Tuple[Tuple[str, int], ...] = ()
 
     @property
     def accepted(self) -> bool:
@@ -149,15 +160,43 @@ def causally_eligible_attempts(
     return tuple(eligible)
 
 
-def causal_group_embeddings(
+def causal_attempt_embeddings(
     group: AttemptGroup,
     crossing: CrossingRecord,
 ) -> Tuple[Tuple[float, ...], ...]:
+    """Only THIS visit's gate crops — the reference set before the gallery."""
     return tuple(
         embedding
         for attempt in causally_eligible_attempts(group, crossing)
         for embedding in attempt.embeddings
     )
+
+
+def causal_group_embeddings(
+    group: AttemptGroup,
+    crossing: CrossingRecord,
+) -> Tuple[Tuple[float, ...], ...]:
+    """Everything this identity may be scored against for this crossing.
+
+    The gallery ENRICHES a causally eligible identity; it never creates one.
+    An identity whose every ANPR read follows the crossing did not exist when
+    the car went past, and letting its previous-visit references compete anyway
+    would let appearance history outvote causality — the one thing the causal
+    projection exists to prevent. So no eligible attempt means no evidence at
+    all, gallery included.
+
+    Past that gate the gallery needs no check of its own: it is frozen when the
+    identity is created, so every vector in it predates the ANPR read that the
+    caller has already placed before the crossing.
+
+    The invariant lives here rather than in each caller because three of them
+    score groups this way, and a guard that only one applies is not an
+    invariant.
+    """
+    attempts = causal_attempt_embeddings(group, crossing)
+    if not attempts:
+        return ()
+    return attempts + tuple(group.gallery_embeddings)
 
 
 class EntryDecisionEngine:
@@ -220,13 +259,22 @@ class EntryDecisionEngine:
         """
         ranked = []
         vetoed = []
+        attempt_only = {}
+        gallery_counts = {}
         query_colour = crossing.colour_hsv
         for group in groups.values():
             if group.status != RecordStatus.PENDING:
                 continue
-            group_embeddings = causal_group_embeddings(group, crossing)
-            if not group_embeddings:
+            attempt_embeddings = causal_attempt_embeddings(group, crossing)
+            # The gallery ENRICHES a causally eligible identity; it never makes
+            # one eligible. An identity whose only ANPR read postdates this
+            # crossing did not exist when the car went past, and letting its
+            # gallery compete anyway would use previous-visit crops to claim a
+            # crossing that happened before the car was seen at the gate.
+            if not attempt_embeddings:
                 continue
+            group_embeddings = attempt_embeddings + tuple(group.gallery_embeddings)
+            gallery_counts[group.group_id] = len(group.gallery_embeddings)
             # COLOUR VETO. Colour is subtractive only: it removes a candidate
             # that cannot be this car, and the margin is then recomputed over
             # the survivors. It never adds score to anything, because colour is
@@ -241,6 +289,9 @@ class EntryDecisionEngine:
             ):
                 vetoed.append(group.group_id)
                 continue
+            attempt_only[group.group_id] = max_similarity(
+                crossing.embeddings, attempt_embeddings
+            )
             ranked.append(
                 (
                     max_similarity(crossing.embeddings, group_embeddings),
@@ -345,6 +396,14 @@ class EntryDecisionEngine:
             match=match,
             ranked=tuple((gid, value) for value, gid in ranked),
             vetoed=tuple(vetoed),
+            attempt_only_score=(
+                attempt_only.get(group_id)
+                if any(gallery_counts.values())
+                else None
+            ),
+            gallery_ref_counts=tuple(
+                sorted(item for item in gallery_counts.items() if item[1])
+            ),
         )
 
     # ------------------------------------------------------------------ #

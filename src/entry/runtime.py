@@ -17,6 +17,7 @@ from .callback import (
     RetryingConfirmationSink,
 )
 from .coordinator import EntryCoordinator
+from .gallery import NullGalleryReferences, RegistryGalleryReferences
 from .identity import RegistryIdentityPublisher
 from .settings import EntrySettings
 
@@ -134,6 +135,17 @@ def build_entry_coordinator(
         sink,
         identity_publisher=RegistryIdentityPublisher(registry),
         decision_log=build_decision_log(settings),
+        # Read-only, and only when configured. The registry owns the gallery;
+        # entry borrows it to score a ramp crossing against the car's own
+        # previous ramp views instead of against two frontal gate crops.
+        gallery_references=(
+            RegistryGalleryReferences(
+                registry,
+                max_refs=settings.gallery_match_max_refs,
+            )
+            if settings.gallery_match_enabled
+            else NullGalleryReferences()
+        ),
     )
 
 

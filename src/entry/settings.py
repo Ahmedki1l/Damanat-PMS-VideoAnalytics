@@ -107,6 +107,22 @@ class EntrySettings:
     reid_min_score: float = 0.75
     reid_row_margin: float = 0.08
     reid_column_margin: float = 0.08
+    # Score a ramp crossing against this car's DURABLE gallery as well as
+    # against the gate crops of the visit in progress. See src/entry/gallery.py
+    # for why the gallery is the better reference set; off by default so the
+    # behaviour a deployment gets is the behaviour it configured.
+    gallery_match_enabled: bool = False
+    # The SAME cap for every candidate. max_similarity over more vectors is
+    # biased upward, so an uncapped comparison would let a twenty-reference car
+    # out-margin a two-reference one on sample count alone and make the row
+    # margin meaningless. Raise only alongside a margin recalibration.
+    gallery_match_max_refs: int = 8
+    # Retire a same-plate identity that the confirmed one has superseded in
+    # source time. Defaults ON because leaving it pending is what let one car's
+    # leftover gate read claim a different car's crossing; the switch exists so
+    # a shadow window that shows it retiring genuine re-entries can be reverted
+    # without a rollback.
+    same_key_retirement_enabled: bool = True
     merge_min_score: float = 0.82
     merge_margin: float = 0.08
     event_consistency_min_score: float = 0.82
@@ -377,6 +393,11 @@ class EntrySettings:
                 "ENTRY_V2_DECISION_LOG_RETENTION_DAYS", 30
             ),
             decision_log_queue_max=_env_int("ENTRY_V2_DECISION_LOG_QUEUE_MAX", 2000),
+            gallery_match_enabled=_env_true("ENTRY_V2_GALLERY_MATCH_ENABLED"),
+            gallery_match_max_refs=_env_int("ENTRY_V2_GALLERY_MATCH_MAX_REFS", 8),
+            same_key_retirement_enabled=os.getenv(
+                "ENTRY_V2_SAME_KEY_RETIREMENT_ENABLED", "1"
+            ).strip().lower() in _ENV_TRUE_VALUES,
             colour_veto_enabled=os.getenv(
                 "ENTRY_V2_COLOUR_VETO_ENABLED", "1"
             ).strip().lower() in _ENV_TRUE_VALUES,
@@ -485,6 +506,11 @@ class EntrySettings:
             "lpd_threads": self.lpd_threads,
             "va_process_count": self.va_process_count,
         }
+        if self.gallery_match_enabled:
+            # Only when the feature is on: a malformed integer arrives here as 0
+            # (see _env_int), and 0 would silently mean "cap everything to
+            # nothing", which reads in the log as a gallery that is simply empty.
+            positive["gallery_match_max_refs"] = self.gallery_match_max_refs
         errors.extend(name for name, value in positive.items() if value <= 0)
         local_zone_cameras = self.local_zone_cameras()
         local_zone_enabled = bool(local_zone_cameras)

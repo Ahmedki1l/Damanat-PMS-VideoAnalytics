@@ -149,6 +149,23 @@ def reid_block(evaluation, settings) -> Dict[str, Any]:
         "min_row_margin": float(settings.reid_row_margin),
         "min_column_margin": float(settings.reid_column_margin),
         "accepted": bool(evaluation.accepted),
+        # What the winner would have scored on this visit's gate crops alone.
+        # `score - attempt_only_score` is the measured value of consulting the
+        # durable gallery, per decision, over real traffic. Null when the
+        # gallery contributed nothing, in which case `score` already is it.
+        "attempt_only_score": (
+            None
+            if getattr(evaluation, "attempt_only_score", None) is None
+            else round(float(evaluation.attempt_only_score), 6)
+        ),
+        # group_id -> gallery references it was scored with. Recorded for every
+        # candidate, not just the winner, because a row margin between a
+        # twenty-reference car and a two-reference one is not a like-for-like
+        # comparison and a review has to be able to see that.
+        "gallery_ref_counts": {
+            str(group_id): int(count)
+            for group_id, count in getattr(evaluation, "gallery_ref_counts", ())
+        },
     }
 
 
@@ -164,6 +181,7 @@ def build_record(
     witnesses: Optional[Iterable[str]] = None,
     colour: Optional[Mapping[str, Any]] = None,
     fifo: Optional[Mapping[str, Any]] = None,
+    gallery: Optional[Mapping[str, Any]] = None,
     hik: Optional[Mapping[str, Any]] = None,
     plate: Optional[Mapping[str, Any]] = None,
     ranked: Optional[Sequence[Tuple[str, float]]] = None,
@@ -202,6 +220,12 @@ def build_record(
         record["colour"] = dict(colour)
     if fifo is not None:
         record["fifo"] = dict(fifo)
+    if gallery:
+        # What the durable gallery could offer this identity. Separates "this
+        # car looks different today" from "we had nothing to compare against",
+        # and `dropped_model_tag` separates an empty folder from a full one
+        # written under a model that is no longer running.
+        record["gallery"] = dict(gallery)
     if hik is not None:
         record["hik"] = dict(hik)
     if plate is not None:

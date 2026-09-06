@@ -369,7 +369,64 @@ ENV ENTRY_V2_FALLBACK_DIRECTIONS=B-to-A,b-entry
 # for 3 missing cars. Confirm the plateau holds over a full week first.
 ENV ENTRY_V2_REID_MIN_SCORE=0.20
 
-ENV ENTRY_V2_REID_MIN_MARGIN=0.08
+# These are the names the code actually reads (settings.py:308-309). The single
+# ENTRY_V2_REID_MIN_MARGIN that used to sit here was read by NOTHING — grep the
+# tree and the Dockerfile is its only occurrence. Both margins happened to be
+# right anyway, because 0.08 is also the code default, so the mistake was
+# invisible: the block above says "KEEP THE MARGINS AT 0.08" and pointed at a
+# variable that could not have moved them either way.
+ENV ENTRY_V2_REID_ROW_MARGIN=0.08
+ENV ENTRY_V2_REID_COLUMN_MARGIN=0.08
+
+# ── Durable gallery as a Re-ID reference set ────────────────────────────────
+# NOT the ENTRY_V2_GALLERY_REID_* family, which is the ADMISSION policy for
+# writing to the gallery (min score 0.85, margins 0.12). These two are about
+# READING it. The prefix is MATCH for exactly that reason — the two were one
+# namespace for an afternoon and it was already confusing.
+#
+# WHY. Until 2026-09-06 src/entry never opened the gallery at all: a CAM-23
+# crossing was scored only against this visit's CAM-ENTRY gate crops. That is
+# the hardest comparison the system can make — cross-view, two reference
+# vectors — and it is why the accepted band tops out at 0.819 with a median of
+# 0.66. Meanwhile the store keeps precisely what this query wants: load_vectors
+# EXCLUDES gate crops from matching and returns CAM-23/CAM-03/parked views,
+# pruned by select_diverse_indices for viewpoint coverage. On 2026-09-06 all 27
+# confirmed cars already had a gallery, 23 of them a full twenty references,
+# and not one was consulted.
+#
+# READ-ONLY. Entry borrows the gallery; it does not teach it. Unsetting this
+# restores the previous matcher exactly, with nothing to undo on disk — which
+# is why it is safe to bake rather than to hold back for a Secret.
+#
+# VERIFIED before shipping: with this OFF, all 1007 recorded Re-ID decisions
+# from the 2026-08-30..09-06 corpus replay identically through the new engine
+# (tools/replay_entry_decisions.py --verify). The flag is the only thing that
+# changes behaviour.
+ENV ENTRY_V2_GALLERY_MATCH_ENABLED=1
+# The SAME cap for every candidate, selected for viewpoint diversity rather
+# than sharpness. max_similarity over more vectors is biased upward, so an
+# uncapped comparison would let a twenty-reference car out-margin a
+# two-reference one on sample count alone — which is a statement about the
+# gallery, not about either car. Raise only with a margin recalibration.
+ENV ENTRY_V2_GALLERY_MATCH_MAX_REFS=8
+
+# Retire a same-plate identity that a confirmed one has superseded IN SOURCE
+# TIME. The gate reads a plate more than once per car; when two reads are too
+# dissimilar to merge at ENTRY_V2_MERGE_MIN_SCORE they become two identities
+# under one key, one takes the ramp crossing, and the leftover stays a live
+# Re-ID competitor for its full ENTRY_IDENTITY_TTL_MINUTES. On 2026-09-06 that
+# leftover won a DIFFERENT car's crossing: GGR-9064 read at 10:09:18 and
+# 10:10:34, confirmed on the 10:11:20 crossing, then its duplicate took
+# RGR-6466's 10:24:04 CAM-23 crossing at 0.636 against RGR-6466's own 0.388.
+# One car, two witnesses, two identities, both confirmed.
+#
+# Source time is the whole test, never plate equality: two live identities may
+# legitimately share a plate — that is what an exit-and-re-entry IS — and a
+# re-entry's gate read necessarily FOLLOWS the previous crossing, so it is
+# untouched. Default ON in code; pinned here so the value is visible in
+# `printenv` alongside everything else it interacts with.
+ENV ENTRY_V2_SAME_KEY_RETIREMENT_ENABLED=1
+
 # Copy app code
 COPY . .
 

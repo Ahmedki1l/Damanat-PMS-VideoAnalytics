@@ -329,6 +329,18 @@ class AttemptGroup:
     weak_votes: Dict["WitnessSource", str] = field(default_factory=dict)
     # PlateSourceKind -> that source's reading. At most one per source.
     plate_sources: Dict["PlateSourceKind", PlateReading] = field(default_factory=dict)
+    # This car's DURABLE gallery, frozen at identity creation.
+    #
+    # Frozen, not looked up at match time, and that is the whole safety
+    # property: the legacy path writes a new reference for this plate a few
+    # seconds AFTER the ramp crossing it just confirmed, so a lazy lookup would
+    # score a crossing against a crop taken from that same crossing and call
+    # the resulting 1.0 a match. Read once, when the ANPR attempt arrives and
+    # the only thing on disk is previous visits.
+    gallery_embeddings: Tuple[Tuple[float, ...], ...] = ()
+    # What the lookup found, for the decision record. A weak score means
+    # something different when the gallery was empty than when it was full.
+    gallery_stats: Dict[str, Any] = field(default_factory=dict)
     # Consumed HikCentral GUIDs, so repeated queries cannot double-ingest.
     hik_guids_consumed: set[str] = field(default_factory=set)
     # Set when this identity's plate differs from a live identity that Re-ID
