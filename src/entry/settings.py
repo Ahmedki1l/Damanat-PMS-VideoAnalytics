@@ -123,6 +123,13 @@ class EntrySettings:
     # a shadow window that shows it retiring genuine re-entries can be reverted
     # without a rollback.
     same_key_retirement_enabled: bool = True
+    # The same rule pointed forwards: retire a NEW same-plate identity whose
+    # evidence predates the crossing that already resolved an earlier one.
+    # Defaults ON because the evidence that builds it is our own confirmed
+    # imagery being forwarded back to us, and a second identity built from it
+    # confirms the same car twice. Separate switch from the backward-looking
+    # one so either direction can be reverted on its own.
+    late_same_key_retirement_enabled: bool = True
     merge_min_score: float = 0.82
     merge_margin: float = 0.08
     event_consistency_min_score: float = 0.82
@@ -397,6 +404,9 @@ class EntrySettings:
             gallery_match_max_refs=_env_int("ENTRY_V2_GALLERY_MATCH_MAX_REFS", 8),
             same_key_retirement_enabled=os.getenv(
                 "ENTRY_V2_SAME_KEY_RETIREMENT_ENABLED", "1"
+            ).strip().lower() in _ENV_TRUE_VALUES,
+            late_same_key_retirement_enabled=os.getenv(
+                "ENTRY_V2_LATE_SAME_KEY_RETIREMENT_ENABLED", "1"
             ).strip().lower() in _ENV_TRUE_VALUES,
             colour_veto_enabled=os.getenv(
                 "ENTRY_V2_COLOUR_VETO_ENABLED", "1"

@@ -348,6 +348,12 @@ class AttemptGroup:
     # A MARKER ONLY: it never merges the identities, because letting appearance
     # override the plate key would put Re-ID back in charge of who a car is.
     correction_candidate_of: str = ""
+    # What the BARRIER did for this car, as HikCentral reports it — allowResult
+    # (1 allowed / 2 not allowed) and allowType (1 manual / 2 auto / 3 not
+    # allowed), carried in from PMS-AI's probe. Empty whenever the probe could
+    # not answer, which is NOT the same as a refusal. Observational only: it is
+    # written to the decision log and nothing reads it back.
+    barrier_verdict: Dict[str, Any] = field(default_factory=dict)
     # NOTE: the primary_ocr_* / primary_blocks_fallback fields that used to sit
     # here are GONE. They existed to arbitrate a CAM-23 plate read against a
     # CAM-03 plate read — a question that no longer exists, because neither

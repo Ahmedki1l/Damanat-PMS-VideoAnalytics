@@ -19,6 +19,7 @@ from .callback import ConfirmationSink, DeliveryResult
 from .decision import (
     EntryDecisionEngine,
     ReIDMatchEvaluation,
+    causal_attempt_embeddings,
     causal_group_embeddings,
     causally_eligible_attempts,
     max_similarity,
@@ -1196,6 +1197,15 @@ class EntryCoordinator:
             guid = str((request.metadata or {}).get("hik_guid", ""))
             if guid:
                 group.hik_guids_consumed.add(guid)
+        # Did the barrier open for this car? PMS-AI probes an API namespace this
+        # pipeline has never called, and the answer rides the same metadata as
+        # the GUID. STRICTLY OBSERVATIONAL — recorded beside the Re-ID score
+        # that actually decides, so a day of shadow logs can say whether an
+        # ordering design is buildable. Nothing here branches on it, and an
+        # absent verdict is a missing answer, never a refusal.
+        barrier = (request.metadata or {}).get("barrier")
+        if isinstance(barrier, Mapping) and barrier:
+            group.barrier_verdict = dict(barrier)
         # The gate's reported plate is not stored: the engine derives it from
         # the attempts, so the causal projection cannot be handed a plate read
         # from after the car went past.
@@ -1219,6 +1229,11 @@ class EntryCoordinator:
                 "attempt_count": len(group.attempts) + 1,
             },
             witnesses=[w.value for w in group.witnesses],
+            extra=(
+                {"barrier": dict(group.barrier_verdict)}
+                if group.barrier_verdict
+                else None
+            ),
         )
         record = AttemptRecord(
             request=request,
@@ -1239,6 +1254,12 @@ class EntryCoordinator:
                     frame.plate.text,
                     ocr_evidence_id=frame.plate.evidence_id,
                 )
+        # Only a freshly created identity can be a late replay of an arrival we
+        # already confirmed. Enriching a live identity means find-or-create
+        # already placed this attempt, and that identity's own confirmation
+        # path owns the same-key question.
+        if created and self._retire_late_same_key_arrival_locked(group):
+            return group
         self._retire_provisional_crossings_before_attempt_locked(record)
         self._release_provisional_crossings_locked()
         return group
@@ -1502,6 +1523,118 @@ class EntryCoordinator:
                 confirmed.group_id,
                 crossing.request.crossing_id,
             )
+
+    def _retire_late_same_key_arrival_locked(self, group: AttemptGroup) -> bool:
+        """Retire an identity built from evidence of an ALREADY-CONFIRMED arrival.
+
+        The mirror of `_retire_superseded_same_key_locked`, and it exists
+        because that one can only look backwards. It runs when a confirmation
+        happens and drops the same-key identities that are already live; an
+        identity created AFTER the confirmation is invisible to it.
+
+        That is not hypothetical. On 2026-09-07 NJS-7894 crossed at 09:27:41 and
+        confirmed correctly at 09:27:55. PMS-AI then forwarded the same car's
+        gate imagery back to us — its own ANPR snapshot and the HikCentral
+        record for the very pass we had just confirmed — and because the first
+        identity was RESOLVED and so no longer a find-or-create candidate, that
+        replayed evidence opened a SECOND identity under the same key at
+        09:28:23. The spare CAM-03 view of that one crossing was still pending,
+        the new identity matched it at 0.821, and one car produced two entries
+        twenty-eight seconds apart.
+
+        THE TEST IS THE SAME ONE, POINTED THE OTHER WAY. Sharing a plate key
+        with a resolved identity proves nothing on its own — a car that leaves
+        and comes back must be allowed to be two visits. What separates the two
+        cases is where this attempt's SOURCE time falls relative to the crossing
+        that resolved the earlier identity:
+
+        * at or before that crossing -> evidence of the arrival we already
+          confirmed, however late it reached us. Retire it.
+        * after that crossing -> a genuinely later journey. Untouched.
+
+        Retired, not rejected. The attempt is still recorded and still
+        acknowledged, so the sender's idempotency is unaffected and the decision
+        log keeps the whole story; the group simply never becomes a live Re-ID
+        competitor for anyone else's crossing.
+
+        Returns True when the group was retired.
+        """
+        if not self.settings.late_same_key_retirement_enabled:
+            return False
+        if not group.identity_key or group.status != RecordStatus.PENDING:
+            return False
+        # ONLY an identity built entirely from evidence WE went and fetched.
+        #
+        # Source time alone is too coarse to be the whole test. Two genuine
+        # visits by one car can both have gate reads before either crossing —
+        # `test_equal_latest_entry_times_close_none_and_retain_one_boundary`
+        # is exactly that shape, two arrivals whose crossings share a
+        # timestamp — and retiring the second would delete a real journey.
+        #
+        # A fresh gate ANPR read is a car at the barrier now, so it always
+        # means a new arrival. A HikCentral-sourced attempt is not: HikCentral
+        # is a pull source, and such an attempt exists only because we asked
+        # for a record of a pass. If that pass predates a crossing already
+        # confirmed under this plate, it is a record OF that crossing coming
+        # back to us, not a second car. That is the whole of NJS-7894.
+        if not all(
+            _is_hik_sourced_attempt(attempt.request)
+            for attempt in group.attempts.values()
+        ):
+            return False
+        try:
+            arrival = max(
+                attempt.request.captured_at
+                for attempt in group.attempts.values()
+            )
+        except (TypeError, ValueError):
+            return False
+        # The confirmed identity itself is GONE by now — finalizing pops it from
+        # `_groups` along with its attempts. `_finalized_journeys` is the
+        # bounded tombstone kept for exactly this class of question, and it
+        # already carries the two things the test needs: the plate key and the
+        # source time of the crossing that closed the journey.
+        for journey in self._finalized_journeys.values():
+            if (
+                journey.canonical_plate_key != group.identity_key
+                or journey.decision_status != "confirmed"
+            ):
+                continue
+            boundary = journey.entry_captured_at
+            if boundary is None:
+                continue
+            try:
+                superseded = arrival <= boundary
+            except TypeError:
+                # Mixed aware/naive timestamps cannot establish ordering, and a
+                # retirement is destructive. Fail closed: leave it pending.
+                continue
+            if not superseded:
+                continue
+            group.status = RecordStatus.RESOLVED
+            self._emit_decision_record(
+                stage="same_key_retirement",
+                result=decision_record.RESULT_EXPIRED,
+                reason="superseded_by_resolved_same_key",
+                identity={
+                    "group_id": group.group_id,
+                    "identity_key": group.identity_key,
+                    "superseded_by": journey.group_id,
+                    "decision_id": journey.decision_id,
+                    "entry_captured_at": boundary.isoformat(),
+                    "attempt_count": len(group.attempts),
+                },
+                witnesses=[w.value for w in group.witnesses],
+            )
+            logger.info(
+                "[EntryV2] retired late same-key identity %s (key=%s): its "
+                "evidence predates the crossing decision %s already confirmed",
+                group.group_id,
+                group.identity_key,
+                journey.decision_id,
+            )
+            return True
+        return False
 
     def _gallery_lookup(self, plate: str):
         """This plate's durable references, read once at identity creation.
@@ -1931,9 +2064,80 @@ class EntryCoordinator:
             crossings,
         )
         if evaluation is None:
+            self._log_uncontested_crossing_locked(crossing, groups)
             return None
         self._log_reid_evaluation_locked(crossing, evaluation)
         return evaluation.match
+
+    def _log_uncontested_crossing_locked(
+        self,
+        crossing: CrossingRecord,
+        groups: Mapping[str, AttemptGroup],
+    ) -> None:
+        """Record a crossing that had NOTHING to be scored against.
+
+        `evaluate_unique_match` returns None when no identity survived to be
+        ranked — every live one was either causally ineligible (its ANPR read
+        follows this crossing) or removed by the colour veto. That is a real
+        outcome and it decides the car's fate, but until now it was the only
+        path through the matcher that wrote no record at all: the observation
+        sat in the pool until its TTL and then expired with `ttl_expiry` as the
+        sole trace, which says when it was dropped and never why.
+
+        That silence is what made the 2026-09-07 SHR-1198 loss unreadable. Its
+        own CAM-23 ramp view was ingested, acknowledged 201, and produced zero
+        decision records; reconstructing why cost a full pass over three
+        services' logs. A crossing that no identity can even compete for is
+        precisely the shape of a missed entry, so it is now stated.
+
+        Deduplicated on the same cache as a scored evaluation, so a crossing
+        that stays uncontested across many passes is recorded once and speaks
+        again only when the reason changes.
+        """
+        pending = [
+            group
+            for group in groups.values()
+            if group.status == RecordStatus.PENDING
+        ]
+        eligible = [
+            group
+            for group in pending
+            if causal_attempt_embeddings(group, crossing)
+        ]
+        reason = (
+            "no_live_identity"
+            if not pending
+            else "no_causally_eligible_identity"
+            if not eligible
+            else "all_candidates_vetoed"
+        )
+        crossing_id = crossing.request.crossing_id
+        fingerprint = ("", reason, len(pending), len(eligible))
+        if self._reid_evaluation_log_cache.get(crossing_id) == fingerprint:
+            self._reid_evaluation_log_cache.move_to_end(crossing_id)
+            return
+        self._reid_evaluation_log_cache[crossing_id] = fingerprint
+        self._reid_evaluation_log_cache.move_to_end(crossing_id)
+        while (
+            len(self._reid_evaluation_log_cache)
+            > max(1, self.settings.max_pending_crossings)
+        ):
+            self._reid_evaluation_log_cache.popitem(last=False)
+        self._emit_decision_record(
+            stage="reid_evaluation",
+            result=decision_record.RESULT_ABSTAINED,
+            reason=reason,
+            crossing=crossing,
+            extra={
+                "uncontested": {
+                    "pending_identities": len(pending),
+                    "causally_eligible": len(eligible),
+                    "identity_keys": sorted(
+                        {group.identity_key for group in pending if group.identity_key}
+                    ),
+                }
+            },
+        )
 
     def _log_reid_evaluation_locked(
         self,

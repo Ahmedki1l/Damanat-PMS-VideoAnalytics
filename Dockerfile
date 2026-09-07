@@ -410,6 +410,10 @@ ENV ENTRY_V2_GALLERY_MATCH_ENABLED=1
 # gallery, not about either car. Raise only with a margin recalibration.
 ENV ENTRY_V2_GALLERY_MATCH_MAX_REFS=8
 
+
+ENV ENTRY_V2_LATE_SAME_KEY_RETIREMENT_ENABLED=1
+
+
 # Retire a same-plate identity that a confirmed one has superseded IN SOURCE
 # TIME. The gate reads a plate more than once per car; when two reads are too
 # dissimilar to merge at ENTRY_V2_MERGE_MIN_SCORE they become two identities

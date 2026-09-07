@@ -204,7 +204,7 @@ def test_hikcentral_plate_reaches_consensus():
         "c1": [frame("c1", "CAM-23", (1.0, 0.0), role="primary")],
     }
     log = _CollectingLog()
-    coord, sink = build(evidence, log=log)
+    coord, sink = _build_committing(evidence, log=log)
     coord.ingest_attempt(attempt("a1", "HGD-2926"), [b"a"])
     coord.ingest_attempt(
         attempt("a-hik", "HGD-2926", captured_at=NOW + timedelta(seconds=5), hik=True),
@@ -414,7 +414,7 @@ def test_retirement_leaves_a_genuine_re_entry_alone():
         "c2": [frame("c2", "CAM-23", (0.0, 1.0, 0.0), role="primary")],
     }
     log = _CollectingLog()
-    coord, sink = build(evidence, log=log)
+    coord, sink = _build_committing(evidence, log=log)
     coord.ingest_attempt(attempt("v1", "KKR-6294"), [b"1"])
     coord.ingest_crossing(
         crossing("c1", captured_at=NOW + timedelta(seconds=40)), [b"c1"]
@@ -447,3 +447,282 @@ def test_retirement_can_be_switched_off():
         crossing("ggr-crossing", captured_at=NOW + timedelta(seconds=122)), [b"c"]
     )
     assert log.of(stage="same_key_retirement") == []
+
+
+# --------------------------------------------------------------------------- #
+# 4. The same retirement, pointed forwards: NJS-7894 on 2026-09-07
+# --------------------------------------------------------------------------- #
+class _CommittingSink(_Sink):
+    """A sink that reports a real session, as PMS-AI does on a confirmation.
+
+    The shared `_Sink` answers `publish_identity=False`, which in AUTHORITATIVE
+    mode means "no live session was created" and so no journey tombstone is
+    kept. These scenarios turn on that tombstone being there, and in the shipped
+    shadow configuration it always is: `_should_remember_journey_locked` returns
+    True unconditionally outside AUTHORITATIVE mode.
+    """
+
+    def deliver(self, payload):
+        self.payloads.append(dict(payload))
+        return DeliveryResult(
+            True, 1, "", publish_identity=True, session_committed=True
+        )
+
+
+def _build_committing(evidence, cfg=None, log=None):
+    sink = _CommittingSink()
+    coord = EntryCoordinator(
+        cfg or settings(),
+        _Processor(evidence),
+        sink,
+        decision_log=log,
+        gallery_references=NullGalleryReferences(),
+    )
+    return coord, sink
+
+
+def _njs_evidence():
+    """One car, one arrival, and our own imagery coming back at us.
+
+    NJS-7894 crossed CAM-23 at 09:27:41 and confirmed at 09:27:55. PMS-AI then
+    forwarded the same car's gate snapshot and the HikCentral record for that
+    very pass back to VA, which opened a SECOND identity under the same key at
+    09:28:23 — the first was RESOLVED and so no longer a find-or-create
+    candidate. The spare CAM-03 view of the one crossing was still pending and
+    the new identity took it at 0.821.
+    """
+    return {
+        "njs-1": [frame("njs-1", "ANPR-ENTRY", (1.0, 0.0, 0.0))],
+        "njs-c23": [frame("njs-c23", "CAM-23", (1.0, 0.0, 0.0), role="primary")],
+        # The spare fallback view of the SAME crossing, two seconds later.
+        "njs-c03": [frame("njs-c03", "CAM-03", (0.821, 0.571, 0.0), role="fallback")],
+        # Our own confirmed imagery, returned to us. It looks like the car
+        # because it IS the car.
+        "njs-replay": [frame("njs-replay", "ANPR-ENTRY", (1.0, 0.0, 0.0))],
+    }
+
+
+def _njs_sequence(coord):
+    """The recorded order: confirm, spare view, then the replay."""
+    coord.ingest_attempt(attempt("njs-1", "NJS-7894"), [b"1"])
+    coord.ingest_crossing(
+        crossing("njs-c23", captured_at=NOW + timedelta(seconds=30)), [b"c23"]
+    )
+    coord.ingest_crossing(
+        crossing(
+            "njs-c03",
+            captured_at=NOW + timedelta(seconds=32),
+            camera_id="CAM-03",
+            role=CrossingRole.FALLBACK,
+        ),
+        [b"c03"],
+    )
+    # The replayed evidence. Its SOURCE time is the gate read it depicts, which
+    # is before the crossing that already confirmed — that is what marks it as
+    # this same arrival rather than a new one.
+    coord.ingest_attempt(
+        attempt(
+            "njs-replay",
+            "NJS-7894",
+            captured_at=NOW + timedelta(seconds=5),
+            hik=True,
+        ),
+        [b"replay"],
+    )
+
+
+def test_replayed_evidence_cannot_confirm_the_same_arrival_twice():
+    """NJS-7894, exactly as it happened, with the forward retirement in place."""
+    log = _CollectingLog()
+    coord, sink = _build_committing(_njs_evidence(), log=log)
+    _njs_sequence(coord)
+
+    retirements = log.of(stage="same_key_retirement")
+    assert len(retirements) == 1
+    assert retirements[0]["reason"] == "superseded_by_resolved_same_key"
+    assert retirements[0]["identity"]["identity_key"] == "NJS7894"
+
+    confirmed = [p for p in sink.payloads if p["status"] == "confirmed"]
+    assert len(confirmed) == 1, "one arrival must produce exactly one entry"
+    assert confirmed[0]["canonical_plate"] == "NJS-7894"
+
+
+def test_without_the_forward_retirement_the_duplicate_returns():
+    """The regression this guards, stated so a revert is not silent."""
+    log = _CollectingLog()
+    coord, sink = _build_committing(
+        _njs_evidence(),
+        cfg=settings(late_same_key_retirement_enabled=False),
+        log=log,
+    )
+    _njs_sequence(coord)
+
+    assert log.of(stage="same_key_retirement") == []
+    confirmed = [p for p in sink.payloads if p["status"] == "confirmed"]
+    assert len(confirmed) == 2, "the duplicate is exactly what the flag re-enables"
+
+
+def test_a_genuine_re_entry_after_the_crossing_still_opens_a_second_visit():
+    """The orthogonality case: sharing a plate key is not the test.
+
+    A car that leaves and comes back is two visits under one key. What must
+    separate it from a replay is only WHEN its gate read happened relative to
+    the crossing that closed the earlier identity.
+    """
+    log = _CollectingLog()
+    evidence = dict(_njs_evidence())
+    evidence["njs-2"] = [frame("njs-2", "ANPR-ENTRY", (1.0, 0.0, 0.0))]
+    evidence["njs-c23b"] = [
+        frame("njs-c23b", "CAM-23", (1.0, 0.0, 0.0), role="primary")
+    ]
+    coord, sink = _build_committing(evidence, log=log)
+
+    coord.ingest_attempt(attempt("njs-1", "NJS-7894"), [b"1"])
+    coord.ingest_crossing(
+        crossing("njs-c23", captured_at=NOW + timedelta(seconds=30)), [b"c23"]
+    )
+    # A real second arrival: the gate read FOLLOWS the first crossing.
+    coord.ingest_attempt(
+        attempt("njs-2", "NJS-7894", captured_at=NOW + timedelta(minutes=6)), [b"2"]
+    )
+    coord.ingest_crossing(
+        crossing("njs-c23b", captured_at=NOW + timedelta(minutes=7)), [b"c23b"]
+    )
+
+    assert log.of(stage="same_key_retirement") == []
+    confirmed = [p for p in sink.payloads if p["status"] == "confirmed"]
+    assert len(confirmed) == 2
+
+
+# --------------------------------------------------------------------------- #
+# 5. A crossing nothing could compete for is stated, not silently dropped
+# --------------------------------------------------------------------------- #
+def test_a_crossing_with_no_eligible_identity_is_recorded():
+    """SHR-1198's silence, which cost a three-service log trawl to explain.
+
+    Its own CAM-23 view was ingested and acknowledged and then produced no
+    decision record at all, because `evaluate_unique_match` returns None when
+    nothing survives to be ranked and that path wrote nothing. The only trace
+    was a `ttl_expiry` an hour later, which says when the observation was
+    dropped and never why.
+    """
+    log = _CollectingLog()
+    coord, _ = build(
+        {"lone-c23": [frame("lone-c23", "CAM-23", (1.0, 0.0), role="primary")]},
+        log=log,
+    )
+    coord.ingest_crossing(crossing("lone-c23"), [b"c"])
+
+    uncontested = [
+        r
+        for r in log.of(stage="reid_evaluation")
+        if r["reason"] == "no_live_identity"
+    ]
+    assert len(uncontested) == 1
+    assert uncontested[0]["uncontested"]["pending_identities"] == 0
+
+
+def test_a_crossing_older_than_every_identity_says_so():
+    """The SHR-1198 shape: identities exist, but none of them can be this car."""
+    log = _CollectingLog()
+    coord, _ = build(
+        {
+            "late-read": [frame("late-read", "ANPR-ENTRY", (1.0, 0.0))],
+            "early-c23": [frame("early-c23", "CAM-23", (1.0, 0.0), role="primary")],
+        },
+        log=log,
+    )
+    # The gate read is recorded as happening AFTER the crossing, so the identity
+    # cannot causally own it — the case the matcher used to drop in silence.
+    coord.ingest_attempt(
+        attempt("late-read", "SHR-1198", captured_at=NOW + timedelta(minutes=5)),
+        [b"a"],
+    )
+    coord.ingest_crossing(crossing("early-c23", captured_at=NOW), [b"c"])
+
+    uncontested = [
+        r
+        for r in log.of(stage="reid_evaluation")
+        if r["reason"] == "no_causally_eligible_identity"
+    ]
+    assert len(uncontested) == 1
+    assert uncontested[0]["uncontested"]["pending_identities"] == 1
+    assert uncontested[0]["uncontested"]["causally_eligible"] == 0
+    assert uncontested[0]["uncontested"]["identity_keys"] == ["SHR1198"]
+
+
+def test_a_fresh_gate_read_is_never_retired_as_a_replay():
+    """The narrowing, pinned: source time alone must not be the whole test.
+
+    Two genuine visits by one car can BOTH have gate reads that precede either
+    crossing — `test_equal_latest_entry_times_close_none_and_retain_one_boundary`
+    is that shape, and an earlier draft of this guard deleted the second
+    journey. A fresh ANPR read is a car at the barrier now; only evidence we
+    went and pulled can be a record of a pass we already confirmed.
+    """
+    log = _CollectingLog()
+    evidence = dict(_njs_evidence())
+    evidence["njs-gate2"] = [frame("njs-gate2", "ANPR-ENTRY", (1.0, 0.0, 0.0))]
+    coord, _ = _build_committing(evidence, log=log)
+
+    coord.ingest_attempt(attempt("njs-1", "NJS-7894"), [b"1"])
+    coord.ingest_crossing(
+        crossing("njs-c23", captured_at=NOW + timedelta(seconds=30)), [b"c23"]
+    )
+    # A second GATE read whose source time also precedes that crossing. Same
+    # timing as the replay, but it is not HikCentral-sourced, so it stands.
+    coord.ingest_attempt(
+        attempt("njs-gate2", "NJS-7894", captured_at=NOW + timedelta(seconds=5)),
+        [b"g2"],
+    )
+
+    assert log.of(stage="same_key_retirement") == []
+
+
+# --------------------------------------------------------------------------- #
+# 6. The barrier verdict reaches the decision log
+# --------------------------------------------------------------------------- #
+def test_the_barrier_verdict_is_written_to_the_decision_log():
+    """Evidence for the shadow review, carried in on the Hik attempt metadata.
+
+    Nothing branches on it — the point is that a day of
+    entry_decisions_gate_*.jsonl can be grouped by what the BARRIER did, beside
+    the Re-ID score that actually decided, so an ordering design can be judged
+    on real traffic before anything is built on it.
+    """
+    log = _CollectingLog()
+    coord, _ = build(
+        {"b-1": [frame("b-1", "ANPR-ENTRY", (1.0, 0.0))]}, log=log
+    )
+    request = replace(
+        attempt("b-1", "GGR-9064", hik=True),
+        metadata={
+            "evidence_source": "hikcentral",
+            "hik_guid": "CA215103F09E4C04A93312F27D3208A4",
+            "barrier": {
+                "allow_result": 2,
+                "allow_type": 3,
+                "enter_time": "2026-09-06T10:09:18+03:00",
+                "gap_seconds": 1.0,
+            },
+        },
+    )
+    coord.ingest_attempt(request, [b"1"])
+
+    created = log.of(stage="anpr_identity")
+    assert len(created) == 1
+    assert created[0]["barrier"]["allow_result"] == 2
+    assert created[0]["barrier"]["allow_type"] == 3
+
+
+def test_no_verdict_means_no_barrier_block_not_a_refusal():
+    """Absence is a missing answer. It must never read as `not allowed`."""
+    log = _CollectingLog()
+    coord, _ = build(
+        {"b-2": [frame("b-2", "ANPR-ENTRY", (1.0, 0.0))]}, log=log
+    )
+    coord.ingest_attempt(attempt("b-2", "GGR-9064", hik=True), [b"1"])
+
+    created = log.of(stage="anpr_identity")
+    assert len(created) == 1
+    assert "barrier" not in created[0]
