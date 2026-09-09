@@ -487,7 +487,51 @@ class EntrySettings:
         """
         if self.va_single_process:
             return True
-        return self.entry_host and self.local_zone_cameras() <= self.group_cameras
+        return self.coordinator_is_single_hosted() and (
+            self.local_zone_cameras() <= self.group_cameras
+        )
+
+    def coordinator_is_single_hosted(self) -> bool:
+        """True when this process is the only one that can hold Entry V2 state.
+
+        The narrower half of :meth:`local_zone_is_co_located` — it asks only
+        whether the coordinator is single-hosted, without the local-zone camera
+        subset test, because HTTP ingest imposes no camera requirement:
+        "a camera that reaches Entry V2 purely over HTTP always lands in the
+        ``--api`` process by construction" (see :meth:`local_zone_cameras`).
+
+        AUTHORITATIVE used to ask ``VA_PROCESS_COUNT == 1`` instead. That was
+        already the wrong question when the supervisor landed -- ``supervisor.py``
+        OVERWRITES ``VA_PROCESS_COUNT`` in every worker with the group count, so
+        a healthy 4-group pod reports 4 and could never satisfy it. On
+        2026-09-09 that took entry recording down for ~4h: VA degraded to
+        ``DisabledEvidenceProcessor``, answered every ingest 503 with
+        ``entry_v2_invalid_configuration:entry_v2_requires_single_process_va``,
+        and PMS-AI returned a camera-facing 503 before legacy dispatch could
+        run. Three cars entered; the HikCentral reconciler recovered two of them
+        33 and 64 minutes late and missed the third.
+
+        The tempting "fix" is ``VA_SINGLE_PROCESS=1``, and it is a trap: that is
+        an ENGINE switch (``main.py`` forces ``VA_INFER=async`` and calls
+        ``engine.run_single_process()``), so setting it merely to pass a config
+        check would collapse a deliberately multi-group deployment onto one
+        async queue.
+
+        Fails closed: with no attestation at all this returns False and the
+        caller degrades, which is correct for a process that cannot host the
+        state.
+        """
+        if self.va_single_process:
+            return True
+        if self.entry_host:
+            return True
+        # A DECLARED count of exactly 1 is still honoured, so a bare
+        # `python main.py --api` with no supervisor keeps working unchanged.
+        # It is safe in both directions: the supervisor only writes 1 here when
+        # it launched a single group, and that group is necessarily the --api
+        # group. What it can never do is attest for a 4-group pod, which is the
+        # case that was wrongly REQUIRING it.
+        return not self.invalid_va_process_count and self.va_process_count == 1
 
     def configuration_errors(self) -> List[str]:
         if self.invalid_mode_value:
@@ -496,9 +540,16 @@ class EntrySettings:
             return []
         errors: List[str] = []
         if self.mode == EntryMode.AUTHORITATIVE:
-            if self.invalid_va_process_count:
-                errors.append("VA_PROCESS_COUNT")
-            elif self.va_process_count != 1:
+            # Attestation, not arithmetic. VA_PROCESS_COUNT describes how many
+            # groups the supervisor launched, never whether THIS process is the
+            # single host of Entry V2 state, and the supervisor overwrites it in
+            # every worker. See coordinator_is_single_hosted for the outage this
+            # produced. VA_PROCESS_COUNT is still validated as an integer below,
+            # where it governs its own bounds, and remains reported when the
+            # attestation is absent so a bare process still names both faults.
+            if not self.coordinator_is_single_hosted():
+                if self.invalid_va_process_count:
+                    errors.append("VA_PROCESS_COUNT")
                 errors.append("entry_v2_requires_single_process_va")
         positive = {
             "max_pending_attempts": self.max_pending_attempts,
