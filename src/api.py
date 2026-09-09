@@ -23,6 +23,7 @@ import os
 import base64
 import asyncio
 import hmac
+import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -814,12 +815,23 @@ def create_app(
 
         try:
             # 1. Send initial connection confirmation (handshake)
-            yield {
+            #
+            # Every yield MUST be wrapped in {"data": ...}. sse_starlette
+            # splats a yielded dict as ServerSentEvent(**payload), and that
+            # class only accepts data/event/id/retry/comment/sep — so yielding
+            # the alert fields directly raised
+            #   TypeError: ServerSentEvent.__init__() got an unexpected
+            #   keyword argument 'is_alert'
+            # and killed the stream on the FIRST message. It fired 19 times on
+            # 2026-09-09 and every connected operator lost live alerts.
+            # json.dumps preserves insertion order, so the wire format and the
+            # field order below are unchanged.
+            yield {"data": json.dumps({
                 "is_alert": False,
                 "severity": "info",
                 "alert_type": "connection_established",
                 "msg": "Real-time alerts stream established"
-            }
+            })}
 
             while True:
                 # Wait for next event
@@ -836,8 +848,10 @@ def create_app(
                 if notification_suppressed(event.event_type):
                     continue
 
-                # Yield the dict directly so fields match the required order/naming
-                yield event.to_dict()
+                # to_dict() fixes the required field order/naming; json.dumps
+                # preserves it. See the handshake above for why the payload
+                # must sit under "data" rather than being yielded directly.
+                yield {"data": json.dumps(event.to_dict())}
                 
         except asyncio.CancelledError:
             print("[API] Client disconnected from alerts stream")

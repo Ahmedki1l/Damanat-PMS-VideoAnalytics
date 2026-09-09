@@ -29,6 +29,10 @@ from .gallery import (
     GalleryReferences,
     NullGalleryReferences,
 )
+# Same import decision.py makes, for the same reason: the veto is recomputed
+# here for the LOG only, and it must be the identical predicate the matcher
+# applied or the record would describe a decision that never happened.
+from src.reid_matcher import body_colour_compatible
 from .identity import (
     IdentitySupersededByExit,
     IdentityPublisher,
@@ -2123,11 +2127,56 @@ class EntryCoordinator:
             > max(1, self.settings.max_pending_crossings)
         ):
             self._reid_evaluation_log_cache.popitem(last=False)
+        # The colour veto is the ONLY refusal that discards a car without ever
+        # producing a number to argue about, and it used to emit no colour at
+        # all: `all_candidates_vetoed` carried `uncontested` and nothing else,
+        # so the evidence needed to judge or tune it did not exist. On
+        # 2026-09-09 it fired on 2 of 32 CAM-23 ramp views — HGD-2926 survived
+        # only because the CAM-03 fallback scored 0.735 five seconds later, and
+        # SHR-1198 did not survive at all. Neither record could say which
+        # colours disagreed.
+        #
+        # Recomputed rather than threaded through, because the matcher returned
+        # None precisely so it would not have to build an evaluation here. Cost
+        # is one HSV comparison per eligible identity, on a path that already
+        # walks them twice.
+        colour = None
+        if reason == "all_candidates_vetoed":
+            # BOTH halves of decision.py's condition, in the same order. Gating
+            # on the flag is not redundant: with the veto off the matcher never
+            # rejects on colour, so reporting a mismatch as "vetoed" would name
+            # a decision that did not happen and send a reader hunting a veto
+            # for an abstention that has some other cause.
+            vetoed = [
+                group
+                for group in eligible
+                if self.settings.colour_veto_enabled
+                and not body_colour_compatible(
+                    crossing.colour_hsv, group.colour_hsv
+                )
+            ]
+            colour = {
+                "query_hsv": _round_hsv(crossing.colour_hsv),
+                "vetoed": [group.group_id for group in vetoed],
+                # Per-candidate, so a bad veto can be read straight from the
+                # record: which car, what colour it was held to be, and how far
+                # that sits from the crop actually being scored.
+                "vetoed_detail": [
+                    {
+                        "group_id": group.group_id,
+                        "identity_key": group.identity_key,
+                        "gallery_hsv": _round_hsv(group.colour_hsv),
+                    }
+                    for group in vetoed
+                ],
+                "enabled": self.settings.colour_veto_enabled,
+            }
         self._emit_decision_record(
             stage="reid_evaluation",
             result=decision_record.RESULT_ABSTAINED,
             reason=reason,
             crossing=crossing,
+            colour=colour,
             extra={
                 "uncontested": {
                     "pending_identities": len(pending),
