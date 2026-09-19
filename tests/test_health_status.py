@@ -1,9 +1,4 @@
-"""The /api/health verdict must be COMPUTED, not hardcoded.
-
-Before this, ``status`` was the constant string ``"ok"`` — a stopped engine, a frozen
-camera (the CAM-24 stale-stream case), or a downed DB all reported green. These tests
-pin the derived verdict and the HTTP-503-on-unhealthy contract.
-"""
+"""Engine diagnostics remain computed; /api/health reports API liveness only."""
 
 import time
 from datetime import datetime, timedelta
@@ -151,18 +146,24 @@ def test_local_entry_failure_is_reported_but_never_degrades_the_service():
 
 # --- HTTP contract --------------------------------------------------------- #
 
-def test_unhealthy_returns_503():
-    app = create_app(get_engine_status=_engine(running=False, cam=_FakeCam(20, [], [], 20)).get_engine_status)
-    r = TestClient(app).get("/api/health")
-    assert r.status_code == 503
-    assert r.json()["status"] == "unhealthy"
-
-
-def test_degraded_returns_200():
-    app = create_app(get_engine_status=_engine(cam=_FakeCam(19, ["CAM-24"], [], 20)).get_engine_status)
+def test_unhealthy_engine_does_not_change_api_liveness(tmp_path):
+    app = create_app(
+        get_engine_status=_engine(running=False, cam=_FakeCam(20, [], [], 20)).get_engine_status,
+        snapshot_base_dir=str(tmp_path),
+    )
     r = TestClient(app).get("/api/health")
     assert r.status_code == 200
-    assert r.json()["status"] == "degraded"
+    assert r.json()["status"] == "ok"
+
+
+def test_degraded_engine_does_not_change_api_liveness(tmp_path):
+    app = create_app(
+        get_engine_status=_engine(cam=_FakeCam(19, ["CAM-24"], [], 20)).get_engine_status,
+        snapshot_base_dir=str(tmp_path),
+    )
+    r = TestClient(app).get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
 
 
 def test_healthy_returns_200_ok():

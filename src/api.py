@@ -250,7 +250,7 @@ def create_app(
                           as a list of dicts. Provided by the engine.
         get_slot_snapshot_source: Callback returning slot runtime metadata
                                  (camera ownership + polygon) for snapshots.
-        get_engine_status: Callback function for health metrics.
+        get_engine_status: Engine metrics callback; disabled for API liveness.
         event_bus: Optional EventBus instance for real-time alerts.
         db_manager: Optional DB manager for querying slot restriction status.
     """
@@ -1512,20 +1512,16 @@ def create_app(
 
     @app.get("/api/health")
     async def health(response: Response):
-        """Enriched health reporting including engine status.
-
-        The default ``ok`` is only a liveness signal (this API answered). When an engine
-        status callback is wired in, its COMPUTED ``status`` overrides it and an
-        ``unhealthy`` verdict is surfaced as HTTP 503 so orchestrators/monitors act on it
-        instead of seeing a green 200 over a wedged engine.
-        """
+        """API liveness: engine, camera, model and DB checks do not gate HTTP 200."""
         health_data = {
             "status": "ok",
             "service": "Damanat PMS Video Analytics",
             "timestamp": datetime.now().isoformat()
         }
-        if get_engine_status:
-            health_data.update(get_engine_status())
+        # Disabled by policy: the dashboard checks API availability only.
+        # Do not run the callback: its DB probe can block this endpoint.
+        # if get_engine_status:
+        #     health_data.update(get_engine_status())
         entry_state = active_entry_coordinator.state_summary()
         callback_load = (
             entry_state["pending_callback_count"]
@@ -1658,8 +1654,8 @@ def create_app(
 
         health_data["entry_v2_reasons"] = entry_v2_reasons
         health_data["entry_v2_status"] = entry_v2_severity
-        if health_data.get("status") == "unhealthy":
-            response.status_code = 503
+        # if health_data.get("status") == "unhealthy":
+        #     response.status_code = 503
         return health_data
 
     return app
