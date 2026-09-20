@@ -38,9 +38,7 @@ def _is_hik_sourced(metadata) -> bool:
 def _safe_dominant_colour(frame):
     """Mean HSV of the crop centre, or None. Never raises.
 
-    Colour is an optional, subtractive signal: a frame that yields no colour
-    simply cannot veto anything, and every consumer fails open. Losing an entry
-    because a colour probe threw would be absurd, so it cannot.
+    Missing colour must not prevent extraction of the ReID evidence.
     """
     try:
         from src.reid_matcher import dominant_color_hsv
@@ -437,14 +435,8 @@ class ExistingModelsEvidenceProcessor:
                         evidence_id=frame_id,
                         embedding=embedding,
                         plate=plate,
-                        # Mean HSV of the crop centre — a few array ops, no
-                        # second model. VA is CPU-starved and a learned colour
-                        # classifier on the gate path would compete with the
-                        # detector for frames; this check is already tuned and
-                        # is only ever used to REMOVE an impossible candidate.
-                        # Measured on the same image Re-ID embeds. On a whole
-                        # frame the "dominant colour" of a gate forecourt is
-                        # asphalt and sky, which is not a fact about the car.
+                        # Measure the vehicle crop for diagnostics and downstream
+                        # gallery handling; colour does not gate entry matching.
                         colour_hsv=_safe_dominant_colour(reid_frame),
                     )
                 )

@@ -275,11 +275,7 @@ ENV ENTRY_V2_DECISION_LOG_RETENTION_DAYS=30
 ENV ENTRY_IDENTITY_TTL_MINUTES=15
 ENV ENTRY_OBSERVATION_TTL_MINUTES=60
 
-# Colour REMOVES a candidate that cannot be this car; the margin is then
-# recomputed over the survivors. It never adds score — two white sedans agreeing
-# on colour is not evidence they are one car. Fails open on missing colour.
-# Vetoed nothing incorrectly across the 2026-08-30/31 window.
-ENV ENTRY_V2_COLOUR_VETO_ENABLED=1
+# Entry colour measurements are diagnostic only; no colour veto is applied.
 
 # OFF, measured — ramp OCR is not reliable enough to WITHHOLD an entry on.
 # Two reads of the SAME car in one window, both above the 0.75 confidence gate:

@@ -68,7 +68,6 @@ def settings(**overrides):
         merge_min_score=0.82,
         merge_margin=0.08,
         ocr_min_confidence=0.75,
-        colour_veto_enabled=False,
         primary_cameras=frozenset({"CAM23"}),
         primary_lines=frozenset({"RAMP-IN"}),
         primary_directions=frozenset({"ramp-entry"}),

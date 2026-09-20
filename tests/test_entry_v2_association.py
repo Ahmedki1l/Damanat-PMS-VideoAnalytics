@@ -1,10 +1,9 @@
-"""Stage 3 — Re-ID association: colour veto, witnesses, and the two-witness rule.
+"""Stage 3 — Re-ID association, colour diagnostics, and the two-witness rule.
 
 Three rules are locked down here:
 
-  * Colour is SUBTRACTIVE. It removes a candidate that cannot be this car and
-    the margin is recomputed over the survivors. It never adds score, because
-    two white sedans agreeing on colour is not evidence they are one car.
+  * Colour is diagnostic only. It cannot reject a candidate or resolve a
+    tie between two visually similar cars.
   * Column competition is PER CAMERA. CAM-23 and CAM-03 seeing the same car are
     two independent witnesses, not rivals for one identity.
   * An entry needs TWO independent observations of the same physical vehicle,
@@ -162,42 +161,16 @@ def statuses(sink):
 
 
 # --------------------------------------------------------------------------- #
-# Colour veto
+# Colour-independent matching
 # --------------------------------------------------------------------------- #
-def test_colour_removes_an_impostor_and_the_survivor_margin_clears():
-    """The tie-break, done subtractively.
-
-    Two identities are almost indistinguishable to Re-ID (0.71 vs 0.70), so the
-    row margin fails and nothing can be decided. Colour rules one of them out
-    entirely; the margin is then recomputed over what is left and the true
-    match clears on its own merit — never because colour 'agreed'.
-    """
+def test_colour_difference_cannot_resolve_an_ambiguous_match():
     evidence = {
         "a-white": [frame("a-white", "ANPR-ENTRY", (1.0, 0.0), colour=WHITE)],
         "a-black": [frame("a-black", "ANPR-ENTRY", (0.99, 0.14), colour=BLACK)],
         "c1": [frame("c1", "CAM-23", (1.0, 0.0), role="primary", colour=WHITE)],
     }
     log = _CollectingLog()
-    coord, _ = build(evidence, log=log)
-    white = coord.ingest_attempt(attempt("a-white", "AAA-1111"), [b"w"])
-    coord.ingest_attempt(attempt("a-black", "BBB-2222"), [b"b"])
-    coord.ingest_crossing(crossing("c1"), [b"c"])
-
-    record = log.of(stage="reid_evaluation")[-1]
-    assert record["reid"]["argmax"] == white.group_id
-    assert record["colour"]["vetoed"]          # the black identity was removed
-    assert record["reid"]["accepted"] is True
-
-
-def test_without_the_veto_the_same_pair_is_ambiguous():
-    """The control for the test above: colour is what changed the outcome."""
-    evidence = {
-        "a-white": [frame("a-white", "ANPR-ENTRY", (1.0, 0.0), colour=WHITE)],
-        "a-black": [frame("a-black", "ANPR-ENTRY", (0.99, 0.14), colour=BLACK)],
-        "c1": [frame("c1", "CAM-23", (1.0, 0.0), role="primary", colour=WHITE)],
-    }
-    log = _CollectingLog()
-    coord, sink = build(evidence, cfg=settings(colour_veto_enabled=False), log=log)
+    coord, sink = build(evidence, log=log)
     coord.ingest_attempt(attempt("a-white", "AAA-1111"), [b"w"])
     coord.ingest_attempt(attempt("a-black", "BBB-2222"), [b"b"])
     coord.ingest_crossing(crossing("c1"), [b"c"])
@@ -205,6 +178,8 @@ def test_without_the_veto_the_same_pair_is_ambiguous():
     record = log.of(stage="reid_evaluation")[-1]
     assert record["reid"]["accepted"] is False
     assert record["result"] == "ambiguous"
+    assert record["reason"] == "row_margin_below_minimum"
+    assert record["colour"]["vetoed"] == []
     assert sink.payloads == []
 
 
@@ -241,23 +216,36 @@ def test_a_missing_colour_fails_open():
     assert record["reid"]["accepted"] is True
 
 
-def test_a_vivid_colour_mismatch_is_vetoed():
+@pytest.mark.parametrize("camera, role", [
+    ("CAM-23", CrossingRole.PRIMARY),
+    ("CAM-03", CrossingRole.FALLBACK),
+])
+@pytest.mark.parametrize("anpr_colour, crossing_colour", [
+    (RED, BLUE),
+    ((54.2, 24.1, 68.2), (103.4, 60.7, 173.7)),
+])
+def test_colour_mismatch_does_not_block_a_unique_entry_match(
+    camera, role, anpr_colour, crossing_colour
+):
     evidence = {
-        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), colour=RED)],
-        "c1": [frame("c1", "CAM-23", (1.0, 0.0), role="primary", colour=BLUE)],
+        "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), colour=anpr_colour)],
+        "c1": [frame("c1", camera, (1.0, 0.0), role=role.value,
+                     colour=crossing_colour)],
     }
     log = _CollectingLog()
     coord, sink = build(evidence, log=log)
-    result = coord.ingest_attempt(attempt("a1", "AAA-1111"), [b"a"])
-    coord.ingest_crossing(crossing("c1"), [b"c"])
+    coord.ingest_attempt(attempt("a1", "AAA-1111"), [b"a"])
+    coord.ingest_crossing(crossing("c1", camera_id=camera, role=role), [b"c"])
 
-    # Every candidate vetoed means no evaluation at all, so nothing is logged
-    # as a match and nothing is confirmed.
-    assert sink.payloads == []
-    assert result.group_id in coord.state_summary()["groups"]
+    record = log.of(stage="reid_evaluation")[-1]
+    assert record["reason"] == "accepted"
+    assert record["colour"]["enabled"] is False
+    assert record["colour"]["vetoed"] == []
+    assert statuses(sink) == ["confirmed"]
+    assert sink.payloads[0]["canonical_plate"] == "AAA-1111"
 
 
-def test_the_veto_is_recorded_even_when_it_changes_nothing():
+def test_colour_measurements_remain_diagnostic():
     evidence = {
         "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), colour=WHITE)],
         "c1": [frame("c1", "CAM-23", (1.0, 0.0), role="primary", colour=WHITE)],
@@ -268,7 +256,7 @@ def test_the_veto_is_recorded_even_when_it_changes_nothing():
     coord.ingest_crossing(crossing("c1"), [b"c"])
 
     colour = log.of(stage="reid_evaluation")[-1]["colour"]
-    assert colour["enabled"] is True
+    assert colour["enabled"] is False
     assert colour["query_hsv"] == [0.0, 5.0, 240.0]
 
 

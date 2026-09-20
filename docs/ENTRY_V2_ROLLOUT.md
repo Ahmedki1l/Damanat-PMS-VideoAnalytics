@@ -4,6 +4,20 @@ This document is the deployment contract for the authoritative gate-entry
 pipeline shared by PMS-AI and Video Analytics (VA). It changes neither Gateway
 nor the database schema. Cameras continue to post only to PMS-AI.
 
+## Entry colour matching
+
+Entry association no longer vetoes candidates using HSV colour differences.
+All causally eligible candidates reach the ReID similarity and ambiguity checks;
+plate and physical-witness requirements still apply. Colour measurements remain
+available for diagnostics and downstream gallery handling. B1 slot matching and
+gallery-admission colour rules are unchanged.
+
+`ENTRY_V2_COLOUR_VETO_ENABLED` has been removed. Existing environment overrides
+are ignored and cannot restore the veto. Scored decision records retain the
+`colour` block with `enabled: false`, `vetoed: []`, and the measured `query_hsv`.
+Historical colour-veto records do not contain scores for the removed candidates;
+replaying those logs cannot establish whether those candidates would now pass.
+
 ## Safety invariants
 
 - An ANPR read alone never opens a parking session in authoritative mode.

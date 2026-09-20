@@ -1,21 +1,8 @@
-"""all_candidates_vetoed must say WHICH colours disagreed.
-
-The colour veto is the only refusal in the matcher that discards a car without
-producing a number to argue about: evaluate_unique_match removes the candidate
-before scoring, ranked comes back empty, and the coordinator falls through to
-all_candidates_vetoed. Until this change the record carried "uncontested" and
-nothing else, so there was no way to tell a correct veto from a wrong one.
-
-It is not hypothetical. On 2026-09-09 it fired on 2 of 32 CAM-23 ramp views:
-HGD-2926 survived only because the CAM-03 fallback scored 0.735 five seconds
-later, and SHR-1198 did not survive at all -- its identity hit the 900s TTL and
-its crossing expired unclaimed. Neither record could say what colour anything
-was.
-"""
+"""Entry colour stays observable without filtering candidates."""
 import dataclasses
 from datetime import datetime, timedelta, timezone
 
-from src.entry.decision import EntryDecisionEngine
+from src.entry.coordinator import EntryCoordinator
 from src.entry.domain import (
     AttemptGroup,
     AttemptInput,
@@ -118,8 +105,6 @@ class _StubSink:
 
 
 def _coordinator(log, **overrides):
-    from src.entry.coordinator import EntryCoordinator
-
     return EntryCoordinator(
         _settings(**overrides), _StubProcessor(), _StubSink(), decision_log=log
     )
@@ -131,95 +116,33 @@ def _log_uncontested(log, crossing, groups, **overrides):
     return log.records[-1] if log.records else None
 
 
-# --------------------------------------------------------------------------- #
-# The fix
-# --------------------------------------------------------------------------- #
-def test_a_vetoed_crossing_now_records_both_colours():
+def test_colour_mismatch_is_scored_and_logged_without_a_veto(monkeypatch):
+    monkeypatch.setenv("ENTRY_V2_COLOUR_VETO_ENABLED", "1")
     log = _CollectingLog()
-    groups = {"g-1": _identity("g-1", "SHR1198", DARK)}
-
-    record = _log_uncontested(log, _crossing(PALE), groups)
-
-    assert record["reason"] == "all_candidates_vetoed"
-    colour = record["colour"]
-    assert colour["query_hsv"] == [99.2, 18.0, 210.0]
-    assert colour["vetoed"] == ["g-1"]
-    assert colour["enabled"] is True
-    detail = colour["vetoed_detail"][0]
-    assert detail["identity_key"] == "SHR1198"
-    assert detail["gallery_hsv"] == [99.2, 20.0, 40.0]
-
-
-def test_every_vetoed_identity_is_named_not_just_the_first():
-    log = _CollectingLog()
-    groups = {
-        "g-1": _identity("g-1", "SHR1198", DARK),
-        "g-2": _identity("g-2", "HGD2926", DARK),
-    }
-
-    colour = _log_uncontested(log, _crossing(PALE), groups)["colour"]
-
-    assert sorted(colour["vetoed"]) == ["g-1", "g-2"]
-    assert sorted(d["identity_key"] for d in colour["vetoed_detail"]) == [
-        "HGD2926",
-        "SHR1198",
-    ]
-
-
-# --------------------------------------------------------------------------- #
-# The record must describe the decision that was actually made
-# --------------------------------------------------------------------------- #
-def test_the_logged_veto_matches_what_the_matcher_actually_did():
-    """The block is recomputed, so it could drift from the real predicate."""
-    settings = _settings()
+    cfg = dataclasses.replace(
+        EntrySettings.from_env(), mode=EntryMode.SHADOW,
+        reid_min_score=0.75, reid_row_margin=0.08, reid_column_margin=0.08,
+    )
+    coordinator = EntryCoordinator(
+        cfg, _StubProcessor(), _StubSink(), decision_log=log
+    )
+    groups = {"g-1": _identity("g-1", "AAA1111", DARK)}
     crossing = _crossing(PALE)
-    groups = {"g-1": _identity("g-1", "SHR1198", DARK)}
 
-    # The matcher abstains with nothing ranked - the path that logs the block.
-    engine = EntryDecisionEngine(settings)
-    assert engine.evaluate_unique_match(crossing, groups, [crossing]) is None
-
-    colour = _log_uncontested(_CollectingLog(), crossing, groups)["colour"]
-    assert colour["vetoed"] == ["g-1"]
-
-
-def test_a_compatible_colour_is_never_reported_as_vetoed():
-    log = _CollectingLog()
-    groups = {"g-1": _identity("g-1", "SHR1198", DARK)}
-
-    record = _log_uncontested(log, _crossing(DARK), groups)
-
-    # Same colour both sides, so nothing may be named. Asserted unconditionally:
-    # a guarded assert here would pass whether or not the block was built.
-    assert record["reason"] == "all_candidates_vetoed"
-    assert record["colour"]["vetoed"] == []
-    assert record["colour"]["vetoed_detail"] == []
-
-
-def test_the_veto_being_disabled_names_nobody():
-    """decision.py gates on colour_veto_enabled BEFORE comparing colours.
-
-    A recomputed block that skips the flag reports a veto the matcher never
-    applied - which is worse than no block, because it sends a reader hunting a
-    colour veto for an abstention that has some other cause. Caught exactly
-    that way: the first version of this fix listed g-1 with the veto off.
-    """
-    log = _CollectingLog()
-    groups = {"g-1": _identity("g-1", "SHR1198", DARK)}
-
-    record = _log_uncontested(
-        log, _crossing(PALE), groups, colour_veto_enabled=False
+    match = coordinator._find_unique_match_with_observability_locked(
+        crossing, groups, [crossing]
     )
 
-    assert record["reason"] == "all_candidates_vetoed"
-    assert record["colour"]["enabled"] is False
-    assert record["colour"]["vetoed"] == []
-    assert record["colour"]["vetoed_detail"] == []
+    assert match is not None
+    assert match.group_id == "g-1"
+    record = log.records[-1]
+    assert record["reason"] == "accepted"
+    assert record["reid"]["score"] == 1.0
+    assert record["colour"] == {
+        "query_hsv": [99.2, 18.0, 210.0], "vetoed": [], "enabled": False,
+    }
 
 
-# --------------------------------------------------------------------------- #
-# The other two reasons have no colour to report
-# --------------------------------------------------------------------------- #
 def test_no_live_identity_carries_no_colour_block():
     record = _log_uncontested(_CollectingLog(), _crossing(PALE), {})
 
@@ -245,14 +168,12 @@ def test_a_causally_ineligible_identity_carries_no_colour_block():
 # --------------------------------------------------------------------------- #
 def test_the_uncontested_block_is_untouched():
     log = _CollectingLog()
-    groups = {"g-1": _identity("g-1", "SHR1198", DARK)}
-
-    record = _log_uncontested(log, _crossing(PALE), groups)
+    record = _log_uncontested(log, _crossing(PALE), {})
 
     assert record["uncontested"] == {
-        "pending_identities": 1,
-        "causally_eligible": 1,
-        "identity_keys": ["SHR1198"],
+        "pending_identities": 0,
+        "causally_eligible": 0,
+        "identity_keys": [],
     }
     assert record["stage"] == "reid_evaluation"
     assert record["result"] == "abstained"
@@ -263,10 +184,8 @@ def test_the_fingerprint_dedup_still_suppresses_a_repeat():
     log = _CollectingLog()
     coordinator = _coordinator(log)
     crossing = _crossing(PALE)
-    groups = {"g-1": _identity("g-1", "SHR1198", DARK)}
-
-    coordinator._log_uncontested_crossing_locked(crossing, groups)
-    coordinator._log_uncontested_crossing_locked(crossing, groups)
+    coordinator._log_uncontested_crossing_locked(crossing, {})
+    coordinator._log_uncontested_crossing_locked(crossing, {})
 
     assert len(log.records) == 1
 
@@ -278,5 +197,5 @@ def test_a_failing_log_still_cannot_break_the_pipeline():
 
     coordinator = _coordinator(_Explodes())
     coordinator._log_uncontested_crossing_locked(
-        _crossing(PALE), {"g-1": _identity("g-1", "SHR1198", DARK)}
+        _crossing(PALE), {}
     )
