@@ -873,6 +873,16 @@ class ParkingEngineRuntimeMixin:
             total_slots += pipeline.slot_count
             for slot in parking_slots:
                 all_active_slot_ids.add(slot.id)
+                # Occupancy restored at boot produces no fresh vehicle_parked
+                # event. Resume its ownership check after pipeline setup.
+                state_machine = pipeline.state_machines.get(slot.id)
+                if (getattr(self, "_reserved_for_map", {}).get(slot.id)
+                        and getattr(self, "_ocr_armed", {}).get(slot.id)
+                        and state_machine is not None
+                        and state_machine.state == SlotState.OCCUPIED):
+                    self._register_pending_ownership(
+                        slot.id, camera_config.id, None, time.time()
+                    )
 
         self._free_plates_on_disabled_cameras()
         return total_slots
@@ -1278,10 +1288,8 @@ class ParkingEngineRuntimeMixin:
                 slot_ctx,
                 detections=detections,
             )
-        # Deadline check on named slots still waiting for identity. Runs after the
-        # identity pass so a plate that just landed settles the verdict properly
-        # (owner => silent) rather than racing the timeout. Costs one dict scan over
-        # a handful of slots.
+        # Settle completed identification failures after identity results have
+        # been applied. Elapsed time never determines an ownership verdict.
         self._sweep_pending_ownership(time.time())
         # Same scan, for the no-parking zones: raise the alerts whose cars stayed.
         self._sweep_pending_violations(time.time())
@@ -1455,6 +1463,7 @@ class ParkingEngineRuntimeMixin:
         # wall: appearance is the only witness that will ever exist here, so go straight
         # to it, from the first attempt rather than the ninth.
         if slot.id in self._no_plate_view_slots():
+            self._mark_slot_ocr_exhausted(slot.id)
             self._retry_reid_identify(cam_id, frame, slot, state_machine, detection, now_ts)
             return
 
@@ -1548,16 +1557,21 @@ class ParkingEngineRuntimeMixin:
                 slot.id, crop, cam_id, decision_ctx=decision_ctx
             )
             if plan is None:
-                return  # no OCR plugin
+                self._ocr_id_attempts[slot.id] = attempts
+                self._retry_reid_identify(cam_id, frame, slot, state_machine, detection, now_ts)
+                return  # unavailable OCR is not a completed identification failure
             from src.core.engine.async_slot_ocr import SlotOcrJob
 
             token = getattr(self, "_ocr_generation", {}).get(slot.id)
-            worker.submit(
+            submitted = worker.submit(
                 SlotOcrJob(
                     slot_id=slot.id, cam_id=cam_id, crop=crop, plan=plan,
                     attempts=attempts + 1, token=token,
                 )
             )
+            if not submitted:
+                # Queue pressure is not a completed identification attempt.
+                self._ocr_id_attempts[slot.id] = attempts
             return
 
         # SYNC (matching.slot_ocr_async = false): keep the plan and scalar OCR
@@ -1566,6 +1580,8 @@ class ParkingEngineRuntimeMixin:
             slot.id, crop, cam_id, decision_ctx=decision_ctx
         )
         if plan is None:
+            self._ocr_id_attempts[slot.id] = attempts
+            self._retry_reid_identify(cam_id, frame, slot, state_machine, detection, now_ts)
             return
         ocr_text, ocr_confidence = self.vehicle_registry.read_slot_plate(
             crop, plan.allow_retry, slot_id=slot.id
@@ -1577,6 +1593,8 @@ class ParkingEngineRuntimeMixin:
             self._maybe_bind_reid_solo(
                 cam_id, slot.id, state_machine, crop, attempts + 1, decision_ctx
             )
+            if attempts + 1 >= self._OCR_ID_MAX_ATTEMPTS:
+                self._mark_slot_ocr_exhausted(slot.id)
             return
         proof = self.vehicle_registry.build_parked_reference_proof(
             plan, plate, ocr_text, ocr_confidence, crop
@@ -1786,6 +1804,8 @@ class ParkingEngineRuntimeMixin:
             cam_id, slot_id, state_machine, job.crop, job.attempts,
             job.plan.decision_ctx or {},
         )
+        if job.attempts >= self._OCR_ID_MAX_ATTEMPTS:
+            self._mark_slot_ocr_exhausted(slot_id)
 
     def _apply_async_track_ocr_result(self, res) -> None:
         """Fold a finished APPROACH read back in — MAIN THREAD.
@@ -2143,6 +2163,7 @@ class ParkingEngineRuntimeMixin:
             self._ocr_id_attempts, self._ocr_id_last_at, self._ocr_armed = {}, {}, {}
         if not hasattr(self, "_reid_retry_last_at"):
             self._reid_retry_last_at = {}
+        getattr(self, "_slot_ocr_exhausted", {}).pop(slot_id, None)
         self._ocr_id_attempts[slot_id] = 0
         self._ocr_id_last_at[slot_id] = 0.0
         self._reid_retry_last_at.pop(slot_id, None)
@@ -2261,8 +2282,8 @@ class ParkingEngineRuntimeMixin:
 
                 if event.event_type == "slot_vacant":
                     # Car left before identity ever resolved — drop the deferred
-                    # ownership verdict so the NEXT car to park here starts its own
-                    # clock instead of inheriting this one's elapsed time. Kept out
+                    # ownership verdict so the NEXT car starts a fresh check.
+                    # Kept out
                     # of the vehicle_registry-guarded branch below: the pending map
                     # is written by the violation filter, which runs with or without
                     # a registry, so it must be cleared unconditionally or it leaks.
@@ -2569,6 +2590,9 @@ class ParkingEngineRuntimeMixin:
             slot, state_machine, vehicle_in_slot, track_id, detection,
             parked_events, plate_matching_enabled,
         ) in slot_ctx:
+            if not plate_matching_enabled and state_machine.state == SlotState.OCCUPIED:
+                # Explicitly disabled identity has no work or retries to await.
+                self._mark_slot_ocr_exhausted(slot.id)
             for event in parked_events:
                 self._identify_parked_slot(
                     cam_id, frame, pipeline, slot, state_machine, track_id,
@@ -2972,7 +2996,7 @@ class ParkingEngineRuntimeMixin:
                 # through as a plain vehicle_parked so occupancy is unaffected, and
                 # the ownership verdict is settled later by
                 # _evaluate_named_slot_ownership (identity landed) or
-                # _sweep_pending_ownership (identity never landed).
+                # _sweep_pending_ownership (identification exhausted).
                 self._register_pending_ownership(event.slot_id, cam_id, crop, now_ts)
                 final_events.append(event)
                 continue
@@ -3016,7 +3040,7 @@ class ParkingEngineRuntimeMixin:
                 event.is_alert = True
                 event.severity = (
                     "critical"
-                    if alert_type == "vehicle_violation"
+                    if alert_type in ("vehicle_violation", "vehicle_intrusion")
                     else "warning"
                 )
                 # Pass the full frame as fallback so the alert always carries an
@@ -3108,7 +3132,7 @@ class ParkingEngineRuntimeMixin:
     # So the verdict is deferred. A parked-but-unnamed named slot is recorded here,
     # and settled exactly once by whichever comes first:
     #   * _evaluate_named_slot_ownership — identity landed; alert only if NOT the owner
-    #   * _sweep_pending_ownership       — identity never landed; alert as unidentified
+    #   * _sweep_pending_ownership       — identification exhausted; alert without a plate
     #   * _clear_pending_ownership       — the car left before either
 
     def _pending_ownership(self) -> dict:
@@ -3135,13 +3159,12 @@ class ParkingEngineRuntimeMixin:
         pending[slot_id] = {
             "cam_id": cam_id,
             "crop": held_crop,
-            "since": now_ts,
+            "generation": getattr(self, "_ocr_generation", {}).get(slot_id),
             "owner_title": self._reserved_for_map.get(slot_id),
             "floor": getattr(pipeline, "floor", "") or "",
             "slot_name": getattr(slot_obj, "label", "") or slot_id,
             "zone_id": getattr(slot_obj, "zone_id", "") or "",
             "zone_name": getattr(slot_obj, "zone_name", "") or "",
-            "alerted": False,
         }
         logger.info(
             "[named-slot] slot=%s occupied by an UNIDENTIFIED car (reserved for %r) "
@@ -3152,6 +3175,7 @@ class ParkingEngineRuntimeMixin:
     def _clear_pending_ownership(self, slot_id: str) -> None:
         """Car left. Drop the pending verdict so the NEXT car starts clean."""
         self._pending_ownership().pop(slot_id, None)
+        getattr(self, "_slot_ocr_exhausted", {}).pop(slot_id, None)
 
     def _evaluate_named_slot_ownership(self, slot_id: str, cam_id: str, plate: str) -> None:
         """Identity landed for a parked car — settle the deferred verdict.
@@ -3181,50 +3205,59 @@ class ParkingEngineRuntimeMixin:
         )
         self._clear_pending_ownership(slot_id)
 
+    def _mark_slot_ocr_exhausted(self, slot_id: str) -> None:
+        """Record completed OCR exhaustion, never merely a submitted final read."""
+        if slot_id not in self._pending_ownership():
+            return
+        exhausted = getattr(self, "_slot_ocr_exhausted", None)
+        if exhausted is None:
+            exhausted = self._slot_ocr_exhausted = {}
+        exhausted[slot_id] = getattr(self, "_ocr_generation", {}).get(slot_id)
+
     def _sweep_pending_ownership(self, now_ts: float) -> None:
-        """Identity never landed — alert on the ones that ran out of time.
+        """Settle terminal identification failures; the clock is not a deadline.
 
-        WHY THIS EXISTS. Waiting for identity forever means a named slot whose
-        identity never resolves gets NO intrusion alert, ever. That is not a corner
-        case: B1_CRO has OCR disabled outright (matching.slot_no_plate_view — the
-        plate is never in frame, 455 attempts and zero reads) and can only be named
-        by appearance, which routinely abstains. Without this sweep the CRO's slot
-        would have exactly zero intrusion coverage.
-
-        The resulting alert deliberately does NOT claim intrusion. Nobody could
-        verify ownership, so it says so, at a lower severity than a proven one.
+        Exhausted/skipped OCR is terminal only when appearance retries are off.
+        With retries enabled, future gallery evidence can still name the vehicle.
         """
-        # Called once per processed frame, so the empty case must be free — and it
-        # is the normal case (only named slots awaiting identity are ever in here).
-        # Checking the map before touching config also keeps this a hard no-op on
-        # engines built without alert config, e.g. test harnesses.
         pending = getattr(self, "_pending_ownership_map", None)
         if not pending:
             return
-        alerts_cfg = getattr(getattr(self, "config", None), "alerts", None)
-        try:
-            timeout = float(
-                getattr(alerts_cfg, "reserved_slot_identity_timeout_s", 300.0)
-            )
-        except (TypeError, ValueError):
-            timeout = 300.0
-        if timeout <= 0:
-            return  # fallback disabled — alert only on a proven non-owner
+        registry = getattr(self, "vehicle_registry", None)
+        matching = getattr(registry, "matching_config", None)
+        retries_enabled = (
+            getattr(matching, "slot_reid_solo_enabled", False)
+            and float(getattr(matching, "slot_reid_retry_interval_s", 60.0) or 0.0) > 0
+        )
+        exhausted = getattr(self, "_slot_ocr_exhausted", {})
         for slot_id, entry in list(pending.items()):
-            if entry.get("alerted"):
+            if entry["generation"] != getattr(self, "_ocr_generation", {}).get(slot_id):
                 continue
-            if now_ts - entry["since"] < timeout:
+            pipeline = (getattr(self, "pipelines", None) or {}).get(entry["cam_id"])
+            state_machine = getattr(pipeline, "state_machines", {}).get(slot_id)
+            if state_machine is None or getattr(state_machine, "state", None) != SlotState.OCCUPIED:
                 continue
-            entry["alerted"] = True  # latch: one alert per occupancy, not per frame
+            identity_disabled = is_identity_disabled(entry["cam_id"], pipeline.floor)
+            plate = None if identity_disabled or self._holds_unverified_restore(slot_id) else (
+                state_machine.plate_number or (registry.get_slot_plate(slot_id) if registry else None)
+            )
+            if plate:
+                # Includes registry/track bindings outside the OCR completion hooks.
+                self._evaluate_named_slot_ownership(slot_id, entry["cam_id"], plate)
+                continue
+            if (slot_id not in exhausted
+                    or exhausted[slot_id] != entry["generation"]
+                    or not getattr(self, "_ocr_armed", {}).get(slot_id)
+                    or (retries_enabled and not identity_disabled)):
+                continue
             logger.warning(
-                "[named-slot] slot=%s UNIDENTIFIED after %.0fs — reserved for %r and "
-                "neither OCR nor ReID could name the occupant, so ownership was never "
-                "testable. Raising a lower-severity alert rather than staying silent.",
-                slot_id, now_ts - entry["since"], entry.get("owner_title"),
+                "[named-slot] slot=%s identification exhausted without a plate; "
+                "raising intrusion for security review", slot_id,
             )
             self._raise_named_slot_alert(
-                slot_id, entry, "reserved_slot_unidentified", plate=None, severity="warning"
+                slot_id, entry, "vehicle_intrusion", plate=None, severity="critical"
             )
+            self._clear_pending_ownership(slot_id)
 
     # ── no-parking zones: occupancy is not yet a violation ──────────────────
     #
