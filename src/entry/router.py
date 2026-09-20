@@ -7,7 +7,6 @@ import json
 import re
 import hmac
 import logging
-import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -131,8 +130,6 @@ class EntryTransportGuard:
             _LEGACY_LINE_CROSSING_PATH,
         }
         self.guarded_paths = self.entry_paths | self.legacy_anpr_paths
-        self._ingress_lock = threading.Lock()
-        self._active_ingest_requests = 0
         self.max_request_bytes = _entry_request_byte_limit(coordinator)
         self.legacy_anpr_max_request_bytes = (
             (coordinator.settings.max_image_bytes + 2) // 3
@@ -239,33 +236,6 @@ class EntryTransportGuard:
                 await self._respond(scope, receive, send, 413, too_large_detail)
                 return
 
-        ingress_acquired = False
-        if path in self.ingest_paths:
-            with self._ingress_lock:
-                at_capacity = (
-                    self._active_ingest_requests
-                    >= self.coordinator.settings.max_concurrent_ingest_requests
-                )
-                if not at_capacity:
-                    self._active_ingest_requests += 1
-                    ingress_acquired = True
-            if at_capacity:
-                logger.warning(
-                    "[EntryV2] ingress capacity exceeded path=%s active=%d limit=%d",
-                    path,
-                    self._active_ingest_requests,
-                    self.coordinator.settings.max_concurrent_ingest_requests,
-                )
-                await self._respond(
-                    scope,
-                    receive,
-                    send,
-                    503,
-                    "entry_v2_ingress_capacity_exceeded",
-                    headers={"Retry-After": "1"},
-                )
-                return
-
         received = 0
 
         async def limited_receive():
@@ -281,10 +251,6 @@ class EntryTransportGuard:
             await self.app(scope, limited_receive, send)
         except _EntryRequestTooLarge:
             await self._respond(scope, receive, send, 413, too_large_detail)
-        finally:
-            if ingress_acquired:
-                with self._ingress_lock:
-                    self._active_ingest_requests -= 1
 
     @staticmethod
     async def _respond(
