@@ -87,6 +87,8 @@ class EntrySettings:
     max_pending_attempts: int = 256
     max_pending_crossings: int = 256
     max_pending_callbacks: int = 128
+    # Legacy name: now only the default RTSP local-zone queue capacity.
+    # HTTP entry requests have no transport-level concurrency rejection.
     max_concurrent_ingest_requests: int = 2
     receipt_capacity: int = 4096
     journey_capacity: int = 4096
@@ -574,8 +576,6 @@ class EntrySettings:
             errors.append("local_zone_requires_two_images")
         if local_zone_enabled and not self.local_zone_is_co_located():
             errors.append("entry_v2_local_zone_requires_single_process_or_gate_group")
-        if self.receipt_capacity < self.max_concurrent_ingest_requests:
-            errors.append("receipt_capacity_below_ingest_concurrency")
         if self.identity_ttl_minutes <= 0:
             errors.append("ENTRY_IDENTITY_TTL_MINUTES")
         if self.observation_ttl_minutes <= 0:

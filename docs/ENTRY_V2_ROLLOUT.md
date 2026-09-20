@@ -185,7 +185,7 @@ assignment. The result is independent of HTTP arrival order and uses no
 business timer. A late old event delivered after closure is still deduplicated
 when its source timestamp, topology, OCR, and ReID agree. If the exit bridge is
 missing, provisional capacity eventually returns 503 rather than evicting or
-guessing; the exit route itself is not subject to V2 ingress capacity.
+guessing. HTTP concurrency does not impose an additional entry admission limit.
 
 One exit closes at most one same-plate open journey: the uniquely latest
 source-ordered eligible journey. If two candidates share the same latest entry
@@ -352,8 +352,12 @@ ENTRY_V2_LPD_THREADS=2
 ENTRY_V2_OCR_MODEL_DIR=
 ```
 
-`ENTRY_V2_RECEIPT_CAPACITY` must be at least
-`ENTRY_V2_MAX_CONCURRENT_INGEST_REQUESTS`; VA rejects an unsafe configuration.
+HTTP entry attempts and crossings are no longer rejected because other requests
+are in flight. `ENTRY_V2_MAX_CONCURRENT_INGEST_REQUESTS` retains its legacy name
+for compatibility and now only sets the default RTSP local-zone queue capacity;
+it does not limit HTTP requests. Receipt capacity is configured independently.
+Model execution, thread pools and downstream services still determine throughput;
+removing the HTTP cap does not guarantee immediate processing under load.
 `ENTRY_V2_JOURNEY_CAPACITY` independently bounds open/retained journey state
 and unmatched exit boundaries. It defaults to `4096`; protected open journeys
 are never evicted, so exhausted capacity rejects new attempts or exit markers

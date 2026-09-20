@@ -1,6 +1,8 @@
+import asyncio
 import threading
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 import pytest
@@ -577,118 +579,66 @@ def test_transport_guard_caps_chunked_body_without_content_length():
     assert response.json()["detail"] == "entry_request_too_large"
 
 
-def test_transport_guard_rejects_concurrent_ingest_before_route_or_body_work():
+@pytest.mark.parametrize("mode", [EntryMode.AUTHORITATIVE, EntryMode.SHADOW])
+def test_concurrent_attempts_and_crossings_reach_routes_without_ingress_rejection(mode):
     cfg = EntrySettings(
-        mode=EntryMode.AUTHORITATIVE,
-        max_concurrent_ingest_requests=1,
-        service_key="contract-secret",
-    )
-    coordinator = EntryCoordinator(cfg, ContractProcessor(), ContractSink())
-    app = FastAPI()
-    install_entry_transport_guard(app, coordinator)
-    entered = threading.Event()
-    release = threading.Event()
-    route_calls = []
-
-    @app.post("/api/v2/entry-attempts")
-    def blocking_ingest():
-        route_calls.append("called")
-        entered.set()
-        assert release.wait(timeout=2)
-        return {"status": "ok"}
-
-    headers = {
-        "X-Service-Key": "contract-secret",
-        "X-Entry-V2-Mode": "authoritative",
-    }
-    first_result = []
-
-    def send_first():
-        with TestClient(app, headers=headers) as client:
-            first_result.append(client.post("/api/v2/entry-attempts"))
-
-    first_thread = threading.Thread(target=send_first)
-    first_thread.start()
-    assert entered.wait(timeout=2)
-    with TestClient(app, headers=headers) as client:
-        rejected = client.post(
-            "/api/v2/entry-attempts",
-            content=b"body-that-must-not-reach-the-route",
-        )
-    release.set()
-    first_thread.join(timeout=2)
-
-    assert not first_thread.is_alive()
-    assert first_result[0].status_code == 200
-    assert rejected.status_code == 503
-    assert rejected.headers["Retry-After"] == "1"
-    assert rejected.json()["detail"] == "entry_v2_ingress_capacity_exceeded"
-    assert route_calls == ["called"]
-
-
-def test_shadow_v2_capacity_does_not_backpressure_legacy_anpr():
-    cfg = EntrySettings(
-        mode=EntryMode.SHADOW,
+        mode=mode,
         max_concurrent_ingest_requests=2,
         service_key="contract-secret",
     )
     coordinator = EntryCoordinator(cfg, ContractProcessor(), ContractSink())
     app = FastAPI()
     install_entry_transport_guard(app, coordinator)
-    entered_count = 0
-    entered_lock = threading.Lock()
-    both_entered = threading.Event()
-    release = threading.Event()
-    v2_route_calls = []
-    legacy_bodies = []
 
-    @app.post("/api/v2/entry-attempts")
-    def blocking_v2_ingest():
-        nonlocal entered_count
-        with entered_lock:
-            entered_count += 1
-            v2_route_calls.append("called")
-            if entered_count == 2:
-                both_entered.set()
-        assert release.wait(timeout=3)
-        return {"status": "ok"}
+    async def exercise():
+        entered = []
+        all_entered = asyncio.Event()
+        release = asyncio.Event()
+        paths = ["/api/v2/entry-attempts", "/api/v2/entry-crossings"] * 2
 
-    @app.post("/api/anpr/event")
-    async def consume_legacy_anpr_body(request: Request):
-        legacy_bodies.append(await request.body())
-        return {"status": "ok"}
+        @app.post("/api/v2/entry-attempts")
+        @app.post("/api/v2/entry-crossings")
+        async def blocking_ingest(request: Request):
+            body = await request.body()
+            entered.append((request.url.path, body))
+            if len(entered) == len(paths):
+                all_entered.set()
+            await release.wait()
+            return {"status": "processed"}
 
-    headers = {
-        "X-Service-Key": "contract-secret",
-        "X-Entry-V2-Mode": "shadow",
-    }
-    blocked_results = []
+        @app.post("/api/anpr/event")
+        async def legacy_anpr(request: Request):
+            return {"body": (await request.body()).decode()}
 
-    def send_blocked_v2():
-        with TestClient(app, headers=headers) as client:
-            blocked_results.append(client.post("/api/v2/entry-attempts"))
+        headers = {
+            "X-Service-Key": "contract-secret",
+            "X-Entry-V2-Mode": mode.value,
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+            headers=headers,
+        ) as client:
+            tasks = [
+                asyncio.create_task(client.post(path, content=str(i).encode()))
+                for i, path in enumerate(paths)
+            ]
+            try:
+                await asyncio.wait_for(all_entered.wait(), timeout=2)
+                if mode == EntryMode.SHADOW:
+                    legacy = await client.post("/api/anpr/event", content=b"legacy")
+                    assert legacy.status_code == 200
+                    assert legacy.json() == {"body": "legacy"}
+            finally:
+                release.set()
+                responses = await asyncio.gather(*tasks)
+            assert all(response.status_code == 200 for response in responses)
+            assert all(response.json() == {"status": "processed"} for response in responses)
+            assert sorted(entered) == sorted(
+                (path, str(i).encode()) for i, path in enumerate(paths)
+            )
 
-    blocked_threads = [threading.Thread(target=send_blocked_v2) for _ in range(2)]
-    for thread in blocked_threads:
-        thread.start()
-    assert both_entered.wait(timeout=3)
-
-    with TestClient(app, headers=headers) as client:
-        legacy_response = client.post("/api/anpr/event", content=b'{"plate":"A1"}')
-        rejected_v2 = client.post("/api/v2/entry-attempts")
-
-    release.set()
-    for thread in blocked_threads:
-        thread.join(timeout=3)
-
-    assert all(not thread.is_alive() for thread in blocked_threads)
-    assert [response.status_code for response in blocked_results] == [200, 200]
-    assert legacy_response.status_code == 200
-    assert legacy_bodies == [b'{"plate":"A1"}']
-    assert rejected_v2.status_code == 503
-    assert rejected_v2.headers["Retry-After"] == "1"
-    assert rejected_v2.json()["detail"] == "entry_v2_ingress_capacity_exceeded"
-    assert v2_route_calls == ["called", "called"]
+    asyncio.run(exercise())
 
 
 def test_off_mode_leaves_concurrent_legacy_anpr_unconstrained_and_v2_disabled():
@@ -1049,9 +999,10 @@ def test_authoritative_mode_accepts_explicit_single_process(monkeypatch):
     assert "entry_v2_requires_single_process_va" not in cfg.configuration_errors()
 
 
-def test_receipt_capacity_covers_all_concurrent_delivery_markers(monkeypatch):
+def test_receipt_capacity_is_independent_of_legacy_local_queue_setting(monkeypatch):
     monkeypatch.setenv("ENTRY_V2_MODE", "authoritative")
     monkeypatch.setenv("ENTRY_V2_PRIMARY_LINES", "RAMP-IN")
+    monkeypatch.setenv("ENTRY_V2_PRIMARY_DIRECTIONS", "ramp-entry")
     monkeypatch.setenv("PMS_API_URL", "http://pms-ai:8080")
     monkeypatch.setenv("ENTRY_V2_SERVICE_KEY", "secret")
     monkeypatch.setenv("VA_PROCESS_COUNT", "1")
@@ -1060,7 +1011,7 @@ def test_receipt_capacity_covers_all_concurrent_delivery_markers(monkeypatch):
 
     cfg = EntrySettings.from_env()
 
-    assert "receipt_capacity_below_ingest_concurrency" in cfg.configuration_errors()
+    assert cfg.configuration_errors() == []
 
 
 @pytest.mark.parametrize(
