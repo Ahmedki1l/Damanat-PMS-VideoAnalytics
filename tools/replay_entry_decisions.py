@@ -1,8 +1,11 @@
 """Replay every recorded Entry decision through the live engine.
 
+Historical colour-veto records omit the rejected candidates' scores. This tool
+cannot reconstruct them or predict their outcome after removal of the veto.
+
 WHY THIS IS POSSIBLE. The decision record was designed as a calibration corpus,
 so it stores not just what happened but everything the policy needed to decide:
-the full ranked candidate list after the colour veto, both runners-up, and the
+the recorded ranked candidate list, both runners-up, and the
 three thresholds the decision was actually held to. That is a complete
 description of one `evaluate_unique_match` call — everything except the raw
 embeddings, which are the one thing the policy never looks at directly. It only
@@ -195,10 +198,6 @@ class Scenario:
             reid_min_score=float(reid["min_score"]),
             reid_row_margin=float(reid["min_row_margin"]),
             reid_column_margin=float(reid["min_column_margin"]),
-            # The corpus has already had the veto applied — `ranked` is the list
-            # AFTER it. Re-applying it here on synthetic colour would remove
-            # candidates the recorded decision actually considered.
-            colour_veto_enabled=False,
         )
 
     def build(self, gallery_uplift: Optional[float] = None):

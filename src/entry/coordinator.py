@@ -32,7 +32,6 @@ from .gallery import (
 # Same import decision.py makes, for the same reason: the veto is recomputed
 # here for the LOG only, and it must be the identical predicate the matcher
 # applied or the record would describe a decision that never happened.
-from src.reid_matcher import body_colour_compatible
 from .identity import (
     IdentitySupersededByExit,
     IdentityPublisher,
@@ -1978,8 +1977,7 @@ class EntryCoordinator:
                 # This is the ONE use of a ramp camera's OCR that survives, and
                 # it is not plate evidence: the question is "are these two
                 # notifications the same event?", never "what is the plate?".
-                # Subtractive, like the colour veto — it can withhold a row, it
-                # can never name a car.
+                # It can withhold a row, but never name a car.
                 #
                 # Applies to BOTH roles now. It used to guard only CAM-03,
                 # because a conflicting CAM-23 read was caught by the primary
@@ -2078,26 +2076,7 @@ class EntryCoordinator:
         crossing: CrossingRecord,
         groups: Mapping[str, AttemptGroup],
     ) -> None:
-        """Record a crossing that had NOTHING to be scored against.
-
-        `evaluate_unique_match` returns None when no identity survived to be
-        ranked — every live one was either causally ineligible (its ANPR read
-        follows this crossing) or removed by the colour veto. That is a real
-        outcome and it decides the car's fate, but until now it was the only
-        path through the matcher that wrote no record at all: the observation
-        sat in the pool until its TTL and then expired with `ttl_expiry` as the
-        sole trace, which says when it was dropped and never why.
-
-        That silence is what made the 2026-09-07 SHR-1198 loss unreadable. Its
-        own CAM-23 ramp view was ingested, acknowledged 201, and produced zero
-        decision records; reconstructing why cost a full pass over three
-        services' logs. A crossing that no identity can even compete for is
-        precisely the shape of a missed entry, so it is now stated.
-
-        Deduplicated on the same cache as a scored evaluation, so a crossing
-        that stays uncontested across many passes is recorded once and speaks
-        again only when the reason changes.
-        """
+        """Record why no pending identity was eligible, suppressing repeats."""
         pending = [
             group
             for group in groups.values()
@@ -2112,8 +2091,6 @@ class EntryCoordinator:
             "no_live_identity"
             if not pending
             else "no_causally_eligible_identity"
-            if not eligible
-            else "all_candidates_vetoed"
         )
         crossing_id = crossing.request.crossing_id
         fingerprint = ("", reason, len(pending), len(eligible))
@@ -2127,56 +2104,11 @@ class EntryCoordinator:
             > max(1, self.settings.max_pending_crossings)
         ):
             self._reid_evaluation_log_cache.popitem(last=False)
-        # The colour veto is the ONLY refusal that discards a car without ever
-        # producing a number to argue about, and it used to emit no colour at
-        # all: `all_candidates_vetoed` carried `uncontested` and nothing else,
-        # so the evidence needed to judge or tune it did not exist. On
-        # 2026-09-09 it fired on 2 of 32 CAM-23 ramp views — HGD-2926 survived
-        # only because the CAM-03 fallback scored 0.735 five seconds later, and
-        # SHR-1198 did not survive at all. Neither record could say which
-        # colours disagreed.
-        #
-        # Recomputed rather than threaded through, because the matcher returned
-        # None precisely so it would not have to build an evaluation here. Cost
-        # is one HSV comparison per eligible identity, on a path that already
-        # walks them twice.
-        colour = None
-        if reason == "all_candidates_vetoed":
-            # BOTH halves of decision.py's condition, in the same order. Gating
-            # on the flag is not redundant: with the veto off the matcher never
-            # rejects on colour, so reporting a mismatch as "vetoed" would name
-            # a decision that did not happen and send a reader hunting a veto
-            # for an abstention that has some other cause.
-            vetoed = [
-                group
-                for group in eligible
-                if self.settings.colour_veto_enabled
-                and not body_colour_compatible(
-                    crossing.colour_hsv, group.colour_hsv
-                )
-            ]
-            colour = {
-                "query_hsv": _round_hsv(crossing.colour_hsv),
-                "vetoed": [group.group_id for group in vetoed],
-                # Per-candidate, so a bad veto can be read straight from the
-                # record: which car, what colour it was held to be, and how far
-                # that sits from the crop actually being scored.
-                "vetoed_detail": [
-                    {
-                        "group_id": group.group_id,
-                        "identity_key": group.identity_key,
-                        "gallery_hsv": _round_hsv(group.colour_hsv),
-                    }
-                    for group in vetoed
-                ],
-                "enabled": self.settings.colour_veto_enabled,
-            }
         self._emit_decision_record(
             stage="reid_evaluation",
             result=decision_record.RESULT_ABSTAINED,
             reason=reason,
             crossing=crossing,
-            colour=colour,
             extra={
                 "uncontested": {
                     "pending_identities": len(pending),
@@ -2259,8 +2191,8 @@ class EntryCoordinator:
             ranked=evaluation.ranked,
             colour={
                 "query_hsv": _round_hsv(crossing.colour_hsv),
-                "vetoed": list(evaluation.vetoed),
-                "enabled": self.settings.colour_veto_enabled,
+                "vetoed": [],
+                "enabled": False,
             },
             fifo=self._fifo_block_locked(crossing, evaluation),
             gallery=(group.gallery_stats if group is not None else None),
@@ -2305,8 +2237,8 @@ class EntryCoordinator:
         disagrees, the attempt gets its own identity under the same key.
 
         This is not Re-ID deciding identity: the plate already decided that.
-        Re-ID is vetoing the pooling of contradictory evidence, exactly as the
-        colour check does. Two live identities may therefore share a plate key
+        Re-ID prevents pooling contradictory evidence. Two live identities
+        may therefore share a plate key
         — which is also what lets a genuine exit-and-re-entry stay two visits.
         """
         if not identity_key:
