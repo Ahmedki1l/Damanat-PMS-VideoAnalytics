@@ -10,18 +10,11 @@ _RESTRICTED_GATED_TYPES = (
     "reserved_slot_unidentified",
 )
 
-_RETIRED_SPECIAL_NEEDS_ALERT_TYPES = frozenset(
-    {"special_needs_review", "special_needs_violation"}
-)
-
 # This retains its historical name because callers use it. All of these rows
 # belong to the current occupancy and must close when that occupancy ends.
 SLOT_SCOPED_VIOLATION_ALERT_TYPES = (
     "vehicle_violation",
     "named_slot_violation",
-    # Retain historical special-needs rows in the departure cleanup; no new
-    # special-needs alerts are produced by VA.
-    "special_needs_violation",
     "vehicle_intrusion",
     # Raised when a car has occupied a named slot past the identity deadline and
     # neither OCR nor ReID could name it, so ownership could never be tested. Not a
@@ -147,15 +140,12 @@ def report_alert(
 ):
     """Create or reuse an alert for a restricted slot.
 
-    ``alert_type`` overrides the slot-derived type. The engine's deferred
+    ``alert_type`` must be a supported slot-scoped type and overrides the
+    slot-derived type. The engine's deferred
     named-slot path uses it to distinguish a PROVEN non-owner (vehicle_intrusion)
     from a car nobody could identify in time (reserved_slot_unidentified) — a
     distinction this function cannot make from the slot row alone.
     """
-    # Do not let an explicit legacy type reintroduce a retired special-needs
-    # producer on another slot classification.
-    if alert_type in _RETIRED_SPECIAL_NEEDS_ALERT_TYPES:
-        return None
     if not check_slot_restricted(db, slot_id):
         return None
 
@@ -163,7 +153,10 @@ def report_alert(
     # no stream. Distinct from notification suppression, which still records the
     # row. Resolve the effective type first so a slot-derived type is covered too.
     effective_type = alert_type or get_alert_type_for_slot(db, slot_id)
-    if alert_type_disabled(effective_type):
+    if (
+        effective_type not in SLOT_SCOPED_VIOLATION_ALERT_TYPES
+        or alert_type_disabled(effective_type)
+    ):
         return None
 
     if not _restricted_zone_alerts_enabled():
@@ -175,7 +168,7 @@ def report_alert(
     # slot's rolling latest image only if the dedicated save path is unavailable.
     resolved_snapshot_path = snapshot_path or (slot.last_snapshot_path if slot else None)
 
-    alert_type = alert_type or get_alert_type_for_slot(db, slot_id)
+    alert_type = effective_type
     slot_name = slot.slot_name if slot and slot.slot_name else slot_id
 
     # Don't duplicate - check if there's already an active alert on this slot

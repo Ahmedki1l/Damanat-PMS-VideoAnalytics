@@ -60,7 +60,7 @@ def test_special_occupancy_and_later_identity_remain_durable_without_alerts(monk
         db.close()
 
 
-def test_special_slot_blocks_explicit_legacy_alert_types_even_if_marked_violation(monkeypatch):
+def test_special_slot_stays_silent_even_if_marked_violation(monkeypatch):
     monkeypatch.setattr(alert_service, "_ENABLE_RESTRICTED_ZONE_ALERTS", True)
     monkeypatch.setattr(alert_service, "_DISABLED_ALERT_TYPES", frozenset())
     db = _session()
@@ -70,7 +70,7 @@ def test_special_slot_blocks_explicit_legacy_alert_types_even_if_marked_violatio
         db.commit()
         assert is_restricted_slot(slot) is False
 
-        for alert_type in ("special_needs_review", "special_needs_violation", "vehicle_violation"):
+        for alert_type in ("vehicle_intrusion", "named_slot_violation", "vehicle_violation"):
             assert alert_service.report_alert(
                 db, slot.slot_id, camera_id="CAM-19", alert_type=alert_type
             ) is None
@@ -85,9 +85,22 @@ def test_special_slot_blocks_explicit_legacy_alert_types_even_if_marked_violatio
         )
         assert alert is not None
 
-        # Explicit retired types are rejected regardless of the slot class.
+    finally:
+        db.close()
+
+
+def test_unknown_alert_type_cannot_create_a_row_for_a_restricted_slot(monkeypatch):
+    monkeypatch.setattr(alert_service, "_ENABLE_RESTRICTED_ZONE_ALERTS", True)
+    monkeypatch.setattr(alert_service, "_DISABLED_ALERT_TYPES", frozenset())
+    db = _session()
+    try:
+        slot = _special_slot(is_violation_zone=True)
+        slot.reservation_type = "GENERAL"
+        db.add(slot)
+        db.commit()
         assert alert_service.report_alert(
-            db, slot.slot_id, camera_id="CAM-19", alert_type="special_needs_violation"
+            db, slot.slot_id, camera_id="CAM-19", alert_type="unsupported_alert"
         ) is None
+        assert db.query(Alert).count() == 0
     finally:
         db.close()
