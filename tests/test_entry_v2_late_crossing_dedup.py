@@ -10,11 +10,13 @@ from src.entry.domain import (
     AttemptInput,
     CrossingInput,
     CrossingRole,
+    EntryUnavailable,
     EntryMode,
     FrameEvidence,
     PlateEvidence,
     PlateReadState,
 )
+from src.entry.durability import EntryDurabilityStore
 from src.entry.settings import EntrySettings
 
 
@@ -153,6 +155,45 @@ class _Sink:
             publish_identity=False,
             session_committed=True,
         )
+
+
+class _OpenSessionSink(_Sink):
+    def deliver(self, payload):
+        self.payloads.append(dict(payload))
+        return DeliveryResult(
+            True,
+            1,
+            "",
+            publish_identity=True,
+            session_committed=True,
+        )
+
+
+class _FailOnceOpenSessionSink(_OpenSessionSink):
+    def __init__(self):
+        super().__init__()
+        self._failed = False
+
+    def deliver(self, payload):
+        self.payloads.append(dict(payload))
+        if not self._failed:
+            self._failed = True
+            return DeliveryResult(False, 1, "transient", retryable=True)
+        return DeliveryResult(
+            True,
+            1,
+            "",
+            publish_identity=True,
+            session_committed=True,
+        )
+
+
+class _CrashAfterDurableCallbackStore(EntryDurabilityStore):
+    """Model process death after the SQLite callback commit, before compaction."""
+
+    def mark_callback(self, *args, **kwargs):
+        super().mark_callback(*args, **kwargs)
+        raise SystemExit("crash_after_durable_callback_commit")
 
 
 class _BlockingSink(_Sink):
@@ -632,7 +673,7 @@ def test_two_genuinely_ambiguous_primary_vehicles_are_not_collapsed():
     assert coordinator.state_summary()["crossing_count"] == 2
 
 
-def test_equivalent_primary_family_keeps_conflicting_ocr_fail_closed():
+def test_equivalent_primary_family_conflicting_ocr_does_not_block_reid():
     evidence = {
         "primary-hikvision": [
             _frame(
@@ -688,19 +729,10 @@ def test_equivalent_primary_family_keeps_conflicting_ocr_fail_closed():
         [b"anpr-1"],
     )
 
-    # Two producers of the SAME physical crossing reading different plates are
-    # evidence they are not the same event, so the family is withheld rather
-    # than pooled — pooling would put two cars' embeddings in one row.
-    #
-    # POLICY CHANGE (stage 4): this used to emit an abstained callback with
-    # reason "primary_ocr_conflict", produced by the CAM-23 plate policy that
-    # no longer exists. The rows are now simply held pending and retried on the
-    # next event, and the refusal is recorded in the decision log instead of
-    # being announced to PMS.
-    assert result.decision_status != "confirmed"
-    assert not any(payload["status"] == "confirmed" for payload in sink.payloads)
-    assert coordinator.state_summary()["attempt_count"] == 1
-    assert coordinator.state_summary()["crossing_count"] == 2
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "AAA-1111"
+    assert coordinator.state_summary()["attempt_count"] == 0
+    assert coordinator.state_summary()["crossing_count"] == 0
 
 
 @pytest.mark.parametrize(
@@ -997,7 +1029,7 @@ def test_late_lookalike_with_conflicting_ocr_remains_eligible():
     ]
 
 
-def test_post_entry_fallback_survives_unrelated_group_compaction_for_delayed_attempt():
+def test_post_entry_fallback_ocr_is_not_retained_for_later_anpr():
     car_b_embedding = (0.92, 0.39191835884530846)
     evidence = {
         "attempt-a": [
@@ -1062,13 +1094,14 @@ def test_post_entry_fallback_survives_unrelated_group_compaction_for_delayed_att
         [b"primary-a"],
     )
 
-    assert waiting.decision_status == "abstained"
+    assert waiting.decision_status == "confirmed"
     assert confirmed_a.decision_status == "confirmed"
-    # Reliable conflicting OCR must never be swallowed by the finalized
-    # look-alike journey. Keep it eligible for its source-earlier ANPR attempt.
-    assert coordinator.state_summary()["crossing_count"] == 1
-    assert coordinator.state_summary()["provisional_crossing_count"] == 0
-    assert coordinator.state_summary()["late_ocr_conflict_count"] == 1
+    # OCR disagreement is logged only, so it cannot retain the fallback row.
+    assert coordinator.state_summary()["crossing_count"] == 0
+    # The source-earlier primary remains retained by the normal journey-order
+    # rule; this is unrelated to OCR and is released by later reconciliation.
+    assert coordinator.state_summary()["provisional_crossing_count"] == 1
+    assert coordinator.state_summary()["late_ocr_conflict_count"] == 0
 
     confirmed_b = coordinator.ingest_attempt(
         _attempt(
@@ -1079,16 +1112,17 @@ def test_post_entry_fallback_survives_unrelated_group_compaction_for_delayed_att
         [b"attempt-b"],
     )
 
-    assert confirmed_b.decision_status == "confirmed"
+    # The fallback was consumed by the immediate ReID confirmation. OCR only
+    # records that disagreement; it cannot retain evidence for a later ANPR.
+    assert confirmed_b.decision_status is None
     assert [
         payload["attempt_id"]
         for payload in sink.payloads
         if payload["status"] == "confirmed"
-    ] == ["attempt-a", "attempt-b"]
-    assert sink.payloads[-1]["crossing_id"] == "fallback-b"
-    assert coordinator.state_summary()["attempt_count"] == 0
+    ] == ["attempt-a"]
+    assert coordinator.state_summary()["attempt_count"] == 1
     assert coordinator.state_summary()["crossing_count"] == 0
-    assert coordinator.state_summary()["provisional_crossing_count"] == 0
+    assert coordinator.state_summary()["provisional_crossing_count"] == 1
 
 
 def test_strict_producer_twin_is_consumed_before_same_car_reentry_matching():
@@ -2118,14 +2152,14 @@ def test_fallback_family_aggregates_nonconflicting_ocr(strong_source):
 
     assert result.decision_status == "confirmed"
     assert len(sink.payloads) == 1
-    # The plate no longer comes from a camera role — it is decided by consensus
-    # across ANPR, HikCentral and our own OCR.
+    # The plate no longer comes from a camera role. ANPR/HikCentral consensus
+    # decides it; OCR is advisory-only.
     assert sink.payloads[0]["ocr_source"] == "consensus"
     assert sink.payloads[0]["ocr_text"] == "AAA-1111"
     assert coordinator.state_summary()["crossing_count"] == 0
 
 
-def test_conflicting_fallback_producers_remain_ambiguous_and_fail_closed():
+def test_conflicting_fallback_producers_do_not_block_reid_confirmation():
     evidence = {
         "attempt-1": [
             _frame(
@@ -2150,7 +2184,7 @@ def test_conflicting_fallback_producers_remain_ambiguous_and_fail_closed():
                 "fallback-va-local",
                 "CAM-03",
                 # The views exceed the dedicated producer-duplicate floor;
-                # their reliable OCR disagreement must remain fail closed.
+                # OCR disagreement remains advisory-only.
                 (0.96, 0.28),
                 plate="BBB2222",
                 role="fallback",
@@ -2182,7 +2216,128 @@ def test_conflicting_fallback_producers_remain_ambiguous_and_fail_closed():
         [b"anpr-1"],
     )
 
-    assert waiting.decision_id is None
-    assert sink.payloads == []
-    assert coordinator.state_summary()["attempt_count"] == 1
-    assert coordinator.state_summary()["crossing_count"] == 2
+    assert waiting.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "AAA-1111"
+    assert coordinator.state_summary()["attempt_count"] == 0
+    assert coordinator.state_summary()["crossing_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("confirmed_role", "late_role"),
+    ((CrossingRole.FALLBACK, CrossingRole.PRIMARY), (CrossingRole.PRIMARY, CrossingRole.FALLBACK)),
+)
+def test_durable_restart_quarantines_late_other_camera_without_a_second_session(
+    tmp_path,
+    confirmed_role,
+    late_role,
+):
+    confirmed_id = "fallback-1" if confirmed_role == CrossingRole.FALLBACK else "primary-1"
+    late_id = "primary-late" if late_role == CrossingRole.PRIMARY else "fallback-late"
+    evidence = {
+        "attempt-1": [_frame("attempt-1", "ANPR-ENTRY", (1.0, 0.0), plate="AAA1111", role="anpr")],
+        confirmed_id: [_frame(confirmed_id, "CAM-03" if confirmed_role == CrossingRole.FALLBACK else "CAM-23", (1.0, 0.0), plate="AAA1111", role=confirmed_role.value)],
+        late_id: [_frame(late_id, "CAM-03" if late_role == CrossingRole.FALLBACK else "CAM-23", (1.0, 0.0), role=late_role.value)],
+    }
+    store = EntryDurabilityStore(str(tmp_path))
+    first_sink = _OpenSessionSink()
+    first = EntryCoordinator(
+        _settings(), _Processor(evidence), first_sink, durability_store=store
+    )
+    first.ingest_attempt(_attempt("attempt-1", "AAA-1111", captured_at=NOW), [b"anpr-1"])
+    confirmed = first.ingest_crossing(
+        _crossing(confirmed_id, role=confirmed_role, captured_at=NOW + timedelta(minutes=5)),
+        [confirmed_id.encode()],
+    )
+    assert confirmed.decision_status == "confirmed"
+    assert len(first_sink.payloads) == 1
+    store.close()  # Simulated process crash releases the lifetime journal lock.
+
+    restarted_sink = _OpenSessionSink()
+    restarted = EntryCoordinator(
+        _settings(),
+        _Processor(evidence),
+        restarted_sink,
+        durability_store=EntryDurabilityStore(str(tmp_path)),
+    )
+    restarted.recover_durable_inputs()
+    assert restarted.state_summary()["finalized_journey_count"] == 1
+    late = restarted.ingest_crossing(
+        _crossing(
+            late_id,
+            role=late_role,
+            captured_at=NOW + timedelta(minutes=5),
+        ),
+        [late_id.encode()],
+    )
+
+    assert late.duplicate is True
+    assert late.decision_id == confirmed.decision_id
+    # Hydration revalidates the original receipt once; the late CAM-23 itself
+    # cannot create another PMS session.
+    assert [item["crossing_id"] for item in restarted_sink.payloads] == [confirmed_id]
+    restarted.durability_store.close()
+
+
+def test_crash_after_callback_commit_keeps_finalized_journey_for_late_cam03(tmp_path):
+    evidence = {
+        "attempt-crash": [_frame("attempt-crash", "ANPR-ENTRY", (1.0, 0.0), plate="AAA1111", role="anpr")],
+        "primary-crash": [_frame("primary-crash", "CAM-23", (1.0, 0.0), plate="AAA1111", role="primary")],
+        "late-cam03": [_frame("late-cam03", "CAM-03", (1.0, 0.0), role="fallback")],
+    }
+    state = _CrashAfterDurableCallbackStore(str(tmp_path))
+    first = EntryCoordinator(_settings(), _Processor(evidence), _OpenSessionSink(), durability_store=state)
+    first.ingest_attempt(_attempt("attempt-crash", "AAA-1111", captured_at=NOW), [b"anpr"])
+    with pytest.raises(SystemExit, match="crash_after_durable_callback_commit"):
+        first.ingest_crossing(
+            _crossing("primary-crash", role=CrossingRole.PRIMARY, captured_at=NOW + timedelta(minutes=5)),
+            [b"primary"],
+        )
+    state.close()
+
+    sink = _OpenSessionSink()
+    restarted = EntryCoordinator(
+        _settings(), _Processor(evidence), sink, durability_store=EntryDurabilityStore(str(tmp_path))
+    )
+    restarted.recover_durable_inputs()
+    late = restarted.ingest_crossing(
+        _crossing("late-cam03", role=CrossingRole.FALLBACK, captured_at=NOW + timedelta(minutes=5)),
+        [b"late"],
+    )
+    assert restarted.state_summary()["finalized_journey_count"] == 1
+    assert late.duplicate is True
+    assert late.decision_id is not None
+    assert [payload["crossing_id"] for payload in sink.payloads] == ["primary-crash"]
+    restarted.durability_store.close()
+
+
+def test_pending_callback_restart_promotes_candidate_before_late_cam03(tmp_path):
+    evidence = {
+        "attempt-pending": [_frame("attempt-pending", "ANPR-ENTRY", (1.0, 0.0), plate="AAA1111", role="anpr")],
+        "primary-pending": [_frame("primary-pending", "CAM-23", (1.0, 0.0), plate="AAA1111", role="primary")],
+        "late-pending-cam03": [_frame("late-pending-cam03", "CAM-03", (1.0, 0.0), role="fallback")],
+    }
+    state = EntryDurabilityStore(str(tmp_path))
+    first = EntryCoordinator(_settings(), _Processor(evidence), _FailOnceOpenSessionSink(), durability_store=state)
+    first.ingest_attempt(_attempt("attempt-pending", "AAA-1111", captured_at=NOW), [b"anpr"])
+    with pytest.raises(EntryUnavailable, match="entry_confirmation_delivery_failed"):
+        first.ingest_crossing(
+            _crossing("primary-pending", role=CrossingRole.PRIMARY, captured_at=NOW + timedelta(minutes=5)),
+            [b"primary"],
+        )
+    pending_id = state.pending_callbacks()[0]["decision_id"]
+    state.close()
+
+    sink = _OpenSessionSink()
+    restarted = EntryCoordinator(
+        _settings(), _Processor(evidence), sink, durability_store=EntryDurabilityStore(str(tmp_path))
+    )
+    assert restarted.retry_pending_callbacks()[pending_id] is True
+    late = restarted.ingest_crossing(
+        _crossing("late-pending-cam03", role=CrossingRole.FALLBACK, captured_at=NOW + timedelta(minutes=5)),
+        [b"late"],
+    )
+    assert restarted.state_summary()["finalized_journey_count"] == 1
+    assert late.duplicate is True
+    assert late.decision_id == pending_id
+    assert [payload["crossing_id"] for payload in sink.payloads] == ["primary-pending"]
+    restarted.durability_store.close()

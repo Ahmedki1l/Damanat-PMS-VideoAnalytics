@@ -28,7 +28,6 @@ def log_camera_feed_event(db: Session, event_type: str, camera_id: str, plate: s
     description_map = {
         "vehicle_violation": "Unauthorized Parking Violation",
         "vehicle_intrusion": "Reserved Slot Ownership Violation",
-        "special_needs_violation": "Special-Needs Slot Violation",
     }
     event_description = description_map.get(event_type, event_type.replace("_", " ").title())
 
@@ -123,8 +122,14 @@ def log_vehicle_event(
         # When a plate IS present the engine has already ruled (engine_runtime.py
         # :2570 returns vehicle_intrusion only for a proven non-owner), so that
         # case still reports here and keeps its plate.
-        named_slot = getattr(slot, "reservation_type", None) == "EMPLOYEE"
-        if named_slot and not plate_value:
+        reservation_type = getattr(slot, "reservation_type", None)
+        named_slot = reservation_type == "EMPLOYEE"
+        if reservation_type == "SPECIAL":
+            logger.debug(
+                "[alert] slot=%s is special-needs — alert production is disabled",
+                slot_id,
+            )
+        elif named_slot and not plate_value:
             logger.debug(
                 "[alert] slot=%s is reserved for %r and no plate is known yet — "
                 "deferring the ownership verdict to the engine",

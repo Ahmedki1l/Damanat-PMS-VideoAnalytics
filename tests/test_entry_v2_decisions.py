@@ -6,9 +6,13 @@ import pytest
 
 from src.entry.callback import DeliveryResult
 from src.entry.coordinator import EntryCoordinator
+from src.entry.decision import EntryDecisionEngine
 from src.entry.domain import (
+    AttemptGroup,
     AttemptInput,
+    AttemptRecord,
     CrossingInput,
+    CrossingRecord,
     CrossingRole,
     EntryCapacityExceeded,
     EntryConflict,
@@ -140,6 +144,14 @@ class RecordingPublisher:
             raise RuntimeError("registry unavailable")
 
 
+class CollectingDecisionLog:
+    def __init__(self):
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
 class BlockingSink:
     def __init__(self, delivered):
         self.delivered = delivered
@@ -192,7 +204,7 @@ def crossing(
     )
 
 
-def coordinator(evidence, *, cfg=None, sink=None, publisher=None):
+def coordinator(evidence, *, cfg=None, sink=None, publisher=None, decision_log=None):
     sink = sink or RecordingSink()
     return (
         EntryCoordinator(
@@ -200,6 +212,7 @@ def coordinator(evidence, *, cfg=None, sink=None, publisher=None):
             FakeProcessor(evidence),
             sink,
             identity_publisher=publisher,
+            decision_log=decision_log,
         ),
         sink,
     )
@@ -752,20 +765,11 @@ def test_duplicate_retry_becoming_permanent_fails_closed():
 
 
 @pytest.mark.parametrize(
-    ("ocr_confidence", "expected"),
-    [(0.75, "abstained"), (0.749, "confirmed")],
+    "ocr_confidence",
+    [0.75, 0.749],
 )
-def test_ocr_confidence_boundary(ocr_confidence, expected):
-    """ocr_min_confidence decides whether OUR reader produced a reading at all.
-
-    The boundary is only observable when the read DISAGREES with ANPR. At or
-    above the bar our OCR is a source and contradicts the gate, so there is no
-    consensus and nothing opens. Below it our OCR has not produced a reading,
-    so ANPR stands alone and the entry confirms.
-
-    (The read is placed on the ANPR image. CAM-23 is not a plate source, so a
-    reading there could not move this boundary either way.)
-    """
+def test_ocr_confidence_cannot_block_the_anpr_plate(ocr_confidence):
+    """Every OCR confidence is advisory; the session retains the ANPR plate."""
     evidence = {
         "a1": [
             frame(
@@ -780,7 +784,7 @@ def test_ocr_confidence_boundary(ocr_confidence, expected):
     coord, _ = coordinator(evidence)
     coord.ingest_attempt(attempt("a1", "AAA-1111"), [b"a"])
     result = coord.ingest_crossing(crossing("c1"), [b"c"])
-    assert result.decision_status == expected
+    assert result.decision_status == "confirmed"
 
 
 @pytest.mark.parametrize("garbage", ["9990", "ABCDEFG", "UNKNOWN"])
@@ -853,8 +857,8 @@ def test_two_plate_readings_of_one_car_stay_separate_identities_and_are_marked()
     appearance is not allowed to collapse them: letting Re-ID overrule the plate
     key would put appearance back in charge of who a car is, which is exactly
     what this rewrite removes. The disagreement is recorded rather than
-    resolved here — `correction_candidate_of` marks it, and the plate consensus
-    over ANPR / HikCentral / our own OCR is what decides which reading is right.
+    resolved here — `correction_candidate_of` marks it, and the existing ANPR /
+    HikCentral consensus decides which reading is right. OCR is advisory only.
 
     Note also that CAM-23's OCR (XYZ9999 above) can no longer break the tie: the
     ramp cameras are visual observation sources and read no plates.
@@ -885,9 +889,9 @@ def test_two_plate_readings_of_one_car_stay_separate_identities_and_are_marked()
         assert groups[group_id]["witnesses"] == ["anpr"]
     assert groups[first.group_id]["plate_sources"]["anpr"] == "ABC-1234"
     assert groups[second.group_id]["plate_sources"]["anpr"] == "XYZ-9999"
-    # The second identity's ANPR image also gave OUR reader a look at it, and
-    # it agrees - two sources, one answer.
-    assert groups[second.group_id]["plate_sources"]["our_ocr"] == "XYZ9999"
+    # OCR remains visible only in the decision log; it cannot become a plate
+    # source or resolve the conflicting ANPR identities during monitoring.
+    assert set(groups[second.group_id]["plate_sources"]) == {"anpr"}
 
     # Two identities of identical appearance leave the crossing unable to pick
     # one, so nothing is confirmed on a guess.
@@ -1570,9 +1574,9 @@ def test_coordinator_state_never_retains_request_image_bytes():
 #
 # All of it answered one question - "which ramp camera's plate reading wins?" -
 # and that question no longer exists. CAM-23 and CAM-03 are visual observation
-# sources for Re-ID and read no plates at all. There are exactly three plate
-# sources: the gate ANPR system, HikCentral, and our own OCR on an available
-# vehicle image. The plate is whatever those agree on.
+# sources for Re-ID and read no plates at all. ANPR and HikCentral remain the
+# confirmation sources. OCR on an available vehicle image is recorded only for
+# offline review and cannot block or correct the plate.
 #
 # The tests below assert the rule that replaced them.
 # =========================================================================== #
@@ -1602,8 +1606,8 @@ def test_one_available_source_confirms_when_two_witnesses_agree():
     assert sink.payloads[0]["ocr_source"] == "consensus"
 
 
-def test_two_agreeing_sources_confirm():
-    """ANPR reported it and our own OCR of the ANPR image read the same."""
+def test_anpr_confirms_even_when_advisory_ocr_agrees():
+    """An agreeing OCR read does not change ANPR-based confirmation."""
     evidence = {
         "a1": [
             frame(
@@ -1623,9 +1627,7 @@ def test_two_agreeing_sources_confirm():
     assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
 
 
-def test_two_sources_that_disagree_have_no_consensus_and_open_nothing():
-    """The whole point of the rule. A wrong plate opens a session under another
-    person's name, so a contradiction refuses rather than picks."""
+def test_disagreeing_ocr_is_advisory_and_retains_the_anpr_plate():
     evidence = {
         "a1": [
             frame(
@@ -1641,9 +1643,8 @@ def test_two_sources_that_disagree_have_no_consensus_and_open_nothing():
     coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
     result = coord.ingest_crossing(crossing("c1"), [b"c"])
 
-    assert result.decision_status == "abstained"
-    assert sink.payloads[0]["reason"] == "plate_no_consensus"
-    assert sink.payloads[0]["canonical_plate"] is None
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
 
 
 def test_an_implausible_read_is_not_a_source_and_cannot_disagree():
@@ -1671,10 +1672,7 @@ def test_an_implausible_read_is_not_a_source_and_cannot_disagree():
     assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
 
 
-def test_our_ocr_reading_two_images_is_still_one_source():
-    """Counting our reader twice would let it reach consensus with itself and
-    manufacture a two-source agreement out of one opinion. When it contradicts
-    itself the source is dropped entirely, leaving ANPR alone to stand."""
+def test_conflicting_ocr_reads_never_block_or_correct_anpr():
     evidence = {
         "a1": [
             frame(
@@ -1694,24 +1692,11 @@ def test_our_ocr_reading_two_images_is_still_one_source():
     coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
     result = coord.ingest_crossing(crossing("c1"), [b"c"])
 
-    # our_ocr contradicted itself and is excluded; ANPR is the only source left.
     assert result.decision_status == "confirmed"
     assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
 
 
-def test_a_ramp_camera_reading_can_withhold_an_entry_but_never_name_one():
-    """The exact limit of what a ramp camera may do to the plate.
-
-    CAM-23 reads XYZ9999 while the sources agree on ABC-1234. It does NOT get
-    to make the plate XYZ9999 — it is not a plate source and never names a car.
-    What it does is withhold: a reliable read that contradicts the consensus is
-    evidence Re-ID matched the wrong identity, so the entry is refused rather
-    than opened under a plate one of the two cameras disagrees with.
-
-    Subtractive, like the colour veto. Disable with
-    ENTRY_V2_OBSERVATION_PLATE_VETO_ENABLED if the shadow window shows ramp
-    reads are too unreliable to withhold on.
-    """
+def test_ramp_ocr_disagreement_is_advisory_and_never_renames_the_entry():
     evidence = {
         "a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)],
         "c1": [
@@ -1725,20 +1710,125 @@ def test_a_ramp_camera_reading_can_withhold_an_entry_but_never_name_one():
     coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
     result = coord.ingest_crossing(crossing("c1"), [b"c"])
 
-    assert result.decision_status == "abstained"
-    assert sink.payloads[0]["reason"] == "observation_plate_contradiction"
-    # It withheld the entry; it did not rename the car.
-    assert sink.payloads[0]["canonical_plate"] is None
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "ABC-1234"
 
-    # With the veto off, the ramp read is inert and ANPR stands alone.
-    coord2, sink2 = coordinator(
-        evidence, cfg=settings(observation_plate_veto_enabled=False)
+
+def test_ocr_disagreement_logs_raw_confidence_without_correcting_anpr():
+    """EE80 is review evidence only; the callback keeps EEB-80 unchanged."""
+    log = CollectingDecisionLog()
+    evidence = {
+        "a1": [
+            frame(
+                "a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.READABLE,
+                "EE80", 0.987654,
+            )
+        ],
+        "c1": [
+            frame(
+                "c1", "CAM-23", (1.0, 0.0), PlateReadState.READABLE,
+                "EEB80", 0.1, "primary",
+            )
+        ],
+    }
+    coord, sink = coordinator(evidence, decision_log=log)
+    coord.ingest_attempt(attempt("a1", "EEB-80"), [b"a"])
+    result = coord.ingest_crossing(crossing("c1"), [b"c"])
+
+    assert result.decision_status == "confirmed"
+    assert sink.payloads[0]["canonical_plate"] == "EEB-80"
+    record = next(item for item in log.records if item["stage"] == "plate_consensus")
+    advisory = record["ocr_advisory"]
+    assert advisory["mode"] == "advisory_only"
+    assert advisory["correction_applied"] is False
+    assert advisory["anpr"] == {"text": "EEB-80", "confidence": 0.91}
+    assert advisory["reads"] == [
+        {
+            "origin": "attempt",
+            "evidence_id": "a1:0",
+            "camera": "ANPR-ENTRY",
+            "source_role": "anpr",
+            "state": "readable",
+            "text": "EE80",
+            "confidence": 0.987654,
+            "disagrees_with_anpr": True,
+        },
+        {
+            "origin": "crossing",
+            "evidence_id": "c1:0",
+            "camera": "CAM-23",
+            "source_role": "primary",
+            "state": "readable",
+            "text": "EEB80",
+            "confidence": 0.1,
+            "disagrees_with_anpr": False,
+        },
+    ]
+    assert advisory["correction_candidates"] == [advisory["reads"][0]]
+
+
+def test_ocr_only_cannot_name_or_confirm_a_plate():
+    """Removing OCR from sources also removes its ability to create a session."""
+    request = replace(attempt("a1", "ABC-1234"), reported_plate="")
+    group = AttemptGroup(
+        group_id="group-ocr-only",
+        attempts={
+            request.attempt_id: AttemptRecord(
+                request=request,
+                evidence=(
+                    frame(
+                        "a1", "ANPR-ENTRY", (1.0, 0.0),
+                        PlateReadState.READABLE, "ABC1234", 0.999,
+                    ),
+                ),
+                group_id="group-ocr-only",
+            )
+        },
     )
-    coord2.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
-    assert (
-        coord2.ingest_crossing(crossing("c1"), [b"c"]).decision_status == "confirmed"
+    resolution = EntryDecisionEngine(settings()).resolve_plate(
+        group,
+        CrossingRecord(request=crossing("c1"), evidence=()),
     )
-    assert sink2.payloads[0]["canonical_plate"] == "ABC-1234"
+
+    assert resolution.outcome == "abstained"
+    assert resolution.reason == "plate_sources_unavailable"
+    assert resolution.canonical_plate is None
+
+
+def test_conflicting_ocr_in_one_producer_family_does_not_skip_reid_matching():
+    """Topology and ReID still define the family; OCR disagreement is logged later."""
+    evidence = {"a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0), PlateReadState.NO_PLATE)]}
+    coord, _ = coordinator(evidence)
+    attempt_result = coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+    hik = CrossingRecord(
+        request=crossing("hik"),
+        evidence=(
+            frame(
+                "hik", "CAM-23", (1.0, 0.0), PlateReadState.READABLE,
+                "ABC1234", 0.99, "primary",
+            ),
+        ),
+    )
+    local_request = replace(
+        crossing("local", captured_at=NOW + timedelta(seconds=1)),
+        metadata={"crossing_source": "va_local_zone"},
+    )
+    local = CrossingRecord(
+        request=local_request,
+        evidence=(
+            frame(
+                "local", "CAM-23", (1.0, 0.0), PlateReadState.READABLE,
+                "XYZ9999", 0.99, "primary",
+            ),
+        ),
+    )
+
+    with coord._lock:
+        coord._crossings = {"hik": hik, "local": local}
+        candidates = coord._rank_pending_matches_locked()
+
+    assert len(candidates) == 1
+    assert candidates[0][3].group_id == attempt_result.group_id
 
 
 def test_a_low_confidence_read_is_not_a_source_at_all():

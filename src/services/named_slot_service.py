@@ -51,6 +51,10 @@ def get_named_slot_title(slot) -> str | None:
 def is_restricted_slot(slot) -> bool:
     if not slot:
         return False
+    # Special-needs bays remain visible to occupancy and identity flows, but
+    # must never create simulated or production alert events.
+    if slot.reservation_type == "SPECIAL":
+        return False
     return slot.reservation_type != "GENERAL" or slot.is_violation_zone
 
 

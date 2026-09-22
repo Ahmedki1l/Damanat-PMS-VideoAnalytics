@@ -522,6 +522,25 @@ class CoordinatorEmissionTests(unittest.TestCase):
         coordinator._log_reid_evaluation_locked(_crossing(), _evaluation())
 
 
+class OCRAdvisoryRecordTests(unittest.TestCase):
+    def test_advisory_block_is_versioned_and_preserves_raw_confidence(self):
+        advisory = {
+            "mode": "advisory_only",
+            "correction_applied": False,
+            "reads": [{"text": "EE80", "confidence": 0.987654321}],
+        }
+        record = decision_record.build_record(
+            stage="plate_consensus",
+            result=decision_record.RESULT_CONFIRMED,
+            reason="reid_and_plate_consensus",
+            ocr_advisory=advisory,
+        )
+
+        self.assertEqual(2, record["record_v"])
+        self.assertEqual(advisory, record["ocr_advisory"])
+        self.assertEqual(0.987654321, record["ocr_advisory"]["reads"][0]["confidence"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

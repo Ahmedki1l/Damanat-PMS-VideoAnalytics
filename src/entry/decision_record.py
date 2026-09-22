@@ -48,7 +48,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
-RECORD_VERSION = 1
+# v2 adds ``ocr_advisory`` to plate-consensus records. It is an additive
+# monitoring block whose data must never be consumed as confirmation input.
+RECORD_VERSION = 2
 EVENT = "entry_decision"
 
 # `result` vocabulary. Every record carries exactly one of these, and the shadow
@@ -184,6 +186,7 @@ def build_record(
     gallery: Optional[Mapping[str, Any]] = None,
     hik: Optional[Mapping[str, Any]] = None,
     plate: Optional[Mapping[str, Any]] = None,
+    ocr_advisory: Optional[Mapping[str, Any]] = None,
     ranked: Optional[Sequence[Tuple[str, float]]] = None,
     observed_plate_text: str = "",
     observed_plate_confidence: Optional[float] = None,
@@ -230,6 +233,10 @@ def build_record(
         record["hik"] = dict(hik)
     if plate is not None:
         record["plate"] = dict(plate)
+    if ocr_advisory is not None:
+        # This is intentionally separate from ``plate``. ``plate`` describes
+        # ANPR/HikCentral consensus; OCR is logged for calibration only.
+        record["ocr_advisory"] = dict(ocr_advisory)
     if observed_plate_text or observed_plate_confidence is not None:
         record["observed_plate_text"] = observed_plate_text
         record["observed_plate_confidence"] = (

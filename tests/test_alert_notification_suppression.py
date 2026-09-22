@@ -22,10 +22,9 @@ class TestNotificationSuppression(unittest.TestCase):
             alert_service.notification_suppressed("reserved_slot_unidentified")
         )
 
-    def test_proven_intrusion_still_notifies(self):
+    def test_actionable_alerts_still_notify(self):
         for alert_type in (
             "vehicle_intrusion",
-            "special_needs_violation",
             "named_slot_violation",
             "vehicle_violation",
         ):

@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
+from src.entry import analyzer as entry_analyzer
 from src.entry.analyzer import ExistingModelsEvidenceProcessor
 from src.entry.domain import EvidenceUnavailable, PlateReadState
 from src.entry.settings import EntrySettings
@@ -46,8 +47,8 @@ class MatchDecision:
 
 
 class Registry:
-    def __init__(self, detector, ocr):
-        self.reid_matcher = FakeReID()
+    def __init__(self, detector, ocr, reid=None):
+        self.reid_matcher = reid or FakeReID()
         self.match_decision = MatchDecision(detector, ocr)
 
 
@@ -304,3 +305,82 @@ def test_plate_read_without_lpd_box_still_logs_no_plate(caplog):
     assert "state=no_plate" in line
     assert "result=no_plate" in line
     assert "crop=0x0" in line
+
+
+def test_evidence_timing_emits_stage_durations_and_preserves_errors(caplog, monkeypatch):
+    class ManualClock:
+        current = 0.0
+
+        def __call__(self):
+            return self.current
+
+        def advance(self, seconds):
+            self.current += seconds
+
+    clock = ManualClock()
+    monkeypatch.setattr(entry_analyzer.time, "perf_counter", clock)
+
+    class TimedOCR(FakeOCR):
+        def read(self, crop, **kwargs):
+            clock.advance(0.125)
+            return super().read(crop, **kwargs)
+
+    processor = ExistingModelsEvidenceProcessor(
+        Registry(FakePlateDetector(), TimedOCR()), EntrySettings()
+    )
+
+    with caplog.at_level("INFO", logger="src.entry.analyzer"):
+        result = processor.analyze(
+            event_id="timing-success",
+            camera_id="CAM-23",
+            source_role="primary",
+            images=(jpeg_bytes(),),
+            metadata={},
+        )
+
+    assert result[0].plate.state == PlateReadState.READABLE
+    success = next(
+        message
+        for message in caplog.messages
+        if message.startswith("[EntryV2][timing]") and "event=timing-success" in message
+    )
+    for field in (
+        "outcome=success",
+        "total_ms=",
+        "model_load_ms=",
+        "vehicle_model_load_ms=",
+        "inference_lock_wait_ms=",
+        "plate_detector_ms=",
+        "reid_ms=",
+        "ocr_ms=",
+    ):
+        assert field in success
+    assert "total_ms=125.0" in success
+    assert "ocr_ms=125.0" in success
+
+    class FailingReID:
+        def extract_feature(self, frame):
+            clock.advance(0.25)
+            raise RuntimeError("reid unavailable")
+
+    clock.current = 0.0
+    failed = ExistingModelsEvidenceProcessor(
+        Registry(FakePlateDetector(), FakeOCR(), reid=FailingReID()), EntrySettings()
+    )
+    with caplog.at_level("INFO", logger="src.entry.analyzer"):
+        with pytest.raises(RuntimeError, match="reid unavailable"):
+            failed.analyze(
+                event_id="timing-error",
+                camera_id="CAM-23",
+                source_role="primary",
+                images=(jpeg_bytes(),),
+                metadata={},
+            )
+
+    error = next(
+        message
+        for message in caplog.messages
+        if message.startswith("[EntryV2][timing]") and "event=timing-error" in message
+    )
+    assert "outcome=RuntimeError" in error
+    assert "reid_ms=250.0" in error

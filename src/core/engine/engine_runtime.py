@@ -3021,7 +3021,7 @@ class ParkingEngineRuntimeMixin:
                     continue
                 if (
                     not self.config.alerts.enable_restricted_zone_alerts
-                    and alert_type in ("special_needs_violation", "vehicle_intrusion")
+                    and alert_type == "vehicle_intrusion"
                 ):
                     final_events.append(event)
                     continue
@@ -3072,12 +3072,12 @@ class ParkingEngineRuntimeMixin:
         Returns the alert type, ``None`` for "no alert" (the rightful owner), or
         :data:`ALERT_DEFER_PENDING_IDENTITY` for "cannot decide yet".
 
-        Only NAMED (EMPLOYEE) slots can defer. A special-needs slot or a violation
-        zone is a violation regardless of WHO parked there, so those decide
-        immediately and are unaffected by identity latency.
+        Only NAMED (EMPLOYEE) slots can defer. Special-needs occupancy is
+        tracked without producing an alert, regardless of identity or any
+        overlapping physical-zone flag.
         """
         if slot_id in self._special_slots:
-            return "special_needs_violation"
+            return None
         named_slot_title = self._reserved_for_map.get(slot_id)
         if named_slot_title:
             # No plate yet. On a vehicle_parked this is the normal case, not the
@@ -3437,16 +3437,13 @@ class ParkingEngineRuntimeMixin:
                     "slot_vacant",
                     "vehicle_violation",
                     "vehicle_intrusion",
-                    "special_needs_violation",
                 ):
                     is_parked = event.event_type in (
                         "vehicle_parked",
                         "vehicle_violation",
                         "vehicle_intrusion",
-                        "special_needs_violation",
                     )
                     plate = getattr(event, "plate_number", None)
-                    # Capture the alert_id from log_vehicle_event
                     _, db_alert_id = log_vehicle_event(
                         session,
                         event.slot_id,

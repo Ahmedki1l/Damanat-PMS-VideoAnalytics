@@ -21,7 +21,6 @@ from .domain import (
     canonical_plate,
     norm_camera_id,
     plate_key,
-    plates_contradict,
 )
 from .settings import EntrySettings
 
@@ -379,41 +378,6 @@ class EntryDecisionEngine:
     # ------------------------------------------------------------------ #
     # Plate consensus
     # ------------------------------------------------------------------ #
-    def our_ocr_reading(self, group: AttemptGroup) -> Optional[PlateReading]:
-        """Fold every image OUR reader looked at into ONE plate source.
-
-        Our OCR is a single opinion however many images produced it. Counting a
-        read of the ANPR image and a read of the HikCentral image as two
-        sources would let our own model reach consensus with itself and
-        manufacture a two-source agreement out of one reader.
-
-        Disagreeing with itself marks the source CONFLICTED, which removes it
-        from the available set entirely. A reader that contradicts itself is
-        evidence of unreliability, not a tie to be broken.
-
-        Note what is NOT in this pool: CAM-23 and CAM-03 evidence. The ramp
-        cameras are visual observation sources and read no plates.
-        """
-        reliable = [
-            item
-            for item in group.cached_plate_evidence
-            if item.state == PlateReadState.READABLE
-            and item.confidence >= self.settings.ocr_min_confidence
-            and item.key
-            and is_plausible_plate(canonical_plate(item.text))
-        ]
-        if not reliable:
-            return None
-        keys = {item.key for item in reliable}
-        best = max(reliable, key=lambda item: item.confidence)
-        return PlateReading(
-            source=PlateSourceKind.OUR_OCR,
-            text=best.text,
-            confidence=best.confidence,
-            origin=",".join(sorted(item.evidence_id for item in reliable)),
-            conflicted=len(keys) > 1,
-        )
-
     def anpr_reading(self, group: AttemptGroup) -> Optional[PlateReading]:
         """What the gate ANPR system reported, folded across its attempts.
 
@@ -446,40 +410,93 @@ class EntryDecisionEngine:
         )
 
     def available_plate_sources(self, group: AttemptGroup):
-        """The plate sources that actually produced a usable reading.
+        """The non-OCR plate sources that may affect a confirmation.
 
-        ANPR and our own OCR are DERIVED from the identity's attempts, so they
-        automatically respect the causal projection and can never fall out of
-        step with the evidence they are folded from. Only what we FETCHED from
-        HikCentral is stored — and stage 5 must attach it with its own
-        causality check, since it does not come from an attempt.
+        ANPR is derived from causally eligible attempts. HikCentral is stored
+        after its own causality check. Our OCR remains observable through the
+        decision log, but is intentionally absent here: it cannot block,
+        rename, or correct the ANPR result during the monitoring window.
         """
         sources = {
             kind: reading
             for kind, reading in group.plate_sources.items()
             if kind is PlateSourceKind.HIK_TEXT
         }
-        for derived in (self.anpr_reading(group), self.our_ocr_reading(group)):
-            if derived is not None:
-                sources[derived.source] = derived
+        anpr = self.anpr_reading(group)
+        if anpr is not None:
+            sources[anpr.source] = anpr
         return {
             kind: reading
             for kind, reading in sources.items()
             if reading.key and not reading.conflicted
         }
 
+    def ocr_advisory(
+        self,
+        group: AttemptGroup,
+        crossings: Sequence[CrossingRecord],
+    ) -> dict:
+        """Return raw OCR evidence for review without influencing a decision.
+
+        This deliberately records every per-frame read, including unreadable,
+        implausible, and low-confidence output. There is no high-confidence
+        correction threshold in this mode: a disagreement is a review
+        candidate only, and ``correction_applied`` is always false.
+        """
+        anpr = self.anpr_reading(group)
+        anpr_key = anpr.key if anpr is not None else ""
+        reads = []
+
+        def add_reads(origin: str, frames: Iterable[PlateEvidence]) -> None:
+            for evidence in frames:
+                text = str(evidence.text or "")
+                key = plate_key(text)
+                reads.append(
+                    {
+                        "origin": origin,
+                        "evidence_id": evidence.evidence_id,
+                        "camera": evidence.camera_id,
+                        "source_role": evidence.source_role,
+                        "state": evidence.state.value,
+                        "text": text,
+                        "confidence": float(evidence.confidence),
+                        "disagrees_with_anpr": bool(
+                            anpr_key
+                            and key
+                            and evidence.state == PlateReadState.READABLE
+                            and key != anpr_key
+                        ),
+                    }
+                )
+
+        for attempt in group.attempts.values():
+            add_reads("attempt", attempt.plate_evidence)
+        for crossing in crossings:
+            add_reads("crossing", crossing.plate_evidence)
+
+        reads.sort(key=lambda item: (item["origin"], item["evidence_id"]))
+        return {
+            "mode": "advisory_only",
+            "correction_applied": False,
+            "anpr": (
+                None
+                if anpr is None
+                else {
+                    "text": anpr.text,
+                    "confidence": float(anpr.confidence),
+                }
+            ),
+            "reads": reads,
+            "correction_candidates": [
+                item for item in reads if item["disagrees_with_anpr"]
+            ],
+        }
+
     def plate_consensus(self, group: AttemptGroup) -> PlateConsensus:
         """Agreement across the sources that actually read a plate.
 
-        The rule is "at least two agreeing", not "two out of exactly three":
-        with n sources available, the winning group must have at least
-        min(2, n) members and must not be tied. So
-
-            three sources, two agree      -> those two win
-            three sources, all disagree   -> no consensus
-            two sources, both agree       -> consensus
-            two sources, they disagree    -> no consensus
-            one source                    -> it stands
+        With one authoritative source, it stands. With ANPR and HikCentral,
+        both must agree. A contradiction is withheld rather than guessed.
 
         The single-source case is deliberate. HikCentral being unreachable or
         an image being unusable must not stop ordinary traffic, and by the time
@@ -534,53 +551,6 @@ class EntryDecisionEngine:
             ),
         )
 
-    def observation_contradicts(
-        self,
-        crossing: CrossingRecord,
-        consensus: PlateConsensus,
-    ) -> bool:
-        """Does the observation itself read a DIFFERENT plate? Then withhold.
-
-        A ramp camera is not a plate source and can never name a car. But when
-        it reads a plate reliably and that plate is not the one the sources
-        agreed on, it is evidence that Re-ID has matched the wrong identity —
-        and refusing on that is not the same as naming a plate with it.
-
-        This closes a real hole. Two similar cars at Re-ID 0.92 with only one
-        ANPR read between them will otherwise confirm the second car's crossing
-        under the first car's plate: the witnesses agree, the consensus has
-        nothing to contradict it, and nothing else is left to object. The old
-        design caught this with its CAM-23 plate policy; with that gone, the
-        veto has to.
-
-        Like the producer-family gate, it can withhold an entry, never create
-        one. Erring toward an entry we do not
-        open rather than a session opened under someone else's name.
-
-        Off via ENTRY_V2_OBSERVATION_PLATE_VETO_ENABLED if the shadow window
-        shows ramp reads are too unreliable to withhold on.
-        """
-        if not self.settings.observation_plate_veto_enabled:
-            return False
-        if consensus.outcome != "consensus" or not consensus.plate:
-            return False
-        for item in crossing.plate_evidence:
-            if (
-                item.state == PlateReadState.READABLE
-                and item.confidence >= self.settings.ocr_min_confidence
-                and item.key
-                and is_plausible_plate(canonical_plate(item.text))
-                # Digit runs, not exact keys. `item.key != key` called
-                # `7286EED` a contradiction of consensus plate `EED7286` (the
-                # same plate, digits-first versus letters-first) and
-                # `AATEIGH7383HAS` a contradiction of `7383HAS` (one car, one
-                # hallucinated prefix). Both would WITHHOLD A CORRECT ENTRY,
-                # which is why this veto currently ships disabled.
-                and plates_contradict(item.text, consensus.plate)
-            ):
-                return True
-        return False
-
     def resolve_plate(
         self,
         group: AttemptGroup,
@@ -597,16 +567,8 @@ class EntryDecisionEngine:
         """
         del correlated_primary_crossings
 
+        del crossing
         consensus = self.plate_consensus(group)
-        contradiction = self.observation_contradicts(crossing, consensus)
-        if contradiction:
-            return PlateResolution(
-                outcome="abstained",
-                reason="observation_plate_contradiction",
-                ocr_source=OCR_SOURCE_CONSENSUS,
-                ocr_text=consensus.plate,
-                ocr_confidence=consensus.confidence,
-            )
         common = dict(
             ocr_source=OCR_SOURCE_CONSENSUS,
             ocr_text=consensus.plate,

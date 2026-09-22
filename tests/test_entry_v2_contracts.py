@@ -1,6 +1,7 @@
 import asyncio
 import threading
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -12,6 +13,7 @@ from src.entry import router as entry_router
 from src.entry.callback import DeliveryResult
 from src.entry.coordinator import EntryCoordinator
 from src.entry.domain import (
+    EntryUnavailable,
     EntryMode,
     FrameEvidence,
     PlateEvidence,
@@ -867,6 +869,69 @@ def test_authoritative_callback_failure_returns_503_and_same_id_retry_delivers()
     )
     assert stable_duplicate.status_code == 200
     assert sink.calls == 2
+
+
+def test_invoke_timing_logs_success_and_retryable_failure(caplog):
+    request = SimpleNamespace(attempt_id="timing-a1", camera_id="CAM-23")
+    expected = object()
+
+    def ingest_attempt(_request, _images):
+        return expected
+
+    with caplog.at_level("INFO", logger="src.entry.router"):
+        assert (
+            asyncio.run(entry_router._invoke(ingest_attempt, request, [b"image"]))
+            is expected
+        )
+
+    success = next(
+        message
+        for message in caplog.messages
+        if message.startswith("[EntryV2][transport-timing]")
+        and "operation=ingest_attempt" in message
+    )
+    assert "outcome=success" in success
+    assert "coordinator_ms=" in success
+
+    def ingest_crossing(_request, _images):
+        raise EntryUnavailable("entry_v2_test_unavailable")
+
+    with caplog.at_level("INFO", logger="src.entry.router"):
+        with pytest.raises(HTTPException) as failure:
+            asyncio.run(entry_router._invoke(ingest_crossing, request, [b"image"]))
+
+    assert failure.value.status_code == 503
+    error = next(
+        message
+        for message in caplog.messages
+        if message.startswith("[EntryV2][transport-timing]")
+        and "operation=ingest_crossing" in message
+    )
+    assert "outcome=retryable_failure" in error
+    assert "reason=entry_v2_test_unavailable" in error
+
+
+def test_invoke_timing_preserves_cancellation(monkeypatch, caplog):
+    request = SimpleNamespace(attempt_id="timing-cancel", camera_id="CAM-23")
+
+    async def cancelled_threadpool(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    def ingest_attempt(_request, _images):
+        raise AssertionError("threadpool cancellation must prevent invocation")
+
+    monkeypatch.setattr(entry_router, "run_in_threadpool", cancelled_threadpool)
+    with caplog.at_level("INFO", logger="src.entry.router"):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(entry_router._invoke(ingest_attempt, request, [b"image"]))
+
+    cancellation = next(
+        message
+        for message in caplog.messages
+        if message.startswith("[EntryV2][transport-timing]")
+        and "operation=ingest_attempt" in message
+    )
+    assert "outcome=cancelled" in cancellation
 
 
 def test_off_mode_route_exists_but_is_unavailable_without_reading_image():

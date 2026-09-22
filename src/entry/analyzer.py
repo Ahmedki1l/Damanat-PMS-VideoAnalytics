@@ -9,6 +9,8 @@ import os
 import re
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple
 
@@ -56,6 +58,66 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _JPEG_START_OF_FRAME_MARKERS = frozenset(
     {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 )
+
+
+class _EntryTiming:
+    """Per-evidence timings that do not change extraction behavior."""
+
+    _STAGES = (
+        "model_load_ms",
+        "vehicle_model_load_ms",
+        "inference_lock_wait_ms",
+        "vehicle_detector_ms",
+        "plate_detector_ms",
+        "reid_ms",
+        "ocr_ms",
+    )
+
+    def __init__(self, *, event_id: str, camera_id: str, source_role: str, images):
+        self._started_at = time.perf_counter()
+        self._event_id = event_id
+        self._camera_id = camera_id
+        self._source_role = source_role
+        self._image_count = len(images)
+        self._durations = {stage: 0.0 for stage in self._STAGES}
+
+    def call(self, stage: str, operation, *args, **kwargs):
+        started_at = time.perf_counter()
+        try:
+            return operation(*args, **kwargs)
+        finally:
+            self._durations[stage] += (time.perf_counter() - started_at) * 1000
+
+    @contextmanager
+    def locked(self, lock):
+        started_at = time.perf_counter()
+        with lock:
+            self._durations["inference_lock_wait_ms"] += (
+                time.perf_counter() - started_at
+            ) * 1000
+            yield
+
+    def log(self, outcome: str) -> None:
+        logger.info(
+            "[EntryV2][timing] event=%s camera=%s role=%s images=%d "
+            "outcome=%s total_ms=%.1f model_load_ms=%.1f "
+            "vehicle_model_load_ms=%.1f inference_lock_wait_ms=%.1f "
+            "vehicle_detector_ms=%.1f "
+            "plate_detector_ms=%.1f reid_ms=%.1f ocr_ms=%.1f",
+            self._event_id,
+            self._camera_id,
+            self._source_role,
+            self._image_count,
+            outcome,
+            (time.perf_counter() - self._started_at) * 1000,
+            self._durations["model_load_ms"],
+            self._durations["vehicle_model_load_ms"],
+            self._durations["inference_lock_wait_ms"],
+            self._durations["vehicle_detector_ms"],
+            self._durations["plate_detector_ms"],
+            self._durations["reid_ms"],
+            self._durations["ocr_ms"],
+        )
 
 
 def _encoded_image_dimensions(encoded: bytes) -> Optional[Tuple[int, int]]:
@@ -191,7 +253,7 @@ class ExistingModelsEvidenceProcessor:
             _is_hik_sourced(metadata) or (source_role or "").lower() == "anpr"
         )
 
-    def _vehicle_crop(self, frame, plate_box):
+    def _vehicle_crop(self, frame, plate_box, *, timing: Optional[_EntryTiming] = None):
         """The subject vehicle inside a whole frame.
 
         Returns ``(crop, share, rule, candidates)``. A ``crop`` of None means
@@ -218,11 +280,19 @@ class ExistingModelsEvidenceProcessor:
         if area <= 0:
             return None, 0.0, "empty_frame", 0
 
-        detector = self._vehicle_models()
+        detector = (
+            self._vehicle_models()
+            if timing is None
+            else timing.call("vehicle_model_load_ms", self._vehicle_models)
+        )
         if detector is None:
             return None, 0.0, "detector_unavailable", 0
         try:
-            detections = detector.detect(frame)
+            detections = (
+                detector.detect(frame)
+                if timing is None
+                else timing.call("vehicle_detector_ms", detector.detect, frame)
+            )
         except Exception:
             logger.warning(
                 "[EntryV2][vehicle-crop] detector raised; keeping the full frame",
@@ -294,9 +364,40 @@ class ExistingModelsEvidenceProcessor:
         images: Sequence[bytes],
         metadata: Mapping[str, Any],
     ) -> Tuple[FrameEvidence, ...]:
+        timing = _EntryTiming(
+            event_id=event_id,
+            camera_id=camera_id,
+            source_role=source_role,
+            images=images,
+        )
+        try:
+            result = self._analyze(
+                event_id=event_id,
+                camera_id=camera_id,
+                source_role=source_role,
+                images=images,
+                metadata=metadata,
+                timing=timing,
+            )
+        except Exception as exc:
+            timing.log(type(exc).__name__)
+            raise
+        timing.log("success")
+        return result
+
+    def _analyze(
+        self,
+        *,
+        event_id: str,
+        camera_id: str,
+        source_role: str,
+        images: Sequence[bytes],
+        metadata: Mapping[str, Any],
+        timing: _EntryTiming,
+    ) -> Tuple[FrameEvidence, ...]:
         if not images:
             raise EvidenceUnavailable("at_least_one_image_is_required")
-        reid, detector, ocr = self._models()
+        reid, detector, ocr = timing.call("model_load_ms", self._models)
         exclude_regions = self._overlay_regions_for(source_role, metadata)
         whole_frame = (
             self._settings.vehicle_crop_enabled
@@ -310,7 +411,7 @@ class ExistingModelsEvidenceProcessor:
         # thread and do not expose a per-request infer handle. Serialize this
         # low-rate entry path so concurrent camera HTTP workers cannot race
         # mutable inference state or oversubscribe the CPU.
-        with self._inference_lock:
+        with timing.locked(self._inference_lock):
             evidence = []
             for index, encoded in enumerate(images):
                 frame_id = f"{event_id}:{index}"
@@ -337,7 +438,9 @@ class ExistingModelsEvidenceProcessor:
                 plate_boxes = None
                 if whole_frame:
                     try:
-                        plate_boxes = detector.detect(frame) or ()
+                        plate_boxes = timing.call(
+                            "plate_detector_ms", detector.detect, frame
+                        ) or ()
                     except Exception:
                         plate_boxes = None
                         logger.warning(
@@ -356,7 +459,7 @@ class ExistingModelsEvidenceProcessor:
                 reid_frame = frame
                 if whole_frame:
                     vehicle, share, rule, candidate_count = self._vehicle_crop(
-                        frame, plate_box
+                        frame, plate_box, timing=timing
                     )
                     if vehicle is not None:
                         reid_frame = vehicle
@@ -371,7 +474,7 @@ class ExistingModelsEvidenceProcessor:
                         candidates=candidate_count,
                     )
 
-                vector = reid.extract_feature(reid_frame)
+                vector = timing.call("reid_ms", reid.extract_feature, reid_frame)
                 embedding: Tuple[float, ...] = ()
                 if vector is not None:
                     array = np.asarray(vector, dtype=np.float32).reshape(-1)
@@ -385,8 +488,12 @@ class ExistingModelsEvidenceProcessor:
                 # would have produced -- and VA has no spare CPU to prove it
                 # twice. Ramp crops never detected above, so they pass None and
                 # crop_plate detects as it always has.
-                plate_crop = detector.crop_plate(
-                    frame, exclude_regions=exclude_regions, boxes=plate_boxes
+                plate_crop = timing.call(
+                    "plate_detector_ms",
+                    detector.crop_plate,
+                    frame,
+                    exclude_regions=exclude_regions,
+                    boxes=plate_boxes,
                 )
                 if plate_crop is None or getattr(plate_crop, "size", 0) == 0:
                     plate = PlateEvidence(
@@ -396,7 +503,9 @@ class ExistingModelsEvidenceProcessor:
                         state=PlateReadState.NO_PLATE,
                     )
                 else:
-                    text, confidence = ocr.read(
+                    text, confidence = timing.call(
+                        "ocr_ms",
+                        ocr.read,
                         plate_crop,
                         allow_retry=False,
                         apply_plate_roi=False,

@@ -17,6 +17,7 @@ from .callback import (
     RetryingConfirmationSink,
 )
 from .coordinator import EntryCoordinator
+from .durability import EntryDurabilityStore
 from .gallery import NullGalleryReferences, RegistryGalleryReferences
 from .identity import RegistryIdentityPublisher
 from .settings import EntrySettings
@@ -129,7 +130,18 @@ def build_entry_coordinator(
         initial_backoff_seconds=settings.callback_initial_backoff_seconds,
         max_backoff_seconds=settings.callback_max_backoff_seconds,
     )
-    return EntryCoordinator(
+    durability_store = None
+    if settings.durability_enabled:
+        try:
+            durability_store = EntryDurabilityStore(settings.durability_state_dir)
+        except Exception as exc:
+            return EntryCoordinator(
+                settings,
+                DisabledEvidenceProcessor(),
+                _DisabledSink(),
+                unavailable_reason="entry_v2_durability_unavailable:" + str(exc),
+            )
+    coordinator = EntryCoordinator(
         settings,
         processor,
         sink,
@@ -146,7 +158,20 @@ def build_entry_coordinator(
             if settings.gallery_match_enabled
             else NullGalleryReferences()
         ),
+        durability_store=durability_store,
     )
+    if durability_store is not None:
+        try:
+            coordinator.recover_durable_inputs()
+        except Exception as exc:
+            durability_store.close()
+            return EntryCoordinator(
+                settings,
+                DisabledEvidenceProcessor(),
+                _DisabledSink(),
+                unavailable_reason="entry_v2_durability_recovery_failed:" + str(exc),
+            )
+    return coordinator
 
 
 async def _callback_retry_loop(coordinator: EntryCoordinator) -> None:
@@ -155,6 +180,11 @@ async def _callback_retry_loop(coordinator: EntryCoordinator) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
+            # Keep the lifespan usable with the minimal coordinator doubles
+            # used by integrations predating the maintenance hook.
+            maintain = getattr(coordinator, "maintain", None)
+            if maintain is not None:
+                await asyncio.to_thread(maintain)
             await asyncio.to_thread(coordinator.retry_pending_callbacks)
         except asyncio.CancelledError:
             raise
@@ -188,5 +218,8 @@ def entry_callback_retry_lifespan(coordinator: EntryCoordinator):
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
                 setattr(app.state, _RETRY_TASK_STATE_KEY, None)
+                close = getattr(coordinator, "close", None)
+                if close is not None:
+                    close()
 
     return lifespan

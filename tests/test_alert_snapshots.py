@@ -404,9 +404,8 @@ def test_vacating_clears_pending_verdict(monkeypatch):
     assert raised == []
 
 
-def test_special_needs_slot_still_alerts_immediately(monkeypatch):
-    """Special-needs and violation zones do NOT depend on identity, so they must
-    keep deciding at park time rather than being dragged into the deferral."""
+def test_special_needs_slot_remains_a_plain_occupancy_with_or_without_identity(monkeypatch):
+    """Special-needs status has precedence over identity and zone alert rules."""
     temp_dir = _make_repo_temp_dir()
     monkeypatch.chdir(temp_dir)
     engine = DummyEngine(special={"G1"})
@@ -419,12 +418,20 @@ def test_special_needs_slot_still_alerts_immediately(monkeypatch):
     assignment = SimpleNamespace(slot_vehicle_map={"G1": (7, detection)})
     frame = np.full((120, 120, 3), 255, dtype=np.uint8)
 
-    result = engine._filter_violation_events(
+    unknown_identity = engine._filter_violation_events(
         frame, assignment, "CAM_01", [_parked_event("G1", 7)]
     )
+    known_identity = _parked_event("G1", 8)
+    known_identity.plate_number = "ABC-123"
+    known_identity = engine._filter_violation_events(
+        frame, assignment, "CAM_01", [known_identity]
+    )
 
-    assert result[0].event_type == "special_needs_violation"
-    assert result[0].is_alert is True
+    for event in unknown_identity + known_identity:
+        assert event.event_type == "vehicle_parked"
+        assert event.is_alert is False
+        assert event.severity == "info"
+        assert event.snapshot_path == ""
     assert "G1" not in engine._pending_ownership()
 
 

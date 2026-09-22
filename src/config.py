@@ -1629,7 +1629,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     # unconditionally clobbered the AlertsConfig default of True. Nothing in the repo
     # ever set that var, and no config.yaml ever carried an `alerts:` block — so from
     # a9ce2ee (2026-05-20) until this fix, EVERY restricted-zone alert (named-slot
-    # intrusion, special-needs violation) was silently dead in every deployment.
+    # intrusion) was silently dead in every deployment.
     # The var is now an explicit deploy-time OVERRIDE: unset means "use the config",
     # not "off".
     if "alerts" in raw:

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
 import hmac
 import logging
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -63,6 +65,7 @@ class EntryIngestResponse(BaseModel):
     decision_id: Optional[str] = None
     decision_status: Optional[str] = None
     callback_delivered: Optional[bool] = None
+    receipt_status: Optional[str] = None
 
 
 class EntryCancellationRequest(BaseModel):
@@ -500,9 +503,20 @@ def _uploads(form: FormData, name: str) -> List[UploadFile]:
 
 
 async def _invoke(call, request, images: List[bytes]) -> IngestResult:
+    started_at = time.perf_counter()
+    outcome = "incomplete"
+    reason = ""
+    operation = getattr(call, "__name__", "coordinator_ingest")
     try:
-        return await run_in_threadpool(call, request, tuple(images))
+        result = await run_in_threadpool(call, request, tuple(images))
+        outcome = "success"
+        return result
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
     except (EntryConflict, EntryInvalid, EvidenceUnavailable) as exc:
+        outcome = "deterministic_rejection"
+        reason = exc.reason
         logger.warning(
             "[EntryV2] deterministic ingest rejection id=%s camera=%s reason=%s",
             getattr(request, "attempt_id", None)
@@ -512,6 +526,8 @@ async def _invoke(call, request, images: List[bytes]) -> IngestResult:
         )
         raise HTTPException(status_code=422, detail=exc.reason) from exc
     except (EntryCapacityExceeded, EntryUnavailable) as exc:
+        outcome = "retryable_failure"
+        reason = exc.reason
         logger.warning(
             "[EntryV2] retryable ingest failure id=%s camera=%s reason=%s",
             getattr(request, "attempt_id", None)
@@ -521,6 +537,8 @@ async def _invoke(call, request, images: List[bytes]) -> IngestResult:
         )
         raise HTTPException(status_code=503, detail=exc.reason) from exc
     except Exception as exc:
+        outcome = "unhandled_failure"
+        reason = type(exc).__name__
         # Model/runtime failures are availability failures, never a fabricated
         # success or a half-created attempt.
         logger.exception(
@@ -532,6 +550,19 @@ async def _invoke(call, request, images: List[bytes]) -> IngestResult:
         raise HTTPException(
             status_code=503, detail="entry_evidence_processing_unavailable"
         ) from exc
+    finally:
+        logger.info(
+            "[EntryV2][transport-timing] operation=%s id=%s camera=%s images=%d "
+            "outcome=%s reason=%s coordinator_ms=%.1f",
+            operation,
+            getattr(request, "attempt_id", None)
+            or getattr(request, "crossing_id", None),
+            getattr(request, "camera_id", ""),
+            len(images),
+            outcome,
+            reason or "-",
+            (time.perf_counter() - started_at) * 1000,
+        )
 
 
 def _require_available(coordinator: EntryCoordinator) -> None:
@@ -665,7 +696,7 @@ async def _read_images(
 
 def _response(result: IngestResult) -> EntryIngestResponse:
     return EntryIngestResponse(
-        status="duplicate" if result.duplicate else "accepted",
+        status=result.receipt_status or ("duplicate" if result.duplicate else "accepted"),
         id=result.resource_id,
         duplicate=result.duplicate,
         mode=result.mode.value,
@@ -674,4 +705,5 @@ def _response(result: IngestResult) -> EntryIngestResponse:
         decision_id=result.decision_id,
         decision_status=result.decision_status,
         callback_delivered=result.callback_delivered,
+        receipt_status=result.receipt_status,
     )

@@ -28,6 +28,7 @@ from src.entry.domain import (
     EntryMode,
     FrameEvidence,
     PlateEvidence,
+    PlateReading,
     PlateReadState,
     PlateSourceKind,
     WitnessSource,
@@ -270,6 +271,26 @@ def test_a_hik_attempt_contributes_hik_text_not_the_anpr_source():
         # so nothing here may present it as one.
         sources = EntryDecisionEngine(coord.settings).available_plate_sources(group)
         assert PlateSourceKind.ANPR not in sources
+
+
+def test_anpr_and_hik_disagreement_still_has_no_consensus():
+    """Only VA OCR became advisory; the independent source rule is unchanged."""
+    evidence = {"a1": [frame("a1", "ANPR-ENTRY", (1.0, 0.0))]}
+    coord, _ = build(evidence)
+    result = coord.ingest_attempt(attempt("a1", "ABC-1234"), [b"a"])
+
+    with coord._lock:
+        group = coord._groups[result.group_id]
+        group.plate_sources[PlateSourceKind.HIK_TEXT] = PlateReading(
+            source=PlateSourceKind.HIK_TEXT,
+            text="XYZ-9999",
+            confidence=0.99,
+            origin="test-hik-guid",
+        )
+        consensus = EntryDecisionEngine(coord.settings).plate_consensus(group)
+
+    assert consensus.outcome == "no_consensus"
+    assert consensus.plate is None
 
 
 def test_the_consumed_guid_is_remembered_so_a_repeat_query_cannot_double_ingest():

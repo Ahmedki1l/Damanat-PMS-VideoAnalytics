@@ -82,14 +82,12 @@ class WitnessSource(str, Enum):
 
 
 class PlateSourceKind(str, Enum):
-    """Something that READ a plate. Exactly three, forever.
+    """A plate reader known to the entry domain.
 
-    There are only two plate-reading systems in this flow — the gate ANPR and
-    HikCentral — plus our own OCR on whatever vehicle image is available
-    (primarily the HikCentral vehiclePicUri image, secondarily the ANPR image).
-
-    There is deliberately no camera-derived member. If one is ever added, the
-    ramp cameras have become plate sources and the separation above is gone.
+    ANPR and HikCentral are confirmation sources. ``OUR_OCR`` remains a
+    vocabulary value for historic records, but current entry OCR is advisory
+    only and must not enter source consensus. Ramp cameras are witnesses, not
+    plate sources.
     """
 
     ANPR = "anpr"
@@ -200,13 +198,12 @@ class PlateReading:
 
     Distinct from PlateEvidence, which is an OCR result on one specific image.
     A PlateReading is what a SOURCE says the plate is: the gate's own reported
-    value, HikCentral's own reported value, or our OCR's conclusion folded
-    across every image it read.
+    value or HikCentral's own reported value. OCR results use
+    :class:`PlateEvidence` and are advisory-only.
 
-    ``conflicted`` marks a source that contradicted itself — our OCR reading two
-    images and disagreeing. Such a source is excluded from consensus entirely
-    rather than having its readings counted as two opinions, because our reader
-    contradicting itself is evidence of unreliability, not a tie to break.
+    ``conflicted`` marks an external source that contradicted itself. Such a
+    source is excluded from consensus entirely rather than being counted as
+    multiple opinions.
     """
 
     source: PlateSourceKind
@@ -357,8 +354,8 @@ class AttemptGroup:
     # NOTE: the primary_ocr_* / primary_blocks_fallback fields that used to sit
     # here are GONE. They existed to arbitrate a CAM-23 plate read against a
     # CAM-03 plate read — a question that no longer exists, because neither
-    # camera is a plate source. Nothing replaced them: the plate is decided by
-    # consensus across ANPR, HikCentral and our own OCR.
+    # camera is a plate source. OCR remains in the advisory decision log; the
+    # confirmation plate is decided only by ANPR and HikCentral.
 
     @property
     def embeddings(self) -> Tuple[Tuple[float, ...], ...]:
@@ -540,6 +537,9 @@ class IngestResult:
     decision_id: Optional[str] = None
     decision_status: Optional[str] = None
     callback_delivered: Optional[bool] = None
+    # Durable admission has an explicit terminal vocabulary.  It prevents a
+    # post-TTL retry from looking like a new, active acceptance.
+    receipt_status: Optional[str] = None
 
 
 class EntryError(Exception):

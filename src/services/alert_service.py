@@ -6,14 +6,21 @@ from src.repositories import AlertRepository, ParkingSlotRepository
 from src.utils.datetime_helper import facility_now_naive
 
 _RESTRICTED_GATED_TYPES = (
-    "special_needs_violation",
     "vehicle_intrusion",
     "reserved_slot_unidentified",
 )
 
+_RETIRED_SPECIAL_NEEDS_ALERT_TYPES = frozenset(
+    {"special_needs_review", "special_needs_violation"}
+)
+
+# This retains its historical name because callers use it. All of these rows
+# belong to the current occupancy and must close when that occupancy ends.
 SLOT_SCOPED_VIOLATION_ALERT_TYPES = (
     "vehicle_violation",
     "named_slot_violation",
+    # Retain historical special-needs rows in the departure cleanup; no new
+    # special-needs alerts are produced by VA.
     "special_needs_violation",
     "vehicle_intrusion",
     # Raised when a car has occupied a named slot past the identity deadline and
@@ -95,16 +102,20 @@ def _restricted_zone_alerts_enabled() -> bool:
     return os.environ.get("ENABLE_RESTRICTED_ZONE_ALERTS", "true").strip().lower() == "true"
 
 def check_slot_restricted(db: Session, slot_id: str) -> bool:
-    """True when a slot should trigger alerts (violation zone, employee, or special-needs)."""
+    """True when a slot should trigger alerts under VA's enforcement policy."""
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
     if not slot:
         return False
-    return slot.is_violation_zone or slot.reservation_type in ("EMPLOYEE", "SPECIAL")
+    # Special-needs occupancy is tracked like every other occupancy, but VA
+    # must not create an alert, review, violation, or notification for it.
+    # This precedence also keeps a stale physical-zone flag from reviving the
+    # retired special-needs alert path.
+    if slot.reservation_type == "SPECIAL":
+        return False
+    return slot.is_violation_zone or slot.reservation_type == "EMPLOYEE"
 
 def get_alert_type_for_slot(db: Session, slot_id: str) -> str:
     slot = ParkingSlotRepository.get_by_id(db, slot_id)
-    if slot and slot.reservation_type == "SPECIAL":
-        return "special_needs_violation"
     if slot and slot.reservation_type == "EMPLOYEE":
         return "vehicle_intrusion"
     if slot and "violation" in (slot.slot_name or "").lower():
@@ -114,8 +125,6 @@ def get_alert_type_for_slot(db: Session, slot_id: str) -> str:
     return "vehicle_intrusion"
 
 def _describe_alert(alert_type: str, slot_name: str, slot) -> str:
-    if alert_type == "special_needs_violation":
-        return f"Vehicle detected in special-needs reserved slot {slot_name}"
     if alert_type == "reserved_slot_unidentified":
         return (
             f"Unidentified vehicle occupying reserved slot {slot_name} — neither "
@@ -136,15 +145,17 @@ def report_alert(
     snapshot_path: str = None,
     alert_type: str = None,
 ):
-    """
-    YOLO detects car in a slot -> check if restricted (is_violation_zone) -> create alert.
-    Returns None if slot is not restricted or alert already active.
+    """Create or reuse an alert for a restricted slot.
 
     ``alert_type`` overrides the slot-derived type. The engine's deferred
     named-slot path uses it to distinguish a PROVEN non-owner (vehicle_intrusion)
     from a car nobody could identify in time (reserved_slot_unidentified) — a
     distinction this function cannot make from the slot row alone.
     """
+    # Do not let an explicit legacy type reintroduce a retired special-needs
+    # producer on another slot classification.
+    if alert_type in _RETIRED_SPECIAL_NEEDS_ALERT_TYPES:
+        return None
     if not check_slot_restricted(db, slot_id):
         return None
 
@@ -213,8 +224,9 @@ def report_alert(
     )
     return AlertRepository.create(db, new_alert)
 
+
 def resolve_alert(db: Session, slot_id: str):
-    """Car leaves restricted slot -> resolve the active alert."""
+    """Resolve the active alert for a slot."""
     active = AlertRepository.get_active_by_slot(db, slot_id)
     if not active:
         return None
@@ -222,12 +234,11 @@ def resolve_alert(db: Session, slot_id: str):
 
 
 def auto_resolve_slot_violation_alerts(db: Session, slot_id: str) -> list[int]:
-    """Bulk-resolve all unresolved slot-scoped violation alerts for a slot.
+    """Bulk-resolve all unresolved slot-scoped alert lifecycle rows for a slot.
 
     Called by VA on a confirmed occupied -> empty transition. Resolves alerts
-    whose alert_type is in SLOT_SCOPED_VIOLATION_ALERT_TYPES, regardless of
-    which service originally wrote them. Skips is_test=True alerts (demo
-    alerts have their own lifecycle).
+    whose alert_type is in SLOT_SCOPED_VIOLATION_ALERT_TYPES. Skips is_test=True
+    alerts (demo alerts have their own lifecycle).
 
     Returns the list of resolved alert ids (may be empty).
     """
