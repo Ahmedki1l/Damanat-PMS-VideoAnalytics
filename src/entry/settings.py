@@ -168,6 +168,10 @@ class EntrySettings:
     callback_initial_backoff_seconds: float = 0.2
     callback_max_backoff_seconds: float = 2.0
     callback_retry_interval_seconds: float = 5.0
+    # Disabled until the single-host pilot has passed its rollout checks.  The
+    # journal contains vehicle crops, so no implicit directory is ever chosen.
+    durability_enabled: bool = False
+    durability_state_dir: str = ""
 
     lpd_model_dir: str = "models/yolo11n_lpd_openvino_model"
     lpd_confidence: float = 0.30
@@ -228,10 +232,9 @@ class EntrySettings:
     decision_log_dir: str = ""
     decision_log_retention_days: int = 30
     decision_log_queue_max: int = 2000
-    # A ramp camera is not a plate source, but a reliable read that contradicts
-    # the consensus plate is evidence Re-ID matched the wrong identity, and
-    # refusing on that is not the same as naming a plate with it. Subtractive:
-    # it can withhold an entry, never create one.
+    # Kept solely to parse existing deployments. OCR is advisory-only during
+    # this monitoring window, so no value of this legacy setting can withhold
+    # an entry. Remove it only with a separately reviewed configuration break.
     observation_plate_veto_enabled: bool = True
     # THE OVERLAY GUARD. Normalised (x1,y1,x2,y2) boxes in 0..1 naming where
     # Hikvision composites its own plate/OSD panel into a frame. A plate box
@@ -372,6 +375,8 @@ class EntrySettings:
             callback_retry_interval_seconds=_env_float(
                 "ENTRY_V2_CALLBACK_RETRY_INTERVAL_SECONDS", 5.0
             ),
+            durability_enabled=_env_true("ENTRY_V2_DURABILITY_ENABLED"),
+            durability_state_dir=os.getenv("ENTRY_V2_DURABILITY_STATE_DIR", "").strip(),
             lpd_model_dir=os.getenv(
                 "ENTRY_V2_LPD_MODEL_DIR", "models/yolo11n_lpd_openvino_model"
             ),
@@ -585,6 +590,8 @@ class EntrySettings:
             # rescued by a late sweep, which is the only reason the two TTLs
             # differ at all.
             errors.append("observation_ttl_below_identity_ttl")
+        if self.durability_enabled and not self.durability_state_dir:
+            errors.append("ENTRY_V2_DURABILITY_STATE_DIR")
         if self.decision_log_dir:
             # Only checked when the log is actually configured. A malformed
             # integer arrives here as 0 (see _env_int), and 0 would silently mean

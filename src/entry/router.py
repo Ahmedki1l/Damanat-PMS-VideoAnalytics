@@ -65,6 +65,7 @@ class EntryIngestResponse(BaseModel):
     decision_id: Optional[str] = None
     decision_status: Optional[str] = None
     callback_delivered: Optional[bool] = None
+    receipt_status: Optional[str] = None
 
 
 class EntryCancellationRequest(BaseModel):
@@ -695,7 +696,7 @@ async def _read_images(
 
 def _response(result: IngestResult) -> EntryIngestResponse:
     return EntryIngestResponse(
-        status="duplicate" if result.duplicate else "accepted",
+        status=result.receipt_status or ("duplicate" if result.duplicate else "accepted"),
         id=result.resource_id,
         duplicate=result.duplicate,
         mode=result.mode.value,
@@ -704,4 +705,5 @@ def _response(result: IngestResult) -> EntryIngestResponse:
         decision_id=result.decision_id,
         decision_status=result.decision_status,
         callback_delivered=result.callback_delivered,
+        receipt_status=result.receipt_status,
     )

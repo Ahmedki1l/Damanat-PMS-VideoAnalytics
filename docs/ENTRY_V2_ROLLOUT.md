@@ -4,6 +4,15 @@ This document is the deployment contract for the authoritative gate-entry
 pipeline shared by PMS-AI and Video Analytics (VA). It changes neither Gateway
 nor the database schema. Cameras continue to post only to PMS-AI.
 
+> The current entry OCR monitoring policy is documented in
+> [`ENTRY_V2_OCR_ADVISORY_MONITORING.md`](ENTRY_V2_OCR_ADVISORY_MONITORING.md).
+> It supersedes the historical OCR decision-policy statements below: OCR is
+> logged for review and cannot block or correct an ANPR plate.
+
+> Optional durable entry recovery and its new PMS receipt-table requirement are
+> described in [ENTRY_V2_DURABILITY.md](ENTRY_V2_DURABILITY.md). The historical
+> rollout steps below predate that extension.
+
 ## Entry colour matching
 
 Entry association no longer vetoes candidates using HSV colour differences.

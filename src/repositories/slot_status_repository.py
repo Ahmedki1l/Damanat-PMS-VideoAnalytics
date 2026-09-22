@@ -15,10 +15,27 @@ class SlotStatusRepository:
 
     @staticmethod
     def get_latest_by_slot(db: Session, slot_id: str):
-        return db.query(SlotStatus).filter(SlotStatus.slot_id == slot_id).order_by(SlotStatus.time.desc()).first()
+        return (
+            db.query(SlotStatus)
+            .filter(SlotStatus.slot_id == slot_id)
+            .order_by(SlotStatus.time.desc(), SlotStatus.id.desc())
+            .first()
+        )
+
+    @staticmethod
+    def get_latest_available_by_slot(db: Session, slot_id: str):
+        return (
+            db.query(SlotStatus)
+            .filter(SlotStatus.slot_id == slot_id, SlotStatus.status == "available")
+            .order_by(SlotStatus.time.desc(), SlotStatus.id.desc())
+            .first()
+        )
 
     @staticmethod
     def get_latest_by_plate(db: Session, plate: str):
-        return db.query(SlotStatus).filter(SlotStatus.plate_number == plate).order_by(SlotStatus.time.desc()).first()
-    
-    
+        return (
+            db.query(SlotStatus)
+            .filter(SlotStatus.plate_number == plate)
+            .order_by(SlotStatus.time.desc(), SlotStatus.id.desc())
+            .first()
+        )

@@ -1200,20 +1200,6 @@ class AlertsConfig:
     """Alerting feature toggles."""
     enable_restricted_zone_alerts: bool = True
 
-    # Named-slot intrusion is decided from IDENTITY, which lands well after the car
-    # parks (OCR/ReID run after occupancy is published — see the identity block in
-    # ParkingEngineRuntimeMixin._process_detections_and_events). So the ownership
-    # verdict is deferred rather than guessed at park time.
-    #
-    # This is how long to wait for identity before giving up and raising a
-    # reserved_slot_unidentified alert instead. Without it, a slot whose identity
-    # NEVER resolves gets no alert at all — and that is not hypothetical: B1_CRO
-    # has OCR disabled outright (matching.slot_no_plate_view) and can only ever be
-    # named by appearance, which routinely abstains. That is a named slot with zero
-    # intrusion coverage. Set <= 0 to disable the fallback and alert only on a
-    # PROVEN non-owner.
-    reserved_slot_identity_timeout_s: float = 300.0
-
     # How long a car must sit in a no-parking zone before it counts as parked
     # there.
     #
@@ -1235,11 +1221,8 @@ class AlertsConfig:
     # endpoints still serve it, so history and auditing are unaffected — the
     # dashboard just stops popping a live alert for these types.
     #
-    # reserved_slot_unidentified is suppressed by default because it is the
-    # "nobody could name this car" fallback above, not a proven intrusion. On
-    # slots that can never be identified (B1_CRO has OCR disabled outright) it
-    # fires on essentially every occupancy, which trains operators to dismiss
-    # the alert panel. Set to () to notify on every alert type.
+    # Retain legacy unidentified-alert suppression for historical compatibility.
+    # New named-slot decisions use vehicle_intrusion after identification finishes.
     suppressed_notification_types: tuple[str, ...] = ("reserved_slot_unidentified",)
     # Alert types turned OFF entirely: no DB row, no notification. Use this (not
     # the suppression list above) to make an alert type vanish completely, e.g.
@@ -1646,7 +1629,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     # unconditionally clobbered the AlertsConfig default of True. Nothing in the repo
     # ever set that var, and no config.yaml ever carried an `alerts:` block — so from
     # a9ce2ee (2026-05-20) until this fix, EVERY restricted-zone alert (named-slot
-    # intrusion, special-needs violation) was silently dead in every deployment.
+    # intrusion) was silently dead in every deployment.
     # The var is now an explicit deploy-time OVERRIDE: unset means "use the config",
     # not "off".
     if "alerts" in raw:
@@ -1657,15 +1640,6 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
                 config.alerts.enable_restricted_zone_alerts,
             )
         )
-        try:
-            config.alerts.reserved_slot_identity_timeout_s = float(
-                a.get(
-                    "reserved_slot_identity_timeout_s",
-                    config.alerts.reserved_slot_identity_timeout_s,
-                )
-            )
-        except (TypeError, ValueError):
-            pass
         try:
             config.alerts.violation_min_dwell_s = float(
                 a.get(

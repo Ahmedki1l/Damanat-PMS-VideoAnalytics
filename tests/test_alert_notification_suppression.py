@@ -1,14 +1,7 @@
-"""`reserved_slot_unidentified` is recorded but not pushed to the alert stream.
+"""Legacy unidentified alerts remain recorded but suppressed from the stream.
 
-That alert is the "nobody could name this car" fallback, not a proven intrusion
-(see AlertsConfig.reserved_slot_identity_timeout_s). On a slot that can never be
-identified — B1_CRO has OCR disabled outright via matching.slot_no_plate_view —
-it fires on essentially every occupancy, and an alert panel that is permanently
-red gets ignored, including for the proven intrusions next to it.
-
-So the gate is on the STREAM, not on report_alert: the row, the snapshot and the
-REST history are all untouched. These tests pin that split, because "just stop
-raising it" would look equivalent and quietly delete the evidence.
+New named-slot decisions use vehicle_intrusion. Notification suppression remains
+independent of persistence for existing categories and historical compatibility.
 """
 
 import unittest
@@ -29,10 +22,9 @@ class TestNotificationSuppression(unittest.TestCase):
             alert_service.notification_suppressed("reserved_slot_unidentified")
         )
 
-    def test_proven_intrusion_still_notifies(self):
+    def test_actionable_alerts_still_notify(self):
         for alert_type in (
             "vehicle_intrusion",
-            "special_needs_violation",
             "named_slot_violation",
             "vehicle_violation",
         ):

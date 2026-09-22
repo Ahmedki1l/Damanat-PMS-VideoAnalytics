@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 import hashlib
 import json
 import logging
@@ -33,6 +32,7 @@ from .gallery import (
 # here for the LOG only, and it must be the identical predicate the matcher
 # applied or the record would describe a decision that never happened.
 from .identity import (
+    GalleryAuthorizationProof,
     IdentitySupersededByExit,
     IdentityPublisher,
     NullIdentityPublisher,
@@ -67,8 +67,8 @@ from .domain import (
     canonical_plate,
     norm_camera_id,
     plate_key,
-    plates_contradict,
 )
+from .durability import EntryDurabilityStore
 from .settings import EntrySettings
 
 
@@ -155,6 +155,7 @@ class EntryCoordinator:
         decision_log: Optional[Any] = None,
         clock: Optional[Any] = None,
         gallery_references: Optional[GalleryReferences] = None,
+        durability_store: Optional[EntryDurabilityStore] = None,
     ):
         # The ONLY wall clock in the coordinator, and it exists solely to age
         # state out. It is never consulted to decide whether two observations
@@ -173,6 +174,12 @@ class EntryCoordinator:
         # none of them should have to know about a log. None means "record
         # nothing", never "fail".
         self._decision_log = decision_log
+        self._durability_store = durability_store
+        if self._durability_store is not None:
+            self._durability_store.bind_mode(settings.mode.value)
+        self._durability_recovery_lock = threading.RLock()
+        self._durably_admitted: set[Tuple[str, str]] = set()
+        self._durability_journeys_restored = False
         self._engine = EntryDecisionEngine(settings)
         self._unavailable_reason = unavailable_reason
         self._lock = threading.RLock()
@@ -231,22 +238,101 @@ class EntryCoordinator:
             return "entry_v2_disabled"
         return ""
 
+    @property
+    def durability_store(self) -> Optional[EntryDurabilityStore]:
+        return self._durability_store
+
+    def recover_durable_inputs(self) -> int:
+        """Rebuild only undecided persisted evidence in source-time order."""
+        if self._durability_store is None:
+            return 0
+        recovered = 0
+        with self._durability_recovery_lock:
+            self._restore_durable_journeys()
+            for kind, resource_id, request in self._durability_store.recovery_candidates(
+                limit=32
+            ):
+                if not self._durability_store.is_pending(kind, resource_id):
+                    continue
+                with self._lock:
+                    live = (
+                        resource_id in self._attempts
+                        if kind == "attempt"
+                        else resource_id in self._crossings
+                    )
+                    if live or (kind, resource_id) in self._inflight:
+                        continue
+                    self._durably_admitted.add((kind, resource_id))
+                loaded = self._durability_store.load_input(kind, request)
+                if loaded is None:
+                    continue
+                _, _, images = loaded
+                try:
+                    if kind == "attempt":
+                        self.ingest_attempt(request, images)
+                    else:
+                        self.ingest_crossing(request, images)
+                except EntryCapacityExceeded:
+                    continue
+                recovered += 1
+        return recovered
+
+    def maintain(self) -> Dict[str, bool]:
+        """Run TTL expiry even when no producer submits another event."""
+        with self._lock:
+            decisions = [] if self._analysis_inflight else self._evaluate_pending_locked()
+        outcomes = self._dispatch(decisions)
+        # Capacity or a transient analyzer failure leaves the durable row
+        # pending. Re-drive it here; live RAM rows are skipped by recovery.
+        self.recover_durable_inputs()
+        return outcomes
+
+    def close(self) -> None:
+        if self._durability_store is not None:
+            self._durability_store.close()
+
+    def admit_local_crossing(
+        self, request: CrossingInput, images: Sequence[bytes]
+    ) -> Optional[IngestResult]:
+        """Persist local-zone evidence before its bounded RAM worker admits it."""
+        if self._durability_store is None:
+            return None
+        receipt = self._durability_store.accept("crossing", request, images)
+        if receipt is not None:
+            return replace(receipt, duplicate=True)
+        with self._lock:
+            self._durably_admitted.add(("crossing", request.crossing_id))
+        return None
+
+    def claim_persisted_local_crossing(self, request: CrossingInput) -> bool:
+        """Reserve one journaled local crossing for the bridge worker."""
+        if self._durability_store is None:
+            return False
+        with self._lock:
+            key = ("crossing", request.crossing_id)
+            if key in self._inflight:
+                return False
+            self._durably_admitted.add(key)
+        return True
+
     def ingest_attempt(
         self, request: AttemptInput, images: Sequence[bytes]
     ) -> IngestResult:
         self._ensure_available()
         self._validate_attempt(request, images)
-        fingerprint = self._fingerprint("attempt", request, images)
-        key = ("attempt", request.attempt_id)
-        duplicate = self._preflight(
-            key,
-            fingerprint,
-            maximum=self.settings.max_pending_attempts,
-        )
-        if duplicate is not None:
-            return replace(duplicate, duplicate=True, accepted=False)
-
+        durable_duplicate = self._durable_accept("attempt", request, images)
+        if durable_duplicate is not None:
+            return durable_duplicate
         try:
+            fingerprint = self._fingerprint("attempt", request, images)
+            key = ("attempt", request.attempt_id)
+            duplicate = self._preflight(
+                key,
+                fingerprint,
+                maximum=self.settings.max_pending_attempts,
+            )
+            if duplicate is not None:
+                return replace(duplicate, duplicate=True, accepted=False)
             evidence = tuple(
                 self._processor.analyze(
                     event_id=request.attempt_id,
@@ -291,7 +377,8 @@ class EntryCoordinator:
                     delivered.get(reported.decision_id) if reported else None
                 ),
             )
-            self._complete_request(key, fingerprint, result)
+            result = self._complete_request(key, fingerprint, result)
+            self._durable_record_result("attempt", result)
             if blocking is not None:
                 raise EntryUnavailable(
                     "entry_confirmation_permanent_failure"
@@ -308,17 +395,19 @@ class EntryCoordinator:
     ) -> IngestResult:
         self._ensure_available()
         self._validate_crossing(request, images)
-        fingerprint = self._fingerprint("crossing", request, images)
-        key = ("crossing", request.crossing_id)
-        duplicate = self._preflight(
-            key,
-            fingerprint,
-            maximum=self.settings.max_pending_crossings,
-        )
-        if duplicate is not None:
-            return replace(duplicate, duplicate=True, accepted=False)
-
+        durable_duplicate = self._durable_accept("crossing", request, images)
+        if durable_duplicate is not None:
+            return durable_duplicate
         try:
+            fingerprint = self._fingerprint("crossing", request, images)
+            key = ("crossing", request.crossing_id)
+            duplicate = self._preflight(
+                key,
+                fingerprint,
+                maximum=self.settings.max_pending_crossings,
+            )
+            if duplicate is not None:
+                return replace(duplicate, duplicate=True, accepted=False)
             evidence = tuple(
                 self._processor.analyze(
                     event_id=request.crossing_id,
@@ -409,6 +498,7 @@ class EntryCoordinator:
                     ),
                 )
             result = self._complete_request(key, fingerprint, result)
+            self._durable_record_result("crossing", result)
             if blocking is not None:
                 raise EntryUnavailable(
                     "entry_confirmation_permanent_failure"
@@ -435,6 +525,32 @@ class EntryCoordinator:
             try:
                 result = self._deliver_decision(decision, payload)
                 outcomes[decision.decision_id] = result.delivered
+                if self._durability_store is not None:
+                    finalized_record = None
+                    if result.delivered:
+                        with self._lock:
+                            if (
+                                decision.finalizes_group
+                                and self._should_remember_journey_locked(
+                                    decision, result
+                                )
+                            ):
+                                finalized = self._finalized_journey_for_decision_locked(
+                                    decision,
+                                    superseding_exit_at=result.superseding_exit_at,
+                                )
+                                finalized_record = (
+                                    self._durability_finalized_record(finalized)
+                                    if finalized is not None
+                                    else None
+                                )
+                    self._durability_store.mark_callback(
+                        decision.decision_id,
+                        result.delivered,
+                        result.error,
+                        result.retryable,
+                        finalized_record,
+                    )
                 if result.delivered:
                     with self._lock:
                         self._pending_callbacks.pop(decision.decision_id, None)
@@ -467,6 +583,97 @@ class EntryCoordinator:
                     [] if self._analysis_inflight else self._evaluate_pending_locked()
                 )
             self._dispatch(decisions)
+        if not pending:
+            outcomes.update(self._retry_durable_callbacks())
+        return outcomes
+
+    def _durable_accept(self, kind, request, images):
+        if self._durability_store is None:
+            return None
+        resource_id = request.attempt_id if kind == "attempt" else request.crossing_id
+        with self._durability_recovery_lock, self._lock:
+            if (kind, resource_id) in self._durably_admitted:
+                self._durably_admitted.discard((kind, resource_id))
+                return None
+        receipt = self._durability_store.accept(kind, request, images)
+        return replace(receipt, duplicate=True) if receipt is not None else None
+
+    def _durable_record_result(self, kind: str, result: IngestResult) -> None:
+        if self._durability_store is not None:
+            self._durability_store.record_result(kind, result)
+
+    def _retry_durable_callbacks(self) -> Dict[str, bool]:
+        if self._durability_store is None:
+            return {}
+        outcomes: Dict[str, bool] = {}
+        for payload, identity, candidate in self._durability_store.pending_callback_records():
+            decision_id = str(payload.get("decision_id", ""))
+            if not decision_id:
+                continue
+            result = self._deliver(payload)
+            delivered = result.delivered
+            error = result.error
+            if delivered and identity is not None and result.publish_identity:
+                try:
+                    self._identity_publisher.publish(
+                        self._durable_identity_from_record(identity)
+                    )
+                except IdentitySupersededByExit as exc:
+                    if candidate is None or not self._timestamp_at_or_after(
+                        datetime.fromisoformat(candidate["entry_captured_at"]),
+                        exc.latest_exit_at,
+                    ):
+                        delivered = False
+                        error = "identity_superseded_exit_timestamp_invariant"
+                        result = DeliveryResult(
+                            False,
+                            result.attempts,
+                            error,
+                            publish_identity=False,
+                            retryable=False,
+                            session_committed=False,
+                            ack_result="identity_superseded_by_exit",
+                        )
+                    else:
+                        result = DeliveryResult(
+                            True,
+                            result.attempts,
+                            str(exc),
+                            publish_identity=False,
+                            retryable=False,
+                            session_committed=False,
+                            ack_result="identity_superseded_by_exit",
+                            superseding_exit_at=exc.latest_exit_at,
+                        )
+                except Exception as exc:
+                    delivered = False
+                    error = "identity_publish:" + str(exc)
+            if result.superseding_exit_at is not None and candidate is not None:
+                candidate = dict(candidate)
+                candidate["exit_captured_at"] = result.superseding_exit_at.isoformat()
+            remember_candidate = delivered and (
+                self.settings.mode == EntryMode.SHADOW
+                or result.session_committed is True
+                or result.publish_identity
+                or (
+                    result.ack_result == "identity_superseded_by_exit"
+                    and result.superseding_exit_at is not None
+                )
+            )
+            self._durability_store.mark_callback(
+                decision_id,
+                delivered,
+                error or "callback_delivery_failed",
+                result.retryable,
+                candidate if remember_candidate else None,
+            )
+            if remember_candidate and candidate is not None:
+                finalized = self._durability_finalized_journey_from_record(candidate)
+                with self._lock:
+                    self._finalized_journeys[finalized.decision_id] = finalized
+                    self._finalized_journeys.move_to_end(finalized.decision_id)
+                    self._trim_finalized_journeys_locked()
+            outcomes[decision_id] = delivered
         return outcomes
 
     def state_summary(self) -> Dict[str, Any]:
@@ -645,6 +852,12 @@ class EntryCoordinator:
             selected,
             exit_captured_at=exit_key[1],
         )
+        if self._durability_store is not None:
+            self._durability_store.save_finalized_journey(
+                self._durability_finalized_record(
+                    self._finalized_journeys[selected.decision_id]
+                )
+            )
         self._pending_exits.pop(exit_key, None)
         self._remember_applied_exit_locked(exit_key)
         closed_decision_ids = {selected.decision_id}
@@ -1888,6 +2101,7 @@ class EntryCoordinator:
                 # neither question can be answered from a decision status.
                 consensus = self._engine.plate_consensus(causal_group)
                 _observed = _best_observed_plate_read(crossing)
+                family = self._crossing_family_members_locked(crossing)
                 self._emit_decision_record(
                     stage="plate_consensus",
                     result=(
@@ -1904,6 +2118,7 @@ class EntryCoordinator:
                         "identity_key": group.identity_key,
                     },
                     plate=consensus.as_record(),
+                    ocr_advisory=self._engine.ocr_advisory(causal_group, family),
                     witnesses=[w.value for w in group.confirming_witnesses()],
                     observed_plate_text=_observed[0],
                     observed_plate_confidence=_observed[1],
@@ -1967,46 +2182,11 @@ class EntryCoordinator:
                 )
             )
         for members, family_row in zip(families, family_rows):
-            if self._family_has_reliable_ocr_conflict(members):
-                # Two producers reading DIFFERENT plates are evidence they are
-                # not reporting the same physical crossing after all, and
-                # pooling them would put two cars' embeddings in one row — the
-                # poisoning that makes every later match ambiguous. Keep the
-                # family pending for explicit correction/cancellation.
-                #
-                # This is the ONE use of a ramp camera's OCR that survives, and
-                # it is not plate evidence: the question is "are these two
-                # notifications the same event?", never "what is the plate?".
-                # It can withhold a row, but never name a car.
-                #
-                # Applies to BOTH roles now. It used to guard only CAM-03,
-                # because a conflicting CAM-23 read was caught by the primary
-                # OCR policy instead; that policy is gone, so the guard has to
-                # cover what it used to.
-                #
-                # Withholding is silent to PMS — the rows simply stay pending
-                # and are retried on the next event — so it MUST be recorded
-                # here, or a fail-closed refusal would leave no trace anywhere.
-                self._emit_decision_record(
-                    stage="producer_family",
-                    result=decision_record.RESULT_AMBIGUOUS,
-                    reason="producer_family_ocr_conflict",
-                    crossing=family_row,
-                    extra={
-                        "family": [
-                            member.request.crossing_id for member in members
-                        ],
-                        "observed_plate_texts": sorted(
-                            {
-                                item.text
-                                for member in members
-                                for item in member.plate_evidence
-                                if item.text
-                            }
-                        ),
-                    },
-                )
-                continue
+            # OCR may reveal that the two producers read different text, but
+            # it is advisory during this monitoring window. The existing
+            # topology, source-time, and strict ReID predicates still decide
+            # whether this is one producer family; raw reads are emitted with
+            # the eventual plate-consensus record for offline review.
             match = self._find_unique_match_with_observability_locked(
                 family_row,
                 self._groups,
@@ -2309,6 +2489,10 @@ class EntryCoordinator:
             self._groups.pop(group_id, None)
             for attempt_id in group.attempts:
                 self._attempts.pop(attempt_id, None)
+                if self._durability_store is not None:
+                    self._durability_store.mark_terminal(
+                        "attempt", attempt_id, "expired", "identity_ttl_expired"
+                    )
             self._emit_decision_record(
                 stage="ttl_expiry",
                 result=decision_record.RESULT_EXPIRED,
@@ -2330,6 +2514,10 @@ class EntryCoordinator:
             if age is None or age < observation_ttl:
                 continue
             self._crossings.pop(crossing_id, None)
+            if self._durability_store is not None:
+                self._durability_store.mark_terminal(
+                    "crossing", crossing_id, "expired", "observation_ttl_expired"
+                )
             self._emit_decision_record(
                 stage="ttl_expiry",
                 result=decision_record.RESULT_EXPIRED,
@@ -2545,30 +2733,6 @@ class EntryCoordinator:
             return False
         return True
 
-    def _family_has_reliable_ocr_conflict(
-        self,
-        members: Sequence[CrossingRecord],
-    ) -> bool:
-        """True when this producer family holds two reads of DIFFERENT cars.
-
-        Was `len({keys}) > 1`, i.e. any two distinct plate strings. Exact keys
-        treat a digits-first/letters-first swap and a hallucinated letter
-        prefix as disagreements, so this gate refused one real crossing
-        thirteen times on 2026-08-30 (`7383HAS` against `AATEIGH7383HAS`, both
-        above the confidence gate, one car). `plates_contradict` compares digit
-        runs instead, so only a genuine difference blocks the family.
-        """
-        reliable = [
-            item.text
-            for member in members
-            for item in member.plate_evidence
-            if item.key and item.confidence >= self.settings.ocr_min_confidence
-        ]
-        return any(
-            plates_contradict(left, right)
-            for left, right in itertools.combinations(reliable, 2)
-        )
-
     @staticmethod
     def _crossing_source(crossing: CrossingRecord) -> str:
         return EntryCoordinator._request_crossing_source(crossing.request)
@@ -2736,6 +2900,33 @@ class EntryCoordinator:
             capacity_freed = False
             for decision in current:
                 payload = decision.callback_payload(self.settings.mode)
+                if self._durability_store is not None:
+                    # Commit before network I/O. A restart can then retry this
+                    # exact idempotent payload instead of rematching evidence.
+                    with self._lock:
+                        resources = self._durability_resources_for_decision_locked(
+                            decision
+                        )
+                        identity = self._durability_identity_for_decision_locked(
+                            decision
+                        )
+                        candidate = self._finalized_journey_for_decision_locked(
+                            decision
+                        )
+                    self._durability_store.record_decision(
+                        resources,
+                        payload,
+                        identity,
+                        {
+                            "mode": self.settings.mode.value,
+                            "group_id": decision.group_id,
+                        },
+                        (
+                            self._durability_finalized_record(candidate)
+                            if candidate is not None
+                            else None
+                        ),
+                    )
                 logger.info(
                     "[EntryV2] decision=%s status=%s reason=%s attempt=%s "
                     "crossing=%s plate=%s reid=%.4f row_margin=%.4f "
@@ -2765,6 +2956,32 @@ class EntryCoordinator:
                     result.error,
                 )
                 delivered[decision.decision_id] = result.delivered
+                if self._durability_store is not None:
+                    finalized_record = None
+                    if result.delivered:
+                        with self._lock:
+                            if (
+                                decision.finalizes_group
+                                and self._should_remember_journey_locked(
+                                    decision, result
+                                )
+                            ):
+                                finalized = self._finalized_journey_for_decision_locked(
+                                    decision,
+                                    superseding_exit_at=result.superseding_exit_at,
+                                )
+                                finalized_record = (
+                                    self._durability_finalized_record(finalized)
+                                    if finalized is not None
+                                    else None
+                                )
+                    self._durability_store.mark_callback(
+                        decision.decision_id,
+                        result.delivered,
+                        result.error,
+                        result.retryable,
+                        finalized_record,
+                    )
                 with self._lock:
                     self._callback_reservations.pop(decision.decision_id, None)
                     if decision.finalizes_group and not result.delivered:
@@ -2974,6 +3191,10 @@ class EntryCoordinator:
                 if remember_journey
                 else None
             )
+            if finalized is not None and self._durability_store is not None:
+                self._durability_store.save_finalized_journey(
+                    self._durability_finalized_record(finalized)
+                )
             for crossing_id, crossing in list(self._crossings.items()):
                 assigned_to_decision = crossing_id == decision.crossing_id or (
                     crossing.status == RecordStatus.RESOLVED
@@ -2994,6 +3215,13 @@ class EntryCoordinator:
                 )
                 if assigned_to_decision or finalized_match_kind is not None:
                     self._crossings.pop(crossing_id, None)
+                    if self._durability_store is not None:
+                        self._durability_store.mark_terminal(
+                            "crossing",
+                            crossing_id,
+                            "resolved",
+                            "finalized_journey_consumed",
+                        )
                     if finalized_match_kind == "provisional":
                         crossing.matched_group_id = None
                         self._provisional_crossings[crossing_id] = (
@@ -3015,6 +3243,88 @@ class EntryCoordinator:
                     self._attempts.pop(attempt_id, None)
             self._trim_receipts_locked()
 
+    def _restore_durable_journeys(self) -> None:
+        if self._durability_store is None or self._durability_journeys_restored:
+            return
+        with self._lock:
+            for record in self._durability_store.finalized_journeys():
+                if record.get("lifecycle") == "closed_without_exit_timestamp":
+                    continue
+                finalized = self._durability_finalized_journey_from_record(record)
+                self._finalized_journeys[finalized.decision_id] = finalized
+                if finalized.exit_captured_at is None:
+                    identity = self._durability_store.identity_for_decision(
+                        finalized.decision_id
+                    )
+                    callback = self._durability_store.callback_for_decision(
+                        finalized.decision_id
+                    )
+                    # A local lack of exit is never proof of an open PMS
+                    # session after VA downtime. Revalidate the exact durable
+                    # callback; PMS owns the idempotent session verdict.
+                    result = self._deliver(callback) if callback is not None else None
+                    if (
+                        identity is not None
+                        and result is not None
+                        and result.delivered
+                        and result.publish_identity
+                    ):
+                        self._identity_publisher.publish(
+                            self._durable_identity_from_record(identity)
+                        )
+                    elif result is not None and result.delivered:
+                        # PMS says the original session is no longer open. Do
+                        # not manufacture an exit time or preserve an open
+                        # local journey that would block a genuine re-entry.
+                        self._finalized_journeys.pop(finalized.decision_id, None)
+                        self._durability_store.close_finalized_journey(
+                            finalized.decision_id,
+                            result.ack_result or "pms_session_not_open",
+                        )
+            self._durability_journeys_restored = True
+
+    @staticmethod
+    def _durability_finalized_journey_from_record(
+        record: Dict[str, Any],
+    ) -> _FinalizedJourney:
+        return _FinalizedJourney(
+            decision_id=record["decision_id"],
+            group_id=record["group_id"],
+            decision_status=record["decision_status"],
+            canonical_plate_key=record["canonical_plate_key"],
+            first_attempt_at=datetime.fromisoformat(record["first_attempt_at"]),
+            entry_captured_at=datetime.fromisoformat(record["entry_captured_at"]),
+            crossing_role=CrossingRole(record["crossing_role"]),
+            crossing_camera_id=record["crossing_camera_id"],
+            crossing_source=record["crossing_source"],
+            embeddings=tuple(tuple(row) for row in record["embeddings"]),
+            exit_captured_at=(
+                datetime.fromisoformat(record["exit_captured_at"])
+                if record["exit_captured_at"]
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _durability_finalized_record(finalized: _FinalizedJourney) -> Dict[str, Any]:
+        return {
+            "decision_id": finalized.decision_id,
+            "group_id": finalized.group_id,
+            "decision_status": finalized.decision_status,
+            "canonical_plate_key": finalized.canonical_plate_key,
+            "first_attempt_at": finalized.first_attempt_at.isoformat(),
+            "entry_captured_at": finalized.entry_captured_at.isoformat(),
+            "crossing_role": finalized.crossing_role.value,
+            "crossing_camera_id": finalized.crossing_camera_id,
+            "crossing_source": finalized.crossing_source,
+            "embeddings": [list(row) for row in finalized.embeddings],
+            "exit_captured_at": (
+                finalized.exit_captured_at.isoformat()
+                if finalized.exit_captured_at is not None
+                else None
+            ),
+        }
+
     def _remember_finalized_journey_locked(
         self,
         decision: EntryDecision,
@@ -3027,28 +3337,39 @@ class EntryCoordinator:
         ordering distinguishes an old notification from a later genuine
         journey by the same (or visually similar) vehicle.
         """
+        finalized = self._finalized_journey_for_decision_locked(
+            decision,
+            superseding_exit_at=superseding_exit_at,
+        )
+        if finalized is None:
+            return None
+        canonical_key = finalized.canonical_plate_key
+        if superseding_exit_at is not None:
+            self._pending_exits.pop((canonical_key, superseding_exit_at), None)
+            self._remember_applied_exit_locked((canonical_key, superseding_exit_at))
+        self._finalized_journeys[decision.decision_id] = finalized
+        self._finalized_journeys.move_to_end(decision.decision_id)
+        self._trim_finalized_journeys_locked()
+        return finalized
+
+    def _finalized_journey_for_decision_locked(
+        self,
+        decision: EntryDecision,
+        *,
+        superseding_exit_at: Optional[datetime] = None,
+    ) -> Optional[_FinalizedJourney]:
+        """Serialize a journey candidate without mutating live lifecycle state."""
         group = self._groups.get(decision.group_id)
         crossing = self._crossings.get(decision.crossing_id)
         if group is None or crossing is None or not group.attempts:
             return None
-
         selected_attempt = group.attempts.get(decision.attempt_id)
         if selected_attempt is None:
             return None
         embeddings = tuple(selected_attempt.embeddings) + tuple(crossing.embeddings)
         if not embeddings:
             return None
-
         canonical_key = plate_key(decision.canonical_plate or "")
-        if superseding_exit_at is not None:
-            exit_captured_at = superseding_exit_at
-            self._pending_exits.pop((canonical_key, exit_captured_at), None)
-            self._remember_applied_exit_locked((canonical_key, exit_captured_at))
-        else:
-            # A retained boundary is assigned only after every already-reserved
-            # same-plate callback settles. Otherwise sequential callback order
-            # can close an older journey before a newer eligible one finalizes.
-            exit_captured_at = None
         finalized = _FinalizedJourney(
             decision_id=decision.decision_id,
             group_id=decision.group_id,
@@ -3062,11 +3383,8 @@ class EntryCoordinator:
             crossing_camera_id=crossing.request.camera_id,
             crossing_source=self._crossing_source(crossing),
             embeddings=embeddings,
-            exit_captured_at=exit_captured_at,
+            exit_captured_at=superseding_exit_at,
         )
-        self._finalized_journeys[decision.decision_id] = finalized
-        self._finalized_journeys.move_to_end(decision.decision_id)
-        self._trim_finalized_journeys_locked()
         return finalized
 
     def _find_finalized_journey_locked(
@@ -3394,6 +3712,120 @@ class EntryCoordinator:
                 replace(result, **updates),
             )
             self._receipts.move_to_end(key)
+
+    def _durability_resources_for_decision_locked(
+        self,
+        decision: EntryDecision,
+    ) -> tuple[Tuple[str, str], ...]:
+        """Mirror every receipt the decision reconciliation will consume."""
+        resources = {
+            ("crossing", crossing_id)
+            for crossing_id, crossing in self._crossings.items()
+            if crossing_id == decision.crossing_id
+            or (
+                crossing.status == RecordStatus.RESOLVED
+                and crossing.matched_group_id == decision.group_id
+            )
+        }
+        resources.add(("crossing", decision.crossing_id))
+        group = self._groups.get(decision.group_id)
+        if group is not None:
+            resources.update(("attempt", attempt_id) for attempt_id in group.attempts)
+        return tuple(sorted(resources))
+
+    def _durability_identity_for_decision_locked(
+        self,
+        decision: EntryDecision,
+    ) -> Optional[Dict[str, Any]]:
+        if (
+            self.settings.mode != EntryMode.AUTHORITATIVE
+            or decision.status != DecisionStatus.CONFIRMED
+        ):
+            return None
+        identity = self._validated_identity(decision)
+        proof = identity.gallery_authorization
+        return {
+            "decision_id": identity.decision_id,
+            "canonical_plate": identity.canonical_plate,
+            "attempt_id": identity.attempt_id,
+            "crossing_id": identity.crossing_id,
+            "entered_at": identity.entered_at.isoformat(),
+            "crossing_camera_id": identity.crossing_camera_id,
+            "crossing_embeddings": [list(row) for row in identity.crossing_embeddings],
+            "attempt_embeddings": [
+                [camera_id, list(row)] for camera_id, row in identity.attempt_embeddings
+            ],
+            "gallery_authorization": (
+                {
+                    "authorized": proof.authorized,
+                    "reason": proof.reason,
+                    "decision_id": proof.decision_id,
+                    "authorization_path": proof.authorization_path,
+                    "canonical_plate": proof.canonical_plate,
+                    "crossing_id": proof.crossing_id,
+                    "crossing_camera_id": proof.crossing_camera_id,
+                    "crossing_role": proof.crossing_role.value,
+                    "reported_plate": proof.reported_plate,
+                    "reported_confidence": proof.reported_confidence,
+                    "reid_score": proof.reid_score,
+                    "reid_row_margin": proof.reid_row_margin,
+                    "reid_column_margin": proof.reid_column_margin,
+                    "ocr_source": proof.ocr_source,
+                    "ocr_text": proof.ocr_text,
+                    "ocr_confidence": proof.ocr_confidence,
+                    "ocr_evidence_ids": list(proof.ocr_evidence_ids),
+                    "corrected": proof.corrected,
+                    "requires_parked_ocr": proof.requires_parked_ocr,
+                }
+                if proof is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _durable_identity_from_record(record: Dict[str, Any]) -> ValidatedIdentity:
+        proof_record = record.get("gallery_authorization")
+        proof = (
+            GalleryAuthorizationProof(
+                authorized=proof_record["authorized"],
+                reason=proof_record["reason"],
+                decision_id=proof_record["decision_id"],
+                authorization_path=proof_record["authorization_path"],
+                canonical_plate=proof_record["canonical_plate"],
+                crossing_id=proof_record["crossing_id"],
+                crossing_camera_id=proof_record["crossing_camera_id"],
+                crossing_role=CrossingRole(proof_record["crossing_role"]),
+                reported_plate=proof_record["reported_plate"],
+                reported_confidence=proof_record["reported_confidence"],
+                reid_score=proof_record["reid_score"],
+                reid_row_margin=proof_record["reid_row_margin"],
+                reid_column_margin=proof_record["reid_column_margin"],
+                ocr_source=proof_record["ocr_source"],
+                ocr_text=proof_record["ocr_text"],
+                ocr_confidence=proof_record["ocr_confidence"],
+                ocr_evidence_ids=tuple(proof_record["ocr_evidence_ids"]),
+                corrected=proof_record["corrected"],
+                requires_parked_ocr=proof_record["requires_parked_ocr"],
+            )
+            if proof_record is not None
+            else None
+        )
+        return ValidatedIdentity(
+            decision_id=record["decision_id"],
+            canonical_plate=record["canonical_plate"],
+            attempt_id=record["attempt_id"],
+            crossing_id=record["crossing_id"],
+            entered_at=datetime.fromisoformat(record["entered_at"]),
+            crossing_camera_id=record["crossing_camera_id"],
+            crossing_embeddings=tuple(
+                tuple(row) for row in record["crossing_embeddings"]
+            ),
+            attempt_embeddings=tuple(
+                (camera_id, tuple(row))
+                for camera_id, row in record["attempt_embeddings"]
+            ),
+            gallery_authorization=proof,
+        )
 
     def _reconcile_quarantined_crossing_locked(
         self,

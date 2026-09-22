@@ -2,8 +2,9 @@
 
 The camera webhooks still terminate at PMS-AI.  This module consumes only the
 vehicle detections that VA already produces from RTSP frames and submits a
-metadata-plus-crop crossing to the shared :class:`EntryCoordinator`.  Images
-remain in memory and are released after inference; nothing is written here.
+metadata-plus-crop crossing to the shared :class:`EntryCoordinator`. Images
+remain in memory unless the opt-in durability journal accepts a completed,
+validated local visit before the bounded worker queue takes it.
 """
 
 from __future__ import annotations
@@ -31,11 +32,10 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 VA_HOST_GRAB_TIMESTAMP_SOURCE = "va_host_grab"
 VA_HOST_DIRECT_READ_TIMESTAMP_SOURCE = "va_host_direct_read"
 
-# Zone crops are RAM-only by contract, and a visit that never reaches the
-# coordinator (tracker_loss, ambiguity, queue saturation) is freed without ever
-# passing through the analyzer — so nothing lands in entry_plate_crops and there
-# is no artefact to inspect. That makes "did we actually capture the car?"
-# unanswerable from disk, which is exactly what field calibration needs.
+# Zone crops are RAM-only until a completed, validated visit reaches the
+# coordinator. With durability disabled, a queue-saturated visit is still
+# released without persistence. With it enabled, exact selected crops are kept
+# in the local journal so saturation and restart do not lose that evidence.
 #
 # Setting ENTRY_V2_LOCAL_CAPTURE_DEBUG_DIR writes the entry frame as it was
 # captured, before any submission decision. Deliberately OFF by default: this
@@ -666,6 +666,12 @@ class LocalZoneCrossingBridge:
                 visit,
             )
 
+        duplicate = self._coordinator.admit_local_crossing(
+            visit.prepared_request, visit.prepared_images
+        )
+        if duplicate is not None:
+            self._increment("submissions_completed")
+            return True
         if not self._queue(
             visit.prepared_request,
             visit.prepared_images,
@@ -951,6 +957,9 @@ class LocalZoneCrossingBridge:
         if self._closed:
             return False
         if not self._capacity.acquire(blocking=False):
+            if self._coordinator.durability_store is not None:
+                self._increment("submissions_capacity_rejected")
+                return True
             self._mark_capacity_rejected(request)
             return False
         self._clear_capacity_saturation(request)
@@ -1034,10 +1043,21 @@ class LocalZoneCrossingBridge:
                 images,
                 retry_attempt=retry_attempt + 1,
             )
-        # Keep the completed future visible until any retry has been installed;
-        # otherwise wait_for_idle could observe a false empty gap between them.
+        # Install any persisted successor before exposing an empty worker set;
+        # otherwise controlled shutdown could race the durable drain.
+        self._drain_durable_queue()
         with self._lock:
             self._futures.discard(future)
+
+    def _drain_durable_queue(self) -> None:
+        """Submit one on-disk local crossing after a worker slot is released."""
+        store = self._coordinator.durability_store
+        if store is None or self._closed:
+            return
+        for request, images in store.pending_local_crossings():
+            if self._coordinator.claim_persisted_local_crossing(request):
+                self._queue(request, images, retry_attempt=0)
+                return
 
     def metrics(self) -> Dict[str, object]:
         with self._lock:

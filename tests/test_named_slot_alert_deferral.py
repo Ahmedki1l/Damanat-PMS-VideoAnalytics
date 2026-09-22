@@ -69,10 +69,10 @@ class TestNamedSlotAlertDeferral(unittest.TestCase):
         report = _log(_slot("GENERAL"), plate="")
         report.assert_called_once()
 
-    def test_special_needs_still_alerts_immediately(self):
-        """Special-needs is a violation regardless of identity — unchanged."""
+    def test_special_needs_occupancy_stays_silent(self):
+        """Special-needs bays retain occupancy without entering alert handling."""
         report = _log(_slot("SPECIAL"), plate="")
-        report.assert_called_once()
+        report.assert_not_called()
 
     def test_vacate_still_resolves_on_a_named_slot(self):
         """Deferring the raise must not stop the alert being resolved on exit."""

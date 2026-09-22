@@ -224,13 +224,8 @@ def test_b13_coo_stranger_parks_raises_intrusion(monkeypatch):
     assert B13 not in engine._pending_ownership()
 
 
-def test_b13_coo_identity_never_lands_falls_back_to_unidentified(monkeypatch):
-    """CAM-08 films B13 at a shallow angle and the plate often never reads.
-
-    docs/SLOT_IDENTITY_FINDINGS lists B13_COO under "plate not in frame". If the
-    verdict simply waited forever, this slot would have no coverage at all — so
-    the deadline converts silence into a lower-severity, honestly-worded alert.
-    """
+def test_b13_coo_identity_pending_has_no_deadline(monkeypatch):
+    """Elapsed time must not turn pending identification into intrusion."""
     temp_dir = _make_repo_temp_dir()
     monkeypatch.chdir(temp_dir)
     engine = _b13_engine(None, identity_timeout_s=300.0)
@@ -242,10 +237,11 @@ def test_b13_coo_identity_never_lands_falls_back_to_unidentified(monkeypatch):
     detection = SimpleNamespace(bbox=[420, 0, 570, 60])
     assignment = SimpleNamespace(slot_vehicle_map={B13: (4473, detection)})
     frame = np.full((360, 640, 3), 90, dtype=np.uint8)
+    monkeypatch.setattr(engine_runtime_module.time, "time", lambda: 1000.0)
     engine._filter_violation_events(
         frame, assignment, B13_CAM, [_parked_event(B13, 4473)]
     )
-    parked_at = engine._pending_ownership()[B13]["since"]
+    parked_at = 1000.0
 
     # OCR keeps failing. Frames keep arriving; the sweep runs on each one.
     for elapsed in (30, 120, 299):
@@ -253,12 +249,12 @@ def test_b13_coo_identity_never_lands_falls_back_to_unidentified(monkeypatch):
     assert raised == [], "must not alert while identity may still land"
 
     engine._sweep_pending_ownership(parked_at + 301)
-    assert raised == [(B13, "reserved_slot_unidentified", None, "warning")]
+    assert raised == []
 
-    # The sweep runs every frame for as long as the car stays — one alert only.
+    # Even long waits never imply that identification has completed.
     for elapsed in (400, 900, 3600):
         engine._sweep_pending_ownership(parked_at + elapsed)
-    assert len(raised) == 1
+    assert raised == []
 
 
 def test_b13_coo_blank_vehicle_title_flags_the_owner(monkeypatch):
@@ -366,36 +362,19 @@ def test_named_slot_non_owner_raises_intrusion(monkeypatch):
     assert "B3_CEO" not in engine._pending_ownership()
 
 
-def test_unidentified_named_slot_alerts_after_timeout(monkeypatch):
-    """B1_CRO has OCR disabled and appearance routinely abstains, so identity may
-    never land. Without the sweep that slot would have zero intrusion coverage."""
-    temp_dir = _make_repo_temp_dir()
-    monkeypatch.chdir(temp_dir)
-    engine = DummyEngine(reserved_for={"B1_CRO": "CRO"}, identity_timeout_s=300.0)
-    engine.pipelines["CAM_21"] = SimpleNamespace(
-        state_machines={"B1_CRO": SimpleNamespace(is_violation_zone=False)},
-        slots=[SimpleNamespace(id="B1_CRO", label="B1", zone_id="B", zone_name="B")],
-        floor="B1",
-    )
-    engine._register_pending_ownership("B1_CRO", "CAM_21", None, 1000.0)
-
-    raised = []
-    engine._raise_named_slot_alert = lambda slot_id, entry, alert_type, **k: raised.append(
-        (slot_id, alert_type)
-    )
-
-    engine._sweep_pending_ownership(1000.0 + 299.0)
-    assert raised == []  # still inside the deadline
-
-    engine._sweep_pending_ownership(1000.0 + 301.0)
-    assert raised == [("B1_CRO", "reserved_slot_unidentified")]
-
-    # Latched: the sweep runs every frame and must not re-alert.
-    engine._sweep_pending_ownership(1000.0 + 900.0)
-    assert len(raised) == 1
+def test_completed_identification_failure_raises_plateless_critical_once():
+    engine = _identity_engine()
+    engine._mark_slot_ocr_exhausted("B1_CRO")
+    engine._sweep_pending_ownership(1001.0)
+    assert [(e.event_type, e.plate_number, e.severity) for e in engine.emitted] == [
+        ("vehicle_intrusion", "", "critical")]
+    assert engine.pipelines["CAM_21"].state_machines["B1_CRO"].state == engine_runtime_module.SlotState.OCCUPIED
+    engine._sweep_pending_ownership(900000.0)
+    assert len(engine.emitted) == 1
+    assert not engine._pending_ownership()
 
 
-def test_timeout_fallback_can_be_disabled(monkeypatch):
+def test_legacy_timeout_does_not_control_identification(monkeypatch):
     temp_dir = _make_repo_temp_dir()
     monkeypatch.chdir(temp_dir)
     engine = DummyEngine(reserved_for={"B1_CRO": "CRO"}, identity_timeout_s=0.0)
@@ -425,9 +404,8 @@ def test_vacating_clears_pending_verdict(monkeypatch):
     assert raised == []
 
 
-def test_special_needs_slot_still_alerts_immediately(monkeypatch):
-    """Special-needs and violation zones do NOT depend on identity, so they must
-    keep deciding at park time rather than being dragged into the deferral."""
+def test_special_needs_slot_remains_a_plain_occupancy_with_or_without_identity(monkeypatch):
+    """Special-needs status has precedence over identity and zone alert rules."""
     temp_dir = _make_repo_temp_dir()
     monkeypatch.chdir(temp_dir)
     engine = DummyEngine(special={"G1"})
@@ -440,12 +418,20 @@ def test_special_needs_slot_still_alerts_immediately(monkeypatch):
     assignment = SimpleNamespace(slot_vehicle_map={"G1": (7, detection)})
     frame = np.full((120, 120, 3), 255, dtype=np.uint8)
 
-    result = engine._filter_violation_events(
+    unknown_identity = engine._filter_violation_events(
         frame, assignment, "CAM_01", [_parked_event("G1", 7)]
     )
+    known_identity = _parked_event("G1", 8)
+    known_identity.plate_number = "ABC-123"
+    known_identity = engine._filter_violation_events(
+        frame, assignment, "CAM_01", [known_identity]
+    )
 
-    assert result[0].event_type == "special_needs_violation"
-    assert result[0].is_alert is True
+    for event in unknown_identity + known_identity:
+        assert event.event_type == "vehicle_parked"
+        assert event.is_alert is False
+        assert event.severity == "info"
+        assert event.snapshot_path == ""
     assert "G1" not in engine._pending_ownership()
 
 
@@ -694,3 +680,254 @@ def test_report_alert_falls_back_to_slot_snapshot_when_dedicated_snapshot_missin
         alert = alert_service.report_alert(fake_db, "Violation_1", snapshot_path=None)
 
     assert alert.snapshot_path == "slot_Violation_1_latest.jpg"
+
+
+def _identity_engine(*, retries=False):
+    engine = DummyEngine(reserved_for={"B1_CRO": "CRO"})
+    engine.emitted = []
+    engine.event_bus = SimpleNamespace(emit_batch=engine.emitted.extend)
+    engine._save_alert_snapshot = lambda *a, **k: ""
+    state = SimpleNamespace(state=engine_runtime_module.SlotState.OCCUPIED,
+                            plate_number=None, is_violation_zone=False)
+    engine.pipelines["CAM_21"] = SimpleNamespace(
+        state_machines={"B1_CRO": state}, slots=[], floor="B1")
+    engine.vehicle_registry = SimpleNamespace(
+        matching_config=SimpleNamespace(slot_reid_solo_enabled=retries,
+            slot_reid_retry_interval_s=60, slot_ocr_async=False,
+            slot_no_plate_view=[], slot_ocr_min_gap_s=0),
+        get_slot_plate=lambda slot: None,
+        plan_slot_ocr=lambda *a, **k: SimpleNamespace(allow_retry=False, decision_ctx={}),
+        read_slot_plate=lambda *a, **k: ("", 0),
+        confirm_slot_ocr=lambda *a: None,
+    )
+    engine._arm_ocr_for_slot("B1_CRO")
+    engine._register_pending_ownership("B1_CRO", "CAM_21", None, 1000)
+    return engine
+
+
+def test_exhausted_ocr_with_continuing_reid_stays_pending():
+    engine = _identity_engine(retries=True)
+    engine._mark_slot_ocr_exhausted("B1_CRO")
+    engine._sweep_pending_ownership(10**12)
+    assert engine.emitted == []
+    assert "B1_CRO" in engine._pending_ownership()
+
+
+def test_final_sync_read_not_submission_exhausts_identification():
+    engine = _identity_engine()
+    engine._ocr_id_attempts["B1_CRO"] = engine._OCR_ID_MAX_ATTEMPTS - 1
+    engine._sweep_pending_ownership(10**12)
+    assert engine.emitted == []
+    engine._try_ocr_identify("CAM_21", np.zeros((20,20,3), dtype=np.uint8),
+        SimpleNamespace(id="B1_CRO"), engine.pipelines["CAM_21"].state_machines["B1_CRO"],
+        SimpleNamespace(bbox=(1,1,10,10)))
+    engine._sweep_pending_ownership(1000)
+    assert [(e.event_type, e.plate_number, e.severity) for e in engine.emitted] == [
+        ("vehicle_intrusion", "", "critical")]
+
+
+def _final_result(engine, token=None):
+    slot = "B1_CRO"
+    return SimpleNamespace(job=SimpleNamespace(slot_id=slot, cam_id="CAM_21",
+        token=engine._ocr_generation[slot] if token is None else token,
+        attempts=engine._OCR_ID_MAX_ATTEMPTS, crop=np.zeros((8,8,3), dtype=np.uint8),
+        plan=SimpleNamespace(decision_ctx={})), text="", conf=0)
+
+
+def test_final_async_result_settles_failure_only_after_foldback():
+    engine = _identity_engine()
+    engine._ocr_id_attempts["B1_CRO"] = engine._OCR_ID_MAX_ATTEMPTS
+    engine._sweep_pending_ownership(10**12)
+    assert engine.emitted == []
+    engine._apply_async_ocr_result(_final_result(engine))
+    engine._sweep_pending_ownership(1000)
+    assert [(e.event_type, e.plate_number, e.severity) for e in engine.emitted] == [
+        ("vehicle_intrusion", "", "critical")]
+
+
+def test_stale_failure_cannot_alert_for_departed_or_replacement_car():
+    engine = _identity_engine()
+    result = _final_result(engine)
+    engine._clear_pending_ownership("B1_CRO")
+    engine._ocr_armed.pop("B1_CRO")
+    engine._apply_async_ocr_result(result)
+    engine._sweep_pending_ownership(1000)
+    assert engine.emitted == []
+    engine._arm_ocr_for_slot("B1_CRO")
+    engine._register_pending_ownership("B1_CRO", "CAM_21", None, 2000)
+    engine._apply_async_ocr_result(result)
+    engine._sweep_pending_ownership(10**12)
+    assert engine.emitted == []
+    assert "B1_CRO" in engine._pending_ownership()
+
+
+def test_rejected_async_submission_does_not_spend_identification_budget():
+    engine = _identity_engine()
+    engine.vehicle_registry.matching_config.slot_ocr_async = True
+    engine._ocr_worker = SimpleNamespace(pending_or_inflight=lambda _: False,
+                                        submit=lambda job: False)
+    engine._ocr_id_attempts["B1_CRO"] = engine._OCR_ID_MAX_ATTEMPTS - 1
+    # Load the real lightweight job module without importing the YOLO engine package.
+    spec = importlib.util.spec_from_file_location("test_slot_ocr_jobs",
+        Path(engine_runtime_module.__file__).with_name("async_slot_ocr.py"))
+    jobs = importlib.util.module_from_spec(spec)
+    with patch.dict(sys.modules, {"test_slot_ocr_jobs": jobs,
+                                 "src.core.engine.async_slot_ocr": jobs}):
+        spec.loader.exec_module(jobs)
+        engine._try_ocr_identify("CAM_21", np.zeros((20,20,3), dtype=np.uint8),
+            SimpleNamespace(id="B1_CRO"), engine.pipelines["CAM_21"].state_machines["B1_CRO"],
+            SimpleNamespace(bbox=(1,1,10,10)))
+    engine._sweep_pending_ownership(10**12)
+    assert engine._ocr_id_attempts["B1_CRO"] == engine._OCR_ID_MAX_ATTEMPTS - 1
+    assert engine.emitted == []
+
+
+def test_immediate_intrusion_is_critical():
+    engine = _identity_engine()
+    engine._is_named_slot_vehicle_allowed = lambda *a: False
+    event = _parked_event("B1_CRO", 1)
+    event.plate_number = "OTHER-123"
+    result = engine._filter_violation_events(np.zeros((20,20,3), dtype=np.uint8),
+        SimpleNamespace(slot_vehicle_map={}), "CAM_21", [event])
+    assert [(e.event_type, e.plate_number, e.severity) for e in result] == [
+        ("vehicle_intrusion", "OTHER-123", "critical")]
+
+
+def test_no_plate_view_is_pending_with_retries_and_terminal_without_them():
+    for retries in (False, True):
+        engine = _identity_engine(retries=retries)
+        engine.vehicle_registry.matching_config.slot_no_plate_view = ["B1_CRO"]
+        # An enabled retry is paced, not finished, on this frame.
+        engine._reid_retry_last_at["B1_CRO"] = 10**12
+        engine._try_ocr_identify("CAM_21", np.zeros((20,20,3), dtype=np.uint8),
+            SimpleNamespace(id="B1_CRO"), engine.pipelines["CAM_21"].state_machines["B1_CRO"],
+            SimpleNamespace(bbox=(1,1,10,10)))
+        engine._sweep_pending_ownership(10**12)
+        assert len(engine.emitted) == (0 if retries else 1)
+        if not retries:
+            assert engine.emitted[0].event_type == "vehicle_intrusion"
+            assert engine.emitted[0].plate_number == ""
+            assert engine.emitted[0].severity == "critical"
+
+
+def test_unavailable_ocr_plan_does_not_consume_attempt_or_declare_failure():
+    engine = _identity_engine()
+    engine.vehicle_registry.plan_slot_ocr = lambda *a, **k: None
+    engine._ocr_id_attempts["B1_CRO"] = engine._OCR_ID_MAX_ATTEMPTS - 1
+    engine._try_ocr_identify("CAM_21", np.zeros((20,20,3), dtype=np.uint8),
+        SimpleNamespace(id="B1_CRO"), engine.pipelines["CAM_21"].state_machines["B1_CRO"],
+        SimpleNamespace(bbox=(1,1,10,10)))
+    engine._sweep_pending_ownership(10**12)
+    assert engine._ocr_id_attempts["B1_CRO"] == engine._OCR_ID_MAX_ATTEMPTS - 1
+    assert engine.emitted == []
+
+
+def test_final_async_identification_owner_does_not_emit_failure():
+    engine = _identity_engine()
+    engine.vehicle_registry.confirm_slot_ocr = lambda *a: "OWNER-123"
+    engine.vehicle_registry.build_parked_reference_proof = lambda *a: None
+    engine.vehicle_registry.bind_plate_to_slot = lambda *a, **k: None
+    engine.vehicle_registry.save_parked_reference = lambda *a, **k: True
+    engine._is_named_slot_vehicle_allowed = lambda *a: True
+    state = engine.pipelines["CAM_21"].state_machines["B1_CRO"]
+    state.bind_identity = lambda plate, *a, **k: setattr(state, "plate_number", plate)
+    engine._apply_async_ocr_result(_final_result(engine))
+    engine._sweep_pending_ownership(10**12)
+    assert state.plate_number == "OWNER-123"
+    assert engine.emitted == []
+    assert not engine._pending_ownership()
+
+
+def test_vacancy_event_clears_pending_and_exhaustion_before_failure_alert():
+    engine = _identity_engine()
+    engine._mark_slot_ocr_exhausted("B1_CRO")
+    engine.vehicle_registry = None
+    pipeline = engine.pipelines["CAM_21"]
+    state = pipeline.state_machines["B1_CRO"]
+    event = SlotEvent(event_type="slot_vacant", slot_id="B1_CRO", track_id=None,
+                      timestamp="2026-09-20T12:00:00")
+    def vacate(**kwargs):
+        state.state = engine_runtime_module.SlotState.VACANT
+        return [event]
+    state.update = vacate
+    pipeline.slots = [SimpleNamespace(id="B1_CRO", label="CRO", zone_id="B1", zone_name="B1")]
+    engine._log_slot_hold = lambda *a: None
+    engine._trace_occupancy_frame = lambda *a: None
+    events, _ = engine._update_slot_occupancy("CAM_21", None, pipeline,
+        SimpleNamespace(slot_vehicle_map={}))
+    engine._sweep_pending_ownership(10**12)
+    assert events == [event]
+    assert state.state == engine_runtime_module.SlotState.VACANT
+    assert not engine._pending_ownership()
+    assert not engine._slot_ocr_exhausted
+    assert engine.emitted == []
+
+
+def test_legacy_deadline_setting_is_ignored_by_config_loader(tmp_path):
+    from src.config import load_config
+    path = tmp_path / "alerts.yaml"
+    path.write_text("alerts:\n  reserved_slot_identity_timeout_s: 0.001\n")
+    config = load_config(str(path))
+    assert not hasattr(config.alerts, "reserved_slot_identity_timeout_s")
+
+
+def test_restart_restores_pending_named_slot_check_for_existing_occupancy():
+    for plate in (None, "OWNER-123", "OTHER-123"):
+        engine = _identity_engine()
+        engine._clear_pending_ownership("B1_CRO")
+        pipeline = engine.pipelines.pop("CAM_21")
+        pipeline.slot_count = 1
+        pipeline.slots = [SimpleNamespace(id="B1_CRO", label="CRO", zone_id="B1", zone_name="B1")]
+        engine._build_camera_pipeline = lambda *a: (pipeline, pipeline.slots)
+        engine._free_plates_on_disabled_cameras = lambda: None
+        assert engine._initialize_camera_pipelines([SimpleNamespace(id="CAM_21")]) == 1
+        assert "B1_CRO" in engine._pending_ownership()
+        engine._is_named_slot_vehicle_allowed = lambda candidate, title: candidate == "OWNER-123"
+        if plate:
+            engine._evaluate_named_slot_ownership("B1_CRO", "CAM_21", plate)
+        else:
+            engine._mark_slot_ocr_exhausted("B1_CRO")
+            engine._sweep_pending_ownership(1000)
+        assert not engine._pending_ownership()
+        assert len(engine.emitted) == (0 if plate == "OWNER-123" else 1)
+        if engine.emitted:
+            assert engine.emitted[0].event_type == "vehicle_intrusion"
+            assert engine.emitted[0].severity == "critical"
+            assert engine.emitted[0].plate_number == (plate or "")
+
+
+def test_unverified_restored_plate_cannot_authorize_completed_failure():
+    engine = _identity_engine()
+    engine._restored_plate_slots = {"B1_CRO"}
+    engine.pipelines["CAM_21"].state_machines["B1_CRO"].plate_number = "STALE-123"
+    engine._is_named_slot_vehicle_allowed = lambda *a: True
+    engine._mark_slot_ocr_exhausted("B1_CRO")
+    engine._sweep_pending_ownership(1000)
+    assert [(e.event_type, e.plate_number, e.severity) for e in engine.emitted] == [
+        ("vehicle_intrusion", "", "critical")]
+
+
+def test_identity_disabled_camera_reaches_plateless_failure_without_waiting():
+    engine = _identity_engine(retries=True)
+    pipeline = engine.pipelines["CAM_21"]
+    pipeline.floor = "ground"
+    state = pipeline.state_machines["B1_CRO"]
+    slot = SimpleNamespace(id="B1_CRO")
+    engine._update_slot_identity("CAM_21", None, pipeline,
+        [(slot, state, True, 1, None, [], False)])
+    engine._sweep_pending_ownership(1000)
+    assert [(e.event_type, e.plate_number, e.severity) for e in engine.emitted] == [
+        ("vehicle_intrusion", "", "critical")]
+
+
+def test_live_registry_identity_settles_pending_even_with_retries_enabled():
+    for authorized in (True, False):
+        engine = _identity_engine(retries=True)
+        engine.vehicle_registry.get_slot_plate = lambda _: "LIVE-123"
+        engine._is_named_slot_vehicle_allowed = lambda *a: authorized
+        engine._sweep_pending_ownership(1000)
+        assert not engine._pending_ownership()
+        assert len(engine.emitted) == (0 if authorized else 1)
+        if engine.emitted:
+            assert engine.emitted[0].plate_number == "LIVE-123"
+            assert engine.emitted[0].severity == "critical"
