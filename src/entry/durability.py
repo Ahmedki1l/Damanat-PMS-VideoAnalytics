@@ -84,6 +84,21 @@ class EntryDurabilityStore:
         connection.execute("PRAGMA synchronous=FULL")
         return connection
 
+    def load_arrival_boundaries(self) -> dict[str, datetime]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT key, value FROM entry_journal_metadata WHERE key LIKE 'arrival_boundary:%'"
+            ).fetchall()
+        return {key.removeprefix("arrival_boundary:"): datetime.fromisoformat(value)
+                for key, value in rows}
+
+    def save_arrival_boundary(self, camera: str, captured_at: datetime) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO entry_journal_metadata(key, value) VALUES (?, ?)",
+                ("arrival_boundary:" + camera, captured_at.isoformat()),
+            )
+
     def close(self) -> None:
         lock_file = getattr(self, "_lock_file", None)
         if lock_file is None:

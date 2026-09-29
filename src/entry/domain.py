@@ -345,6 +345,7 @@ class AttemptGroup:
     # A MARKER ONLY: it never merges the identities, because letting appearance
     # override the plate key would put Re-ID back in charge of who a car is.
     correction_candidate_of: str = ""
+    retirement_reason: str = ""
     # What the BARRIER did for this car, as HikCentral reports it — allowResult
     # (1 allowed / 2 not allowed) and allowType (1 manual / 2 auto / 3 not
     # allowed), carried in from PMS-AI's probe. Empty whenever the probe could
