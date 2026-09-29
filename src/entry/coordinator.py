@@ -133,6 +133,7 @@ class _FinalizedJourney:
     crossing_source: str
     embeddings: Tuple[Tuple[float, ...], ...]
     exit_captured_at: Optional[datetime] = None
+    arrival_camera_ids: Tuple[str, ...] = ()
 
 
 class EntryCoordinator:
@@ -177,6 +178,10 @@ class EntryCoordinator:
         self._durability_store = durability_store
         if self._durability_store is not None:
             self._durability_store.bind_mode(settings.mode.value)
+        self._arrival_boundaries = (
+            self._durability_store.load_arrival_boundaries()
+            if self._durability_store is not None else {}
+        )
         self._durability_recovery_lock = threading.RLock()
         self._durably_admitted: set[Tuple[str, str]] = set()
         self._durability_journeys_restored = False
@@ -377,6 +382,8 @@ class EntryCoordinator:
                     delivered.get(reported.decision_id) if reported else None
                 ),
             )
+            if group.retirement_reason:
+                result = replace(result, accepted=False, receipt_status="expired")
             result = self._complete_request(key, fingerprint, result)
             self._durable_record_result("attempt", result)
             if blocking is not None:
@@ -1323,7 +1330,9 @@ class EntryCoordinator:
         # PLATE-KEYED find-or-create. The plate is the identity, so a second
         # ANPR read of the same plate enriches the live candidate instead of
         # creating a rival for it.
-        group = self._identity_for_plate_locked(identity_key, embeddings)
+        is_superseded = self._arrival_is_superseded(request)
+        group = (None if is_superseded else
+                 self._identity_for_plate_locked(identity_key, embeddings, request.camera_id))
         same_key_split = bool(
             group is None
             and identity_key
@@ -1347,13 +1356,15 @@ class EntryCoordinator:
                     self._engine.find_merge_group(embeddings, self._groups.values())
                     or ""
                 )
-            else:
+            elif not is_superseded:
                 # PLATELESS. There is no key to group by, so appearance is all
                 # there is — this is the dropped-ANPR recovery path, and the
                 # Re-ID merge gate is retained for exactly this case.
                 merged = self._engine.find_merge_group(
                     embeddings,
-                    [g for g in self._groups.values() if not g.identity_key],
+                    [g for g in self._groups.values() if not g.identity_key
+                     and all(norm_camera_id(a.request.camera_id) == norm_camera_id(request.camera_id)
+                             for a in g.attempts.values())],
                 )
                 if merged:
                     group = self._groups.get(merged)
@@ -1474,6 +1485,9 @@ class EntryCoordinator:
         # already confirmed. Enriching a live identity means find-or-create
         # already placed this attempt, and that identity's own confirmation
         # path owns the same-key question.
+        if is_superseded:
+            self._retire_older_arrival_locked(group)
+            return group
         if created and self._retire_late_same_key_arrival_locked(group):
             return group
         self._retire_provisional_crossings_before_attempt_locked(record)
@@ -1660,6 +1674,61 @@ class EntryCoordinator:
         if ocr_evidence_id:
             hypothesis.ocr_evidence_ids.add(ocr_evidence_id)
 
+    def _arrival_is_superseded(self, request: AttemptInput) -> bool:
+        boundary = self._arrival_boundaries.get(norm_camera_id(request.camera_id))
+        if boundary is None:
+            return False
+        try:
+            return request.captured_at < boundary
+        except TypeError:
+            return False
+
+    def _retire_older_arrival_locked(self, group: AttemptGroup) -> None:
+        group.retirement_reason = "superseded_by_newer_lane_arrival"
+        group.status = RecordStatus.RESOLVED
+        for attempt_id in group.attempts:
+            key = ("attempt", attempt_id)
+            receipt = self._receipts.get(key)
+            if receipt is not None:
+                self._receipts[key] = (receipt[0], replace(
+                    receipt[1], accepted=False, receipt_status="expired"
+                ))
+            if self._durability_store is not None:
+                self._durability_store.mark_terminal(
+                    "attempt", attempt_id, "expired", "superseded_by_newer_lane_arrival"
+                )
+        self._emit_decision_record(
+            stage="arrival_retirement",
+            result=decision_record.RESULT_EXPIRED,
+            reason="superseded_by_newer_lane_arrival",
+            identity={"group_id": group.group_id, "identity_key": group.identity_key,
+                      "attempt_ids": list(group.attempts)},
+        )
+
+    def _advance_arrival_boundaries_locked(self, confirmed: AttemptGroup) -> None:
+        # Use the earliest ANPR capture for this visit, never its ramp crossing
+        # or processing time: repeated gate reads must not move the visit later.
+        by_camera = {}
+        for attempt in confirmed.attempts.values():
+            request = attempt.request
+            camera = norm_camera_id(request.camera_id)
+            captured = request.captured_at
+            if camera not in by_camera or captured < by_camera[camera]:
+                by_camera[camera] = captured
+        for camera, captured in by_camera.items():
+            previous = self._arrival_boundaries.get(camera)
+            if previous is not None and captured <= previous:
+                continue
+            # Persist first so a crash cannot revive old pending work on replay.
+            if self._durability_store is not None:
+                self._durability_store.save_arrival_boundary(camera, captured)
+            self._arrival_boundaries[camera] = captured
+        for group in self._groups.values():
+            if (group.status == RecordStatus.PENDING and group.attempts
+                    and any(self._arrival_is_superseded(a.request)
+                            for a in group.attempts.values())):
+                self._retire_older_arrival_locked(group)
+
     def _retire_superseded_same_key_locked(
         self,
         confirmed: AttemptGroup,
@@ -1698,11 +1767,15 @@ class EntryCoordinator:
         if not confirmed.identity_key:
             return
         boundary = crossing.request.captured_at
+        confirmed_cameras = {norm_camera_id(a.request.camera_id)
+                             for a in confirmed.attempts.values()}
         for group in list(self._groups.values()):
             if (
                 group.group_id == confirmed.group_id
                 or group.status != RecordStatus.PENDING
                 or group.identity_key != confirmed.identity_key
+                or not all(norm_camera_id(a.request.camera_id) in confirmed_cameras
+                           for a in group.attempts.values())
                 or not group.attempts
             ):
                 continue
@@ -1814,6 +1887,8 @@ class EntryCoordinator:
             if (
                 journey.canonical_plate_key != group.identity_key
                 or journey.decision_status != "confirmed"
+                or not all(norm_camera_id(a.request.camera_id) in journey.arrival_camera_ids
+                           for a in group.attempts.values())
             ):
                 continue
             boundary = journey.entry_captured_at
@@ -2150,6 +2225,7 @@ class EntryCoordinator:
                         related.matched_group_id = group.group_id
                         related.status = RecordStatus.RESOLVED
                     group.status = RecordStatus.RESOLVED
+                    self._advance_arrival_boundaries_locked(group)
                     self._retire_superseded_same_key_locked(
                         group,
                         resolution_crossing,
@@ -2393,7 +2469,7 @@ class EntryCoordinator:
             observed_plate_confidence=_observed[1],
         )
 
-    def _identity_for_plate_locked(self, identity_key: str, embeddings):
+    def _identity_for_plate_locked(self, identity_key: str, embeddings, camera_id: str):
         """The live identity for this plate key that this attempt may enrich.
 
         Derived by scan rather than kept as an index. `_groups` is bounded by
@@ -2428,6 +2504,8 @@ class EntryCoordinator:
             for group in self._groups.values()
             if group.status == RecordStatus.PENDING
             and group.identity_key == identity_key
+            and all(norm_camera_id(a.request.camera_id) == norm_camera_id(camera_id)
+                    for a in group.attempts.values())
         ]
         if not candidates:
             return None
@@ -3298,6 +3376,7 @@ class EntryCoordinator:
             crossing_camera_id=record["crossing_camera_id"],
             crossing_source=record["crossing_source"],
             embeddings=tuple(tuple(row) for row in record["embeddings"]),
+            arrival_camera_ids=tuple(record.get("arrival_camera_ids", ())),
             exit_captured_at=(
                 datetime.fromisoformat(record["exit_captured_at"])
                 if record["exit_captured_at"]
@@ -3318,6 +3397,7 @@ class EntryCoordinator:
             "crossing_camera_id": finalized.crossing_camera_id,
             "crossing_source": finalized.crossing_source,
             "embeddings": [list(row) for row in finalized.embeddings],
+            "arrival_camera_ids": list(finalized.arrival_camera_ids),
             "exit_captured_at": (
                 finalized.exit_captured_at.isoformat()
                 if finalized.exit_captured_at is not None
@@ -3384,6 +3464,8 @@ class EntryCoordinator:
             crossing_source=self._crossing_source(crossing),
             embeddings=embeddings,
             exit_captured_at=superseding_exit_at,
+            arrival_camera_ids=tuple(sorted({norm_camera_id(a.request.camera_id)
+                                            for a in group.attempts.values()})),
         )
         return finalized
 
