@@ -74,22 +74,25 @@ jobs:
       - name: Push Docker image
         id: push_image
         run: |
-          docker push ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }}
-
-      - name: Tag as latest
-        id: push_latest
-        run: |
-          docker tag ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }} \
-                     ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:latest
-
-          docker push ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:latest
+          docker buildx create --use --name ci-builder
+          docker buildx build \
+            -f ${{ env.DOCKERFILE }} \
+            --tag ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }} \
+            --tag ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:latest \
+            --push \
+            --provenance=false \
+            --sbom=false \
+            --compression=gzip \
+            --compression-level=9 \
+            --force-compression \
+            ${{ env.DOCKERFILE_PATH }}
 
       - name: Remove runtime config
         if: always()
         run: rm -f config.yaml
 
       - name: Notify docker push success
-        if: always() && steps.push_image.outcome == 'success' && steps.push_latest.outcome == 'success'
+        if: always() && steps.push_image.outcome == 'success'
         run: |
           echo "✅ Docker push succeeded for ${{ github.repository }}"
           echo "Image: ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }}"
@@ -98,7 +101,7 @@ jobs:
         shell: bash
 
       - name: Notify docker push failure
-        if: always() && (steps.push_image.outcome == 'failure' || steps.push_latest.outcome == 'failure')
+        if: always() && steps.push_image.outcome == 'failure'
         run: |
           echo "❌ Docker push failed for ${{ github.repository }}"
           echo "Image: ${{ secrets.NEXUS_REGISTRY }}/${{ secrets.NEXUS_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.calc_tag.outputs.image_tag }}"
